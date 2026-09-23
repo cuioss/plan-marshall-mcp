@@ -70,8 +70,10 @@ host build server) are added with their first code, not as empty shells.
 - `@QuarkusTest` + `McpAssured` (quarkus-mcp-server-test) for MCP tools; management endpoints via
   `@TestHTTPResource(value = "/health/ready", management = true)`.
 - Test data: cui-test-generator; log assertions: cui-test-juli-logger (`@EnableTestLogger`).
-- Minimum 80% line and branch coverage; unit-test logic in separate classes rather than in the
-  `@QuarkusMain` entry point (excluded from coverage).
+- Minimum 80% instruction and branch coverage, enforced by the JaCoCo `check` of the parent's
+  `-Pcoverage` profile (merged Maven and `quarkus-jacoco` data) and by the SonarCloud quality gate.
+- Unit-test logic in separate classes rather than in the `@QuarkusMain` entry point, which is
+  excluded from JaCoCo and Sonar coverage.
 - Container-level behaviour belongs in `integration-tests` (`*IT`), not in unit tests.
 
 ### Container image

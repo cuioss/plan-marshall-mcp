@@ -22,11 +22,13 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -70,8 +72,19 @@ class ContainerHealthIT {
         var command = new ArrayList<>(List.of("docker"));
         command.addAll(List.of(args));
         var process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        var output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-        assertTrue(process.waitFor(30, TimeUnit.SECONDS), "docker command timed out: " + command);
+        // Read concurrently: readAllBytes() blocks until the process exits, which would bypass the timeout
+        var outputFuture = CompletableFuture.supplyAsync(() -> {
+            try {
+                return new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+        if (!process.waitFor(30, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new AssertionError("docker command timed out: " + command);
+        }
+        var output = outputFuture.join();
         assertEquals(0, process.exitValue(), "docker command failed: " + command + "\n" + output);
         return output;
     }

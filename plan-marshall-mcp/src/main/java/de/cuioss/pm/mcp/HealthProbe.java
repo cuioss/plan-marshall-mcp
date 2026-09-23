@@ -20,6 +20,9 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.Arrays;
 
+
+import lombok.experimental.UtilityClass;
+
 /**
  * Pre-boot container health probe invoked by the image's {@code HEALTHCHECK}.
  * <p>
@@ -30,7 +33,8 @@ import java.util.Arrays;
  *
  * @since 0.1
  */
-final class HealthProbe {
+@UtilityClass
+class HealthProbe {
 
     /** The command-line token requesting a health probe. */
     static final String PROBE_FLAG = "--health-probe";
@@ -39,10 +43,6 @@ final class HealthProbe {
     static final int MANAGEMENT_PORT = 9000;
 
     private static final int CONNECT_TIMEOUT_MILLIS = 2000;
-
-    private HealthProbe() {
-        // utility class
-    }
 
     /**
      * @param args the raw command line
