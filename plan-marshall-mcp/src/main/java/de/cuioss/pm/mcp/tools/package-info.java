@@ -1,5 +1,5 @@
 /*
- * Copyright © 2023-present CUI-OpenSource-Software (info@cuioss.de)
+ * Copyright © 2026-present CUI-OpenSource-Software (info@cuioss.de)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,23 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package de.cuioss.template;
-
-import lombok.ToString;
-
 /**
- * @author Oliver Wolff
- *
+ * MCP tools exposed by the PM-MCP server.
  */
-@ToString
-public class Hello {
-
-    /**
-     * @param name to be greeted
-     * @return the greeted String
-     */
-    public String hello(String name) {
-        return "Hello " + name;
-    }
-
-}
+package de.cuioss.pm.mcp.tools;
