@@ -1,0 +1,132 @@
+= Technology
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Concept] » Technology
+
+== Decisions
+
+[cols="1,3"]
+|===
+|Area |Decision
+
+|Language and framework
+|Java 21+ with Quarkus.
+
+|MCP implementation
+|The Quarkiverse https://github.com/quarkiverse/quarkus-mcp-server[Quarkus MCP Server] extension, tracking its 2.1 line for the extension API.
+
+|Front end
+|Quarkus native executable, stdio transport.
+
+|Core daemon
+|Quarkus native executable in the target state; JVM mode until LSP4J and the other daemon dependencies are verified under native image.
+
+|Skills extension
+|Implemented by PM-MCP on the framework's extension API; tool-based delivery is primary regardless (xref:04-skill-model.adoc#_delivery[Skill Model]).
+
+|Long-running work
+|PM-MCP's own job model (`pm.build`, `pm.wait`); the MCP Tasks extension is adopted once the framework ships it and hosts support it.
+
+|HTTP security and OAuth
+|https://github.com/cuioss/cui-http[cui-http] and https://github.com/cuioss/TokenSheriff[TokenSheriff] (<<_security_libraries>>).
+
+|LSP client
+|Eclipse LSP4J.
+
+|Container runtime access
+|Docker-compatible Engine API through PM-MCP's runtime adapter (xref:08-container-backend.adoc#runtimes[Container Backend]).
+
+|Target image
+|Native executables on a distroless base, containing no interpreter and no external command-line tools (<<_target_image>>).
+
+|Python
+|Not part of the target image. plan-marshall's existing scripts run during migration only; where they run is open (<<_target_image>>). The test environment runs them next to the Java implementation (xref:14-test-strategy.adoc[Test Strategy]).
+
+|Git and CI access
+|Git through a Java library and CI providers through their REST APIs (cui-http), not through the `git` and `gh` command-line tools, so that the target image needs neither.
+
+|Delivery
+|Container image for PM-MCP; build runtime images; host build server as native binary (<<_delivery>>).
+|===
+
+The evaluation behind these decisions — framework assessment, comparison with the official MCP SDKs, Python runtime options — is in xref:discussions/technology-evaluation.adoc[Technology Evaluation].
+
+== Rationale
+
+* The Quarkus MCP Server supports the current protocol revision (`2026-07-28`) and legacy stateful clients simultaneously, offers stdio and Streamable HTTP, runtime registration of tools and resources, and an extension API for custom methods.
+* One codebase yields native executables for front end, daemon and host build server.
+* The security layer is first-party, hardened and benchmarked, and matches the operator's expertise.
+* Known gaps are covered: Skills are implemented on the extension API; Tasks are not required by the design.
+
+Risks carried with this choice — the framework is a Quarkiverse extension outside the official SDK tiers, the extension API is not yet in a released version, Tasks support is a draft — are tracked in xref:13-open-questions.adoc[Open Questions].
+
+== Security libraries
+
+cui-http::
+Validation of inbound requests on PM-MCP's HTTP endpoints (attack-pattern detection), TLS context management, and the HTTP client for upstream services (CI provider, code-quality service, upstream MCP servers).
+
+TokenSheriff::
+* *Server side* — `token-sheriff-validation` protects PM-MCP's HTTP endpoints as an OAuth resource wherever they are reachable beyond a local channel: the host build server's outbound connection, and team or remote deployments.
+* *Client side* — `token-sheriff-client` performs OAuth and OIDC client flows: the host build server authenticating to PM-MCP, the MCP proxy connecting to upstream MCP servers that use MCP's OAuth-based authorization, and token acquisition for CI and quality APIs.
+
+Both provide Quarkus extensions.
+
+== Delivery
+
+PM-MCP image::
+One image, used in two roles:
++
+* `serve --stdio` — the per-session front end, started by the host as `docker run -i --rm … serve --stdio`;
+* `daemon` — the long-lived core daemon, started once per machine.
++
+Front ends reach the daemon over Streamable HTTP on a local port or a shared socket volume. The image contains no build toolchains.
+
+What the PM-MCP container receives::
+* repositories and worktrees, mounted at their host paths;
+* the container runtime API socket, narrowed by a socket proxy for rootful Docker;
+* git identity and credentials for the git operations PM-MCP performs.
+
+Build runtime images::
+One per wrapper family (JDK, Python, Node and combinations), used by the container backend (xref:08-container-backend.adoc[Container Backend]).
+
+Host build server::
+A native binary installed on the developer's host, for projects using the host backend (xref:07-build-execution.adoc#_host_backend[Build Execution]).
+
+== Target image
+
+The PM-MCP image's target state is native executables on a distroless base: no shell, no package manager, no interpreter, no `git` or `gh` binaries. This minimises size and attack surface.
+
+It constrains the migration:
+
+* *No Python in the image.* An image containing CPython cannot be distroless in this sense. As long as plan-marshall scripts run inside the PM-MCP image, the image is not in its target state.
+* *No command-line tools.* plan-marshall's scripts drive `git` and `gh`. The Java implementation uses a git library and the CI providers' REST APIs instead.
+* *Native daemon.* The daemon must run as a native executable; verifying LSP4J and the container-runtime client under native image is therefore a precondition for the target state.
+
+Where not-yet-ported scripts run during migration decides when the target image is reached:
+
+[cols="1,2,2"]
+|===
+| |Scripts in the PM-MCP image |Scripts through the host build server
+
+|Image during migration
+|Interim image with CPython, `git`, `gh`; not distroless
+|Distroless from the start
+
+|Target image reached
+|When the last script is ported
+|Immediately; only the daemon's native mode remains
+
+|Host prerequisite during migration
+|None
+|Host build server on every machine using PM-MCP
+|===
+
+The choice is open (xref:13-open-questions.adoc#_open_decisions[Open Questions]); the variants are described in xref:discussions/technology-evaluation.adoc#_python_runtime_options[Technology Evaluation].
+
+== Consequences for this repository
+
+* The repository is still the uncustomised `cui-java-module-template` (single `jar` module, template coordinates). It is customised and restructured into modules: core daemon, front end, Skills extension, container runtime adapter, host build server, domain extensions, and the image builds.
+* The build produces the native front end, the daemon (native in the target state), the PM-MCP image, the build runtime images and the host build server binary.
+* The Skills extension implementation is written so it can be contributed upstream to the Quarkus MCP Server once stable.
