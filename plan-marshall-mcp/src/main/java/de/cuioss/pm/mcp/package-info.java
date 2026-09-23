@@ -1,5 +1,5 @@
 /*
- * Copyright © 2023-present CUI-OpenSource-Software (info@cuioss.de)
+ * Copyright © 2026-present CUI-OpenSource-Software (info@cuioss.de)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,17 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package de.cuioss.template;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
-import org.junit.jupiter.api.Test;
-
-class HelloTest {
-
-    @Test
-    void test() {
-        assertEquals("Hello cui", new Hello().hello("cui"));
-    }
-
-}
+/**
+ * The PM-MCP server application: entry point, container health probe and log messages.
+ */
+package de.cuioss.pm.mcp;
