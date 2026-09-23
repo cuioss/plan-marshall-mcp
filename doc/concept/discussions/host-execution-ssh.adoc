@@ -1,0 +1,162 @@
+= Host Execution through ssh
+:toc: left
+:toclevels: 3
+:nofooter:
+
+xref:../README.adoc[Concept] » xref:README.adoc[Discussions] » Host Execution through ssh
+
+Detailed design of an alternative that is not part of the target design. The decided build execution is described in xref:../07-build-execution.adoc[Build Execution]; this variant is compared with the others in xref:execution-alternatives.adoc[Execution Alternatives].
+
+== Problem
+
+PM-MCP is delivered as a Docker image (xref:../10-technology.adoc[Technology]). Builds, however, must run on the developer's host: with the host's toolchains, credentials, paths and file ownership, and without slow bind-mounted file systems. A container cannot start a host process on its own — preventing exactly that is the purpose of container isolation. Host execution therefore always needs a host-side counterpart; the question is how small and how controlled it can be.
+
+== Precondition: the wrapper convention
+
+Every executable PM-MCP starts in a project is a *wrapper* committed at the root of the project tree: `mvnw`, `gradlew`, `pw`, and equivalents for other build systems. PM-MCP never starts a toolchain binary directly.
+
+This closes the set of executables the host must allow. It is small, can be checked statically, and requires no knowledge of any build tool. From the container's point of view a wrapper is simply an executable.
+
+== Pattern: forwarding shim plus controlled host counterpart
+
+The container calls an executable that forwards the invocation to the host; a guard on the host verifies and runs it. The pattern is established: Flatpak's `flatpak-spawn --host` and distrobox's `distrobox-host-exec` let sandboxed processes run host commands through a controlled channel.
+
+[source,text]
+----
+container                                   host
+┌───────────────────────────────┐           ┌─────────────────────────────────┐
+│ PM-MCP calls:                 │           │ sshd with a key restricted by   │
+│   host-exec /work/proj/mvnw   │  ssh      │ a forced command:               │
+│        │                      ├──────────►│   command="pm-exec-guard"       │
+│   host-exec shim              │  argv,cwd │        │                        │
+│                               │  stdio    │   verify → exec ./mvnw on host  │
+│   exit code, streamed output ◄┤  exit     │   audit, slot limit, timeout    │
+└───────────────────────────────┘           └─────────────────────────────────┘
+----
+
+== Components
+
+=== Shim (container)
+
+A small executable, `host-exec`, installed at a fixed path in the image outside any mounted tree. PM-MCP invokes it explicitly and passes the wrapper path as data: `host-exec /work/proj/mvnw verify`. It is not installed under wrapper names, because the worktree is mounted at its host path and would hide an image file at the same path; the shim never has to intercept a wrapper invocation.
+
+It transmits:
+
+* the argument vector, unchanged;
+* the working directory;
+* an allowlisted subset of environment variables;
+* stdin, and streams stdout and stderr back;
+* the real exit code of the host process.
+
+Cancellation closes the connection; the host side terminates the process group. The shim contains no policy; it only forwards.
+
+=== Transport: sshd with a forced command
+
+The transport uses the host's standard SSH server, with no additional daemon:
+
+* The container holds a dedicated key pair generated for PM-MCP.
+* On the host, the public key is registered in `authorized_keys` with restrictive options:
++
+[source,text]
+----
+command="/usr/local/bin/pm-exec-guard",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,from="<docker network range>" ssh-ed25519 AAAA… pm-mcp
+----
+* With `command=`, sshd ignores what the client asks to run and always starts the guard; the requested command is available to the guard in `SSH_ORIGINAL_COMMAND`.
+* The container reaches the host through `host.docker.internal`.
+* On macOS this requires enabling Remote Login; on Linux, a running sshd.
+
+=== Guard (host)
+
+`pm-exec-guard` is the trust boundary. It never resolves what to run; it *verifies* the request against the operator's enrolment and refuses anything off-template. The model is the verify-not-resolve model of plan-marshall's `marshalld` build server.
+
+Checks, in order:
+
+. *Parse without a shell.* The request is decoded into an argument vector and a working directory; it is never passed to a shell.
+. *Enrolled tree.* The working directory is canonicalised (symlinks resolved) and must lie in an operator-enrolled project root or in a live linked worktree whose git common directory resolves to that root.
+. *Wrapper.* The executable must be a recognised wrapper name, located at the root of that tree, and tracked by git.
+. *Wrapper integrity.* The wrapper's content must equal its content at a reference revision (`HEAD`, or the default branch). A wrapper modified in the working tree is refused.
+. *Arguments.* The argument vector must match the allowlist or schema registered for that wrapper.
+. *Limits.* A machine-wide slot limit (file lock) and a timeout apply.
+. *Execute.* The wrapper is executed directly with the verified working directory, as the host user, in its own process group.
+. *Audit.* One append-only record per request: project, working directory, wrapper, arguments, verdict, exit code, duration.
+
+A refusal returns a distinct exit code and a machine-readable reason on stderr, so PM-MCP can represent it as a state instead of a build failure.
+
+== Enrolment
+
+Enrolment is an operator action on the host, never reachable from PM-MCP or the model:
+
+* registering a project root (and implicitly its worktrees);
+* registering the wrappers and argument schemas allowed for it;
+* setting slot limit and timeout.
+
+The enrolment file is owned by the host user and not writable from the container. This keeps the property that a plan cannot enrol itself, as with `marshalld` today.
+
+== Path identity
+
+Paths must mean the same on both sides. Two options:
+
+Same-path bind mount::
+The container mounts the project tree at the identical absolute path. PM-MCP can then read files directly, and every path in a representation, log or diagnostic is valid on the host and in the IDE.
+
+No mount::
+The container has no access to the tree; every file and git operation goes through host execution as well. Stronger isolation, more round trips.
+
+The same-path bind mount is the default; builds still run on the host, so mount performance does not affect them.
+
+== Security considerations
+
+* *A wrapper is repository code.* Running it on the host is what plan-marshall does today, so the exposure does not grow. The integrity check prevents a model edit to a wrapper from turning it into an arbitrary host command.
+* *Build scripts are repository code too.* A wrapper runs the project's build definition, which the model may have edited as part of its task. This is inherent to building on the host and unchanged from today; the guard's scope is the entry point, not the build logic.
+* *Key scope.* The key only ever starts the guard (`command=`), accepts connections only from the container network (`from=`), and gets no PTY, port, agent or X11 forwarding.
+* *No shell anywhere.* Neither the shim, sshd's forced command nor the guard interprets the request through a shell.
+* *Listening port.* sshd listens on the host; the `from=` restriction and the forced command bound what a connection can do. Hosts that do not want a listening SSH server use the runner variant (<<runner>>).
+
+== Relation to PM-MCP
+
+* Build execution in the build server (xref:../06-services.adoc#build-server[Build server]) would become: select the wrapper and arguments for the operation, call it through `host-exec`, parse the output into the structured result.
+* A refusal by the guard is a distinct outcome in the representation, not a red build (xref:../03-hypermedia-workflow.adoc#_explicit_outcomes[Explicit outcomes]).
+* The container image needs no build toolchains and builds are unaffected by bind-mount performance.
+
+[[runner]]
+== Evolution: host runner
+
+The guard can grow into a dedicated host runner when needs exceed a per-call executable:
+
+[cols="1,2,2"]
+|===
+| |ssh + forced-command guard |Host runner
+
+|Host software
+|sshd (built in) plus the guard
+|Runner binary
+
+|Container sees
+|An executable
+|A job API
+
+|Control
+|Verify, audit, slots, timeout
+|Same, plus structured results
+
+|Direction
+|Container connects to host sshd
+|Runner dials out to PM-MCP and polls for jobs; no listening port on the host
+
+|Language servers
+|Not covered
+|Runner hosts warm language servers with host toolchains
+
+|Remote PM-MCP
+|Not suited
+|Works unchanged against a remote or team PM-MCP, authenticated with OAuth
+|===
+
+The verification rules are identical in both; the runner reuses the guard as its verification core. Starting with ssh and the guard needs almost no new infrastructure and matches the view that, for the container, a build is just an executable.
+
+== Open points
+
+* Exact argument schemas per wrapper, and how they are derived from project configuration.
+* Wrapper integrity reference: `HEAD` versus default branch, and handling of plans that legitimately change a wrapper.
+* Environment allowlist for the shim.
+* Windows hosts: availability of OpenSSH server and equivalent semantics.

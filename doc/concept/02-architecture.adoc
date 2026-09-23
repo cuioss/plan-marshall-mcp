@@ -1,0 +1,165 @@
+= Architecture
+:toc: left
+:toclevels: 3
+:nofooter:
+
+xref:README.adoc[Concept] » Architecture
+
+== Principles
+
+. *The server owns process; the model owns judgment.* Everything deterministic — state, transitions, gates, argument assembly, execution — lives in PM-MCP. The model decides only what requires judgment.
+. *State is addressed, never reconstructed.* Every interaction names a `plan_id` or an `epic_id`. The server answers with the authoritative state; the model never rebuilds state from documents.
+. *State lives in the filesystem.* Every piece of state is persisted in files; no process — front end, daemon, host build server — holds state that is lost when it stops. There is no session context (<<_state_persistence>>).
+. *Confined to the working directory.* Every operation is limited to the project the context works in; other projects are reachable only after the user's approval (xref:09-security.adoc#_workspace_confinement[Workspace confinement]).
+. *Hypermedia drives the workflow.* The server tells the model what it can do next as pre-fabricated tool calls (xref:03-hypermedia-workflow.adoc[Hypermedia Workflow]).
+. *One process, one version.* Skills, tools and services are served by the same server and cannot drift.
+. *Local by design.* PM-MCP runs on the developer's machine, next to the repository and worktrees. It is not a remote service.
+. *Runtime-neutral.* Everything a host needs is reachable through plain MCP tools; MCP extensions are used where present and are never a precondition.
+
+== Component view
+
+[source,text]
+----
+ Host (Claude Code / OpenCode / Antigravity / …)
+ ┌──────────────────────────────────────────────┐
+ │  Model ──► MCP client                         │
+ └───────────────┬──────────────────────────────┘
+                 │ stdio (per host session)
+ ┌───────────────▼──────────────────────────────────────────────────┐
+ │ PM-MCP front end (one per host session)                           │
+ │  ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌─────────────────────┐ │
+ │  │ Skills   │ │ Tools    │ │ Resources │ │ Proxied upstream MCP│ │
+ │  │ (vocab)  │ │ (verbs)  │ │ (state)   │ │ tools/resources     │ │
+ │  └────┬─────┘ └────┬─────┘ └─────┬─────┘ └──────────┬──────────┘ │
+ └───────┼────────────┼─────────────┼──────────────────┼────────────┘
+         │            │ local IPC   │                  │
+ ┌───────▼────────────▼─────────────▼──────────────────▼────────────┐
+ │ PM-MCP core daemon (one per machine)                              │
+ │  ┌───────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────┐ │
+ │  │ Workflow      │ │ State store  │ │ Build server │ │ LSP pool │ │
+ │  │ engine (FSM)  │ │ plans/epics  │ │ jobs, slots  │ │ + proxy  │ │
+ │  └───────────────┘ └──────────────┘ └──────┬───────┘ └──────────┘ │
+ │  ┌───────────────┐ ┌──────────────┐ ┌──────┴───────────────────┐  │
+ │  │ Skill         │ │ Audit / event│ │ Upstream MCP connections │  │
+ │  │ generator     │ │ log, metrics │ │ (proxy)                  │  │
+ │  └───────────────┘ └──────────────┘ └──────────────────────────┘  │
+ └──────────────────────────────────────────────┬────────────────────┘
+                                                │ build backends
+                        ┌───────────────────────┴───────────────────┐
+                        ▼                                           ▼
+          build containers (Docker / Podman)          host build server (native)
+----
+
+=== Front end
+
+A thin stdio MCP server started by the host. It declares the `resources` capability and the Skills extension, exposes the tool surface, and forwards every request to the core daemon. Keeping it thin makes host restarts, sub-agents and parallel sessions cheap; everything expensive lives in the daemon.
+
+=== Core daemon
+
+A long-lived machine-local process owning everything that must outlive a host session or be shared across sessions and sub-agents:
+
+Workflow engine::
+The state machines for plans (init → refine → outline → plan → execute → finalize, including the finalize step sequence) and for orchestrator epics. It computes representations and links and validates every transition.
+
+State store::
+Reads and writes the authoritative plan and epic state in the filesystem (<<_state_persistence>>). Access happens through the engine only; in memory the daemon keeps caches, never the only copy.
+
+Build server::
+Build jobs, scheduling and policy; execution is delegated to a build backend selected per project (xref:06-services.adoc#build-server[Build server], xref:07-build-execution.adoc[Build Execution]).
+
+LSP pool and proxy::
+Warm language servers per workspace and language (xref:06-services.adoc#lsp[LSP]).
+
+Skill generator::
+Produces the vocabulary skills per project and client from project configuration, domain extensions and the client profile (xref:04-skill-model.adoc[Skill Model], xref:15-client-profiles.adoc[Client Profiles]).
+
+Upstream MCP connections::
+Connections to other MCP servers whose tools and resources PM-MCP re-exposes (xref:06-services.adoc#mcp-proxy[MCP proxy]).
+
+Audit and event log::
+Every transition, tool call and build is recorded. Metrics, retrospectives and landing records are derived from it rather than written by the model.
+
+== Interaction model
+
+[source,text]
+----
+Model                          PM-MCP
+  │  pm.state(plan_id)            │
+  ├──────────────────────────────►│  engine computes representation
+  │  representation + links       │
+  │◄──────────────────────────────┤
+  │  (optionally loads the        │
+  │   vocabulary skill named in   │
+  │   the representation)         │
+  │  link: pm.<verb>(bound, free) │
+  ├──────────────────────────────►│  validate state_token, execute
+  │  result + next representation │
+  │◄──────────────────────────────┤
+  ⋮                               ⋮
+----
+
+Every transition returns the next representation, so the workflow is a chain of link-follows; a separate `pm.state` call is needed only to resume.
+
+== Scoping
+
+Every call is scoped by identifiers:
+
+* `client` — the agent runtime (`claude`, `opencode`, `antigravity`, …) of the session, declared at the entry point by a minimal entry script and carried afterwards as a bound link parameter; it selects the client profile used to render skills, representations and links (xref:15-client-profiles.adoc[Client Profiles]). The model never decides it.
+* `plan_id` — a plan and its worktree. The server resolves the worktree, branch and configuration from it; the model never passes paths.
+* `epic_id` — an orchestrator epic.
+* `project` — the workspace root: the repository checkout the entry point was invoked in, persisted with the plan or epic run; every operation is confined to it (xref:09-security.adoc#_workspace_confinement[Workspace confinement]).
+
+A call without a plan or epic scope is limited to entry and discovery (`pm.enter`, `pm.plans`, `pm.epics`, `pm.start`).
+
+== State persistence
+
+=== Decision
+
+All state is persisted in the filesystem. Processes hold caches only.
+
+[cols="1,2"]
+|===
+|State |Location
+
+|Plan state: phase, tasks, findings, references, `state_token`, the client identity of the run, build jobs of the plan
+|The project's `.plan/` tree (git-ignored local part)
+
+|Epic state: ledgers, inbox, landings
+|The project's `.plan/` tree (git-tracked part)
+
+|Approvals for access beyond the project (xref:09-security.adoc#_access_to_other_projects[Access to other projects])
+|The project's `.plan/` tree (git-ignored local part)
+
+|Enrolment, build-slot and lock state, audit log
+|Machine-wide PM-MCP state directory
+|===
+
+=== No session context
+
+MCP does not provide a session to hold state in: protocol `2025-11-25` has a handshake-based session, but the current revision `2026-07-28` removed it, and every request describes itself in its metadata. PM-MCP therefore does not use one, in either revision:
+
+* the scope of a call — client, plan or epic, state token — travels in its arguments, as bound link parameters;
+* every call is answered from the persisted state alone;
+* any front end and any daemon instance can serve any call, so host restarts, `/clear`, compaction, daemon restarts and switching clients mid-plan lose nothing.
+
+The layout and file formats are compatible with plan-marshall's `.plan/` tree during migration.
+
+== Boundaries
+
+In scope::
+Process state and transitions, execution of deterministic operations (git, builds, CI provider, file-footprint capture, findings storage), language services, skill generation, aggregation of upstream MCP servers.
+
+Out of scope::
+Content produced by judgment (outlines, code, triage decisions, commit and PR prose). The server stores and validates it; the model writes it.
+
+Not relied on::
+MCP sampling for server-initiated model calls. Every judgment step is a free parameter of a link the model follows.
+
+== Deployment topology
+
+* PM-MCP is delivered as a container image (xref:10-technology.adoc#_delivery[Delivery]).
+* One core daemon per machine, serving all enrolled projects, running from that image.
+* One front end per host session, including sub-agent sessions where the host starts separate MCP connections.
+* Repositories and worktrees are mounted into the PM-MCP container at their host paths.
+* Builds run outside the PM-MCP container, through the build backend selected per project (xref:07-build-execution.adoc[Build Execution]).
+* Cross-session coordination (merge mutex, review-bot rate windows, build slots) is serialised by the daemon and persisted as files, so a daemon restart loses no lock, window or slot.

@@ -1,0 +1,222 @@
+= Container Backend
+:toc: left
+:toclevels: 3
+:nofooter:
+
+xref:README.adoc[Concept] » Container Backend
+
+== Decisions
+
+. Each build runs in a *short-lived build container*, started as a sibling of PM-MCP through the host's container runtime (Docker-out-of-Docker). No container runtime runs inside another container.
+. PM-MCP composes the container specification itself; nothing about it comes from the model.
+. The worktree is mounted at its *host path*.
+. *Docker and Podman* are both supported through one runtime adapter; on Linux, rootless runtimes are preferred and required for builds that start containers.
+. *A fresh container per build* is the default; warm builder containers are an opt-in per project.
+. Builds that start containers themselves use *sibling containers* through the same runtime, opt-in per project.
+
+The backend is the default of xref:07-build-execution.adoc[Build Execution]; the job contract, enrolment and shared policy are described there.
+
+== Flow
+
+[source,text]
+----
+client ──► PM-MCP                        pm.build(plan_id, "verify")
+             │ 1. resolve worktree, wrapper, arguments, image
+             │    (from enrolment and project configuration)
+             │ 2. container API: create + start
+             ▼
+        container runtime (Docker / Podman, via API socket)
+             │
+             ▼
+        build container (sibling, removed after the run)
+          image:   runtime image for the wrapper (e.g. python-3.x, temurin-21)
+          mounts:  worktree            read-write, host path
+                   caches              named volumes (m2, gradle, uv, pip, npm, pyprojectx)
+                   log directory       plan-scoped
+          user:    host user (runtime-specific mapping)
+          limits:  CPU, memory, timeout
+          network: per project policy
+          cmd:     ./pw verify          cwd = worktree
+             │
+             ▼  stdout/stderr → plan log, exit code
+        PM-MCP: wait → parse log → structured result → next representation
+----
+
+== Relation to marshalld
+
+The container replaces only the build subprocess; state and policy stay in PM-MCP's build server:
+
+[cols="1,1"]
+|===
+|`marshalld` today |Container backend
+
+|Long-lived host daemon
+|PM-MCP build server
+
+|Operator enrolment (registry)
+|PM-MCP enrolment, plus image allowlist per project
+
+|Verifier (verify-not-resolve, tree containment)
+|Container specification composed by PM-MCP: verified worktree, fixed wrapper, argument schema
+
+|Scheduler (machine-wide slot cap, queue)
+|PM-MCP scheduler; the slot cap counts running build containers
+
+|Supervisor (spawns and watches the build process)
+|Container runtime: create, start, wait, stop on timeout
+
+|Journal
+|PM-MCP job store
+
+|Interaction and lifecycle audit
+|PM-MCP audit log
+
+|Build process on the host
+|Build container, removed after the run
+|===
+
+== Container runtime adapter
+
+[[runtimes]]
+PM-MCP talks to the runtime through one adapter targeting the Docker-compatible Engine API, restricted to a common subset: create, start, attach or logs, wait, stop, remove, named volumes, resource limits.
+
+The adapter provides:
+
+* a configurable API endpoint (`DOCKER_HOST`-style);
+* runtime detection: Docker or Podman, rootful or rootless;
+* per-runtime mount, ownership and labelling options;
+* a CLI fallback (`docker run` / `podman run`) when PM-MCP runs on the host and no API socket is available.
+
+Supported runtimes:
+
+[cols="1,2,2"]
+|===
+|Runtime |API endpoint |Notes
+
+|Docker Desktop, OrbStack (macOS, Windows)
+|Docker socket
+|Builds run in the runtime's VM; `/Users` is shared by default, so host-path mounts work.
+
+|Docker Engine (Linux)
+|`/var/run/docker.sock`
+|Rootful: socket access is equivalent to host root; fronted by a socket proxy (<<control>>).
+
+|Rootless Docker
+|User socket
+|Socket access limited to the user's privileges.
+
+|Podman (Linux, rootless)
+|`podman system service`, usually socket-activated (`podman.socket`), at `$XDG_RUNTIME_DIR/podman/podman.sock`
+|Daemonless: the API service runs only while requests arrive. Socket access equals the user's own privileges.
+
+|Podman (macOS, Windows)
+|API socket of the `podman machine` VM
+|`/Users` is mounted into the VM by default.
+|===
+
+Runtime-specific differences handled by the adapter:
+
+[cols="1,2,2"]
+|===
+|Topic |Docker |Rootless Podman
+
+|File ownership on bind mounts
+|`--user` with host UID and GID
+|`--userns=keep-id`
+
+|SELinux hosts
+|Relabelling may be required
+|`:Z` / `:z` mount options
+
+|Networking
+|Bridge networks
+|Rootless networking (pasta or slirp4netns)
+
+|Testcontainers inside a build
+|Socket passthrough
+|Socket passthrough; Ryuk usually disabled
+|===
+
+== Images, caches, logs
+
+Build images::
+One runtime image per wrapper family: a JDK for `mvnw` and `gradlew`, Python for `pw`, Node for npm-based wrappers, combinations where needed. Wrappers download their own tool versions, so images stay small. The image per project is part of the enrolment.
+
+Caches::
+Named volumes per cache type (Maven repository, Gradle, uv, pip, npm, pyprojectx), shared across builds of the same user. Without them every build downloads its dependencies again.
+
+Logs and results::
+Container output is streamed through the runtime API into the plan's log file; the exit code comes from the runtime's wait operation; PM-MCP parses the log into the structured result.
+
+== Path identity
+
+The runtime resolves bind-mount sources on the *host*. PM-MCP therefore addresses every worktree by its host path; when PM-MCP runs in a container, it mounts the repositories at the identical absolute path. Paths in logs, diagnostics and representations are valid for PM-MCP, the host and the IDE alike.
+
+== Control
+
+[[control]]
+Access to a container runtime API is powerful — for a rootful daemon it is equivalent to root on the host. It is never exposed to the model:
+
+* *PM-MCP composes every API call.* The model supplies only `plan_id` and a transition; images, mounts, commands and limits come from enrolment and project configuration.
+* *Fixed container policy:* image allowlist per project; mounts limited to worktree, caches and log directory; no runtime socket in the build container unless the project opts in; resource limits; timeout; removal after the run; network policy per project.
+* *Narrowed API access:* for rootful Docker, a socket proxy (for example `tecnativa/docker-socket-proxy`) limits PM-MCP to the endpoints it needs. Rootless runtimes remove the root equivalence and are preferred on Linux.
+* *Audit:* one record per build — project, plan, wrapper, arguments, image, verdict, exit code, duration.
+* *Enrolment is operator-only*: a plan cannot enrol itself or widen its image allowlist.
+
+== Builds that start containers
+
+[[container-using-builds]]
+Modern builds start containers themselves: container-based compilation (for example Quarkus native builds with `quarkus.native.container-build=true`), image builds, and integration-test environments (Testcontainers, `docker compose` stacks with tests against published ports). TokenSheriff's integration tests combine all three.
+
+=== Sibling containers
+
+Such a build receives access to the same runtime PM-MCP uses; the containers it starts are siblings of the build container, not nested in it.
+
+Requirements:
+
+Host-path mounts::
+Tools inside the build pass bind-mount sources such as `$PWD/target` to the runtime, which resolves them on the host. Because the worktree is mounted at its host path, these paths are valid.
+
+Runtime CLI in the image::
+Images for container-using builds contain the `docker` or `podman` CLI and the Compose plugin.
+
+Network reachability::
+Ports published by sibling containers are bound on the runtime's host (on macOS: the runtime VM). Tests connecting to `localhost` therefore require the build container to use the runtime host's network (`--network host`). Alternatively the build container joins the Compose or Testcontainers network, or Testcontainers uses a host override.
+
+=== Opt-in
+
+Declared per project in the enrolment, never inferred from the build:
+
+`containers: none`::
+Default. No socket, isolated network policy.
+
+`containers: siblings`::
+Socket passed in, image with runtime CLI, runtime host network, audit record marked as container-enabled.
+
+Projects that build images without a runtime — Jib, or Quarkus' Jib container-image extension — stay in `containers: none`; daemonless image builds are preferred.
+
+=== Security
+
+A build is repository code that the model may have edited; with socket access it controls the runtime.
+
+* *Rootful Docker on Linux*: not permitted for `containers: siblings`. Socket access equals host root, and a socket proxy cannot prevent it because the build legitimately creates containers with mounts.
+* *Rootless Podman or rootless Docker*: required on Linux. Socket access equals the developer's own privileges — the same exposure as running the build on the host.
+* *Docker Desktop, OrbStack, `podman machine` on macOS*: containers run in a VM; reach into the host is limited to the shared directories, which are the developer's own files.
+
+Projects that need container-using builds without these conditions use the host backend.
+
+=== Cleanup
+
+Sibling containers outlive the build container when a build crashes or is cancelled. PM-MCP records the containers, networks and volumes created during a job from the runtime's event stream and removes them when the job ends, is cancelled or times out; Testcontainers' own reaper remains active where used.
+
+== Warm builders
+
+[[warm-builders]]
+A fresh container per build costs about 0.3–1 s (container start plus cold JVM); for real test runs this is below the run-to-run variance. Incremental build state is not lost, because `target/` and equivalent directories live in the mounted worktree. Caches matter more than warm processes: the dependency repository must be available to every build container. Details: xref:discussions/container-build-measurements.adoc[Container Build Measurements].
+
+For projects with many very short builds, a long-lived *builder container* per project or worktree can be enabled: builds are executed in it (`exec`), and it is removed with the plan's worktree. It keeps build daemons warm at the cost of state accumulating between builds. Fresh containers remain the default.
+
+== Implementation notes
+
+* Java access to the runtime API: a client library such as docker-java, or a minimal client for the Engine REST API over the Unix socket using JDK Unix-domain-socket channels. Behaviour under Quarkus native image is to be verified.
+* The runtime adapter is independent of MCP and is tested against Docker and Podman with integration tests.

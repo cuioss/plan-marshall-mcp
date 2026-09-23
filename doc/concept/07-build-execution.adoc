@@ -1,0 +1,128 @@
+= Build Execution
+:toc: left
+:toclevels: 3
+:nofooter:
+
+xref:README.adoc[Concept] » Build Execution
+
+== Decisions
+
+. *Builds always run through the project's wrapper.* Every build is `<wrapper> <arguments>` in the plan's worktree — `mvnw`, `gradlew`, `pw` or equivalent, committed at the root of the tree. PM-MCP never invokes a toolchain binary directly.
+. *Builds run outside the PM-MCP container*, through a *build backend*.
+. *The backend is chosen per project by the operator.* Two backends are supported:
++
+`container`::: The default. Each build runs in a short-lived sibling container started through the host's container runtime (xref:08-container-backend.adoc[Container Backend]).
++
+`host`::: The host build server — the successor of plan-marshall's `marshalld` — runs builds natively on the developer's host (<<_host_backend>>).
+. *Both backends share one job contract, one policy model and one result format*, so the workflow, the tool surface and the representations do not depend on the choice.
+
+Variants that were considered and the research behind them are in xref:discussions/execution-alternatives.adoc[Execution Alternatives] and xref:discussions/execution-patterns.adoc[Execution Patterns].
+
+== Choosing a backend
+
+[cols="2,2,2"]
+|===
+|Aspect |`container` |`host`
+
+|Isolation
+|Build sees only worktree, caches and log directory
+|Build runs with the developer's full user environment
+
+|Toolchains
+|Runtime image plus wrapper-managed tools; reproducible
+|Host toolchains; may drift between developers
+
+|Performance
+|About 0.3–1 s fixed cost per build (xref:discussions/container-build-measurements.adoc[measurements])
+|Native; warm build daemons possible
+
+|Builds that start containers
+|Opt-in `containers: siblings`, rootless runtime required on Linux
+|Work unchanged against the host runtime
+
+|Credentials
+|Only what is mounted or passed
+|Host credentials available
+
+|Prerequisite
+|Container runtime (Docker or Podman)
+|Host build server installed and running
+|===
+
+Guidance:
+
+* `container` for projects that benefit from isolated, reproducible builds and have no or simple container use.
+* `host` for projects with heavy container use in their builds (native container builds, Compose stacks, Testcontainers), projects that depend on host-specific toolchains, or where the speed of short, frequent builds matters most.
+
+== Enrolment
+
+The backend and its parameters are part of the project's enrolment, set by the operator and never by the model or a plan:
+
+[source,yaml]
+----
+project: /Users/oliver/git/TokenSheriff
+build:
+  backend: host            # container | host
+  wrappers: [mvnw]
+  # container backend only:
+  # image: temurin-21
+  # containers: none       # none | siblings
+----
+
+Changing the backend is an operator action. A plan in flight keeps the backend it started with, so results within a plan remain comparable.
+
+== Job contract
+
+PM-MCP's build server composes each job; the backend executes it.
+
+Job specification::
+* project and worktree (host path);
+* wrapper and argument vector (checked against the argument schema);
+* environment allowlist;
+* limits: timeout, and resources where the backend supports them;
+* container-use class (`none` or `siblings`) for the container backend.
+
+Operations::
+`submit` → job id; `events` (log stream and state changes); `wait` (bounded); `cancel`; `cleanup`.
+
+Outcome::
+Closed-enum state — `succeeded`, `failed`, `refused`, `cancelled`, `timed_out`, `backend_unavailable` — plus exit code, log location, duration and the backend that ran the job. `refused` (the job did not match the enrolment) and `backend_unavailable` are distinct states in the representation, never reported as a failed build.
+
+Implemented once in PM-MCP, for both backends:
+
+* enrolment and argument schemas (verify-not-resolve);
+* the scheduler with the machine-wide slot cap;
+* the job store and the audit log;
+* log parsing into the structured build result (xref:05-tool-surface.adoc#_build_results[Build results]);
+* freshness tracking for gates;
+* cleanup of containers, networks and volumes a build created, recorded from the runtime's event stream.
+
+== Host backend
+
+=== Role
+
+The host build server is `marshalld` evolved into a PM-MCP backend. It runs on the developer's host as the developer's user and executes wrappers natively.
+
+It keeps `marshalld`'s properties:
+
+* strictly opt-in: a project is served only after operator enrolment;
+* verify-not-resolve: each job is checked against the enrolment — worktree containment (enrolled root or a live linked worktree of it), wrapper at the tree root and tracked by git, argument schema — and refused otherwise;
+* the wrapper is executed directly, never through a shell, in its own process group;
+* machine-wide slot cap, job journal, append-only audit;
+* enrolment is operator-only and never reachable from a plan.
+
+=== Channel to PM-MCP
+
+PM-MCP on the host::
+Owner-only Unix domain socket, as with `marshalld` today.
+
+PM-MCP in a container or remote::
+The host build server connects *out* to PM-MCP and polls for jobs. The host opens no listening port. The connection is authenticated with OAuth (TokenSheriff, cui-http). Host Unix sockets are not forwarded into containers, because that is unreliable across the VM boundary on macOS.
+
+=== Builds that start containers
+
+They use the host's container runtime directly, as when the developer runs the build by hand: no sibling setup, no path translation, no network workaround. Leftover containers are still removed by PM-MCP's cleanup.
+
+=== Warm processes
+
+The host build server is long-lived, so projects can use build daemons (Gradle daemon, `mvnd`) that stay warm between builds. Whether a project does is a property of its wrapper and configuration.

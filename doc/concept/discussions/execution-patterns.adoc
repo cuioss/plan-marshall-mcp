@@ -1,0 +1,111 @@
+= Execution Patterns
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../README.adoc[Concept] » xref:README.adoc[Discussions] » Execution Patterns
+
+Research into how comparable tools execute builds and commands, behind the decisions in xref:../07-build-execution.adoc[Build Execution] and xref:../08-container-backend.adoc[Container Backend]. It reflects a point-in-time view of the ecosystem; recheck the sources before relying on it.
+
+== Where coordinators and execution run
+
+[cols="1,2,1,1,1"]
+|===
+|Pattern |Examples |Coordinator |Execution |Toolchains
+
+|A. Host-native server
+|https://github.com/oraios/serena[Serena] (language-server based MCP server), https://thetoolshelf.dev/mcp/servers/desktop-commander-mcp/[Desktop Commander], plan-marshall and `marshalld`
+|Host
+|Host
+|Host
+
+|A+. Host-native server with OS sandbox
+|https://github.com/anthropic-experimental/sandbox-runtime[Anthropic sandbox-runtime], Claude Code's sandboxed Bash tool (https://code.claude.com/docs/en/sandbox-environments[sandbox environments])
+|Host
+|Host, confined by Seatbelt (macOS) or bubblewrap (Linux), network through a proxy
+|Host
+
+|B. Everything in a container
+|Dev containers, https://docs.docker.com/ai/mcp-catalog-and-toolkit/toolkit/[Docker MCP catalog] servers
+|Container
+|Container
+|Image
+
+|C. Coordinator starts execution containers
+|https://github.com/docker/mcp-gateway[Docker MCP Gateway] (host binary starting server containers), https://github.com/dagger/container-use[Dagger container-use] (container and git branch per agent), Testcontainers
+|Host or container
+|Container per job or agent
+|Image
+
+|D. Container coordinator, execution on the host
+|https://man7.org/linux/man-pages/man1/flatpak-spawn.1.html[flatpak-spawn --host], https://github.com/1player/host-spawn[host-spawn], https://github.com/89luca89/distrobox/blob/main/docs/usage/distrobox-host-exec.md[distrobox-host-exec]
+|Container or sandbox
+|Host
+|Host
+
+|E. Workers dialling out to a coordinator
+|GitHub Actions self-hosted runners, Bazel remote execution, Buildkite agents
+|Anywhere, including remote
+|Worker host
+|Worker
+|===
+
+Observations:
+
+* Local coding tools that need toolchains and language servers predominantly use A.
+* Where isolation is wanted, the established answers are A+ (Anthropic) and C (Docker, Dagger).
+* D originates in desktop sandboxing, not in agent tooling. The existing tools are coarse: once permitted, the sandbox can run any host command, without argument validation. No MCP project using D was found.
+* E is the established shape for a remote or shared control plane.
+
+Adopted in the target design: C for the container backend, A-style native execution with E for the host backend's channel when PM-MCP runs elsewhere.
+
+== Builds that start containers
+
+How comparable projects handle builds and tests that start containers themselves.
+
+=== Sibling containers through the host runtime's socket
+
+[cols="1,3"]
+|===
+|Project |Approach
+
+|https://java.testcontainers.org/supported_docker_environment/continuous_integration/dind_patterns/[Testcontainers] — official pattern for running tests inside a container
+|Socket mounted, source mounted at the *same path* (`-v $PWD:$PWD -w $PWD -v /var/run/docker.sock:/var/run/docker.sock`); `TESTCONTAINERS_HOST_OVERRIDE` (for example `host.docker.internal` on Docker Desktop) to reach started containers.
+
+|https://github.com/devcontainers/features/tree/main/src/docker-outside-of-docker[Dev Containers `docker-outside-of-docker` feature]
+|Socket mount. Documents the path problem explicitly: bind mounts must use *host* paths, worked around with `LOCAL_WORKSPACE_FOLDER` (https://github.com/devcontainers/features/issues/919[devcontainers/features#919]).
+
+|GitLab CI socket binding
+|Same approach; considered https://oneuptime.com/blog/post/2026-01-16-docker-socket-binding-cicd/view[dangerous] because the daemon runs as root — socket proxy recommended, not for untrusted code.
+|===
+
+Adopted: this is the container backend's `containers: siblings` mode, with same-path mounts and rootless runtimes on Linux.
+
+=== Private runtime per environment
+
+[cols="1,3"]
+|===
+|Project |Approach
+
+|https://www.docker.com/blog/why-microvms-the-architecture-behind-docker-sandboxes/[Docker Sandboxes] — built for coding agents (Claude Code, Codex, OpenCode, …)
+|One microVM per agent with its *own Docker daemon*; the agent is root inside the VM with no path back to the host. Testcontainers and image builds work unchanged.
+
+|https://coder.com/docs/templates/docker-in-workspaces[Coder]
+|Sysbox runtime: Docker inside unprivileged workspace containers (envbox on Kubernetes).
+
+|Gitpod
+|Rootless Docker inside the workspace.
+
+|GitLab CI `docker:dind`, Dev Containers `docker-in-docker` feature
+|Classic Docker-in-Docker with a privileged container — simplest, weakest isolation.
+|===
+
+The agent-specific trend is a private runtime inside a microVM. It is recorded as a candidate third backend in xref:execution-alternatives.adoc#_candidate_microvm_backend_docker_sandboxes[Execution Alternatives].
+
+=== No runtime for image builds
+
+Kaniko, Buildah and rootless BuildKit are https://docs.gitlab.com/ci/docker/using_buildkit/[GitLab's recommendation] for image builds in CI; Jib does the same for Java. Adopted: daemonless image builds are preferred and keep projects in `containers: none`.
+
+=== Runtime facade
+
+Dagger places a https://github.com/dagger/dagger/discussions/11710[Docker API facade] in front of its engine, so Testcontainers talks to Dagger instead of a Docker daemon. Not pursued.
