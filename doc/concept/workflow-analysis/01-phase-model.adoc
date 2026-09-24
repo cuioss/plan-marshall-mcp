@@ -1,0 +1,253 @@
+= Phase Model and Planning Phases
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Workflow Analysis] » Phase Model and Planning Phases
+
+== Scope
+
+The phase state machine as a whole and phases 1–4 (init, refine, outline, plan):
+
+* `plan-marshall/SKILL.md` (312 lines) routes actions; `plan-marshall/workflow/planning.md` (1,088) and `planning-outline.md` (598) are the actual orchestrator for phases 1–4.
+* The phase skills: `phase-1-init` (1,260 lines), `phase-2-refine` (374 plus 961 of detail), `phase-3-outline` (828 plus 1,263 plus the light lane with 312), `phase-4-plan` (1,251).
+* `manage-status` (about 8,000 lines of script): transition, planning lane, change-type heuristic, confidence aggregation, sibling collision, classification validation, step recording.
+* The phase handshake: `plan-marshall/scripts/phase_handshake.py`, `_invariants.py` (1,980 lines), `_handshake_store.py`.
+* `ref-workflow-architecture/standards/`: phases, phase lifecycle, change types, scope deviation, agents.
+
+== How it works today
+
+The phase model is a forward state machine, `1-init → … → 6-finalize`, with one back-edge from finalize to execute. No single piece of code carries it; it is spread over prose the orchestrator follows, deterministic scripts, and shared contract documents.
+
+Phase 1 runs in the main session and asks the user up to six questions directly. Phases 2–4 run as `execution-context` dispatches; a sub-agent that needs input returns a prompt envelope (`refine_prompt`, `outline_prompt`, `escalate_ask`) and the main session asks. Correctness is enforced mostly by prose ("never skip …") and mechanically only at a few points: the handshake, the artifact gate on `transition`, and `git status --porcelain` after each planning phase.
+
+The documents already disagree with each other — `workflow-overview.md` still dispatches phase 1 and loops the outline review "until approval", `phases.md` describes an unbounded refine loop, `phase-2-refine` states both "max iterations 5" and "re-dispatch at most once". A single state machine removes this class of drift.
+
+== Elements
+
+[cols="2,3,1,4"]
+|===
+|Element |What it is |Verdict |Reasoning
+
+|Phase sequence and states
+|`status.json` phases with pending, in progress, done and `current_phase`
+|Reshaped
+|Becomes the engine's closed state set (03 Representation). Sub-states the model keeps in its context today become persisted states: `outline.review`, `refine.awaiting_answers`, the Q-Gate iteration.
+
+|`manage-status transition`
+|Marks a phase done and advances
+|Reshaped
+|Only checks that the phase name exists (`_cmd_lifecycle.py:711-856`), not that it is the current phase, although its documentation claims ordering validation. The engine validates by construction. Its guards stay: artifact gate, finalize-findings refusal, clean-tree refusal.
+
+|Artifact gate and `--allow-bare-transition`
+|Refuses exits from 2, 3, 4 without their artifact
+|Transfers / Open
+|The guard becomes a transition guard. The exemption forces a gate and belongs to the operator (03 Omission is enforcement).
+
+|Phase entry protocol
+|Q-Gate check, handshake verification, start log (`phase-lifecycle.md:44-101`)
+|Reshaped
+|Guards on the entry transition. Today it depends on the model calling it (`doc/concepts/process-enforcement.adoc`).
+
+|Phase completion protocol
+|Transition, logs, separator, capture
+|Obsolete
+|One engine transition, recorded in the audit log.
+
+|Phase boundary metrics
+|Token and duration boundaries and their repair on resume
+|Obsolete / Open
+|Durations derive from the audit log; token usage of sub-agents is visible only to the host (see README, dispatch observability).
+
+|Handshake store (`handshakes.toon`)
+|One invariant row per phase
+|Reshaped
+|Replaced by engine state (16 Storage and output formats).
+
+|Invariants on the outside world
+|`main_sha`, dirty files, worktree state, `config_hash`
+|Transfers
+|Real-world checks; guards backed by git jobs, with their per-invariant blocking scopes (`phase-handshake.md:126-151`).
+
+|Store integrity invariants
+|Task state hash, reference validity, task graph, unfinished tasks, open Q-Gate findings
+|Reshaped
+|The engine is the only writer, but the model can still edit files under `.plan/`. A digest recorded on write and checked on read replaces the hashes; unfinished tasks and open findings become explicit guards.
+
+|`pending_findings_blocking_count`, `pr_title_present`
+|Blocking findings; PR title required from refine on
+|Transfers
+|Transition guards.
+
+|`mark-step-done`, `assert-step-recorded`
+|Proof that intra-phase steps ran
+|Obsolete (phases 1–4)
+|Each step is a state; it cannot be skipped. Phases 1–4 have no step enforcement today at all.
+
+|Drift override
+|User authorises drift (`capture --override --reason`)
+|Transfers
+|Forcing a gate is operator-only (09 Operator channel).
+
+|Loop-back auto-override
+|Re-entry drift accepted exactly once
+|Reshaped
+|The engine knows a loop-back is sanctioned. Refusal errors are never bypassed (`phase-handshake.md:71-85`).
+
+|Clean main checkout after each planning phase
+|`git status --porcelain` checks (`planning.md:439-475`)
+|Transfers
+|A guard on every planning transition; the server cannot prevent the model's own edits, so detection stays.
+
+|`marshal.json` recovery
+|Never discard; the operator decides
+|Transfers
+|A `*.blocked` state with an operator decision (`planning.md:477-499`).
+
+|Init file creation
+|Plan directory, request, references, status
+|Transfers
+|Part of `pm_start` (05).
+
+|Plan id derivation, phantom-id guard
+|Slug rules; ids shaped like lesson ids or UUIDs are refused (`phase-1-init:147-204`)
+|Reshaped
+|The server derives the id; a model-supplied slug is validated by schema. The timestamp suffix for recipe plans, which prevents branch reuse, stays.
+
+|Recipe match, planning lane, change-type and scope heuristics, classification validation, sibling collision
+|Classifiers without a model
+|Transfers
+|Pure functions over state, ported with differential tests. Order stays: recipe match before lane routing; an explicit recipe choice is never overridden.
+
+|Change-type fallback
+|Judgment when the heuristic is ambiguous
+|Reshaped
+|A `submit` with `change_type` (closed enum of six) and reasoning, guided by a vocabulary skill. The heuristic does not persist an ambiguous result (single writer, `phase-3-outline:241-265`).
+
+|Refine analysis
+|Five quality dimensions, module mapping, scope, premise and proposed-fix checks
+|Reshaped
+|One judgment state submitting scores, module mapping, scope estimate, affected files, clarified request, PR title and open questions. The server aggregates with the fixed weights (`phase-2-refine:218-245`), applies the threshold, widens domains and derives the lane.
+
+|Prompt envelopes (`refine_prompt`, `outline_prompt`, `escalate_ask`)
+|Sub-agent returns questions, orchestrator asks
+|Reshaped
+|Questions are persisted with the submit, the plan moves to an awaiting-answers state, answers are persisted, and the "re-dispatch at most once" counter is persisted. Today counter and questions live only in the orchestrator's context and are lost on `/clear`.
+
+|Outline authoring
+|Judgment per lane and change type, with normative rules
+|Reshaped
+|`submit` of the outline; deterministic rules become server validators (per-file intent marker, test deliverables require the module-testing profile, surgical bypass predicate). The rest becomes `skill://pm/outline` with a supporting file per change type.
+
+|Light lane
+|Bounded read set (cap 25, band 8) and escalation to deep
+|Transfers / Reshaped
+|Cap and band triggers are deterministic; premise and cross-cutting triggers are judgment submits. The escalation, today a backward `set-phase 2-refine`, becomes an engine transition.
+
+|Q-Gate validation
+|Validators after a phase; content-hash rerun gate; `off`, `once`, `until_clean`
+|Reshaped
+|The sibling dispatch exists only because a sub-agent cannot dispatch; the hash gate and the exit on the pending count become engine logic.
+
+|User review gate (outline to plan)
+|Approve or request changes; feedback becomes Q-Gate findings
+|Reshaped
+|An `outline.review` state answered through elicitation. Today the outline phase is marked done before approval, so a pending approval does not survive `/clear`.
+
+|Workflow settings
+|`init/plan/execute_without_asking`, lane selection, `auto_route_recipe`, confidence threshold, compatibility, simplicity
+|Transfers
+|Engine configuration that decides which links are offered. Not yet listed in the concept.
+
+|Task derivation (phase 4)
+|Profile mapping, dependency graph with cycle detection, skill resolution, atomic `batch-add`
+|Transfers / Reshaped
+|Almost entirely deterministic over structured deliverables; computed by the engine, with a small judgment submit for task descriptions. The re-entry guard is obsolete: no "create tasks" link is offered once tasks exist.
+
+|Envelope packing and cost sizing
+|Groups tasks by context budget
+|Reshaped
+|Still needed for dispatch (see README, dispatch unit); computed by the engine.
+
+|Execution manifest composition and posture preview
+|Selects the phase 5 and 6 steps
+|Reshaped
+|Engine state (see xref:02-execute-finalize.adoc[Execute and Finalize]). Preview and composition keep sharing one resolver.
+
+|Executor preflight, plan checkout location, build-server preflight, session check, dispatch termination causes
+|Workarounds of the current architecture
+|Obsolete
+|The server resolves worktree, daemon, client and level. The role-to-level mapping transfers as data.
+
+|Issue mirror
+|Clarifications and outline posted to the issue
+|Transfers
+|A CI job after the transition; not in the concept yet.
+
+|Mailbox check in the transition payload
+|Advisory inbox count
+|Reshaped
+|A fact in the plan representation.
+
+|Change-type contract
+|Closed enum of six, priority, orthogonal to domain and profile
+|Transfers
+|Keeps the refusal when plan scope and deliverable scope disagree.
+
+|Scope-deviation contract
+|Hold, accept with rationale, split
+|Reshaped
+|The sub-agent submits a structured deviation; the task becomes blocked, the operator decides through elicitation, side effects are deterministic. Softening a deviation without a decision becomes impossible.
+
+|Resume anchor
+|Routing context and phase-to-action table
+|Reshaped
+|`pm_state(plan_id)` (03 Resumption).
+
+|Track (simple, complex)
+|Glossary term
+|Obsolete
+|Derived from the lane; one concept remains.
+|===
+
+== Gaps in the concept
+
+. *Routine user dialogue.* The concept knows only `escalate` to an operator decision. Phases 1–4 have about ten routine interactions — existing plan, obsolescence, recipe choice, ambiguous domain, sibling collision, posture, clarifications, outline review, Q-Gate exhaustion — several of them with free text. Missing: an awaiting-user state, an elicitation form schema, and the fallback without elicitation.
+. *Plan sources.* `pm_start(request)` does not cover description, issue, lesson and recipe sources, the base branch, moving the lesson file with its premise check, and fetching the issue body through CI.
+. *Recipes* are not modelled (see xref:04-extensions.adoc[Extension Mechanism]).
+. *Workflow settings* that decide link emission are not listed.
+. *Stores needed by phases 1–4* are missing from the transition order in 16: outline parsing and validation, architecture queries, the execution manifest, request sections.
+. *Token metrics* once phase boundaries are gone.
+. *Outline vocabulary per change type and domain* is not in the skill catalogue.
+. *Edits under `.plan/` by the model* outside the server: no store digests yet.
+
+== Conflicts
+
+* *Sub-agent escalation.* Concept 03 sends a sub-agent's decision through `escalate` and blocks it in a wait. plan-marshall deliberately lets the sub-agent finish with its best judgment, return questions in one batch and allow one re-dispatch (`ref-workflow-architecture/standards/agents.md:121-158`). That is cheaper and bounded; see README, sub-agent questions.
+* *Deleting a plan.* 03 makes deletion operator-only, but init answers delete plans (obsolete → close, collision → rename or abort, exists → replace). An elicitation answer counts as operator consent; the lesson carry-back veto of `delete-plan` stays.
+* *Approval by the model.* plan-marshall lets the model ask for approval and relay the answer. Under 09 the model must never approve an outline or accept a deviation; hosts without elicitation make this a usability question (see README, user interaction).
+
+== Invariants to preserve
+
+* Planning phases write only under the plan directory; the main checkout is clean at every planning transition; `marshal.json` is never discarded without an operator decision.
+* A bare transition out of 2, 3 or 4 is refused unless the artifact exists or a reasoned exemption is recorded.
+* Task creation is not idempotent: `batch-add` is atomic, and the plan phase never runs twice against existing tasks.
+* The lane ratchet is one-way. An unknown scope estimate biases to deep; an unset change type does not (`phase-1-init:832-860`).
+* Refine only widens domains; outline narrows them once.
+* Change type has a single writer; disagreement between plan and deliverable scope is refused; classification validation flags but never blocks.
+* Phantom plan ids are refused; recipe plan ids carry a timestamp suffix.
+* Clarifications are asked in one batch; re-dispatch at most once; review feedback is persisted as Q-Gate findings.
+* The Q-Gate loop runs at most three iterations, with the content-hash rerun gate, the exit on the pending count and the surgical bypass predicate.
+* Handshake drift is a signal, never rationalised or remediated automatically; the loop-back override fires once; worktree refusals are never bypassed; the `.plan/` exemption is keyed on git trackedness.
+* Missing counts are omitted, never zeroed.
+* A scope deviation is decided before it is logged; accept needs a persisted rationale that appears in the PR body; split creates a lesson; deviations are batched into one question.
+* Posture preview and manifest composition use the same resolver.
+* A PR title exists from refine on.
+
+== Conclusions
+
+. Phases 1 and 4 are mostly deterministic: init becomes `pm_start` with server classifiers and user-choice states, and phase 4 can be computed by the engine, which saves a dispatch. Judgment concentrates in three submit states — refine analysis, outline authoring, change-type fallback — each with a closed parameter set.
+. Handshakes collapse into transition guards. Invariants that detect the model's process violations become obsolete; those observing git, configuration and findings stay as guards.
+. The user interaction model is the main open decision for the planning phases.
+. Resume needs sub-phase states: pending approval, refine questions and answers, re-dispatch counters and Q-Gate iterations are persisted, and the plan does not advance past outline before approval.
+. Change type and scope deviation carry over almost unchanged as data; enforcement becomes stronger because no link records a softening.

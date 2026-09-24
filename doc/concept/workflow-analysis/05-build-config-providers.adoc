@@ -1,0 +1,226 @@
+= Build, Configuration and Providers
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Workflow Analysis] » Build, Configuration and Providers
+
+== Scope
+
+The largest deterministic block of plan-marshall, about 90,000 lines of Python and Markdown:
+
+* the shared build library `script-shared/scripts/build/` (about 10,000 lines) and the four `build-*` skills (about 8,500: discovery, execution, parsers);
+* `manage-build-server` and `build-server-client` (about 5,500: the `marshalld` daemon and its client);
+* `manage-config` (15,000), `manage-architecture` (14,000), `marshall-steward` (10,000), `tools-integration-ci` (8,000), `manage-run-config` (3,700), `manage-providers` (2,900);
+* `extension-api/standards/`: canonical commands, build API, build execution, build systems, build extension point, module discovery, `marshal.json` reference, provider extension point.
+
+== How it works today
+
+The steward wizard seeds `marshal.json`. Extensions discover modules by running the build tool itself (for example `mvn help:all-profiles dependency:tree`, `build-maven/scripts/_maven_cmd_discover.py:570`) and write `derived.json` per module, which contains complete command strings. The model asks `architecture resolve` for a command and receives a `python3 .plan/execute-script.py …` string to run through Bash, optionally routed to `marshalld`, which checks it against a registry. The build wrapper writes the log, learns the timeout, parses the log into status, errors, warnings and tests, and returns TOON. Providers are declared per skill and persisted into `marshal.json`; secrets live in `~/.plan-marshall/credentials/`.
+
+== Elements
+
+[cols="2,3,1,4"]
+|===
+|Element |What it is |Verdict |Reasoning
+
+|Canonical command vocabulary
+|`clean` to `package`; `module-tests`, `quality-gate`, `verify` required (`extension-api/standards/canonical-commands.md:13-28`)
+|Transfers
+|The `pm_build` verb set (05). The resolution rules carry over: POM modules get only `quality-gate`, `module-tests` only with tests, commands from profiles.
+
+|Commands stored as strings in `derived.json`
+|"Complete, no runtime composition"
+|Reshaped
+|Today an executable string sits in a file the model can write. PM-MCP composes wrapper and arguments at job time from domain support and discovered module facts and checks them against the enrolment (07 Execution).
+
+|`architecture resolve` with timeout, tier and hint fields
+|`manage-architecture/standards/resolve-command.md:14-60`
+|Obsolete
+|Exist only for the 600-second Bash ceiling and sub-agent routing (06: host timeouts no longer shape builds).
+
+|Wrapper preference
+|`./mvnw` then `mvn`, `./gradlew` then `gradle`, `./pw` then `pwx`, `npx`/`npm` (`build-execution.md:192-203`)
+|Open
+|07 allows only the committed wrapper (conflict 2).
+
+|Adaptive timeouts
+|Learned value × 1.25; update 0.8 × max + 0.2 × min; floors per engine; keyed by the full arguments (`build-execution.md:205-264`)
+|Reshaped
+|Server state feeding the job's timeout. 07 names a timeout without a source.
+
+|Result contract
+|Status success, error, timeout, killed, indeterminate; errors with file, line, message, category; tests; log (`build-execution.md:49-130`)
+|Transfers / conflict
+|The fields match 05 Build results; the outcome enum of 07 lacks `killed` and `indeterminate` (conflict 1).
+
+|Output modes and acceptable warnings
+|Actionable, structured, errors; `{tool}.acceptable_warnings`
+|Reshaped
+|Modes become representation detail (actionable inline, the rest through the log resource). Acceptable warnings move from git-ignored run configuration to tracked project configuration.
+
+|Log parsers
+|Maven and Gradle patterns (`_build_jvm_patterns.py`), npm parser registry (tsc, jest, eslint, tap), pytest with mypy and ruff, success markers such as `BUILD SUCCESS`
+|Transfers
+|Split per 11 Domain support: engines compiled in (registry detection, combination of parsers, traceback, TAP and JSON reading, deduplication key); category tables, markers and the category-to-skill routing as data.
+
+|Coverage parsing
+|JaCoCo, Cobertura, LCOV, Istanbul; threshold (`_coverage_parse.py`)
+|Transfers
+|Compiled in; missing from 11.
+
+|Gate honesty helpers
+|Population examined (`_build_examined.py`), gate coverage (`_gate_coverage.py`), test-scope divergence
+|Transfers
+|The substance of 06's "covers the scope a gate requires"; pure functions.
+
+|Build map and `derive-verification`
+|Write-once routes of glob, role and build class; changed paths to a verification set; fail-closed read (ADR-004)
+|Transfers
+|Server-owned; the map stays project configuration. Not in the concept.
+
+|Module discovery
+|Paths, profiles, packages, dependencies, statistics per module
+|Reshaped
+|Deterministic analysis on the server, cached per commit. Its build-tool invocations must be enrolled jobs too.
+
+|Architecture enrichment
+|The model writes responsibility, purpose, key packages with reasoning
+|Reshaped
+|Judgment as link parameters; "every module enriched" becomes a guard.
+
+|Architecture queries
+|Files, which module, graph, path, neighbours, impact, overview, module diff, descriptor regression, capabilities
+|Reshaped
+|MCP resources or a query tool; missing from 05 Resources.
+
+|`marshalld` registry
+|Operator-only registration; defaults for allowed notations and worktree containers (`manage-build-server/SKILL.md:47-87`)
+|Reshaped
+|07 Enrolment; enrolled content changes from executor notations to wrappers and argument schemas.
+
+|Verifier
+|Argument template; executable path and cwd each resolved to the root or a live worktree sharing the git common directory and lying under a registered container (`_marshalld_verifier.py`)
+|Transfers
+|07 keeps verify-not-resolve but drops the container restriction (see invariants).
+
+|In-process fallback and shared `build-queue.json`
+|Builds without the daemon
+|Obsolete
+|The daemon is the server; enrolment is a precondition.
+
+|Slot cap and its source
+|Machine configuration, default, invalid, unreadable; re-resolved per submission
+|Transfers
+|Moves to `~/.plan-marshall/mcp/`; the source stays reported.
+
+|Journal replay and interaction audit
+|Jobs in flight become `killed` on restart; request status is not fate; fate written at termination
+|Transfers
+|02 covers orderly drains only; crash replay is not specified.
+
+|Client: submit, wait, ping, preflight, impostor socket, version handshake
+|`build-server-client/SKILL.md:45-93`
+|Obsolete / Transfers
+|Socket and re-attach are replaced by `wait` links. "A bounded wait returns a live running state with elapsed time and progress, never a timeout" transfers.
+
+|Background-build ledger, two-layer timeout, bans on background runs
+|`build-systems-common.md:69-230`
+|Obsolete
+|Bash harness workarounds.
+
+|`marshal.json` as project configuration
+|`plan.*`, `project.*`, skill domains, build map, credentials configuration, providers, orchestrator, code intelligence, interaction mode
+|Reshaped
+|Split three ways (conclusion 4).
+
+|Provisioning and runtime fields
+|`system.provisioned_version`, seed fingerprint, plugin-cache retention, runtime target, `sync-defaults`
+|Obsolete
+|Distribution and executor artefacts; client identity comes from the entry record; seeding becomes format migration.
+
+|`run-configuration.json`
+|Timeouts, CI durations, language servers, derivation resolvers, architecture refresh, display time zone
+|Reshaped
+|Learned values become server state; language servers are open (gap 8); the rest becomes project configuration.
+
+|Provider declaration and lanes
+|A verify command selects the command-line lane, header name and verify endpoint the REST lane; categories version control (1), CI (≤1), other; detection patterns (`ext-point-provider.md`, ADR-018)
+|Transfers
+|08 adopts the lanes, but not cardinality, detection or URL derivation (gap 7).
+
+|Credential file store
+|Keyed by the provider skill name; project directory from the remote's repository name or a cwd hash; header fields in the file; URL in `marshal.json` with a legacy fallback (`_providers_core.py:70-88, 356-425, 887-906`)
+|Transfers / conflict
+|08 describes a different layout (conflict 3).
+
+|REST client
+|HTTPS required when an authentication header is set
+|Transfers
+|08 goes further: same origin, no redirect downgrade.
+
+|`ensure-denied`, `migrate-home`
+|Deny rules in host settings; home migration
+|Reshaped / Obsolete
+|`install-client` (08); the home is already migrated.
+
+|CI integration
+|`gh` and `glab` router, failure logs into `artifacts/ci-runs/`, adaptive first wait from CI durations
+|Reshaped
+|CI jobs (07); log download and adaptive waiting become server logic; exit-code conventions are obsolete.
+
+|Sonar provider
+|REST lane, organization and project key, rules file
+|Transfers
+|Token lane in Java; rules as data.
+
+|Steward wizard
+|Bootstrap steps 1–4, configuration steps 5–13, permissions, upgrade
+|Obsolete / Open
+|Bootstrap, permissions and upgrade are obsolete; no successor for the configuration steps is designed (gap 1).
+|===
+
+== Gaps in the concept
+
+. *Project setup.* No successor for the wizard's steps 5–13: base branch, providers, architecture, build map, skill domains, finalize steps, CI, credentials. Proposal: a project-level setup state machine with links for the judgment parts and operator-CLI hand-offs for enrolment and secrets.
+. *Argument schemas* are named in 07 and left open in 13. Proposal: argument templates per canonical verb as domain-support data (`test -pl {module}`, `verify -P{profile} -pl {module}`), with typed placeholders checked at job time against the server's own discovery — module in the discovered set, profile declared in the descriptor. The operator enrols wrapper and template set, not concrete values, so a new module needs no re-enrolment. Free `-D`, `-f`, `--settings` or `-s` are never accepted.
+. *Discovery jobs* run the build tool (`help:all-profiles dependency:tree`, Gradle `properties`, `dependencies`, `tasks`) and need enrolled templates of their own.
+. *Timeout source*: learning, floors and keying need a home in server state.
+. *Architecture and module model*: discovery caching, enrichment links, query resources, the build map with `derive-verification` and the derivation resolvers are not covered.
+. *Coverage, warnings, examined population*: 11 names only log parsers.
+. *Provider details*: category cardinality, detection patterns, non-secret configuration, and where a token-lane provider's base URL comes from — 08's "only to the issuing origin" needs a stored origin.
+. *Language server binaries*: today an argument vector in a git-ignored file the model can write. Proposal: from domain-support data, host overrides through enrolment like wrappers.
+. *Crash replay*: a job in flight during a daemon crash is replayed as `killed`.
+. *Migration sequencing*: stage 2 promises structured results from `pm_build`, which needs either Java parsers by then or build jobs that still run as Python script jobs.
+
+== Conflicts
+
+. *Outcome enum.* 07 has succeeded, failed, refused, cancelled, timed out; plan-marshall has success, error, timeout, killed, indeterminate (`build-execution.md:55-88`), and the daemon uses unknown (ADR-009). Without `killed`, restart kills are retried blindly; without `indeterminate`, "could not tell" is folded into a neighbour. Fix: add both to 07.
+. *Wrapper only.* npm has no wrapper (`build-execution.md:201`); Maven and Gradle fall back to the system binary, pyproject to `pwx`. Under 07 an npm project cannot build. Proposal: an executable kind "enrolled host tool from the daemon's `PATH`", as for `git` and `gh`, with the same argument check.
+. *Credential file layout.* 08 calls the store identical to plan-marshall's with `<provider>.json`. In fact the key is the provider skill name (`workflow-integration-sonar.json`), the project directory is the repository name from the remote or a cwd hash, and the file may carry `header_name`, `header_value_template` and a legacy `url`. PM-MCP must reproduce this exactly or drop the claim of a shared store.
+. *Overridable `verify_command`.* It lives in tracked `marshal.json` as a legitimate override and is executed after `shlex.split` (`_providers_core.py:1075`). Under PM-MCP the model never supplies an argument vector: it comes from domain support only, overrides through the operator.
+. *MCP proxy example.* 06 names a CI provider and a code-quality service as upstream MCP servers, contradicting 07 and 08 (CI through the official CLI) and ADR-018 (API providers through the REST client).
+. *Documentation drift not to inherit:* `.plan/architecture/` versus the real `.plan/project-architecture/`; `.plan/credentials/` in the `marshal.json` reference; `ci.commands` although the data model has no `ci` block.
+
+== Invariants to preserve
+
+* Non-finishes stay apart: timeout, killed and indeterminate never become error, create no error rows and store no findings; killed means "do not retry blindly"; only a zero-failure test block is attached to a non-finish.
+* Branch on error explicitly; an unknown status is reported as unrecognised, never as red. Read the status, not the exit code.
+* Maven and Gradle success needs the log marker, not only exit 0.
+* A green run clears findings only if it examined a non-empty population with an analysis able to reach them; gates run mypy without cache.
+* Timeout learning: one key per distinct argument string; an explicit bound overrides the learned value but not the floor; a killed duration is never learned.
+* Verify-not-resolve: both execution root and cwd are checked; a worktree must be live, share the root's git common directory and lie under a registered container; builds run in a clean environment without provider secrets. PM-MCP re-verifies worktree paths read from plan state, because the model's shell can edit `.plan/`.
+* Enrolment is never reachable from a plan.
+* The slot cap is machine-wide and independent of the cwd, always reported with its source; invalid and unreadable are never folded into default.
+* Audit fate is written at termination, not joined later.
+* The build map is seeded once, read fail-closed and applies only to discovered modules.
+* Every build carries its plan, with a sentinel routed to the main checkout for builds outside a plan.
+* Credentials: command-line declarations carry no HTTP fields; placeholders mean incomplete; symlink and escape protection; HTTPS for authentication headers; sanitised project names.
+
+== Conclusions
+
+. *Build execution transfers almost entirely; the resolution layer inverts.* Vocabulary, result shape, parsers, timeout learning, slot cap, journal and audit carry over. What changes is who composes the command: the chain from `resolve` to an executable string to Bash becomes server-side composition checked against the enrolment.
+. *The argument schema is the central undecided contract*: templates per canonical verb as domain data with typed placeholders checked against discovery, covering discovery runs and tools without a wrapper. The job outcome enum regains `killed` and `indeterminate`.
+. *Parsers split into engines and pattern data*: engines and structured-format readers (JUnit and JaCoCo XML, LCOV, Jest JSON, TAP) compiled in; categories, markers, routing and Sonar rules as data; acceptable warnings and coverage thresholds as project configuration.
+. *`marshal.json` splits three ways*: project configuration (tracked; the model may propose changes through links) — plan and project settings, skill domains, build map, provider selection and non-secret provider configuration, acceptable warnings, coverage; operator enrolment (`~/.plan-marshall/mcp/`) — wrappers, argument templates, worktree containers, slot cap, language server and host tool binaries, `verify_command` overrides; server state — learned timeouts, CI durations, discovery cache, verification times, jobs and logs. Rule: nothing that decides what executes comes from a file the model can write.
+. *Architecture analysis belongs on the server* but is not in the concept: discovery, dependency graph, module lookup, impact, `derive-verification` and drift checks as server-computed resources; only enrichment remains judgment. A project setup state machine replaces the steward.

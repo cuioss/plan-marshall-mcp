@@ -1,0 +1,336 @@
+= Execute and Finalize
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Workflow Analysis] » Execute and Finalize
+
+== Scope
+
+Phases 5 and 6. Finalize is the pilot of the migration (xref:../12-migration.adoc[Migration Path], stage 3) and is covered in detail.
+
+* `phase-6-finalize`: 11,500 lines of Markdown and 4,400 of Python; `SKILL.md` alone 1,984 lines, `branch-cleanup.md` 2,107; 72 test files.
+* `phase-5-execute` (1,563 lines plus 730 of standards and 550 of Python) and `execute-task` (465 plus 980).
+* `manage-execution-manifest` (9,400 lines), `automatic-review` (7,500), `workflow-pr-doctor`, the git, GitHub, GitLab and Sonar integrations.
+* `extension-api/standards/`: finalize step order bands, finalize step, build verify step, verify.
+
+== How it works today
+
+Phase 4 composes the execution manifest `execution.toon`: the verification steps of phase 5, the lane-resolved finalize steps and a snapshot of step parameters.
+
+Phase 5 dispatches one execution context per *envelope* — a bin-packed group of tasks — which loops over its tasks and loads `execute-task` for each (`phase-5-execute/SKILL.md:132-136`). When the last task of a deliverable finishes, the envelope commits and runs a module-scoped build; at the end, whole-tree gates run. Build failures return as `triage_required` and trigger a verification-feedback dispatch. The phase transition requires both the freshness gate and the pending-tasks gate.
+
+Phase 6 is a loop the model runs over the manifest's steps (`phase-6-finalize/SKILL.md:664-1599`), with re-entry, commit instrumentation, a completion guard, metrics bookkeeping and three hooks: escalate-ask, loop-back and unified triage. The order is fixed in bands: settle (below 11), exactly one push (11), a concurrent wait region, the merge gate (70), a post-run band (above 70).
+
+== Finalize steps
+
+[cols="2,3,2,2"]
+|===
+|Step (order) |Kind in PM-MCP |Long-running |Operator decision
+
+|sync-baseline (3)
+|Link: git rebase job
+|Fetch
+|Overlap above the rebase threshold
+
+|simplify (5), security-audit (7)
+|Dispatch and submit; the server commits the edits
+|–
+|–
+
+|pre-submission self-review (8)
+|Server surfaces candidates, the model submits the verdict
+|–
+|–
+
+|architecture-refresh (9)
+|Job, then a judgment submit
+|–
+|In prompt mode
+
+|pre-push quality gate (10)
+|Link: build jobs per bundle, whole tree, test compile, module-test divergence
+|Yes
+|–
+
+|push (11)
+|Link: freshness gate, git job
+|–
+|–
+
+|create-pr (20)
+|Submit of title and body, then a CI job
+|–
+|–
+
+|ci-verify (22)
+|Link: failure taxonomy; red checks become findings
+|CI completion
+|–
+
+|automatic-review (30)
+|Link: fetch and participation; finding only
+|Bot buffer, completion, rate windows
+|Re-review timeout, refusals
+
+|sonar-roundtrip (40)
+|Link: fetch
+|Sonar analysis
+|–
+
+|unified triage (hook)
+|Submit per finding (`triage:F-n`) with reply text; the server posts replies
+|–
+|Options inside triage
+
+|adr-propose (62)
+|Signal gate, then submit
+|–
+|–
+
+|branch-cleanup (70)
+|Chain of links
+|Merge lock, CI, re-review, merge queue, merge CI
+|Pre-rebase, pre-merge consent, barrier, red-CI override
+
+|lessons-capture (991), plan-retrospective, lessons housekeeping, review retrospective
+|Signal gate, then dispatch
+|–
+|–
+
+|preference emitter (992), phase breakdown (999), emit-landing (1000), archive-plan (1100)
+|Link
+|–
+|–
+
+|record-metrics (998)
+|Derived from the audit log; token part open
+|–
+|–
+
+|deploy-target (81), sync-plugin-cache (85)
+|Obsolete: plan-marshall's own distribution
+|–
+|–
+|===
+
+== Elements
+
+[cols="2,3,1,4"]
+|===
+|Element |What it is |Verdict |Reasoning
+
+|Finalize step loop
+|Model-run iterator with re-entry, guards and hooks
+|Reshaped
+|Engine code (02 Workflow engine, 12 stage 3). About 70% of the finalize skill is this mechanics.
+
+|Step descriptor facts
+|`order`, `mutates_source`, `head_dependent`, `verdict_inputs`, `advances_main_via_rebase`, `post_run_review`, `reads`, `destroys`, `records_facts`, `requires_prompt_fields`
+|Transfers
+|A Java step descriptor record. The build-time checks — order collisions, reads-after-destroys, mutual exclusion, bands (`finalize-step-order-bands.md:292-351`) — become compile-time or unit checks.
+
+|Re-entry and `head_at_completion`
+|Skip, re-fire or retry per step
+|Transfers
+|"State is addressed" (03 Resumption). A step is never done without its HEAD (`ext-point-finalize-step.md:80-91`); an engine invariant.
+
+|Verdict currency (`verdict_currency.py`)
+|Keeps a verdict when a HEAD advance cannot change it
+|Transfers
+|Ported.
+
+|Commit instrumentation
+|The dispatcher owns every commit a step's edits produce, including re-stamp and reconciliation
+|Reshaped
+|A git job at `submit`; the commit message is a free parameter with a deterministic fallback. The reconciliation becomes structured state instead of a decision-log line that `push.md:79-95` searches for.
+
+|Completion guard, `assert-step-recorded`, required steps
+|Catches steps that forgot to record
+|Obsolete
+|The server records outcomes itself.
+
+|Record-before-return, yield names, `display_detail` rules
+|Sub-agent authoring discipline
+|Obsolete (mostly)
+|`submit` persists the result. The short `display_detail` stays.
+
+|Manifest reconcile, loadability check, step re-resolution after rebase
+|Heals deleted documents and version skew
+|Obsolete
+|Step bodies are compiled in. A binary upgrade in the middle of a plan remains a skew source (gap 5).
+
+|Execution manifest (`execution.toon`)
+|Per-plan selection of verification and finalize steps
+|Reshaped
+|A persisted plan program (16). The composition rules, pre-filters, lanes, presets and ceremony selection (`decision-rules.md`) keep their semantics. `step_execution_tier` is obsolete; the execution log becomes the audit log; step parameters stay plan-local configuration.
+
+|Dispatched versus inline steps
+|Which steps get a sub-agent
+|Reshaped
+|Decided by the state machine (link or `dispatch`).
+
+|Level resolution per role
+|Picks the agent level
+|Reshaped
+|Rendered through the client profile (see xref:03-dispatch-orchestration.adoc[Dispatch and Orchestration]).
+
+|Timeout wrapper, Bash-ceiling clamping, detach seam, execution tiers, "a sub-agent cannot reap a build"
+|Workarounds for host call ceilings
+|Obsolete
+|Jobs live in the daemon; bounded and progress waits work in sub-agents (16 Waiting primitives).
+
+|Concurrent wait barrier
+|Waits on CI, review and Sonar at once off one HEAD, with bounded re-settle (`proceed`, `pending`, `failed`, `re_settle`)
+|Open
+|`wait:<job>` covers one job. Proposal: `wait:<state>` (gap 1).
+
+|Freshness gate
+|Did a build observe exactly this tree (`fresh`, `exempt`, `stale`, `undecidable`)?
+|Transfers
+|Matches 06 build server, but keyed on the working tree (conflict 3).
+
+|Pre-merge review barrier and merge authorization
+|Two predicates, fail-closed; grants bound to HEAD and gap class (`branch-cleanup.md:36-60, 720-1140`)
+|Transfers / Reshaped
+|The logic transfers; grants come from the operator channel.
+
+|Merge mutex and merge queue
+|Cross-plan serialisation: widened hold, FIFO, release at every wait, budget reclaim; closed set of merge dispatches
+|Transfers
+|Daemon-owned (02 Deployment); the hold rules carry over verbatim.
+
+|CI failure taxonomy (`ci-verify.md:174-200`)
+|Deterministic classification of failing checks
+|Transfers
+|Ported.
+
+|Automatic review
+|Bot registry, participation contract, rate-limit recovery, re-review triggers
+|Transfers / Reshaped
+|Data plus CI jobs; the per-bot documents become domain or project data. Escalations are reshaped.
+
+|Unified triage
+|FIX, SUPPRESS or ACCEPT per finding
+|Reshaped
+|A `submit` per finding; the PR doctor command becomes an entry link.
+
+|Verify extension point
+|Adversarial refutation before triage for producers with a verification profile
+|Transfers
+|A verify sub-state per finding with a judgment submit and the refutation skill as guidance.
+
+|Loop-back hook
+|Back to execute or finalize, ceiling before knob, persisted counter, footprint refresh
+|Transfers
+|Engine transitions; the concept shows no finalize-to-execute edge yet (gap 2).
+
+|Escalate-ask hook
+|Five reasons, option sets per reason
+|Reshaped
+|Operator channel (conflict 1).
+
+|Signal gates for lessons and ADRs
+|Deterministic pre-checks avoiding a dispatch
+|Transfers
+|Guards on whether a `dispatch` link is offered.
+
+|Post-run source guard
+|Detects stray tracked writes after the merge
+|Transfers
+|Matches footprint detection (09 Host tools).
+
+|Worktree and main resolution, `git -C`, `--plan-id` and `--project-dir` routing
+|Path discipline
+|Obsolete
+|The server resolves paths.
+
+|Move-back of the plan directory and worktree-removal guards
+|ADR-002
+|Open
+|See conflict 4.
+
+|Envelope loop
+|Bin-packing, `budget_yield`, one context per envelope
+|Open
+|See conflict 2.
+
+|`execute-task` profiles
+|Implementation, module testing, verification
+|Reshaped
+|Vocabulary skill `skill://pm/execute/task`; verification commands become build jobs; Bash rules are obsolete.
+
+|Independent verification of a task
+|Non-empty diff, re-run of the verification commands, obfuscation check
+|Transfers
+|Server checks at task `submit`.
+
+|Scope-creep check, `verify_failure_scope`
+|Footprint against declared scope
+|Transfers
+|Server facts at `submit` and in triage.
+
+|Chain-tail commit and change ledger
+|One commit per deliverable, owned by the envelope
+|Reshaped
+|The server detects the chain tail; the commit is a git job with a message parameter.
+
+|Verification steps
+|Module-scoped build, quality sweep, per-bundle verify, footprint-based build decision, architecture gate
+|Reshaped
+|A list of (canonical verb, scope) job specifications — `module-tests`, `quality-gate`, `coverage` — with the footprint gate on the server (06, 07).
+
+|Worktree creation, baseline fast path
+|Branch and worktree; drift detection
+|Transfers
+|Git jobs; drift becomes a state.
+
+|Metrics accumulation
+|Token and dispatch accounting, termination causes
+|Reshaped / Open
+|Derived from the audit log except tokens (gap 4); most termination causes are obsolete.
+
+|Finalize step and build verify step extension points
+|Discovery through `implements:` front matter
+|Reshaped
+|No domain bundle contributes a finalize step today. The real contributors are built-in steps, automatic review, the retrospective and six project-local `finalize-step-*` skills (gap 3).
+|===
+
+== Gaps in the concept
+
+. *Composite and non-job waits.* The finalize barrier (wake on any arm's change, re-settle only the affected arms), review-bot rate windows lasting hours, merge-lock admission and merge-queue landing have no single job. Proposal: `wait:<state>`, for example `wait:finalize-barrier`; the server polls the arms internally.
+. *Backward transitions.* Loop-back from finalize to execute with fix tasks, the persisted iteration ceiling and both knobs (`loop_back_without_asking`, `finalize_without_asking`) are not described; the state machine example in 03 is forward-only.
+. *Project-local steps.* 11 Domain support has no mechanism for `project:finalize-step-*` or verify steps. Proposal: steps declared as data with the descriptor facts above, either as a script job with an enrolled command or as a judgment step with a project vocabulary skill; bands and ordering are validated at composition.
+. *Token metrics.* Only the host sees usage. Proposal: the dispatch return carries usage; missing usage is recorded as unmeasured, never as zero.
+. *Binary upgrade in the middle of a plan.* The concept migrates state formats only. Proposal: the plan program is frozen with the version of the step definitions; an upgrade offers an explicit `recompose` link instead of drifting.
+. *Not described yet:* merge authorization records, the review-bot registry as data, lanes, presets and execution profiles, the local-only mode without push, landing emission to the epic inbox, archiving, and the rendering of the PR's intent section.
+
+== Conflicts
+
+. *Operator decisions.* plan-marshall asks about twelve questions through the model — pre-merge consent, merge anyway, accept a coverage gap, red-CI override, defer, disable a reviewer, pre-rebase confirmation, scope deviation, triage options — and the model records the grants (`branch-cleanup.md:42-47`). Concept 09 makes overriding a gate operator-only. Proposal: everything that mints a merge grant or demotes a required bot goes through elicitation; scope deviation and triage remain judgment with operator escalation. Without elicitation every interactive merge needs the operator CLI — a usability risk to decide before the pilot.
+. *Dispatch unit.* The example `dispatch:task-4` (03) contradicts one context per envelope (`phase-5-execute/SKILL.md:134`). Proposal: the dispatched entity is the envelope; each task `submit` returns the envelope's next task; packing stays plan-time data.
+. *Freshness key.* 06 tracks "which commit a result belongs to". plan-marshall keys on `worktree_sha`, which includes uncommitted changes, because phase 5 builds before it commits; it also has the `exempt` route and the re-stale reconciliation inside finalize. A commit key reads an unbuilt dirty tree as fresh.
+. *Plan state location during coexistence.* ADR-002 moves the plan directory into the worktree for phases 5 and 6. A finalize pilot entered after a legacy phase 5 finds its state there. Proposal: plans owned by PM-MCP never move; for a legacy hand-over the first engine transition moves the directory back, keeping "move back before removing the worktree" and the merge lock.
+. *Return statuses.* The concept's closed set is `success`, `error`, `loop_back`, `blocked`. plan-marshall also needs `budget_yield`, `triage_required`, `escalate_ask`, `infeasible` and `baseline_drift`. In PM-MCP they are persisted server states, not return values; the concept should say so.
+
+== Invariants to preserve
+
+* *HEAD-dependent verdicts.* A verdict is never green for a HEAD it was not computed against; a missing HEAD means re-fire, with the old verdict reported as unverified. A verdict is preserved only on HEAD equality or when the change does not touch its declared inputs, and the HEAD is never re-stamped on a preserve. Remote verdicts — CI, review, Sonar — declare no inputs. A rebase re-stales everything, but only when it actually rebased.
+* *Freshness.* Read the status member itself, never "not stale"; status, not exit code; every build ledger row matches a build notation of this project; a stale result carries its reason; phase 5 evaluates both gates before acting on either.
+* *Ordering.* Settle, exactly one push, wait, merge, post-run. The pre-push quality gate is last in the settle band; source-mutating steps precede the merge; post-run review and source mutation exclude each other; reads and destroys edges hold; no two steps share an order.
+* *Push.* Re-entry is decided by branch parity; a merged and deleted branch is never pushed again; the tree is clean before the push.
+* *Pre-merge barrier.* Both predicates — unhandled comments and required-bot participation against this HEAD. An unknown verdict never authorises and never mints a grant. Route on "admissible" (right HEAD and right gap class), not on "authorised"; a decision-log entry is never evidence; the authorization check is the last gate before the merge.
+* *Merging.* The merge dispatch set is closed (safe merge, merge queue). The mutex is released at every wait and every abort with FIFO order kept; a holder is reclaimed only when provably stale.
+* *Loop-back.* Target only execute or finalize; ceiling checked before the knob; counter persisted.
+* *Outcomes.* `executed`, `skipped`, `loop_back`, `failed` and `error` stay distinct; token figures are unmeasured rather than zero; "could not look" is never a zero count.
+* *Escalations.* Options are rendered exactly as returned, recommendation first; a structural refusal is never offered a wait; a decline is not a timeout; an absent outcome is unknown, not a timeout.
+* *CI.* A definitive conclusion wins over the deadline fallback; "no checks" is distinct from red; failures are never cached; a red Sonar or review arm still runs its finding pass.
+* *Phase 5.* Green needs a verdict artifact and a clean tree; the server re-verifies what the agent claims; `infeasible` is terminal, and no weaker deliverable is substituted under the same name; no batched destructive checkout; a file relocation always triggers the whole-tree gate; the commit belongs to the envelope, never to the task.
+
+== Conclusions
+
+. Finalize is a good pilot. About 70% of its prose is state-machine mechanics; the remaining judgment is small — simplify, security audit, self-review, PR body, triage decisions and replies, lessons, ADRs, retrospective, architecture tier 1. The step descriptor facts carry over as a record.
+. The operator split is the critical decision for stage 3: merge consent and every grant go through elicitation, and elicitation support in Claude Code decides whether the pilot is usable.
+. Finalize cannot run on links alone before the wait model covers composite and non-job waits.
+. The manifest becomes a persisted plan program; its selection rules transfer, reconcile, loadability checks, execution tiers and step recording disappear, and execution logging moves into the audit log.
+. Phase 5 needs one decision — envelope dispatch — and one correction — freshness on the working-tree hash. Everything built around host timeouts disappears.

@@ -1,0 +1,205 @@
+= Extension Mechanism
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Workflow Analysis] » Extension Mechanism
+
+== Scope
+
+`extension-api` has about 10,800 lines: `SKILL.md` (536), about 5,500 lines of Markdown contracts — 17 `ext-point-*` documents, `extension-contract.md` alone 1,009 — and about 2,900 lines of Python: `extension_discovery.py` (1,601), `configurable_contract.py` (499), `_path_attribution_merge.py` (398), `extension_api.py` (245), `_derivation_merge.py` (205). Also examined: the ten domain extensions (`*/skills/plan-marshall-plugin/extension.py`, 64 to 614 lines each), the recipe skills, `ext-self-review-plan-marshall`, and `doc/concepts/{extension-architecture,recipes,skill-handling}.adoc`.
+
+The build, verify and finalize step extension points are covered in xref:05-build-config-providers.adoc[Build, Configuration and Providers] and xref:02-execute-finalize.adoc[Execute and Finalize]; execution context and lanes in xref:03-dispatch-orchestration.adoc[Dispatch and Orchestration].
+
+== How extensions are bound today
+
+Three mechanisms:
+
+. *Python classes loaded in process.* Each bundle ships `skills/plan-marshall-plugin/extension.py`, found through the `implements: …/ext-point-domain-bundle` front matter of a sibling `SKILL.md` (`extension_discovery.py:333`), loaded with `importlib` and instantiated (`:129-155`). Build systems have their own list (`build-*/scripts/extension.py`). Four disjoint base classes: skill loading (A), file-to-build routing (B), edge derivation (C) and path attribution (D), the last two opted into by multiple inheritance (ADR-004, ADR-013).
+. *Front matter `implements:`.* `find_implementors()` (`:1372`) scans bundle skills, the phase 5 and 6 step documents and project-local `finalize-step-*` skills; project `recipe-*` skills are scanned separately.
+. *Frozen in `marshal.json`.* The steward calls the hooks once and stores the results in `skill_domains.{key}`; runtime resolution reads this configuration.
+
+Discovery is already a closed world: `get_marketplace_bundles_path()` (`:44-78`) resolves only the plan-marshall source tree or its plugin-cache root. No third-party marketplace and no project-local `extension.py` is ever loaded. The only project-local extension surface is Markdown — `recipe-*` and `finalize-step-*` skills — some of which ship Python scripts.
+
+About 80% of what the ten extensions contain is constant data returned from methods: skill lists per profile, triage, outline, architecture gate, file globs, recipes, retrospective aspects, path claims, configuration defaults. Genuine code is limited to module applicability predicates, module discovery (build descriptor parsing), edge derivation (coordinate and name joins, Python import analysis, documentation cross-references, symbol harvest through LSP), two domain verbs of about 200 lines each, and the self-review surfacer with about 4,200 lines of detectors.
+
+== Elements
+
+[cols="2,3,1,4"]
+|===
+|Element |What it is |Verdict |Reasoning
+
+|`extension.py`, `importlib` loading, `ExtensionBase`
+|In-process plugin mechanism
+|Obsolete (mechanism), Reshaped (contract)
+|Loading code at runtime contradicts the native closed world (10 Native binary). The data it returns becomes a domain descriptor (11 Domain support).
+
+|Four axes A–D (ADR-004, ADR-013)
+|Skill loading, file-to-build routing, edge derivation, path ownership
+|Transfers
+|Separation of concerns, not a Python artefact: sealed Java interfaces per axis, implemented by compiled domain modules.
+
+|`get_skill_domains`
+|Domain identity and skills per profile
+|Reshaped
+|Data; input to the skill generator (04). Skill notations become `skill://pm/domain/<d>/<topic>`.
+
+|`applies_to_module`
+|Signal rules choosing domain and profiles per module
+|Reshaped
+|Simple predicates (build system, dependency contains, path matches, promote optional to default): a small rule schema in the descriptor, evaluated in Java. Not covered by the concept.
+
+|`config_defaults`
+|Seeds configuration keys, write-once
+|Reshaped
+|A defaults map per domain, applied write-once.
+
+|`provides_file_globs`
+|Domain detection globs
+|Transfers
+|Data. Its glob dialect differs from the build map's fnmatch dialect; both stay separate.
+
+|`discover_modules`, file-to-build classification
+|Module discovery per build system
+|Reshaped
+|Compiled-in descriptor parsers (POM, Gradle, `package.json`, `pyproject.toml`). 11 names only log parsers.
+
+|Edge derivation (Maven, pyproject, npm, Python imports, Markdown, documentation, LSP)
+|Module dependency edges
+|Reshaped
+|Compiled in; Python imports need a Java parser or the LSP route; the LSP resolver maps onto the LSP pool (06).
+
+|`_derivation_merge.py`
+|Union of several resolvers with provenance
+|Transfers
+|Ported as is (ADR-014).
+
+|Path claims (`claim_paths`)
+|Path-prefix ownership
+|Reshaped
+|All three implementations return constant tuples: data.
+
+|`_path_attribution_merge.py`
+|Claim merge, collisions, longest-prefix lookup
+|Transfers
+|Ported with its invariants.
+
+|Triage extension and `ext-triage-{domain}` skills
+|Domain triage knowledge: suppression syntax, severity, disposition
+|Transfers
+|Vocabulary skill `skill://pm/triage/<domain>` (04) — exactly the judgment-only content the concept wants.
+
+|Default severity mapping without a triage skill
+|Fallback
+|Open
+|Proposal: a generic triage vocabulary chosen by the server.
+
+|Outline extension (`ext-outline-workflow`, 1,127 lines)
+|Domain instructions per change type
+|Reshaped
+|One implementor (plugin development). Inventory and component analysis become server facts in the outline representation; the judgment part becomes a supporting file per domain.
+
+|Recipes (`provides_recipes`, recipe skills)
+|Predefined, repeatable plan shapes
+|Reshaped / Open
+|Model-followed procedures that mostly call scripts (`doc/concepts/recipes.adoc`). In PM-MCP: recipe definition as data, deterministic deliverable mapping on the server, judgment states only for selection and coverage. The concept does not mention recipes.
+
+|Project `recipe-*`
+|Recipes authored in the project
+|Open
+|Together with finalize steps the only project extensibility users have (see conflicts).
+
+|Recipe match and recipe lane
+|Tier-1 routing during init
+|Transfers
+|Deterministic keyword scoring; an init transition with an alternative link.
+
+|Domain verbs (`search-markers`, `parse-rewrite-log`)
+|Domain-owned commands
+|Reshaped
+|A build-log parser and a tree scan: compiled in. Verbs survive as named internal capabilities, invisible when absent (ADR-010).
+
+|Architecture gate declaration
+|ArchUnit, import-linter, dependency-cruiser
+|Transfers
+|Data; the tool runs as a build job through the wrapper.
+
+|Retrospective aspects
+|Deterministic retrospective checks per domain
+|Reshaped / Obsolete
+|A compiled-in aspect registry; the only aspect today scans plan-marshall's own CI wrappers and disappears with the Python corpus.
+
+|Self-review surfacing and its implementor
+|Deterministic candidates for a model review
+|Reshaped / Open
+|The contract is sound: facts in, judgment on candidates. The only implementor is 4,200 lines of detectors for the plan-marshall domain, which the concept's domain list does not contain. Decide whether PM-MCP needs a detector suite; otherwise users get the "not run" path.
+
+|`workflow_skills` override per profile
+|A domain replaces the task workflow
+|Obsolete
+|No implementor exists; the state machine owns the workflow (04: whole-phase workflow documents do not exist).
+
+|`configurable_contract.py`
+|Parameters and defaults of finalize steps
+|Reshaped
+|Built-in steps become compiled step definitions with a parameter schema; project steps need a declaration format (gap 8).
+
+|`extension_api.py resolve-skills`
+|Security profile skills per plan domain
+|Transfers
+|Part of building representations and `skills[]`.
+
+|`find_implementors`, plugin-cache and source path handling
+|Front-matter discovery over cache, source and project roots
+|Obsolete / Reshaped
+|Built-ins become a compiled registry; the cache and version-directory handling (`:44-78`, `:1285-1300`) exists only for the plugin cache. Project-local discovery is reshaped.
+
+|Extension validation in the plugin doctor
+|A validator nobody runs
+|Obsolete
+|Types and unit tests replace it.
+
+|Frozen `skill_domains` in `marshal.json`
+|Snapshot of hook results
+|Reshaped
+|Domain data lives in the binary; only the project's activation and operator overrides stay in configuration.
+|===
+
+== Gaps in the concept
+
+. *Project-local and third-party extensibility* is undefined. plan-marshall users write project `recipe-*` and `finalize-step-*` skills — the plan-marshall repository itself has five and six, some with Python.
+. *The script job is temporary* ("until the last plan-marshall script is ported", 07). Project steps with code need a permanent project script job: a host subprocess with a declared argument schema and output contract, under the project's enrolment.
+. *Recipes* are absent from the skill catalogue and the workflow: no transition, representation or data format, and no recipe match during init.
+. *Module discovery and architecture* are not domain-support code in the concept: descriptor parsing, applicability rules, edge derivation and path attribution are code too.
+. *Applicability rules*: nothing specifies how the domain skills for a module are chosen.
+. *The plugin-development domain* is missing from the domain list, although it owns the outline extension, the self-review surfacer, a retrospective aspect, the Markdown resolver and the `.claude` path attribution.
+. *Triage without a domain extension* is unspecified.
+. *Parameters of project steps* have no declaration format.
+
+== Conflicts
+
+* *Closed world versus project code.* 10 says nothing is loaded as code at runtime; project `finalize-step-*` skills ship Python today. Loading code in process is impossible in a native image, and GraalVM Python or WASM would add heavy dependencies and contradict "no Python in PM-MCP". Proposal: no in-process plugins. Project extensions are either data plus Markdown — step or recipe descriptors, vocabulary served from the project tree — or out-of-process executables run as a project script job with a declared schema; the server owns ordering, gating and state, the script only returns facts. Third-party domains ship as data packs, optionally with executables, never with Java code; new parsers remain a PM-MCP release matter.
+* *Domain support is part of the release* (11), while plan-marshall has additive bundles (`pm-dev-java-cui`, `pm-dev-frontend-cui`, organisation-specific content). Compiled in, they are fine, but an organisation domain then needs a PM-MCP release. Decide whether organisation packs are allowed as data packs.
+* *Frozen `skill_domains`* would override the data compiled into the binary; migration must treat the stored extension entries as derived, not authoritative.
+
+== Invariants to preserve
+
+* Null on absent never fabricates a positive (ADR-010): an inactive domain's capability is invisible; a promised gate that cannot run is a diagnosable refusal, never a silent pass.
+* Not run is not clean: the self-review fallback records "not run: no surfacer resolved"; every surface carries its scope statement, structural limit and delta coverage; a delta class with no files does not count as measured.
+* Delta rounds narrow the file set, never the hunk basis; an unresolvable base is an error, never a silent widening; a delta round cannot close the step.
+* Merges of several producers carry producer identity and never suppress silently (ADR-014): edge union is idempotent and keeps all resolver ids; a path-claim collision yields no claim and a reported collision, never an iteration-order winner; claim and lookup share one path normaliser; claims for absent modules are dropped.
+* An LSP resolver that did not run reports why — absent, failed to start, timeout, unsupported; a dead server never reads as zero edges.
+* Resolvers are activated by id, never by file pattern.
+* Configuration defaults are written once and never override user configuration.
+* The file-glob and build-map dialects stay separate.
+* Loading failures are loud. Today a broken `extension.py` disappears behind a catch-all (`extension-contract.md` Validation); PM-MCP fails closed with an explicit error when it loads domain or project descriptors (ADR-009).
+* A recipe without its domain is excluded; an explicit recipe choice beats recipe match.
+* The security profile only resolves skills; it never creates implementation tasks.
+
+== Conclusions
+
+. *Most of the extension surface is data disguised as Python.* It becomes a descriptor per domain. Genuine code — module discovery, edge derivation, log and marker parsers, the self-review detectors — fits "compiled-in parsers" once that term covers more than log parsers.
+. *Dropping in-process plugins loses nothing users have today* except project-local scripts, which need a permanent out-of-process project script job, not a plugin loader.
+. *Several extension points exist mainly to steer the model.* Triage survives unchanged as vocabulary; outline and recipe procedures become server facts plus judgment states; the workflow override disappears.
+. *Recipes are the largest uncovered area.* The concept needs a recipe model and a decision on project recipes, which as Markdown fit the closed world when served as project vocabulary.
+. *The merge cores are ported as they are*, with differential tests: they carry provenance, collision-without-winner and not-run-versus-clean rules.
