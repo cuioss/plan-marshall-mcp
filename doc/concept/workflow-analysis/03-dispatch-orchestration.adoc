@@ -1,0 +1,227 @@
+= Dispatch and Orchestration
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Workflow Analysis] » Dispatch and Orchestration
+
+== Scope
+
+* *Dispatch contract* (about 2,600 lines): the agents `execution-context` and `execution-context-reader`; the per-client variant emitters `marketplace/targets/{claude,opencode,antigravity}/variant_emitter.py`, which produce levels 1–7 and an `inherit` variant; `extension-api/standards/` (execution-context workflow, dispatch granularity, dynamic level executor, lane element, profiles) and `ref-workflow-architecture/standards/` (agents, dispatch walkthrough and logging, skill loading, citations-only return, execute-task skills, operator prompt authoring).
+* *Level selection*: `plan-marshall/standards/effort-{levels,roles,variants}.md`.
+* *Personas*: nine `persona-*` skills and `manage-personas`; the base persona `persona-plan-marshall-agent` has about 1,500 lines.
+* *Epic orchestration*: `plan-orchestrator` (531 lines plus about 2,100 of workflows and standards, `orchestrator.py`, `_orchestrator_inbox.py`), `persona-plan-orchestrator/standards/orchestration-model.md`, `manage-locks`, the concepts orchestration, execution context, personas, parallelism and locking, and ADR-024. `marshall-orchestrator` is an empty leftover.
+
+== How it works today
+
+The main context resolves a role to a level and a variant (`manage-config effort resolve-target`, which also writes the `[DISPATCH]` log), flattens the persona into `skills[]` and dispatches with the five-field prompt body. The sub-agent loads the base persona and the skills, reads the workflow document, persists through scripts and returns `status` and `display_detail`.
+
+== Elements
+
+[cols="2,3,1,4"]
+|===
+|Element |What it is |Verdict |Reasoning
+
+|Generic dispatcher with level variants
+|One agent body, seven level variants and `inherit`, pinning model and effort
+|Transfers
+|03 Dispatch keeps the structure; 15 installs the variants per client. The body shrinks to "load skills, call `start`, follow links, submit, return".
+
+|Variant tool list
+|`Read, Write, Edit, Glob, Grep, Bash, Skill` (`agents/execution-context.md:7`)
+|Reshaped
+|Excludes MCP tools. PM-MCP variants must list the `pm_*` tools, or the sub-agent cannot reach `start`. Not stated in the concept.
+
+|Reader family (`execution-context-reader`)
+|Read-only: web search and fetch, read, grep; no skills, no Bash; returns a candidate validated by a deterministic script
+|Open
+|09 names a restricted context but not a variant family; 03 and 15 know one family. The reader has no MCP tools, which conflicts with "results through `submit`" (conflict 2).
+
+|Prompt body: `name`, `plan_id`, `skills[]`, `WORKTREE`, `caller_phase`
+|Core fields
+|Transfers
+|03 dispatch table. The base persona becomes the implicit `skill://pm/core`.
+
+|`workflow` or `instructions`
+|Document path or inline steps the sub-agent follows
+|Reshaped
+|Replaced by `start: pm_state(scope, entity)`. The `instructions` form, used by orchestrator sub-steps and fallbacks, has no counterpart: every dispatch needs an entity.
+
+|Workflow-specific inputs (`producer`, `track`, `task_number`, `envelope_id`, `scope`, `pr_number`)
+|Free fields
+|Reshaped
+|Entity state rendered by `pm_state(entity)`. "The dispatch carries the producer only; the sub-agent queries the store" (`dispatch-granularity.md`) is already the PM-MCP model.
+
+|`plan_id: none`
+|Dispatch without a plan (research, retrospective, orchestrator sub-steps)
+|Open
+|PM-MCP requires a plan or epic. Proposal: require one, or introduce a project-scoped session entity.
+
+|Role registry
+|`plan.<phase>.effort.<subkey>` → phase default → plan default → `inherit`; orchestrator group with a `max` clamp (`effort-roles.md`)
+|Reshaped
+|Server configuration and engine resolution. 15 has only "model and effort per level"; the role layer is missing.
+
+|Level ladder
+|Machine-local `.plan/local/effort-ladder.json`, defaults per client, alias gating of levels 6 and 7
+|Transfers
+|Client profile data with a local override. Never name a variant that was not installed (`effort-variants.md:82`).
+
+|Dynamic level executor
+|Variants emitted at build time; level chosen per dispatch
+|Reshaped
+|Emission moves into installation per client. Claude Code pins its agent registry per session, so a ladder change still needs a reinstall and reload. Option: Claude Code's agent call accepts a model parameter, so only effort would need variants.
+
+|Dispatch logging
+|One record per firing: target, level, role, workflow, plan (`dispatch-logging.md`)
+|Reshaped
+|The server renders the link but never sees the host run it. Needs a `dispatch_id`, recorded as rendered, claimed on the first entity call carrying it, and returned.
+
+|Sub-agent invariants
+|No sub-dispatch, no user questions, record before return, cannot reap a background build
+|Mixed
+|No sub-dispatch transfers (03 Leaf). Record-before-return becomes submit-before-return; once the return report exists (gap 2), the server flags a reported `success` without a submitted entity and never synthesises one. Build reaping and execution tiers are obsolete.
+
+|Prompt envelopes (`escalate_ask`, `refine_prompt`, `outline_prompt`)
+|Sub-agent returns options; the main context asks and continues
+|Open
+|03 routes through `escalate` and blocks (conflict 3).
+
+|Operator prompt authoring
+|Option text names the branch
+|Transfers
+|Options become enum values bound to transitions; the mapping becomes testable.
+
+|Citations-only return
+|Read-only dispatches return counts; details stay in a sink
+|Transfers
+|Every return is status and display detail, results go through `submit`. Stays separate from the reader boundary.
+
+|Return statuses and termination causes
+|`success`, `error`, `loop_back`, `blocked` plus `escalate_ask`, `triage_required`, `budget_yield`, `baseline_drift`, `harness_cancellation`; no-progress predicate (`plan-marshall/workflow/execution.md:189-260`)
+|Reshaped
+|Most become entity or plan state. Harness cancellation, empty returns and usage are known only to the dispatching session and need a return report.
+
+|Dispatch granularity heuristics
+|10K rule, bundle rather than iterate, find the judgment core, envelope bin-packing
+|Transfers
+|Rules for where the engine offers `dispatch` links. Bin-packing stays: a sub-agent's context window is real.
+
+|Workflow resolution root, plugin-cache staleness
+|Finds the workflow document
+|Obsolete
+|Skills are served by the daemon.
+
+|Two-tier skill loading
+|System skills plus task skills per profile (`skill-loading.md`)
+|Reshaped
+|`skills[]` becomes `skill://pm/domain/…` URIs; resolution at plan time stays.
+
+|Lane elements
+|`lane:` front matter (class, tier, prune predicate, cost size), lattice minimal ⊏ standard ⊏ full, floor immunity, `ask` seed
+|Reshaped
+|Element data and engine resolution; the posture is a link parameter at init. The concept only mentions the outline lane.
+
+|Persona model
+|Persona, reference and profile; `profiles:` and `composes:`; DAG flattening with cycle rejection
+|Reshaped
+|Resolution moves into the engine and fills `skills[]`. Personas carrying knowledge (module tester, security expert, code-review lenses) become vocabulary skills; empty shells (implementer, documenter) become resolution data; the priming preamble becomes client-profile rendering.
+
+|Base persona
+|Behaviour rules, user communication, thoroughness, Bash hygiene, argument naming
+|Split
+|Obsolete: Bash rules, argument placement and naming, subcommand rules, `git -C`. Into `skill://pm/core`: Boy Scout rule, ask when in doubt, dependency approval, minimum implementation, provenance before re-fixing, user-communication rules, thoroughness rules.
+
+|Epic ledger
+|`status.json` header, `queue/{PLAN-ID}.json` rows, `resume_anchor.md`; one file per concern for git merges (ADR-024)
+|Transfers / Reshaped
+|02 keeps epic state in the git-tracked tree; the daemon becomes the only writer. The per-file split stays.
+
+|Queue view
+|Generated overview; regenerated on conflict; refuses on an unreadable source
+|Transfers
+|A server-rendered artifact; readable in a plain clone.
+
+|Plan status vocabulary
+|Ten statuses; live and terminal, shipped and closed-unshipped partitions
+|Transfers
+|03 Explicit outcomes.
+
+|`next`, parallelization scope, `auto_emit`
+|The orchestrator emits plans, never launches them
+|Transfers
+|Conflicts with the epic `dispatch` link in 03 (conflict 1). Improvement: `running` is observed from the plan's entry record.
+
+|Surface disjointness gate
+|One reader of the expected surface; indeterminate is never disjoint
+|Transfers
+|Computed while building the epic representation.
+
+|Inbox and mailbox
+|Append-only envelopes with lifecycle; three empty states; the mailbox fails open
+|Reshaped
+|A plan-scope link (outbox) and plan representation (mailbox); the epic lists pending messages.
+
+|Landing
+|Plan emits facts, the drain checks completeness; `n/a` versus `unknown`
+|Reshaped
+|Facts derive from the audit log; the model submits only the analysis. Degraded answers stay distinct from "could not read".
+
+|Orchestrator dispatch rule
+|Depth, fork freedom, write freedom; read-only by instruction; no ledger writes; fall back inline
+|Reshaped
+|Read-only and no-ledger-writes become server-enforced: the entity offers only a draft `submit`. An inline alternative link keeps the fallback.
+
+|Merge mutex, review-bot window, build limiter and reaper
+|`manage-locks`
+|Transfers
+|Serialised and persisted by the daemon (02 Deployment); the reaper simplifies because slots are daemon children.
+
+|Terminal title, `client.toon`
+|Host rendering hooks and runtime information
+|Obsolete
+|The entry record replaces `client.toon`.
+|===
+
+== Gaps in the concept
+
+. *Dispatch link fields* against the real contract: a `dispatch_id`; role and resolved level; a reader schema and a way to select the reader family; a replacement for `plan_id: none` and `instructions`; the rule that runtime inputs live in entity state; the flattened persona in `skills[]`.
+. *Return channel.* The server never learns about harness cancellation, empty or error returns, or token usage, so it cannot run the no-progress predicate or detect a missing submit. Proposal: every `dispatch` link pairs with `returned:<dispatch_id>` (status, display detail, usage).
+. *Role registry* and where it is configured — project configuration or machine-local ladder.
+. *Variant installation*: MCP tools in the tool list, the reader family, alias-gated levels, session-pinned reload.
+. *Execution postures* (lanes): floor immunity, prune predicates, overrides per element, cost preview.
+. *Personas*: no entries and no composition model in the skill catalogue of 04.
+. *Envelopes*: dispatch an envelope entity, not a task, keeping plan-time bin-packing.
+. *Plan and epic linkage*: `pm_start` has no reference to a staged specification, so detection and the landing obligation have no anchor.
+. *Parallel fan-out*: nothing says a representation may offer several concurrent `dispatch` links (for example enrichment per module).
+
+== Conflicts
+
+. *Epics start plans by `dispatch` (03 Epic orchestration).* A plan dispatches its own sub-agents, and a sub-agent is a leaf, so a plan cannot run as a sub-agent. plan-marshall forbids launching inline (`orchestration-model.md`, prime directive). The epic link must be `emit:<plan>`, returning a `pm-mcp enter` command for the operator and recording `launched`; `running` is observed when the plan's entry record appears.
+. *Reader family and "results through `submit`" (03).* The reader has no MCP tools by design. Proposal: its candidate goes back through the dispatching session into a server-side validation link (the validator becomes Java); the reader never receives `pm_do`, which would give a write path to a context holding untrusted input.
+. *Blocking `escalate` in sub-agents.* plan-marshall's sub-agents return an otherwise complete result with open questions, and the orchestrator batches them. A sub-agent blocked in `wait` burns turns, and it is unverified whether hosts show elicitation raised from a sub-agent. Proposal: an entity-scope `escalate` records a pending decision and ends the sub-agent with `blocked`; the question fires from the dispatching session.
+. *Serialised writes and the git-distributed epic (ADR-024).* A daemon lock does not span machines; reconciliation across machines stays a git merge. Open: which checkout's copy of the epic the daemon writes. Proposal: the main checkout's copy, under the epic lock, committed by git jobs of the orchestrator — which changes ADR-024's "a plan's worktree write is visible at merge" and needs an explicit decision.
+. *Coexistence locking (12 Coexistence).* Holding the plan lock for the whole duration of a script job serialises parallel sub-agents and blocks transitions for minutes. Reads must be lock-free snapshots; cross-scope writes need a fixed lock order: plan, then epic, then machine.
+. *"No build-time generation per client" (15).* Agent variants remain per-client files with model and effort baked in; that generation stays and moves into installation.
+
+== Invariants to preserve
+
+* Sub-agents never dispatch, never reach the operator, record their outcome before returning; a dispatcher never synthesises a missing record and halts with attribution instead.
+* One dispatch log record per firing, never per role; a re-fire records again; no hand-written log beside the seam.
+* The reader's containment is a deterministic validator, not the reader itself; it is never folded into the citations-only rule.
+* Never name a variant that was not installed.
+* Unknown role keys warn and fall back; they never block a dispatch. Orchestrator dispatches name their role explicitly, so the `max` clamp cannot be bypassed.
+* A lane `off` on core or derived-state elements is ignored and noted; an unresolved `ask` is dropped only when its provider is absent.
+* Indeterminate is never disjoint; one reader of the expected surface; absent, unlistable and unreadable stay distinct (ADR-019); the three inbox empty states, the four mailbox states, `n/a` versus `unknown`.
+* Emit is not running, and `auto_emit` never automates the start. The executing plan never writes the ledger. The inbox is append-only, with three recorded in-place changes. Consumption is a claim. Adding a queue row uses exclusive create. Row-local read-modify-write. The legacy layout is refused, never read as empty. Regeneration refuses on an unreadable source.
+* A dispatch that does not return is never retried blindly: verify the state on disk, then complete inline.
+* Claims are labelled observed or hypothesis; a hypothesis names the artifact that confirms or refutes it.
+* Reaping happens in the same atomic change as admission; the build limiter is FIFO and never drops a build.
+
+== Conclusions
+
+. The dispatch concept in 03 matches plan-marshall's structure but lacks the *observability loop* — `dispatch_id`, return report, role-to-level layer. Without it the server cannot enforce the post-return invariants plan-marshall has already debugged.
+. There are *two agent families*, not one. The reader's read-only surface without MCP is a security property and contradicts "submit, not answer"; this must be resolved explicitly.
+. *Epics emit plans; they never dispatch them.* PM-MCP improves on plan-marshall by observing `running` from the entry record and deriving landing facts on the server.
+. *Personas and lanes become server data*; about two thirds of the base persona disappears, the rest becomes `skill://pm/core`.
+. Per-plan locking fits one daemon, but the epic tier is distributed through git: the concept needs the epic write location, a lock order across scopes and lock-free reads, and must not carry the coexistence rule over to parallel sub-agents.
