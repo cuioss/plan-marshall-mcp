@@ -38,8 +38,11 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Analyze each build's TOON result: `status`, `errors[N]{file,line,message,category}`, `log_file`.
 
 - Always build and test through Maven and JUnit; never run `javac` directly or write ad-hoc verifier classes.
-- The quality gate (`-Ppre-commit`) rewrites files (license headers, OpenRewrite recipes including Java 21
-  migration, import order). Review every resulting diff and commit it; then run Full verify again.
+- The quality gate (`-Ppre-commit`) rewrites files (license headers, OpenRewrite recipes, import
+  order). Review every resulting diff and commit it; then run Full verify again.
+- Java level: `maven.compiler-plugin.release` (25) in the root `pom.xml`. The root `pre-commit`
+  profile overrides the parent's recipe list without `UpgradeToJava21`, which would downgrade the
+  release and break unnamed variables (`_`).
 - The compiler runs with `failOnWarning`: fix deprecations and warnings, don't suppress them.
 
 ## Dependencies and Versions
@@ -54,7 +57,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 ## Code Standards
 
-- Java 21, Lombok (`@UtilityClass`, `@Value`, `@Builder`), prefer records, `var` for obvious types,
+- Java 25, Lombok (`@UtilityClass`, `@Value`, `@Builder`), prefer records, `var` for obvious types,
   final fields, package-private over public where possible.
 - No `module-info.java` in Quarkus modules; set `maven.jar.plugin.automatic.module.name` instead.
 - Every package has a `package-info.java` with Javadoc; every public type is documented.
