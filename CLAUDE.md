@@ -21,19 +21,25 @@ and verified by container-based integration tests.
 New modules from the concept (core daemon, front end, skills extension, container runtime adapter,
 host build server) are added with their first code, not as empty shells.
 
-## Build Commands
+## Development Notes
 
-```bash
-./mvnw clean install                                              # build + unit tests
-./mvnw test -pl plan-marshall-mcp -Dtest=ClassName[#method]       # single test
-./mvnw clean verify -Pintegration-tests -pl integration-tests -am # container ITs (needs Docker)
-./mvnw clean verify -Pcoverage                                    # coverage (jacoco)
-./mvnw -Ppre-commit clean verify -DskipTests                      # pre-commit auto-fix
-```
+### Build Commands
+
+Never hard-code build tool invocations; use the resolved canonical commands below.
+
+- Compile: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "compile"`
+- Quality gate: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Ppre-commit"`
+- Full verify: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify"`
+- Coverage: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pcoverage"`
+- Tests (plan-marshall-mcp): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl plan-marshall-mcp -am"` — only on plan-marshall-mcp
+- Tests (plan-marshall-mcp-integration-tests): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl integration-tests -am"` — only on plan-marshall-mcp-integration-tests
+- Integration tests (plan-marshall-mcp-integration-tests): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests -pl integration-tests -am"` — only on plan-marshall-mcp-integration-tests (needs Docker)
+- Use a Bash timeout of 600000ms for build commands.
+- Analyze each build's TOON result: `status`, `errors[N]{file,line,message,category}`, `log_file`.
 
 - Always build and test through Maven and JUnit; never run `javac` directly or write ad-hoc verifier classes.
-- `-Ppre-commit` rewrites files (license headers, OpenRewrite recipes including Java 21 migration,
-  import order). Review every resulting diff and commit it; then run `./mvnw clean install` again.
+- The quality gate (`-Ppre-commit`) rewrites files (license headers, OpenRewrite recipes including Java 21
+  migration, import order). Review every resulting diff and commit it; then run Full verify again.
 - The compiler runs with `failOnWarning`: fix deprecations and warnings, don't suppress them.
 
 ## Dependencies and Versions
@@ -113,3 +119,12 @@ configuration in `.github/project.yml`. Required checks: `build / conclusion`,
 ## IDE Detection
 
 To open a file for the user: if `TERM_PROGRAM=vscode`, use `code <path>`, otherwise `open <path>`.
+
+## Temporary Files
+
+Use `.plan/temp/` for ALL temporary and generated files (covered by `Edit(.plan/**)` permission — avoids permission prompts).
+
+## Tool Usage
+
+- Use proper tools (Edit, Read, Write) instead of shell commands (echo, cat)
+- Never use Bash for file operations (find, grep, cat, ls) — use Glob, Read, Grep tools instead
