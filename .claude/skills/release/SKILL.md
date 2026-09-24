@@ -19,16 +19,9 @@ Temporary files go under `.plan/temp/`.
 
 ## How the release is wired — READ THIS FIRST
 
-`.github/workflows/release.yml` has exactly two triggers, so there are exactly two release paths:
-
-```yaml
-on:
-  workflow_dispatch:
-  pull_request:
-    types: [closed]
-    branches: [main]
-    paths: ['.github/project.yml']
-```
+`.github/workflows/release.yml` is the source of truth for the triggers; read its `on:` block and
+the `release` job's `if:` there. Step 3(i) states the guarded shape it must still have. It has
+exactly two triggers, so there are exactly two release paths:
 
 | Path | When it publishes | Role |
 |---|---|---|
@@ -76,17 +69,17 @@ runs **before** the merge.
 **1a — Derive versions.** `.github/project.yml` and Maven are the only sources; never git tags or memory.
 
 ```bash
-eval "$(python3 -c '
-import pathlib, re
+# Read as data, never eval: project.yml may come from an untrusted PR checkout.
+read -r PREV_VERSION DECLARED_NEXT < <(python3 -c '
+import pathlib, re, sys
 text = pathlib.Path(".github/project.yml").read_text()
 def field(key):
     m = re.search(r"^\s*" + key + r":\s*(\S+)\s*$", text, re.M)
-    if not m:
-        raise SystemExit(key + " not found in .github/project.yml")
+    if not m or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?", m.group(1)):
+        sys.exit(key + " missing or not a version in .github/project.yml")
     return m.group(1)
-print("PREV_VERSION=" + field("current-version"))
-print("DECLARED_NEXT=" + field("next-version"))
-')"
+print(field("current-version"), field("next-version"))
+') || { echo "STOP: could not read the declared versions" >&2; exit 1; }
 POM_VERSION=$(./mvnw -B -q help:evaluate -Dexpression=project.version -DforceStdout -N)
 echo "declared: current=$PREV_VERSION next=$DECLARED_NEXT pom=$POM_VERSION"
 ```
