@@ -22,7 +22,8 @@ the answer is a representation of that state together with the valid next transi
 (hypermedia-driven workflow). The model follows links and contributes judgment only; the server
 owns the state machine.
 
-The design is described in the [concept documents](doc/concept/README.adoc).
+The design is described in the [concept documents](doc/concept/README.adoc); the order in which it is
+built is in the [roadmap](doc/roadmap.adoc).
 
 > [!NOTE]
 > The project is at its very beginning: the build currently produces a Quarkus application with a
