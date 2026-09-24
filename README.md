@@ -12,7 +12,6 @@
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=cuioss_plan-marshall-mcp&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=cuioss_plan-marshall-mcp)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=cuioss_plan-marshall-mcp&metric=coverage)](https://sonarcloud.io/summary/new_code?id=cuioss_plan-marshall-mcp)
 
-[Generated Documentation on github-pages](https://cuioss.github.io/plan-marshall-mcp/about.html)
 
 ## What is it?
 
@@ -27,15 +26,14 @@ The design is described in the [concept documents](doc/concept/README.adoc).
 
 > [!NOTE]
 > The project is at its very beginning: the build currently produces a Quarkus application with a
-> single `hello` MCP tool, packaged as a JVM container image and verified by container-based
-> integration tests.
+> single `hello` MCP tool, verified by unit tests and by integration tests against the packaged
+> application.
 
 ## Modules
 
 | Module | Content |
 |---|---|
-| `plan-marshall-mcp` | The Quarkus application: MCP server (Quarkiverse Quarkus MCP Server, Streamable HTTP at `/mcp`), health checks on the management port (`9000`, `/q/health`), container image (`src/main/docker/Dockerfile.jvm`). |
-| `integration-tests` | Builds the image, starts it with Docker Compose and runs the `*IT` tests against the running container. Never published. |
+| `plan-marshall-mcp` | The Quarkus application: MCP server (Quarkiverse Quarkus MCP Server, Streamable HTTP at `/mcp`), health checks on the management port (`9000`, `/q/health`). Its `*IT` tests run against the packaged application (`@QuarkusIntegrationTest`). |
 
 ## Technology
 
@@ -50,19 +48,18 @@ See [Technology](doc/concept/10-technology.adoc).
 # Build and unit tests
 ./mvnw clean install
 
-# Container-based integration tests (requires Docker)
-./mvnw clean verify -Pintegration-tests -pl integration-tests -am
+# Integration tests against the packaged application
+./mvnw clean verify -Pintegration-tests -pl plan-marshall-mcp -am
 
 # Pre-commit: license headers and OpenRewrite recipes - review and commit the resulting diff
 ./mvnw -Ppre-commit clean verify -DskipTests
 ```
 
-Run the image manually:
+Run the application manually:
 
 ```bash
 ./mvnw package -pl plan-marshall-mcp -am -DskipTests
-docker build -f plan-marshall-mcp/src/main/docker/Dockerfile.jvm -t plan-marshall-mcp:jvm plan-marshall-mcp
-docker run --rm -p 8080:8080 -p 9000:9000 plan-marshall-mcp:jvm
+java -jar plan-marshall-mcp/target/quarkus-app/quarkus-run.jar
 curl http://localhost:9000/q/health
 ```
 

@@ -8,18 +8,18 @@ plan-marshall-mcp (PM-MCP) is a local MCP server that takes over the process log
 through a hypermedia-driven workflow. The design lives in `doc/concept/` (start at
 `doc/concept/README.adoc`); it describes the target state, most of which is not implemented yet.
 
-Current state: a Quarkus application with one `hello` MCP tool, packaged as a JVM container image
-and verified by container-based integration tests.
+Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
+`@QuarkusIntegrationTest` integration tests against the packaged application. No container image
+is built (the target is a native `pm-mcp` binary on the host, `doc/concept/10-technology.adoc`).
 
 ## Modules
 
 | Module | Content |
 |---|---|
-| `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`), `src/main/docker/Dockerfile.jvm` |
-| `integration-tests` | Builds the image via `docker compose`, starts it (`scripts/`), runs `*IT` tests with RestAssured against ports 18080/19000. Never published |
+| `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
 
-New modules from the concept (core daemon, front end, skills extension, container runtime adapter,
-host build server) are added with their first code, not as empty shells.
+New modules from the concept (daemon, command-line modes of `pm-mcp`, Skills extension, domain
+support) are added with their first code, not as empty shells.
 
 ## Development Notes
 
@@ -32,8 +32,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Full verify: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify"`
 - Coverage: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pcoverage"`
 - Tests (plan-marshall-mcp): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl plan-marshall-mcp -am"` — only on plan-marshall-mcp
-- Tests (plan-marshall-mcp-integration-tests): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl integration-tests -am"` — only on plan-marshall-mcp-integration-tests
-- Integration tests (plan-marshall-mcp-integration-tests): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests -pl integration-tests -am"` — only on plan-marshall-mcp-integration-tests (needs Docker)
+- Integration tests (plan-marshall-mcp): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests -pl plan-marshall-mcp -am"` — only on plan-marshall-mcp
 - Use a Bash timeout of 600000ms for build commands.
 - Analyze each build's TOON result: `status`, `errors[N]{file,line,message,category}`, `log_file`.
 
@@ -67,7 +66,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 ### Logging
 
 - `private static final CuiLogger LOGGER = new CuiLogger(X.class);` (cui-java-tools). No slf4j,
-  log4j, `System.out`/`System.err` (the pre-boot `HealthProbe` is the documented exception).
+  log4j, `System.out`/`System.err`.
 - `%s` placeholders only; exception first.
 - INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` (prefix `PM_MCP`,
   ranges INFO 001-099, WARN 100-199, ERROR 200-299), each documented in `doc/LogMessages.adoc`.
@@ -81,17 +80,10 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Test data: cui-test-generator; log assertions: cui-test-juli-logger (`@EnableTestLogger`).
 - Minimum 80% instruction and branch coverage, enforced by the JaCoCo `check` of the parent's
   `-Pcoverage` profile (merged Maven and `quarkus-jacoco` data) and by the SonarCloud quality gate.
-- Unit-test logic in separate classes rather than in the `@QuarkusMain` entry point, which is
+- Unit-test logic in separate classes rather than in a `@QuarkusMain` entry point, which is
   excluded from JaCoCo and Sonar coverage.
-- Container-level behaviour belongs in `integration-tests` (`*IT`), not in unit tests.
-
-### Container image
-
-- The image `HEALTHCHECK` runs the application itself with `--health-probe` (`HealthProbe`: TCP
-  connect to management port 9000). Keep it shell-free: the target image is a native executable on
-  distroless (`doc/concept/10-technology.adoc`).
-- Base images are digest-pinned; Dependabot updates them.
-- Don't add a `healthcheck:` to the compose service: it would override the image's own check.
+- Behaviour of the packaged application belongs in `*IT` tests (`@QuarkusIntegrationTest`, run with
+  `-Pintegration-tests`), not in unit tests.
 
 ## Documentation
 
