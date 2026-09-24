@@ -15,78 +15,72 @@
  */
 package de.cuioss.pm.mcp.integration;
 
-import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-import io.restassured.path.json.JsonPath;
-import io.restassured.response.Response;
-import io.restassured.specification.RequestSpecification;
+import java.net.URI;
+import java.util.Map;
+
+
+import io.quarkiverse.mcp.server.test.McpAssured;
+import io.quarkiverse.mcp.server.test.McpAssured.McpStreamableTestClient;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Calls the {@code hello} tool through the MCP Streamable HTTP transport as a client would:
- * {@code initialize}, {@code notifications/initialized}, {@code tools/call}.
+ * Talks to the containerised server through the Streamable HTTP transport with the McpAssured
+ * client of quarkus-mcp-server.
  */
 @DisplayName("MCP hello tool in the container")
 class HelloToolIT extends BaseIntegrationTest {
 
-    private static final String MCP_PATH = "/mcp";
-    private static final String SESSION_HEADER = "Mcp-Session-Id";
-    private static final String PROTOCOL_VERSION = "2025-11-25";
+    private McpStreamableTestClient client;
+
+    @BeforeEach
+    void connect() {
+        client = McpAssured.newStreamableClient()
+                .setBaseUri(URI.create("http://localhost:" + httpPort()))
+                .build()
+                .connect();
+    }
+
+    @AfterEach
+    void disconnect() {
+        // null if connect() failed: don't mask that failure with an NPE
+        if (client != null) {
+            client.disconnect();
+        }
+    }
+
+    @Test
+    @DisplayName("initialize reports the server name")
+    void shouldReportServerName() {
+        assertEquals("plan-marshall-mcp", client.initResult().serverName());
+    }
+
+    @Test
+    @DisplayName("tools/list exposes the hello tool")
+    void shouldListHelloTool() {
+        client.when()
+                .toolsList(page -> {
+                    var tool = page.findByName("hello");
+                    assertNotNull(tool, "hello tool must be listed");
+                    assertEquals("Returns a greeting for the given name.", tool.description());
+                })
+                .thenAssertResults();
+    }
 
     @Test
     @DisplayName("tools/call hello returns the greeting")
     void shouldGreetViaMcp() {
-        var initialize = mcpRequest(null).body("""
-                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                  "protocolVersion":"%s","capabilities":{},
-                  "clientInfo":{"name":"plan-marshall-mcp-it","version":"1.0"}}}
-                """.formatted(PROTOCOL_VERSION))
-                .post(MCP_PATH);
-        assertEquals(200, initialize.statusCode());
-        assertEquals("plan-marshall-mcp", jsonRpcResult(initialize).getString("result.serverInfo.name"));
-        var sessionId = initialize.header(SESSION_HEADER);
-
-        mcpRequest(sessionId).body("""
-                {"jsonrpc":"2.0","method":"notifications/initialized"}
-                """)
-                .post(MCP_PATH).then().statusCode(202);
-
-        var call = mcpRequest(sessionId).body("""
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                  "name":"hello","arguments":{"name":"Container"}}}
-                """)
-                .post(MCP_PATH);
-        assertEquals(200, call.statusCode());
-        var result = jsonRpcResult(call);
-        assertFalse(result.getBoolean("result.isError"));
-        assertEquals("Hello, Container!", result.getString("result.content[0].text"));
-    }
-
-    private static RequestSpecification mcpRequest(String sessionId) {
-        var spec = given()
-                .contentType("application/json")
-                .accept("application/json, text/event-stream")
-                .header("MCP-Protocol-Version", PROTOCOL_VERSION);
-        return sessionId == null ? spec : spec.header(SESSION_HEADER, sessionId);
-    }
-
-    /**
-     * The server may answer a request either with a JSON body or with an SSE stream carrying the
-     * JSON-RPC response as {@code data:} event.
-     */
-    private static JsonPath jsonRpcResult(Response response) {
-        var body = response.asString();
-        if (response.contentType().startsWith("text/event-stream")) {
-            body = body.lines()
-                    .filter(line -> line.startsWith("data:"))
-                    .map(line -> line.substring("data:".length()).trim())
-                    .filter(data -> data.contains("\"result\"") || data.contains("\"error\""))
-                    .findFirst()
-                    .orElseThrow(() -> new AssertionError("No JSON-RPC response in SSE stream: " + response.asString()));
-        }
-        return JsonPath.from(body);
+        client.when()
+                .toolsCall("hello", Map.of("name", "Container"), response -> {
+                    assertFalse(response.isError());
+                    assertEquals("Hello, Container!", response.content().getFirst().asText().text());
+                })
+                .thenAssertResults();
     }
 }

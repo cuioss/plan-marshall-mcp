@@ -33,8 +33,12 @@ abstract class BaseIntegrationTest {
     @BeforeAll
     static void setUpBaseIntegrationTest() {
         RestAssured.baseURI = "http://localhost";
-        RestAssured.port = Integer.parseInt(System.getProperty("test.http.port", DEFAULT_HTTP_PORT));
+        RestAssured.port = httpPort();
         RestAssured.enableLoggingOfRequestAndResponseIfValidationFails();
+    }
+
+    static int httpPort() {
+        return Integer.parseInt(System.getProperty("test.http.port", DEFAULT_HTTP_PORT));
     }
 
     static RequestSpecification givenManagement() {
