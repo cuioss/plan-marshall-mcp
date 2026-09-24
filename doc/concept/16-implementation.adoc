@@ -1,0 +1,161 @@
+= Implementation Approach
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Concept] » Implementation Approach
+
+== Decisions
+
+. *Libraries only where they are small and native-capable.* The workflow engine and the TOON encoder are PM-MCP's own code; JSON uses the Jackson that Quarkus manages.
+. *JSON for machine state, TOON for output.* Persisted machine state is JSON or JSONL with a format version; documents written for people and the model stay Markdown; TOON is produced only when a result is rendered for the model.
+. *Project-local development skills* under their own `pm-mcp-` prefix drive a development instance of PM-MCP, separated from the installed plan-marshall commands and from real state.
+. *Two waiting primitives*, both links: a bounded `wait` that any host survives, and a `wait` carrying progress notifications where the client profile allows longer calls. MCP Tasks are adopted later.
+. *Transition: foundation first, then by category.* The foundation routes every call to the Python scripts; then ported stores switch individually, redesigned workflows switch phase by phase, retired parts are dropped with the surface that replaces them.
+
+== Libraries
+
+[cols="1,2,3"]
+|===
+|Need |Choice |Reason
+
+|Workflow engine
+|Own code: states and link relations as sealed interfaces and records, transitions as a data-driven table, guards as plain methods
+|The small libraries are dormant or archived — stateless4j (last release 2019), squirrel-foundation (2022, pulls Guava and MVEL), easy-states (archived). Enterprise engines (Camunda, Flowable, Temporal, Spring Statemachine) bring their own persistence and runtime, which contradicts filesystem state and derived links (xref:03-hypermedia-workflow.adoc[Hypermedia Workflow]). Exhaustive `switch` over sealed types gives the compile-time check a library would.
+
+|TOON output
+|Own encoder for the subset PM-MCP emits: objects, tabular arrays, inline primitive arrays, quoting and escaping by the specification (v4.1)
+|The Java implementation JToon (`dev.toonformat:jtoon`) is maintained and spec-compliant, but brings Jackson 3 next to Quarkus's Jackson 2 and a runtime code generator (Blackbird) that is a risk under native image. An encoder over PM-MCP's own records is small and has no reflection.
+
+|TOON input
+|A reader for plan-marshall's TOON dialect, in the test and migration code only
+|The model sends arguments as JSON; PM-MCP parses TOON only to compare Python output in differential tests and to convert legacy TOON stores. plan-marshall's parser deviates from the specification (tab rows sniffed instead of declared, JSON in table cells, block scalars, comments), so a spec parser does not read it.
+
+|JSON
+|Jackson 2 as managed by Quarkus, with records; persisted types registered for reflection
+|Already in the stack; records serialise without mapping code. Types read and written outside REST are not discovered by Quarkus and need `@RegisterForReflection`.
+|===
+
+The TOON encoder is verified against the conformance fixtures of the TOON specification, for the subset it emits.
+
+== Storage and output formats
+
+=== Principle
+
+The store is written and read by the server only; the model sees representations and results, rendered as TOON (xref:05-tool-surface.adoc[Tool Surface]). Storage therefore optimises for exact round-trips, schema evolution and tooling; output optimises for tokens.
+
+[cols="1,2"]
+|===
+|Kind |Format
+
+|State the server reads and writes
+|JSON, one document per entity; JSONL for append-only logs (findings, change ledger, audit). Every document carries a format version; the daemon migrates older versions forward on start (xref:02-architecture.adoc#_updates[Updates]).
+
+|Documents written for people and the model
+|Markdown, unchanged: request, solution outline, landings, lessons, epic and inbox documents.
+
+|Results and representations
+|TOON, rendered from the same records at the tool boundary.
+|===
+
+=== plan-marshall's current stores
+
+plan-marshall already stores its core state as JSON — `status.json`, `tasks/TASK-NNN.json`, `references.json`, the orchestrator ledger — and renders it as TOON on output. The stores still written as TOON are auxiliary or derived:
+
+[cols="2,1,2"]
+|===
+|Store |Category |Target
+
+|`execution.toon` (execution manifest), `handshakes.toon` (phase invariants)
+|Redesigned
+|Replaced by the workflow engine's JSON state; not converted.
+
+|`work/metrics*.toon`, `work/fragment-*.toon`, `work/retro-fragments.toon`
+|Ported
+|JSON, converted in plan-marshall before the owning script is ported.
+
+|`work/module_mapping.toon`, `work/deliverable-hashes.toon`, `work/lessons-consult.toon`, `artifacts/ci-runs/{N}/manifest.toon`
+|Ported
+|JSON, converted in plan-marshall before the owning script is ported.
+
+|`work/ci-precondition-cache.toon`
+|Redesigned
+|Part of the finalize state; not converted.
+
+|`.plan/local/marshall-state.toon`
+|Retired
+|Removed with executor generation.
+|===
+
+Converting in plan-marshall first keeps one format per store on the shared state tree during coexistence (xref:12-migration.adoc#_coexistence[Coexistence]); the differential tests then compare JSON state trees and TOON output only. Skill instructions that read a `.toon` store directly — the retrospective reads `handshakes.toon` and `work/metrics.toon` — are replaced by `pm_state` and resources.
+
+== Development skills
+
+Development of PM-MCP needs Claude Code sessions that drive the server under development. They are project-local skills in this repository, `.claude/skills/pm-mcp-*`, and never part of what PM-MCP delivers.
+
+[cols="1,3"]
+|===
+|Skill |Purpose
+
+|`pm-mcp-dev`
+|Build and start a development daemon, stop it, show its status and log. Registers it as the MCP server `pm-mcp-dev`, so its tools (`mcp__pm-mcp-dev__pm_state`) never collide with an installed PM-MCP or with plan-marshall's commands.
+
+|`pm-mcp-scenario`
+|Run an end-to-end scenario against a fixture project: enter a plan, follow links until a target state, report the path taken and every deviation.
+
+|`pm-mcp-inspect`
+|Show the persisted state, entry record and audit log of a development plan.
+|===
+
+The development daemon runs with its own home (`PLAN_MARSHALL_HOME` pointing into `.plan/temp/`), its own port and its own OS credential store service name (`plan-marshall-mcp-dev` instead of `plan-marshall-mcp`), so it never touches the operator's plans, enrolment or credentials: a credential missing for development is reported as `not_found`, never resolved from the operator's entries. The skills call the build through the project's canonical commands.
+
+== Waiting primitives
+
+=== Host limits
+
+Long-running work — builds, CI runs, review-bot windows, merge queues — regularly exceeds what one tool call may take. For Claude Code:
+
+* An HTTP MCP call is aborted after *5 minutes without a response or progress notification* (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`; 30 minutes for stdio). A progress notification resets the idle timer.
+* The overall limit per call (`MCP_TOOL_TIMEOUT`) is far above any job; progress does not extend it.
+* In the main conversation, a call still running after 2 minutes moves to the background and the model continues; calls of sub-agents are never moved to the background.
+* Claude Code does not support MCP Tasks; the Quarkus MCP Server extension does not implement them yet.
+
+Other hosts differ; the limits are part of the client profile (xref:15-client-profiles.adoc#_client_profiles[Client profiles]).
+
+=== Primitives
+
+A job always outlives the call that follows it: it runs in the daemon and its state is persisted (xref:07-build-execution.adoc[Build Execution]). Waiting is therefore only a question of how long one call blocks.
+
+[cols="1,3"]
+|===
+|Primitive |Behaviour
+
+|Bounded wait
+|`wait:<job>` blocks up to a bound below the host's idle timeout — by default 4 minutes — and returns the final representation or the running one with updated progress and a new `wait` link. Works on every host and in sub-agents; costs one turn per bound.
+
+|Progress wait
+|The same `wait:<job>` link, on a host whose profile states that progress resets the idle timeout: the call sends a progress notification at least every 60 seconds and blocks until the job ends or a longer bound (default 30 minutes) is reached.
+
+|Cancel
+|`cancel:<job>` ends a job; the representation shows the cancelled state.
+|===
+
+The model does not choose between the waits. The server uses the progress wait only when both hold — the client profile states that progress resets the idle timeout, and the call carries a progress token; otherwise it uses the bounded wait. There is no separate polling primitive: a `wait` that returns early is the poll. MCP Tasks replace the progress wait once the framework and the hosts support them (xref:10-technology.adoc#_decisions[Technology]).
+
+=== Tests
+
+Both primitives are tested through the link approach, not as tool internals:
+
+* integration tests with a controllable fake job: a bounded wait across several bounds, a progress wait with notifications, cancel during a wait, a daemon restart during a wait followed by resume through `pm_state`;
+* a Claude Code scenario (`pm-mcp-scenario`) with a job longer than the idle timeout and the idle timeout lowered, in the main conversation and in a sub-agent.
+
+== Transition order
+
+The transition follows two axes: first the foundation, then the categories of the migration inventory (xref:14-test-strategy.adoc#_categories[Categories]).
+
+. *Foundation.* Binary, daemon, state store with JSON and format versions, TOON renderer, entry, jobs and the executor adapter. Every script call still runs the Python script; nothing changes in behaviour.
+. *Ported stores*, bottom-up by data dependency: references, tasks, findings, status, then lessons, metrics and the git and CI integrations. Each switches individually after its differential tests pass (xref:14-test-strategy.adoc#_switch_over[Switch-over]).
+. *Redesigned workflows*, phase by phase, starting with the finalize pilot. A phase switches once the stores it writes are ported, because the workflow engine writes only through Java stores under the plan's lock.
+. *Retired parts* are removed together with the surface that makes them obsolete, not in advance.
+
+The roadmap orders these steps with the services (xref:../roadmap.adoc[Roadmap]).
