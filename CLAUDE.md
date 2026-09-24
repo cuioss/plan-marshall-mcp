@@ -80,8 +80,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Test data: cui-test-generator; log assertions: cui-test-juli-logger (`@EnableTestLogger`).
 - Minimum 80% instruction and branch coverage, enforced by the JaCoCo `check` of the parent's
   `-Pcoverage` profile (merged Maven and `quarkus-jacoco` data) and by the SonarCloud quality gate.
-- Unit-test logic in separate classes rather than in a `@QuarkusMain` entry point, which is
-  excluded from JaCoCo and Sonar coverage.
+- Keep a `@QuarkusMain` entry point thin and unit-test its logic in separate classes.
 - Behaviour of the packaged application belongs in `*IT` tests (`@QuarkusIntegrationTest`, run with
   `-Pintegration-tests`), not in unit tests.
 
