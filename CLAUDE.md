@@ -115,6 +115,10 @@ All cuioss repositories have branch protection on `main`. Direct pushes to `main
 7. Do **NOT** enable auto-merge unless explicitly instructed. Wait for user approval.
 8. Return to main: `git checkout main && git pull`
 
+**Releases:** merging a change of `release.current-version` in `.github/project.yml` publishes to Maven
+Central (central version-changed guard, see `.github/workflows/release.yml`). Never change it in an
+ordinary PR; releases go through the runbook `.claude/skills/release/SKILL.md`.
+
 CI: reusable workflows from `cuioss/cuioss-organization`, pinned by full SHA with a version comment;
 configuration in `.github/project.yml`. Required checks: `build / conclusion`,
 `integration-tests / conclusion`.
