@@ -1,5 +1,5 @@
 /*
- * Copyright © 2026-present CUI-OpenSource-Software (info@cuioss.de)
+ * Copyright © 2026-present Oliver Wolff
  *
  * SPDX-License-Identifier: FSL-1.1-ALv2
  *
