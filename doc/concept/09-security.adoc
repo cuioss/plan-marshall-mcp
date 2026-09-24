@@ -9,31 +9,35 @@ xref:README.adoc[Concept] » Security and Trust Model
 
 [source,text]
 ----
- operator ──(host UI, commands)──► host ──(MCP)──► PM-MCP ──► repo, git, CI, build backends
-                                    ▲                 │
-                                    │                 └──► upstream MCP servers (untrusted)
-                                  model
-       (acts on untrusted content: repo files, PR comments, web)
+ operator ──(host UI, elicitation)──► host ──(MCP)──► PM-MCP ──► repo, git, CI, builds
+    │                                  ▲                ▲  │
+    │                                  │                │  └──► upstream MCP servers (untrusted)
+    │                                model              │
+    │    (acts on untrusted content:                    │
+    │     repo files, PR comments, web)                 │
+    └──(operator CLI: loopback endpoint, operator token)┘
 ----
 
 * The *operator* is trusted and is the only party allowed to take operator-only actions, including enrolment.
 * The *model* is trusted to exercise judgment within offered links, but is exposed to untrusted content and is therefore never given capabilities it could be tricked into using against the operator's intent.
 * *PM-MCP* is first-party, local software acting with the operator's permissions.
-* *Repository code* — including build definitions and wrappers — may have been edited by the model and is executed only through a build backend.
+* *Repository code* — including build definitions, wrappers and git hooks — may have been edited by the model and is executed only as a build job or, for hooks, a git job.
 * *Upstream MCP servers* and all external content (PR comments, review bots, fetched web content) are untrusted.
 
 == Workspace confinement
 
 === Decision
 
-Every operation in a context is confined to the directory the context works on — normally the repository checkout the session entered from. Access to another project requires the user's explicit approval.
+Every PM-MCP operation in a context is confined to the directory the context works on — normally the repository checkout the session entered from. Access to another project requires the user's explicit approval.
+
+The host's own tools, which the model uses to read and edit files, are governed by the host's permissions, not by PM-MCP. PM-MCP detects changes they make outside the plan's worktree (<<_host_tools>>).
 
 === Workspace root
 
-* The workspace root is set at the entry point: the entry script reports the working directory, and PM-MCP resolves it to the repository root.
+* The workspace root is set at the entry point: `pm-mcp enter` reports the working directory, and PM-MCP resolves it to the repository root.
 * Where the client provides MCP roots, they are cross-checked with the entry's working directory; a disagreement is reported, and the narrower set applies.
-* The root is persisted with the plan or epic run, so a resumed run is confined to the same root.
-* The project must be enrolled; enrolment defines which projects PM-MCP may act on at all, confinement narrows that to one project per context.
+* The root is persisted in the plan's or epic's entry record (xref:15-client-profiles.adoc#_persistence[Persistence]), so every later call in that scope is confined to the same root.
+* The project must be enrolled; enrolment defines which projects PM-MCP may act on at all — and confinement narrows that to one project per context.
 
 === Enforcement
 
@@ -42,15 +46,26 @@ Enforced by PM-MCP for every operation, independent of what the client declares:
 * every path is canonicalised (symlinks resolved) and must lie inside the workspace root, or inside a live linked worktree whose git common directory resolves to the root;
 * the model never passes paths; scopes are resolved server-side, and resolution outside the root is refused;
 * git, CI and build operations act only on the root's repository and its worktrees;
-* build backends receive only the root's worktrees (xref:07-build-execution.adoc[Build Execution]);
+* build jobs run only in the root's worktrees (xref:07-build-execution.adoc[Build Execution]);
 * a refused access is a distinct state in the representation, with an `escalate` link to request approval.
+
+=== Host tools
+
+The model implements with the host's file and shell tools. For them it receives the plan's worktree as a fact, and dispatched sub-agents receive it as `WORKTREE` (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]). PM-MCP does not confine these tools; it detects what they change:
+
+* when a task starts, PM-MCP records the state of the root's main checkout and of its other worktrees;
+* at every task `submit` and before every commit, it compares the realised changes against that record;
+* changes outside the plan's worktree move the plan into a `*.footprint-violation` state with a finding naming the files, and `fix` and `escalate` links; the transition does not proceed;
+* the realised footprint of the plan's worktree is recorded with the plan.
+
+Changes outside the root's repository are not visible to PM-MCP.
 
 === Access to other projects
 
 Some work legitimately spans projects — an epic landing in a consumer repository, a fix verified against a dependent project. Such access:
 
 * is requested through an `escalate` link naming the target project and the access needed (read, or read and write);
-* is approved by the user, never by the model — through MCP elicitation where the client supports it, which asks the user directly without passing through the model, otherwise through an operator-only action;
+* is approved by the user, never by the model — through MCP elicitation where the client supports it, which asks the user directly without passing through the model, otherwise through the operator CLI (<<operator-channel>>);
 * is scoped: target project, access level, and lifetime (the current plan or epic run);
 * is persisted with the run, recorded in the audit log, and revocable;
 * is limited to enrolled projects.
@@ -60,19 +75,33 @@ Some work legitimately spans projects — an epic landing in a consumer reposito
 The model can only do what links offer and what the tool surface validates. Operator-only actions:
 
 * are never emitted as links;
-* are rejected by `pm.do` regardless of arguments;
-* are reachable only through `pm.operator`, which the host gates with explicit per-call user permission.
+* are rejected by `pm_do` regardless of arguments;
+* are not part of PM-MCP's MCP tool surface; they are taken only through the operator channel (<<operator-channel>>).
 
-Rules that today live in documentation ("never force the gate", "never delete the plan directory by hand") become properties of the system.
+Rules such as "never force the gate" or "never delete the plan directory by hand" are properties of the system, not instructions to the model.
+
+== Operator channel
+
+[[operator-channel]]
+Operator-only actions — enrolment, forcing a gate, overriding a merge barrier, deleting a plan, approving access to other projects — are taken through two channels. Neither passes through the model.
+
+Elicitation::
+When a running plan or epic needs an operator decision, PM-MCP requests it through MCP elicitation. The client presents the request to the user directly, and the answer returns to PM-MCP without passing through the model.
+
+Operator CLI::
+`pm-mcp operator <action>` talks to the daemon over its loopback endpoint with the operator token. It requires interactive confirmation on a terminal. It is the channel for enrolment and other machine- or project-level actions, and for approvals where the client does not support elicitation.
+
+While a decision is outstanding, the plan or epic is in a `*.blocked` state. Its representation names the pending request and the CLI command that answers it, and offers only a `wait` link; the model cannot answer the request.
+
+The model reaches no operator action through PM-MCP's MCP surface. A model with unrestricted shell access runs as the operator's user; for it, the CLI's interactive confirmation and the host's own shell permissions are the guard.
 
 == Execution
 
 * No PM-MCP skill instructs host code execution; the MCP Skills extension's execution-approval gate is never triggered by PM-MCP skills.
 * PM-MCP's inputs are closed-enum transitions and schema-validated free parameters, never shell strings from the model.
 * Text parameters (commit message, PR body, outline) are treated as data and never interpolated into a command line.
-* Builds run only through a build backend, as wrapper invocations checked against the operator's enrolment (xref:07-build-execution.adoc[Build Execution]).
-* Container runtime access is never exposed to the model as a tool; container policy, socket narrowing and the rootless requirement for container-using builds are defined in xref:08-container-backend.adoc#control[Container Backend].
-* Indirect access remains through build code: a project enrolled with `containers: siblings` passes the runtime socket into its builds, and build definitions are repository code the model may have edited. Such code acts on the runtime with the runtime's privileges — on a rootless runtime the developer's own. The opt-in and the rootless requirement bound this exposure; they do not remove it. Projects that must exclude it are enrolled with `containers: none` or use the host backend, where the same code runs with the developer's privileges as it does today.
+* Builds run only as build jobs, as wrapper invocations checked against the operator's enrolment (xref:07-build-execution.adoc[Build Execution]). Build code is repository code the model may have edited; it runs with the developer's privileges, confined on Linux (<<_hardening>>).
+* Every git operation runs only as a git job, composed by PM-MCP from a closed set of operations (xref:07-build-execution.adoc#_git_jobs[Git jobs]). PM-MCP holds no git credentials; git uses the developer's own configuration.
 
 == Skill integrity
 
@@ -88,8 +117,47 @@ Rules that today live in documentation ("never force the gate", "never delete th
 
 == Local attack surface
 
-* The front end speaks stdio only.
-* Front end and daemon communicate over a local channel restricted to the operator's user.
-* The host build server either listens on an owner-only Unix socket or connects out with OAuth; it never opens a listening network port.
-* Projects must be enrolled explicitly by the operator before PM-MCP or a build backend acts on them.
+* Hosts obtain the MCP token through `pm-mcp token` as a header helper, or connect through `pm-mcp serve --stdio`; no host configuration or environment contains a PM-MCP token. A model with unrestricted shell access runs as the operator's user and could run `pm-mcp token` itself; the MCP token grants exactly what the MCP surface offers.
+* The daemon's MCP endpoint binds to `127.0.0.1` only, validates `Origin` and `Host` on every request, rejects unexpected values with HTTP 403, and requires a short-lived MCP token (<<_hardening>>).
+* The operator CLI authenticates with a separate operator token; the MCP token grants no operator action.
+* The LSP proxy endpoint (xref:06-services.adoc#lsp[LSP]) is protected like the MCP endpoint: loopback only, `Origin` and `Host` validation, token.
+* MCP sessions are never used for authentication; every request is authenticated on its own.
+* Projects must be enrolled explicitly by the operator before PM-MCP acts on them.
 * The audit log records every call and every build with scope, client identity, caller session and outcome; a mismatch between declared and self-reported client identity is recorded and reported.
+
+== Hardening
+
+Endpoint::
+* `quarkus.http.host=127.0.0.1` is set explicitly. The Quarkus default in production binds all interfaces, which would also switch off the rebinding check.
+* The MCP Server extension's DNS rebinding check (`quarkus.mcp.server.http.dns-rebinding-check.enabled`) rejects foreign `Origin` values. A route filter additionally accepts only the `Host` values `127.0.0.1:<port>` and `localhost:<port>`.
+* A custom `HttpAuthenticationMechanism` validates the bearer token in constant time, and the HTTP permission `authenticated` covers `/mcp/*`; no request reaches a tool unauthenticated.
+
+Short-lived tokens::
+A signing secret is kept in the credential store. `pm-mcp token` derives a fresh MCP token with a lifetime of minutes from it on every connection, and `pm-mcp serve --stdio` renews its own. A host that receives HTTP 401 runs the header helper again and retries; Claude Code does so automatically.
+
+Local token instead of MCP OAuth::
+The MCP authorization specification (OAuth 2.1) is a SHOULD for HTTP transports. The loopback endpoint deliberately uses the local token instead: an authorization server on the developer's machine would add a component without adding a trust boundary. Deployments reachable beyond the machine use OAuth through TokenSheriff (xref:10-technology.adoc#_security_libraries[Security libraries]).
+
+Process confinement::
+* The daemon runs as the developer's user, without a container around it.
+* On Linux it always runs under systemd confinement — as the OS service unit, or, when started on demand, through `systemd-run --user` with the same properties: `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, and `ProtectHome=read-only` with write access only to the enrolled project roots, `~/.plan-marshall/` and the caches the enrolled wrappers use. Enrolling a project updates the write paths. Its subprocesses — build, git and script jobs and language servers — inherit the confinement.
+* On macOS there is no supported equivalent; the unconfined daemon is a residual risk.
+* Every git and script job receives an environment allowlist, as build jobs do; the daemon's own tokens never reach a subprocess.
+
+Error handling::
+Tool results and MCP errors never contain stack traces, internal exceptions or tokens. A failure reports a closed-enum reason and the id of its audit record; the details are in the audit log only. Paths appear only where a representation needs them as facts.
+
+Limits::
+Every tool call has a timeout; work that takes longer is a job with a `wait` link. Results have a size cap, and larger data is referenced as a resource. Calls are rate-limited per client identity.
+
+Strict schemas::
+Every tool parameter schema is closed (`additionalProperties: false`). Free parameters have closed types, enumerations or length limits; anything else is rejected before the workflow engine sees it.
+
+Audit::
+The audit log records every call with its full parameters, scope, client identity and outcome. Secrets and tokens are redacted before a record is written.
+
+Credential store::
+Provider credentials, the signing secret for MCP tokens and the operator token are kept in the OS credential store — Keychain, Secret Service, Credential Manager — where available, otherwise in files under `~/.plan-marshall/` readable only by the owner. The daemon reads them where it needs them. No credential appears in a host's configuration or in the model's environment.
+
+No token passthrough::
+PM-MCP accepts no token that was not issued to PM-MCP, and never forwards a token it received to an upstream service. The MCP proxy authenticates to each upstream server with its own credentials for that server (xref:06-services.adoc#mcp-proxy[MCP proxy]).
