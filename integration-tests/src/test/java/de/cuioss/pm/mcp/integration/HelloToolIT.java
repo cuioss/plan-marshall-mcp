@@ -49,7 +49,10 @@ class HelloToolIT extends BaseIntegrationTest {
 
     @AfterEach
     void disconnect() {
-        client.disconnect();
+        // null if connect() failed: don't mask that failure with an NPE
+        if (client != null) {
+            client.disconnect();
+        }
     }
 
     @Test
