@@ -7,7 +7,7 @@ xref:README.adoc[Concept] » Hypermedia Workflow
 
 == Idea
 
-The workflow is a hypermedia application in the HATEOAS sense. The client asks for the state of a plan or epic; the server answers with a *representation* of that state and the *links* — pre-fabricated tool calls — that are valid from it. The model advances the workflow by following links. It never needs to know the state machine, never assembles a call from prose, and never sees a transition that is not allowed.
+The workflow is a hypermedia application in the HATEOAS sense. The client asks for the state of a plan or epic; the server answers with a *representation* of that state and the *links* — the transitions valid from it, each identified by a link id — that the model can follow. The model advances the workflow by following links. It never needs to know the state machine, never assembles a call from prose, and never sees a transition that is not allowed.
 
 [cols="1,1"]
 |===
@@ -17,19 +17,16 @@ The workflow is a hypermedia application in the HATEOAS sense. The client asks f
 |A plan (`plan_id`) or an orchestrator epic (`epic_id`)
 
 |Representation
-|Result of `pm.state` or of any transition call
+|Result of `pm_state` or of any transition call
 
 |Link / form
-|Pre-fabricated tool call with bound and free parameters
+|Link id plus the free parameters the model supplies
 
 |Link relation (`rel`)
 |The meaning of a link (`next`, `retry`, `escalate`, …)
 
 |Media type documentation
 |Vocabulary skills (xref:04-skill-model.adoc[Skill Model])
-
-|Conditional request (`ETag` / `If-Match`)
-|`state_token`
 |===
 
 == Representation
@@ -41,17 +38,16 @@ A representation is returned as a tool result in TOON. It contains everything th
 scope: plan
 plan_id: PLAN-X
 state: finalize.push-barrier
-state_token: 7f3a91c2
 summary: tasks 11/11 done, freshness gate green, branch not pushed
 guidance: skill://pm/finalize/push-barrier/SKILL.md
 facts:
   branch: feature/PLAN-X
   commits_ahead: 4
   gate.freshness: green
-links[3]{rel,tool,bound,free}:
-  next,pm.push,"plan_id=PLAN-X;token=7f3a91c2",""
-  amend,pm.commit,"plan_id=PLAN-X;token=7f3a91c2","message"
-  escalate,pm.ask_operator,"plan_id=PLAN-X;token=7f3a91c2","reason"
+links[3]{rel,link,free}:
+  next,push,""
+  alt,commit,"message:text"
+  escalate,escalate,"reason:text"
 ----
 
 === Fields
@@ -61,9 +57,6 @@ What the representation describes.
 
 `state`::
 A dotted, closed-enum state name. Phase and step are both part of the name, so the state alone determines which links can exist.
-
-`state_token`::
-Opaque version of the state. Changes on every transition. Carried by every link (see <<state-token>>).
 
 `summary`::
 One line of human-readable status, for the model and for terminal display.
@@ -79,21 +72,27 @@ The valid transitions. Empty only in terminal states.
 
 == Links
 
-A link is a complete tool call description:
+A link is a transition the model can follow:
 
 `rel`::
 The relation, from a closed vocabulary (<<relations>>).
 
-`tool`::
-The MCP tool to call.
-
-`bound`::
-Parameters the server has already filled in. The model passes them unchanged.
+`link`::
+The link id: the transition, followed by the addressed entity where the transition acts on part of the plan or epic — `push`, `triage:F-12`, `wait:b-2291`. The id is derived from the persisted state; the server stores no link.
 
 `free`::
-Parameters the model must supply. These are exactly the places where judgment is required. Each free parameter has a name and a type; the guidance skill describes what a good value looks like.
+Parameters the model must supply, each with a name and a type. These are exactly the places where judgment is required; the guidance skill describes what a good value looks like.
 
-A link is a *form*, not only a pointer: the bound part removes argument-invention defects, the free part makes the model's contribution explicit and small.
+Every link is followed with one call:
+
+[source,text]
+----
+pm_do(plan_id | epic_id, link, args)
+----
+
+The model copies the scope and the link id and supplies the free parameters as `args`. Everything else — worktree, branch, build command, upstream tool arguments — the server resolves from the link id and the persisted state. The only exception is `dispatch`, which the model executes with the host's sub-agent mechanism (<<dispatch>>).
+
+A link is a *form*, not only a pointer: the link id removes argument-invention defects, the free part makes the model's contribution explicit and small.
 
 === Relations
 
@@ -120,13 +119,13 @@ The relation vocabulary is closed and documented once, in a vocabulary skill:
 |Hand judgment output to the server (an outline, a triage decision, a task result).
 
 |`dispatch`
-|Start a sub-agent; the link carries a ready-to-use prompt (<<dispatch>>).
+|Start a sub-agent; the link comes with the rendered host call (<<dispatch>>).
 
 |`wait`
 |Poll or monitor a long-running operation (<<long-running>>).
 
 |`escalate`
-|Ask the operator; the workflow blocks until answered.
+|Request an operator decision through the operator channel; the workflow blocks until it is answered (xref:09-security.adoc#operator-channel[Operator channel]).
 
 |`abort`
 |Leave the workflow in a defined state.
@@ -134,33 +133,34 @@ The relation vocabulary is closed and documented once, in a vocabulary skill:
 
 === Omission is enforcement
 
-Links the model must not use are not emitted. Operator-only transitions — forcing a gate, overriding a merge barrier, deleting a plan — never appear as links to the model. They are available only through an operator channel (a user-invoked prompt or command, or an explicit `escalate` answer).
+Links the model must not use are not emitted. Operator-only transitions — forcing a gate, overriding a merge barrier, deleting a plan — never appear as links to the model. They are taken only through the operator channel — MCP elicitation or the operator CLI (xref:09-security.adoc#operator-channel[Operator channel]).
 
 Omission is the primary mechanism; the server additionally rejects any call that is not a valid transition (<<validation>>).
 
-== State token
+== Concurrency and repeated calls
 
-[[state-token]]
-Every representation carries a `state_token`; every link binds it. A transition call succeeds only if the token matches the current state. Otherwise the server rejects the call and returns the current representation.
+[[concurrency]]
+The scope of a call is its logical context only: `plan_id` or `epic_id`, and the entity a transition acts on (a task, a finding); the client comes from the scope's entry record. Every call is evaluated against the persisted state of its scope at the moment it arrives.
 
-Token check, transition and persistence form one atomic compare-and-set per plan or epic: the engine validates the token, applies the transition and writes the new state and token as a single step under that plan's or epic's lock. Of two calls carrying the same token, exactly one succeeds; the other receives the new representation.
+Three rules make this safe:
 
-This protects against:
+Serialised writes::
+Validation, transition and persistence form one step under the plan's or epic's lock. Of two concurrent calls, the second is evaluated against the state the first left behind.
 
-* stale links replayed after a context compaction or `/clear`;
-* two sub-agents acting on the same state concurrently;
-* a model following a link from a representation it received several turns earlier.
+Entity addressing::
+A transition that acts on part of a plan names the entity in its link id and is validated against that entity's current state: a triage decision for a finding that is no longer open is rejected. Sub-agents working on different tasks of the same plan do not interfere with each other.
 
-The rejection is not an error the model must interpret: it contains the fresh representation, so the model simply continues from it.
+Idempotent side effects::
+Operations with external effects check the target state before acting and report what they found: pushing an already pushed branch returns `already_pushed`; requesting a build for a commit and scope that is already running joins that job instead of starting another.
+
+These rules cover stale links replayed after a context compaction or `/clear`, sub-agents acting concurrently, and links followed from a representation received several turns earlier. A rejected call is not an error the model must interpret: it contains the current representation, so the model continues from it.
 
 == Validation
 
 [[validation]]
 Links guide; they do not secure. Every tool call is validated by the workflow engine independently of whether it came from a link:
 
-* the target transition exists from the current state;
-* the `state_token` matches;
-* bound parameters equal the values the server would bind;
+* the link id is one of the links of the current state — the transition exists and the addressed entity accepts it;
 * free parameters satisfy their schema.
 
 A call that bypasses the links is treated exactly like a call through them.
@@ -178,15 +178,67 @@ A signal that hides a caveat cannot be expressed in the representation format.
 == Sub-agent dispatch
 
 [[dispatch]]
-A `dispatch` link carries the complete prompt for a sub-agent, including scope identifiers and the entry tool call:
+Sub-agents follow plan-marshall's execution-context structure: a generic dispatcher agent, installed per level so that each variant pins model and effort, receives a short prompt body naming its scope, skills and working directory, and returns a status to the dispatching session.
+
+A `dispatch` link comes with the rendered host call. The model passes `host_tool`, `params` and `prompt` unchanged:
 
 [source,toon]
 ----
-links[1]{rel,tool,bound,free}:
-  dispatch,host.agent,"level=3;prompt_ref=pm://plans/PLAN-X/dispatch/task-4",""
+links[1]{rel,link,free}:
+  dispatch,dispatch:task-4,""
+dispatch:
+  link: dispatch:task-4
+  host_tool: Agent
+  params:
+    subagent_type: plan-marshall:execution-context-level-3
+  prompt: |
+    name: task-4
+    plan_id: PLAN-X
+    entity: task-4
+    skills: [skill://pm/execute/task/SKILL.md, skill://pm/domain/java/core/SKILL.md]
+    WORKTREE: .plan/local/worktrees/PLAN-X
+    start: pm_state(plan_id="PLAN-X", entity="task-4")
 ----
 
-The prompt is a resource the server renders for the session's client — its sub-agent mechanism, model map and tool names (xref:15-client-profiles.adoc[Client Profiles]). The sub-agent's first action is the tool call named in it, which returns the sub-agent's own representation. The orchestrating model never assembles dispatch prompts.
+Prompt body::
++
+[cols="1,3"]
+|===
+|Field |Content
+
+|`name`
+|Label for logging and metrics.
+
+|`plan_id` / `epic_id`
+|The scope the sub-agent works in.
+
+|`entity`
+|The entity the sub-agent works on (a task, a finding).
+
+|`skills[]`
+|Vocabulary skill URIs to load before starting. `skill://pm/core/SKILL.md` is loaded implicitly and never listed.
+
+|`WORKTREE`
+|Repository-relative working directory for the host's file tools; `.` for the main checkout.
+
+|`caller_phase`
+|Optional; set when the same work is dispatched from more than one phase.
+
+|`start`
+|The sub-agent's first call. The work itself is not in the prompt: `pm_state(plan_id, entity)` returns the sub-agent's representation with guidance, facts and links.
+|===
+
+Rendering::
+The client profile recorded with the plan or epic resolves the level to the host's agent variant and model, and renders the host tool, its parameters and the skill load mechanism (xref:15-client-profiles.adoc[Client Profiles]). The orchestrating model never assembles dispatch prompts.
+
+Leaf::
+A sub-agent is a leaf. Representations in an entity scope never contain `dispatch` links; every dispatch originates from the session that works in the plan or epic scope. Operator decisions a sub-agent needs go through `escalate` and the operator channel (xref:09-security.adoc#operator-channel[Operator channel]).
+
+Return::
+A sub-agent persists its results through its own `submit` links, not through its answer. It returns `status` (`success`, `error`, `loop_back`, `blocked`) and `display_detail` (at most 80 ASCII characters, no trailing period). The dispatching session then continues from its current representation.
+
+Hosts whose sub-agents cannot reach MCP servers::
+The client profile marks dispatch as unavailable. Representations then offer the work to the dispatching session itself instead of a `dispatch` link.
 
 == Long-running operations
 
@@ -197,20 +249,20 @@ Builds, CI waits, review-bot windows and merge queues outlast a tool call. Such 
 ----
 state: execute.verify.running
 summary: build job b-2291 running (module-tests), 00:03:12 elapsed
-links[2]{rel,tool,bound,free}:
-  wait,pm.wait,"plan_id=PLAN-X;job=b-2291;token=c01d",""
-  abort,pm.cancel,"plan_id=PLAN-X;job=b-2291;token=c01d",""
+links[2]{rel,link,free}:
+  wait,wait:b-2291,""
+  abort,cancel:b-2291,""
 ----
 
-`pm.wait` blocks up to a bounded time and returns either the final representation or the same `running` representation with updated progress. Hosts that support progress notifications receive them in addition; nothing depends on it.
+Following the `wait` link blocks up to a bounded time and returns either the final representation or the same `running` representation with updated progress. Hosts that support progress notifications receive them in addition; nothing depends on it.
 
 == Resumption
 
-Resuming any plan or epic, after `/clear`, a compaction, a host restart or a new cloud VM, is one call: `pm.state(plan_id)`. The resume anchor is server state. Nothing has to be re-derived from documents or memory.
+Resuming any plan or epic, after `/clear`, a compaction, a host restart or a daemon restart, is one call: `pm_state(plan_id)`. The resume anchor is server state. Nothing has to be re-derived from documents or memory.
 
 == Epic orchestration
 
-The same model applies to orchestrator epics. `pm.state(epic_id)` returns the epic's representation: staged plans, running plans, pending inbox messages, and links such as `dispatch` (start a staged plan), `submit` (record a landing analysis) or `escalate`. Cross-reading live plan state, which the orchestrator ledger today must do by hand, is part of computing the representation.
+The same model applies to orchestrator epics. `pm_state(epic_id)` returns the epic's representation: staged plans, running plans, pending inbox messages, and links such as `dispatch` (start a staged plan), `submit` (record a landing analysis) or `escalate`. Cross-reading live plan state, which the orchestrator ledger today must do by hand, is part of computing the representation.
 
 == Dynamic paths
 

@@ -8,9 +8,9 @@ xref:README.adoc[Concept] » Client Profiles
 == Decisions
 
 . Every request PM-MCP handles is associated with a *client identity* — the agent runtime, for example `claude`, `opencode` or `antigravity`. It is as essential as the plan or epic scope.
-. Several clients run on the same machine against the same PM-MCP. The identity is therefore declared *per session*, at the entry points into plan-marshall, not per machine or per server configuration.
-. The declaration is made by a *minimal entry script* that detects the client from its environment; the model does not determine it.
-. After the entry, the identity travels as a *bound parameter* of every link, like `plan_id` and `state_token`.
+. Several clients run on the same machine against the same PM-MCP. The identity is therefore declared at the *entry points* into plan-marshall, not per machine, per server configuration or per connection.
+. The declaration is made by `pm-mcp enter`, which detects the client from the environment the client sets for its processes; the model does not determine or relay it.
+. The identity is *persisted with the plan or epic* it enters, in that plan's or epic's `mcp/` directory. Every call in that scope reads it from there; links do not carry it. A later entry into the same plan or epic replaces it.
 . Everything PM-MCP renders for the model — skills, representations, links — is translated *on the fly* through a data-driven *client profile*. There is no build-time generation per runtime.
 
 == Why the client identity is needed
@@ -55,31 +55,55 @@ A session enters plan-marshall through one of its user-invoked entry points:
 * plan lifecycle (today `/plan-marshall:plan-marshall`);
 * epic orchestration (today `/plan-marshall:plan-orchestrator`).
 
-These entry points are the only client-specific artefacts installed per client. Each is a thin command in the client's own command format whose single action is to run the entry script and pass its result to PM-MCP's entry tool (`pm.enter`).
+These entry points and the execution-context agent variants per level (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]) are the only client-specific artefacts installed per client. Each is a thin command in the client's own command format whose single action is one call of `pm-mcp`:
 
-=== Entry script
+[source,text]
+----
+pm-mcp enter <entry> [plan_id | epic_id]
+----
 
-A minimal, dependency-free script that reports the session's client identity and, where available, a client session id. It detects the client from the environment the client sets for its processes. For Claude Code these are, for example:
+=== Entry call
+
+`pm-mcp enter` runs in the host's shell and inherits the environment the client sets for its processes. It detects the client identity and, where available, a client session id, takes the working directory, and sends them with the entry and the scope to the daemon, which writes the entry record (<<_persistence>>). It prints only the scope and the first call for the model — `pm_state(plan_id)` for an existing plan or epic, `pm_start(request)` for a new plan. The identity never passes through the model.
+
+For Claude Code the environment contains, for example:
 
 * `AI_AGENT` — for example `claude-code_2-1-280_agent`;
 * `CLAUDECODE=1`;
 * `CLAUDE_CODE_SESSION_ID` — the client's own session id.
 
-The detection rules per client are part of the client profiles. A client whose environment is not recognised is reported as `unknown`; the entry command may also pass the identity explicitly, since each entry command is installed for one client.
+The detection rules per client are part of the client profiles. A client whose environment is not recognised is reported as `unknown`; the entry command may also pass the identity explicitly (`--client`), since each entry command is installed for one client.
 
-=== Binding
+=== Persistence
 
-`pm.enter(client, client_session, entry, …)` returns the first representation. From then on, every link carries `client` — and the client session id where known — as bound parameters, exactly like `plan_id` and `state_token` (xref:03-hypermedia-workflow.adoc#_links[Links]). The model passes them unchanged and never decides them.
+The daemon writes the entry record on every `pm-mcp enter`. The record lives in the `mcp/` sub-directory of the plan's or epic's directory in the `.plan/` tree:
 
-This works without protocol-level sessions: protocol `2026-07-28` is stateless, and the identity is part of each call's arguments. PM-MCP also records the identity with the plan or epic run it drives, so a resumed run (`pm.state`) offers links for the client that resumes it — which may differ from the client that started it.
+[source,json]
+----
+{
+  "client": "claude",
+  "client_version": "2.1.280",
+  "client_session": "c7e1…",
+  "entry": "plan",
+  "workspace_root": "/Users/oliver/git/TokenSheriff",
+  "entered_at": "2026-09-24T10:12:03Z"
+}
+----
+
+* Every call scoped to the plan or epic renders skills, representations and links for the recorded client. The model never passes the identity.
+* An entry without a plan or epic id writes the record at project level in the same form; `pm_start` creates the plan and moves the record into it. The configuration wizard keeps its record at project level.
+* Entering an existing plan or epic again, from the same or another client, replaces the record. The last entry determines the profile; each replacement is recorded in the audit log.
+* The `mcp/` directory is local to the machine and never tracked by git, also inside the git-tracked epic directories.
+
+This needs no protocol-level session: protocol `2026-07-28` is stateless, and every call is answered from the persisted record. `pm_state(plan_id)` after `/clear` or a compaction renders for the recorded client without re-entry.
 
 === Cross-check
 
-MCP carries the client's self-reported name and version — in the initialisation handshake for stateful clients and in the per-request metadata of protocol `2026-07-28`. PM-MCP compares it with the declared identity. A mismatch is recorded in the audit log and reported to the operator; it does not silently change the profile.
+MCP carries the client's self-reported name and version — in the initialisation handshake for stateful clients and in the per-request metadata of protocol `2026-07-28`. PM-MCP compares it with the declared identity. A mismatch is recorded in the audit log and reported to the operator; it does not silently change the profile or the record.
 
 === Sub-agents
 
-A `dispatch` link carries the client identity into the rendered sub-agent prompt, and the sub-agent's first tool call binds it again. Sub-agents therefore use the same profile as the session that dispatched them.
+Sub-agents work in the scope of the plan or epic that dispatched them and therefore read the same entry record. They use the same profile as the dispatching session without passing an identity.
 
 == Client profiles
 
@@ -89,9 +113,11 @@ A client profile is data, owned by PM-MCP and versioned with it:
 * load-directive and command-name templates;
 * idiom rewrites with their dispositions;
 * model and effort map per level;
-* sub-agent dispatch mechanism (the host tool and parameters a `dispatch` link resolves to);
+* sub-agent dispatch mechanism: the host tool, the execution-context agent variant and model per level, and the parameters a `dispatch` link resolves to, or the marker that the host's sub-agents cannot reach MCP servers;
 * component scope (which skills exist for this client);
-* protocol capabilities known for the client (Skills extension support, progress notifications, tool-call timeouts).
+* connection: direct Streamable HTTP with a header helper, or `pm-mcp serve --stdio` for clients that cannot obtain headers dynamically (xref:02-architecture.adoc#_mcp_endpoint[MCP endpoint]);
+* protocol capabilities known for the client (Skills extension support, progress notifications, tool-call timeouts, elicitation);
+* tool schema loading — resident or on demand — and, for on-demand hosts, the tools the entry command preloads (`pm_start`, `pm_state`, `pm_do`).
 
 The rewrite engine and the per-runtime mapping data of plan-marshall's `marketplace/targets` are carried over as the starting point.
 
@@ -101,7 +127,7 @@ Vocabulary skills::
 Generated per project *and* client (xref:04-skill-model.adoc[Skill Model]). Digests are computed per rendered variant, so each client sees a stable, verifiable catalogue.
 
 Representations and links::
-Links to PM-MCP's own tools are client-independent apart from the bound `client` parameter. Links that resolve to client capabilities — sub-agent dispatch, operator questions, file access in guidance — are rendered with the client's tool names and parameters (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]).
+Links to PM-MCP's own tools are client-independent. Links that resolve to client capabilities — sub-agent dispatch, questions to the user, file access in guidance — are rendered with the client's tool names and parameters (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]).
 
 Dispatch prompts::
 Rendered with the client's model map, tool names and load mechanism.
@@ -111,7 +137,7 @@ Exposed under the client's command naming.
 
 == Scope reduction through the target design
 
-The target design removes most of what the translation handles today: vocabulary skills contain no commands, script names or tool-call sequences, because operations arrive as links to PM-MCP tools. What remains client-specific is the host-side surface — sub-agents, questions to the operator, file and search tools used during implementation, models — which keeps the profiles small.
+The target design removes most of what the translation handles today: vocabulary skills contain no commands, script names or tool-call sequences, because operations arrive as links to PM-MCP tools. What remains client-specific is the host-side surface — sub-agents, questions to the user, file and search tools used during implementation, models — which keeps the profiles small.
 
 == Unknown clients
 
