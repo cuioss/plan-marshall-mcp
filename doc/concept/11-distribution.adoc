@@ -9,15 +9,142 @@ xref:README.adoc[Concept] » Distribution
 
 plan-marshall today distributes a corpus through a multi-stage chain: generator per runtime, dist branches and tags, marketplace install per host, plugin cache with registry pin, executor regeneration, host restart. Each stage has its own failure modes, and each additional runtime adds a generator target and an install path.
 
-PM-MCP distributes a program:
+PM-MCP distributes a program, in two parts:
 
-. Versioned artifacts, released as a unit: the native binary `pm-mcp` and, per client, the entry commands and the execution-context agent variants (xref:10-technology.adoc#_delivery[Delivery]).
-. One MCP server entry in the host configuration — user-level, or project-level so that every checkout uses it. The entry contains neither paths nor secrets and can be committed.
-. Skills generated per project at runtime (xref:04-skill-model.adoc[Skill Model]).
+. *The server* — the native binary `pm-mcp` in a small installation layout with control scripts (<<_server_installation>>), released as a unit per platform (xref:10-technology.adoc#_delivery[Delivery]).
+. *The clients* — per client a bundle of entry commands, execution-context agent variants, hooks and host configuration. The bundles are part of the binary; the running daemon serves them and installs them locally (<<_client_installation>>). There is no second download and no separate client release.
+
+Skills are not part of either: vocabulary skills are generated per project at runtime and served by the daemon (xref:04-skill-model.adoc[Skill Model]).
+
+== Server installation
+
+The layout follows Tomcat's split between an installation directory and an instance directory, reduced to what a single native process needs.
+
+[source,text]
+----
+<PM_MCP_HOME>/                    installation; read-only, replaced as a whole on upgrade
+  bin/
+    pm-mcp                        the native binary
+    start.sh                      pm-mcp daemon start
+    stop.sh                       pm-mcp daemon stop
+    run.sh                        pm-mcp daemon run
+    status.sh                     pm-mcp daemon status
+  conf/
+    pm-mcp.properties             documented defaults; never edited
+  service/
+    pm-mcp.plist                  launchd LaunchAgent template
+    pm-mcp.service                systemd --user unit template
+  LICENSE.md  NOTICE  sbom.cdx.json
+
+<PM_MCP_BASE>/                    instance; per user, survives upgrades
+                                  default $PLAN_MARSHALL_HOME/mcp/ = ~/.plan-marshall/mcp/
+  conf/pm-mcp.properties          operator overrides of the defaults
+  logs/                           daemon log, audit log
+  run/                            lock file, pid, port
+  state/                          enrolment, build slots, locks, client install records
+----
+
+* `PM_MCP_HOME` is derived from the binary's own location; `PM_MCP_BASE` from `PLAN_MARSHALL_HOME`. The development daemon sets a different base (xref:16-implementation.adoc#_development_skills[Development skills]); two daemons with different bases never share a lock, port or state.
+* An upgrade replaces the installation directory and leaves the instance directory alone. Homebrew does exactly this: each version is its own keg, and `pm-mcp` is linked into the `PATH`.
+* The scripts contain no logic. Each executes the matching `pm-mcp daemon` verb and passes its arguments through, so behaviour is implemented and tested once, in the binary.
+
+[cols="1,3"]
+|===
+|Verb |Behaviour
+
+|`run`
+|Runs the daemon in the foreground and logs to standard output. Used by launchd, systemd and for debugging.
+
+|`start`
+|Starts the daemon detached, unless one is already running for this base, and returns once its endpoint answers.
+
+|`stop`
+|Drains the daemon: queued jobs stay queued, running jobs finish, then it exits (xref:02-architecture.adoc#_lifecycle[Lifecycle]). `stop --force` cancels running jobs; they are recorded with the outcome `killed` (xref:07-build-execution.adoc#_job_contract[Job contract]).
+
+|`restart`
+|`stop` followed by `start`.
+
+|`status`
+|Version, base, port, uptime, running and queued jobs, connected clients; exit code 0 only when the daemon runs.
+|===
+
+Starting on demand stays the default: `pm-mcp token`, `pm-mcp serve --stdio` and `pm-mcp enter` start the daemon when it is not reachable. The scripts are for operators who want explicit control; `pm-mcp operator service install` renders the service template from `service/` with `run` and registers it.
+
+== Client installation
+
+=== Client bundle
+
+Per client, the binary contains one bundle of everything installed on the client's side:
+
+[cols="1,3"]
+|===
+|Part |Content
+
+|Entry commands
+|The user-invoked entry points, each a call of `pm-mcp enter` (xref:15-client-profiles.adoc#_entry_points[Entry points]).
+
+|Agent variants
+|The execution-context dispatcher agents per level (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]).
+
+|Hooks
+|Where the client has hooks: a session-start check that reports a stale bundle or a resumable plan through `pm-mcp enter --check`.
+
+|Host configuration
+|The MCP server entry (<<_host_configuration>>) and, where the client has a permission model, the deny rules for the credential file store (xref:08-credentials.adoc#_file_store[File store]).
+
+|Static skills
+|Only where a client can discover skills from its filesystem alone: a stub pointing to `pm_skills`. Project skills are never installed; they are served (xref:04-skill-model.adoc#_delivery[Delivery]).
+|===
+
+The bundle is rendered from the client profile (xref:15-client-profiles.adoc[Client Profiles]): command format, agent format, hook events and configuration files are profile data, so a new client is a new profile, not a new generator.
+
+=== Install endpoint
+
+The daemon serves the bundles on its loopback endpoint:
+
+[cols="1,3"]
+|===
+|Request |Answer
+
+|`GET /clients`
+|The clients this version supports, with bundle version and digest.
+
+|`GET /clients/{client}/bundle?scope=user\|project`
+|The manifest: for every file its target path relative to the scope's root, its kind, SHA-256 and mode; for shared configuration files the keys PM-MCP owns (for example `mcpServers.plan-marshall`) instead of the whole file.
+
+|`GET /clients/{client}/files/{path}`
+|One file of the bundle.
+|===
+
+The endpoint is read-only, contains no secret and is bound like the MCP endpoint: loopback only, `Origin` and `Host` validated (xref:09-security.adoc#_local_attack_surface[Local attack surface]). It needs no token, because the bundle is the same content the binary already contains.
+
+Serving the bundle from the running daemon — rather than from files next to the binary — makes the daemon the single version authority: what is installed matches the server that will answer, also between a binary upgrade and the daemon's restart.
+
+=== Applying a bundle
+
+`pm-mcp client` applies a manifest from the endpoint:
+
+[source,text]
+----
+pm-mcp client install <client> [--scope user|project]
+pm-mcp client update  [<client>]
+pm-mcp client remove  <client>
+pm-mcp client status
+----
+
+* *Plan, then confirm.* The command shows the files it adds, changes and removes, and every hook and permission rule, and asks for confirmation on a terminal, like the operator CLI (xref:09-security.adoc#operator-channel[Operator channel]).
+* *Owned files only.* An install record in `state/` lists every file and configuration key PM-MCP wrote, with its digest. An update rewrites and removes only those; a file the user changed since (digest mismatch) is reported and left alone. Shared configuration files are merged at the owned keys, never replaced.
+* *Idempotent.* Applying the same manifest twice changes nothing; `update` is `install` with the recorded scope.
+* *Scopes.* `user` writes into the client's user configuration; `project` writes into the checkout, so a team commits the entry commands and the MCP entry once. The committed files contain neither paths nor secrets.
+* *Detection.* `pm-mcp enter` compares the installed bundle version with the daemon's and names the `pm-mcp client update` command when they differ.
+
+A new machine therefore needs two steps: install the package, then `pm-mcp client install <client>`, which starts the daemon on demand and writes the MCP entry together with everything else.
+
+Where a client's own extension manager can install from a URL — for Claude Code a plugin marketplace, whose plugins carry commands, agents, hooks and MCP servers — the endpoint may additionally serve the bundle in that format, so the client installs and updates it with its own trust prompt. Whether this works against a loopback endpoint is to be verified per client (xref:13-open-questions.adoc#_verifications_pending[Verifications pending]); `pm-mcp client` stays the baseline.
 
 == Host configuration
 
-The form of the MCP server entry depends on the client (xref:02-architecture.adoc#_mcp_endpoint[MCP endpoint]). Clients that obtain headers dynamically connect directly:
+The form of the MCP server entry depends on the client (xref:02-architecture.adoc#_mcp_endpoint[MCP endpoint]); it is part of the client bundle. Clients that obtain headers dynamically connect directly:
 
 [source,json]
 ----
@@ -48,15 +175,15 @@ Clients without dynamic headers:
 
 == Updates
 
-* The operator upgrades `pm-mcp` through the package manager or `pm-mcp operator upgrade`, which verifies the release's signature and checksum before replacing the binary.
-* Updating the binary updates skills, tools, client profiles and services together. There is no second copy that can lag behind.
+* The operator upgrades `pm-mcp` through the package manager or `pm-mcp operator upgrade`, which verifies the release's signature and checksum before replacing the installation directory.
+* Updating the binary updates skills, tools, client profiles, client bundles and services together. There is no second copy that can lag behind, except installed client bundles, which `pm-mcp enter` reports as stale.
 * The next connection finds a newer binary than the running daemon and has the daemon drain and restart; hosts reconnect (xref:02-architecture.adoc#_updates[Updates]).
 * Hosts see changed skill digests and refresh their skill registry; no host restart is required for new skill content.
-* Per-client artefacts — entry commands and execution-context agent variants — are installed with `pm-mcp operator install-client <client>`. `pm-mcp enter` checks their version and reports stale ones.
+* Client bundles are updated with `pm-mcp client update` (<<_applying_a_bundle>>).
 
 == Multiple runtimes
 
-Every client (Claude Code, OpenCode, Antigravity, and others) connects to the same server, also when several clients run on one machine. Per client, only the entry points — thin commands in the client's command format that call `pm-mcp enter` — and the execution-context agent variants per level are installed. There is no per-runtime generator target for the corpus:
+Every client (Claude Code, OpenCode, Antigravity, and others) connects to the same server, also when several clients run on one machine. Per client, only its bundle is installed. There is no per-runtime generator target for the corpus:
 
 * skills, representations and links are translated on the fly through the client's profile (xref:15-client-profiles.adoc[Client Profiles]);
 * skills are delivered through tools everywhere and through the MCP Skills extension where supported;

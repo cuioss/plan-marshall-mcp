@@ -18,8 +18,10 @@ is built (the target is a native `pm-mcp` binary on the host, `doc/concept/10-te
 |---|---|
 | `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
 
-New modules from the concept (daemon, command-line modes of `pm-mcp`, Skills extension, domain
-support) are added with their first code, not as empty shells.
+New modules from the concept are added with their first code, not as empty shells: a plain Java
+`pm-mcp-core` (primitives, workflow DSL and engine, stores) with the module renamed to
+`pm-mcp-server`, then `pm-mcp-dist` for the release layout (`doc/concept/16-implementation.adoc`,
+Modules).
 
 ## Development Notes
 
