@@ -1,0 +1,949 @@
+= Domain Extensions, Build Map & Configuration Split Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Domain Extensions, Build Map & Configuration Split (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document specifies the four-axis domain extension architecture (Axes A–D), provenance-preserving dependency edge and path-attribution merge algorithms, server-owned module discovery and `derive-verification` build map, architecture query resources and enrichment workflow, declarative recipe engine with Tier-1 init scoring, out-of-process `project_script` execution contract, and the normative three-way configuration split for *plan-marshall-mcp* (`PM-MCP`).
+
+In the legacy script-and-prose architecture, domain extensions were implemented as in-process Python classes (`extension.py`) discovered via `importlib` even though roughly 80% of their surface returned constant metadata, while `marshal.json` mixed git-tracked project preferences, frozen hook snapshots, and executable command overrides. `PM-MCP` replaces dynamic code loading with a closed-world native design: declarative domain descriptors paired with sealed Java axis interfaces in `pm-mcp-core`, permanent out-of-process `project_script` jobs for project-local and custom domain code, and a strict security boundary separating git-tracked project settings from operator enrolment and server-managed runtime state.
+
+== Traceability
+
+_See Requirements:_
+
+* _link:../Requirements.adoc#PM-EXT-1[PM-EXT-1: Four-Axis Domain Descriptors (Axes A–D)]_
+* _link:../Requirements.adoc#PM-EXT-2[PM-EXT-2: Provenance-Preserving Edge Derivation & Path Attribution Merges]_
+* _link:../Requirements.adoc#PM-EXT-3[PM-EXT-3: Module Discovery, Build Map & Architecture Enrichment]_
+* _link:../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
+* _link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+* _link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
+
+== Status: PLANNED
+
+== Four-Axis Domain Architecture (Axes A–D, ADR-004 / ADR-013)
+_See Requirement link:../Requirements.adoc#PM-EXT-1[PM-EXT-1: Four-Axis Domain Descriptors (Axes A–D)]_
+
+To comply with the GraalVM native-image closed-world constraint (`PM-TECH-1`), `PM-MCP` eliminates runtime `importlib` plugin loading. Built-in domains (`java`, `java-cui`, `frontend`, `frontend-cui`, `python`, `oci`, `documents`, `requirements`, `plugin-development`, `general-dev`) and organization data packs are represented by declarative JSON descriptors (`classpath:/domains/<domain_id>.json`) bound to four orthogonal, sealed Java interfaces corresponding to Axes A through D (ADR-004, ADR-013).
+
+=== Core Architectural Invariants
+
+1. *Fail-Closed Descriptor Loading (ADR-009)*:
+   Unlike the legacy catch-all that silently ignored broken `extension.py` modules, `PM-MCP` validates every compiled and project-local descriptor against its closed JSON Schema at startup. Any schema violation or unresolvable skill/resolver reference causes an immediate, explicit diagnostic failure rather than silent degradation.
+2. *Null-on-Absent Never Fabricates a Positive (ADR-010)*:
+   When a domain is inactive or does not declare an optional capability (such as an architecture fitness gate or domain verb like `search-markers` or `parse-rewrite-log`), that capability is omitted from representations (`null` / absent). Conversely, if an active domain promises a mandatory gate that cannot execute, the engine halts with a diagnosable refusal (`refused`) and **never** records a synthetic pass.
+3. *Security Profile Resolution Constraint*:
+   The `security` profile in `skills_by_profile` resolves focused security vocabulary skills (`skill://pm/domain/<domain>/security`) for implementation, review, and audit states; it **never** generates standalone implementation tasks of its own.
+
+=== Sealed Java Interfaces for Axes A–D
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.domain;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * Axis A: Skill loading, domain detection globs, profile-to-skill mapping,
+ * triage vocabulary, and architecture gate declarations (ADR-004).
+ */
+public sealed interface SkillLoadingAxis permits DeclarativeDomainAxisA {
+
+    String domainId();
+
+    /** Detection globs (domain-detection glob dialect, distinct from build-map fnmatch). */
+    List<String> providesFileGlobs();
+
+    /** Write-once default configuration entries seeded into .plan/marshal.json. */
+    Map<String, Object> configDefaults();
+
+    /** Maps execution profile (implementation, module_testing, verification, security, documentation) to skill:// URIs. */
+    Map<String, List<String>> skillsByProfile();
+
+    /** Optional domain-specific triage vocabulary skill (e.g. skill://pm/triage/java); falls back to skill://pm/triage/generic. */
+    Optional<String> triageSkillUri();
+
+    /** Optional supporting outline analysis facts and vocabulary URI. */
+    Optional<OutlineExtensionSpec> outlineExtension();
+
+    /** Optional architectural fitness function gate (ArchUnit, import-linter, dependency-cruiser). */
+    Optional<ArchGateDeclaration> archGateDeclaration();
+
+    /** Optional compiled-in domain verbs (e.g. search-markers, parse-rewrite-log). */
+    Set<String> domainVerbs();
+}
+
+/**
+ * Axis B: Module applicability evaluation, file-to-build classification,
+ * and canonical build command templates (ADR-004).
+ */
+public sealed interface BuildRoutingAxis permits DeclarativeDomainAxisB {
+
+    String buildSystemId();
+
+    /** Evaluates declarative signal predicates against a discovered module's facts. */
+    ApplicabilityMatch evaluateApplicability(DiscoveredModuleFacts moduleFacts);
+
+    /** Maps canonical verbs (clean..package, module-tests, quality-gate, verify) to argument templates. */
+    Map<CanonicalBuildVerb, ArgumentTemplate> canonicalCommandTemplates();
+
+    /** Maps discovery operations to enrolled argument templates. */
+    Map<String, ArgumentTemplate> discoveryCommandTemplates();
+}
+
+/**
+ * Axis C: Directed module dependency edge derivation with explicit resolver identity (ADR-013, ADR-014).
+ */
+public sealed interface EdgeDerivationAxis
+        permits MavenEdgeResolver, GradleEdgeResolver, NpmEdgeResolver,
+                PyprojectEdgeResolver, PythonImportEdgeResolver,
+                MarkdownCrossRefResolver, LspSymbolEdgeResolver,
+                ProjectScriptEdgeResolver {
+
+    /** Stable resolver ID (e.g. "maven-pom", "gradle-deps", "npm-workspaces", "pyproject", "python-ast", "markdown-xref", "lsp"). */
+    String resolverId();
+
+    /** Derives directed inter-module dependency edges; never activated by file pattern, only by explicit resolverId. */
+    ResolverExecutionResult deriveEdges(WorkspaceDiscoveryContext context);
+}
+
+/**
+ * Axis D: Repository subtree path-prefix ownership claims (ADR-013, ADR-014).
+ */
+public sealed interface PathOwnershipAxis permits DeclarativeDomainAxisD {
+
+    String domainId();
+
+    /** Returns constant (pathPrefix, targetModuleId) ownership tuples. */
+    List<PathOwnershipClaim> claimPaths();
+}
+----
+
+=== Declarative Domain Descriptor Schema (`<domain_id>.json`)
+
+All constant domain metadata—including Axis-B `applies_to_module` signal predicates (`build_system`, `dependency_contains`, `path_matches`, `file_exists`, `packaging_equals`, and `promote_optional_to_default`)—is expressed in the domain descriptor JSON Schema:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/domain-descriptor-v1.json",
+  "title": "DomainDescriptor",
+  "type": "object",
+  "required": [
+    "format_version",
+    "domain_id",
+    "display_name",
+    "provides_file_globs",
+    "skills_by_profile",
+    "applicability_rules"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "domain_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,31}$"
+    },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "build_system": {
+      "type": ["string", "null"],
+      "enum": ["maven", "gradle", "npm", "pyproject", null]
+    },
+    "provides_file_globs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Domain-detection globs (distinct from build-map fnmatch globs)."
+    },
+    "config_defaults": {
+      "type": "object",
+      "description": "Write-once default keys seeded into .plan/marshal.json when the domain is activated."
+    },
+    "skills_by_profile": {
+      "type": "object",
+      "required": ["implementation", "module_testing", "verification"],
+      "additionalProperties": false,
+      "properties": {
+        "implementation": { "type": "array", "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
+        "module_testing": { "type": "array", "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
+        "integration_testing": { "type": "array", "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
+        "verification": { "type": "array", "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
+        "security": { "type": "array", "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
+        "documentation": { "type": "array", "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } }
+      }
+    },
+    "triage_skill": {
+      "type": ["string", "null"],
+      "pattern": "^skill://pm/triage/[a-z0-9-]+$"
+    },
+    "arch_gate": {
+      "type": ["object", "null"],
+      "required": ["engine", "canonical_verb", "finding_category"],
+      "additionalProperties": false,
+      "properties": {
+        "engine": { "type": "string", "enum": ["archunit", "import-linter", "dependency-cruiser"] },
+        "canonical_verb": { "type": "string", "enum": ["module-tests", "quality-gate", "verify"] },
+        "finding_category": { "type": "string", "const": "arch-constraint" }
+      }
+    },
+    "applicability_rules": {
+      "type": "array",
+      "description": "Axis-B signal rules evaluated against each discovered module.",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "when", "activate_profiles"],
+        "additionalProperties": false,
+        "properties": {
+          "rule_id": { "type": "string" },
+          "when": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "build_system": { "type": "string", "enum": ["maven", "gradle", "npm", "pyproject", "none"] },
+              "packaging_not_equals": { "type": "string" },
+              "dependency_contains_any": { "type": "array", "items": { "type": "string" } },
+              "path_matches_any": { "type": "array", "items": { "type": "string" } },
+              "file_exists_any": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "activate_profiles": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "promote_optional_skills_to_default": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" }
+          }
+        }
+      }
+    },
+    "edge_resolvers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["maven-pom", "gradle-deps", "npm-workspaces", "pyproject", "python-ast", "markdown-xref", "lsp"]
+      }
+    },
+    "claim_paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path_prefix", "target_module"],
+        "additionalProperties": false,
+        "properties": {
+          "path_prefix": { "type": "string", "minLength": 1 },
+          "target_module": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "domain_verbs": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["search-markers", "parse-rewrite-log"] }
+    }
+  }
+}
+----
+
+== Provenance-Preserving Merge Algorithms (ADR-014)
+_See Requirement link:../Requirements.adoc#PM-EXT-2[PM-EXT-2: Provenance-Preserving Edge Derivation & Path Attribution Merges]_
+
+When multiple domains and resolvers are active in a repository, `PM-MCP` merges their module dependency edges (Axis C) and path-prefix ownership claims (Axis D) using deterministic, order-independent algorithms ported from `_derivation_merge.py` and `_path_attribution_merge.py` (ADR-014).
+
+=== Edge Derivation Merge (`DerivationMerge`)
+
+The edge derivation merge combines directed inter-module edges $(u \to v)$ from all explicitly activated Axis-C resolvers while preserving full producer provenance and distinguishing "zero edges found" from "resolver did not run":
+
+1. *Activation by Explicit Resolver ID*: Resolvers are invoked strictly by their configured `resolverId` (never implicitly by file extension).
+2. *Idempotent Union with Provenance*: Multiple resolvers discovering the same directed edge $(u, v)$ are merged into a single `MergedDependencyEdge` record whose `resolverIds` set is the sorted union of all contributing resolver IDs. Self-edges $(u, u)$ and edges referencing undiscovered modules are filtered out and recorded in diagnostics.
+3. *Explicit Non-Run Reporting for LSP & External Resolvers*: An `LspSymbolEdgeResolver` (or `ProjectScriptEdgeResolver`) that could not execute **never returns an empty edge list masquerading as a clean scan**. Instead, it returns a `ResolverExecutionResult` with `status != RAN` and an explicit `NonRunReason` (`ABSENT`, `FAILED_TO_START`, `TIMEOUT`, `UNSUPPORTED`).
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.architecture;
+
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+public final class DerivationMerge {
+
+    public enum ResolverStatus { RAN, NOT_RUN }
+
+    public enum NonRunReason { NONE, ABSENT, FAILED_TO_START, TIMEOUT, UNSUPPORTED }
+
+    public record RawEdge(String fromModule, String toModule, String detail) {}
+
+    public record ResolverExecutionResult(
+            String resolverId,
+            ResolverStatus status,
+            NonRunReason nonRunReason,
+            String diagnosticMessage,
+            List<RawEdge> edges
+    ) {}
+
+    public record MergedDependencyEdge(
+            String fromModule,
+            String toModule,
+            List<String> resolverIds,
+            Map<String, List<String>> detailsByResolver
+    ) {}
+
+    public record ResolverStatusReport(
+            String resolverId,
+            ResolverStatus status,
+            NonRunReason nonRunReason,
+            String diagnosticMessage,
+            int contributedEdgeCount
+    ) {}
+
+    public record DerivationMergeResult(
+            List<MergedDependencyEdge> edges,
+            List<ResolverStatusReport> resolverReports,
+            List<String> droppedUnknownModuleEdges
+    ) {}
+
+    public DerivationMergeResult merge(
+            Set<String> knownModules,
+            List<ResolverExecutionResult> results) {
+
+        record EdgeKey(String from, String to) implements Comparable<EdgeKey> {
+            @Override
+            public int compareTo(EdgeKey o) {
+                int c = this.from.compareTo(o.from);
+                return c != 0 ? c : this.to.compareTo(o.to);
+            }
+        }
+
+        Map<EdgeKey, TreeSet<String>> provenance = new TreeMap<>();
+        Map<EdgeKey, Map<String, TreeSet<String>>> details = new TreeMap<>();
+        TreeSet<String> dropped = new TreeSet<>();
+        Map<String, ResolverStatusReport> reports = new TreeMap<>();
+
+        for (ResolverExecutionResult res : results) {
+            if (res.status() != ResolverStatus.RAN) {
+                reports.put(res.resolverId(), new ResolverStatusReport(
+                        res.resolverId(), res.status(), res.nonRunReason(),
+                        res.diagnosticMessage(), 0));
+                continue;
+            }
+            int acceptedCount = 0;
+            for (RawEdge edge : res.edges()) {
+                if (edge.fromModule().equals(edge.toModule())) {
+                    continue; // ignore self-dependency
+                }
+                if (!knownModules.contains(edge.fromModule()) || !knownModules.contains(edge.toModule())) {
+                    dropped.add(res.resolverId() + ":" + edge.fromModule() + "->" + edge.toModule());
+                    continue;
+                }
+                EdgeKey key = new EdgeKey(edge.fromModule(), edge.toModule());
+                provenance.computeIfAbsent(key, k -> new TreeSet<>()).add(res.resolverId());
+                if (edge.detail() != null && !edge.detail().isBlank()) {
+                    details.computeIfAbsent(key, k -> new TreeMap<>())
+                            .computeIfAbsent(res.resolverId(), r -> new TreeSet<>())
+                            .add(edge.detail());
+                }
+                acceptedCount++;
+            }
+            reports.put(res.resolverId(), new ResolverStatusReport(
+                    res.resolverId(), ResolverStatus.RAN, NonRunReason.NONE,
+                    res.diagnosticMessage(), acceptedCount));
+        }
+
+        List<MergedDependencyEdge> mergedEdges = provenance.entrySet().stream()
+                .map(entry -> {
+                    EdgeKey k = entry.getKey();
+                    Map<String, List<String>> detMap = new LinkedHashMap<>();
+                    details.getOrDefault(k, Map.of())
+                            .forEach((r, s) -> detMap.put(r, List.copyOf(s)));
+                    return new MergedDependencyEdge(
+                            k.from(), k.to(), List.copyOf(entry.getValue()), Map.copyOf(detMap));
+                })
+                .toList();
+
+        return new DerivationMergeResult(
+                mergedEdges,
+                List.copyOf(reports.values()),
+                List.copyOf(dropped)
+        );
+    }
+}
+----
+
+=== Path Attribution Merge & Collision Rejection (`PathAttributionMerge`)
+
+The path attribution merge combines Axis-D `claim_paths` tuples across active domains and resolves repository-relative file paths to their owning module via longest-prefix matching:
+
+1. *Single Shared Path Normalizer (`normalizeRelPath`)*: Both claim registration and file lookup pass through the exact same normalizer, which converts backslashes to `/`, strips leading `./` and `/`, collapses redundant slashes, rejects `..` traversal segments, and removes trailing slashes.
+2. *Absent-Module Pruning*: Any path claim whose `target_module` does not exist in the discovered module set (or registered synthetic domain modules such as `.plan`) is pruned prior to collision detection.
+3. *Collision Without Winner Invariant*: If two distinct domains claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` is removed from the active lookup table and recorded as a `PathClaimCollision` diagnostic. Identical claims `(same prefix, same target_module)` merge idempotently with combined domain provenance.
+4. *Segment-Boundary Longest-Prefix Lookup*: A normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`. Among all matching non-collided claims, the claim with the greatest character/segment length wins.
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.architecture;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+public final class PathAttributionMerge {
+
+    public record RawPathClaim(String domainId, String rawPrefix, String targetModule) {}
+
+    public record ActivePathClaim(String normalizedPrefix, String targetModule, List<String> claimingDomains) {}
+
+    public record PathClaimCollision(String normalizedPrefix, Map<String, List<String>> domainsByTargetModule) {}
+
+    public record AttributionTable(
+            List<ActivePathClaim> claimsByDescendingLength,
+            List<PathClaimCollision> collisions,
+            List<String> prunedAbsentModuleClaims
+    ) {
+        public Optional<ActivePathClaim> attributePath(String rawFilePath) {
+            String norm = normalizeRelPath(rawFilePath);
+            if (norm.isEmpty()) {
+                return Optional.empty();
+            }
+            for (ActivePathClaim claim : claimsByDescendingLength) {
+                String prefix = claim.normalizedPrefix();
+                if (norm.equals(prefix) || norm.startsWith(prefix + "/")) {
+                    return Optional.of(claim);
+                }
+            }
+            return Optional.empty();
+        }
+    }
+
+    public static String normalizeRelPath(String raw) {
+        if (raw == null) {
+            throw new IllegalArgumentException("Path must not be null");
+        }
+        String p = raw.replace('\\', '/').trim();
+        while (p.startsWith("./")) {
+            p = p.substring(2);
+        }
+        while (p.startsWith("/")) {
+            p = p.substring(1);
+        }
+        p = p.replaceAll("/+", "/");
+        if (p.endsWith("/")) {
+            p = p.substring(0, p.length() - 1);
+        }
+        for (String seg : p.split("/")) {
+            if ("..".equals(seg)) {
+                throw new IllegalArgumentException("Relative path traversal '..' is forbidden: " + raw);
+            }
+        }
+        return p;
+    }
+
+    public AttributionTable buildTable(Set<String> validModules, List<RawPathClaim> rawClaims) {
+        Map<String, Map<String, TreeSet<String>>> byPrefixAndTarget = new TreeMap<>();
+        List<String> pruned = new ArrayList<>();
+
+        for (RawPathClaim rc : rawClaims) {
+            String prefix = normalizeRelPath(rc.rawPrefix());
+            if (prefix.isEmpty()) {
+                continue;
+            }
+            if (!validModules.contains(rc.targetModule())) {
+                pruned.add(rc.domainId() + ":" + prefix + "->" + rc.targetModule());
+                continue;
+            }
+            byPrefixAndTarget
+                    .computeIfAbsent(prefix, k -> new TreeMap<>())
+                    .computeIfAbsent(rc.targetModule(), k -> new TreeSet<>())
+                    .add(rc.domainId());
+        }
+
+        List<ActivePathClaim> active = new ArrayList<>();
+        List<PathClaimCollision> collisions = new ArrayList<>();
+
+        for (var entry : byPrefixAndTarget.entrySet()) {
+            String prefix = entry.getKey();
+            Map<String, TreeSet<String>> targets = entry.getValue();
+            if (targets.size() == 1) {
+                var single = targets.entrySet().iterator().next();
+                active.add(new ActivePathClaim(prefix, single.getKey(), List.copyOf(single.getValue())));
+            } else {
+                // Collision: never pick a winner; exclude from active claims and report
+                Map<String, List<String>> reportMap = new TreeMap<>();
+                targets.forEach((mod, doms) -> reportMap.put(mod, List.copyOf(doms)));
+                collisions.add(new PathClaimCollision(prefix, Map.copyOf(reportMap)));
+            }
+        }
+
+        active.sort(Comparator.comparingInt((ActivePathClaim c) -> c.normalizedPrefix().length())
+                .reversed()
+                .thenComparing(ActivePathClaim::normalizedPrefix));
+
+        return new AttributionTable(List.copyOf(active), List.copyOf(collisions), List.copyOf(pruned));
+    }
+}
+----
+
+== Module Discovery, Build Map & Architecture State Machine
+_See Requirement link:../Requirements.adoc#PM-EXT-3[PM-EXT-3: Module Discovery, Build Map & Architecture Enrichment]_
+
+`PM-MCP` moves deterministic module discovery, dependency graph construction, verification routing (`derive-verification`), and architecture queries into the daemon while keeping semantic module enrichment (`responsibility`, `purpose`, `key_packages`) as model judgment.
+
+=== Server-Owned Module Discovery & Enrolled Discovery Jobs
+
+Module discovery combines compiled-in descriptor parsers with optional enrolled build-tool discovery jobs, caching the resulting structural snapshot in server state keyed by the repository's descriptor tree hash:
+
+[cols="1,2,2,3"]
+|===
+|Build System |Compiled-In Descriptor Parser |Enrolled Discovery Job Template |Extracted Module Facts
+
+|Maven
+|`pom.xml` (StAX / DOM parser in `pm-mcp-core`)
+|`help:all-profiles dependency:tree -DoutputType=text`
+|Module coordinates (`groupId:artifactId`), packaging (`pom`, `jar`, `war`), parent/reactor hierarchy, active & optional profiles, test directory presence, Java package roots.
+
+|Gradle
+|`settings.gradle(.kts)`, `build.gradle(.kts)`
+|`properties dependencies tasks --console=plain`
+|Subproject paths, applied plugins, source sets (`main`, `test`, `integrationTest`), inter-project and external dependencies.
+
+|npm / Node
+|`package.json`, `workspaces` globs
+|*(Pure descriptor parse; no subprocess required)*
+|Workspace packages, scripts (`build`, `test`, `lint`), `dependencies` / `devDependencies`, TypeScript `tsconfig.json` presence.
+
+|Python (`pyproject`)
+|`pyproject.toml` (TOML parser in `pm-mcp-core`)
+|*(Pure descriptor parse + AST import scan)*
+|Project metadata, `[project.dependencies]`, `[tool.pytest]`, `[tool.mypy]`, `[tool.ruff]`, top-level package directories and test roots.
+|===
+
+=== Build Map & Deterministic `derive-verification` (ADR-004)
+
+The project's `.plan/marshal.json` contains a write-once `build_map` table that maps changed repository file paths to a classification (`role` and `build_class`) and determines the exact set of canonical verification commands required during Phase 5 (`execute`) and Phase 6 (`finalize`).
+
+* **Separate Glob Dialect**: Build-map routes use the **`fnmatch` glob dialect**, which is kept strictly separate from the Axis-A `provides_file_globs` domain-detection dialect.
+* **Fail-Closed Read Invariant**: `derive-verification` reads `build_map` fail-closed. If `build_map` is absent, malformed, or maps a route to an unknown module, the engine refuses verification derivation with an explicit diagnostic (`build_map_invalid` or `build_map_unseeded`) rather than returning an empty verification set.
+* **Canonical Command Resolution Rules**:
+  - Aggregator-only modules (`packaging == "pom"`) resolve only `quality-gate` (never `module-tests` if no test sources exist).
+  - Standard code changes (`build_class == "module"`) resolve `module-tests` and `quality-gate` on the owning module plus `module-tests` on direct downstream dependents in the merged Axis-C dependency graph.
+  - Build descriptor or root configuration changes (`build_class == "root"`) escalate to repository-wide `verify`.
+  - Documentation or non-compiled path claims (`build_class == "none"`, e.g., `.plan/**`) require zero build jobs and route only to applicable doc/plugin validators.
+
+=== Architecture Query Resources (`pm://architecture/...`)
+
+Instead of invoking Python CLI scripts via Bash to inspect repository structure, the model reads server-computed MCP resources under `pm://architecture/`:
+
+[cols="2,3"]
+|===
+|Resource URI |Returned TOON Payload
+
+|`pm://architecture/overview`
+|Project-wide module inventory, active domains, resolver status reports, and enrichment completion status.
+
+|`pm://architecture/modules/<module_id>`
+|Complete discovered facts, active profiles, resolved `skill://` URIs, key packages, and persisted semantic enrichment for `<module_id>`.
+
+|`pm://architecture/files?path=<rel_path>`
+|Owning module (`which-module`) resolved via module roots and Axis-D `PathAttributionMerge`, plus matching `build_map` route.
+
+|`pm://architecture/graph`
+|Merged Axis-C dependency graph (`MergedDependencyEdge[]` with `resolverIds` provenance) and topological layers.
+
+|`pm://architecture/neighbours/<module_id>`
+|Direct upstream dependencies and direct downstream consumers of `<module_id>`, annotated with resolver provenance.
+
+|`pm://architecture/impact?modules=<m1,m2>`
+|Transitive downstream blast radius and derived verification set (`derive-verification`) for the specified modules or active plan footprint.
+
+|`pm://architecture/drift`
+|Descriptor regression and module-diff report comparing the current working tree against the cached architecture snapshot.
+|===
+
+=== Architecture Enrichment Judgment Links & Project Setup State Machine
+
+Only semantic module enrichment (`responsibility`, `purpose`, and `key_packages` with architectural reasoning) requires model judgment. `PM-MCP` replaces the legacy 13-step `marshall-steward` wizard with a dedicated **`project-setup`** state machine (`classpath:/workflows/project-setup.pmwf`):
+
+[source,text]
+----
+setup.detect-domains (auto: scans provides_file_globs & descriptors)
+         │
+         ▼
+setup.discover-modules (job: runs descriptor parsers & enrolled discovery templates)
+         │
+         ▼
+setup.seed-build-map (link: confirm_build_map / customize_routes)
+         │
+         ▼
+setup.select-providers (link: configure_providers — VCS=1, CI<=1, Sonar/other)
+         │
+         ▼
+setup.awaiting-enrolment (escalate: operator runs `pm-mcp enrol` & `pm-mcp credentials`)
+         │
+         ▼
+setup.enrich-architecture (parallel dispatch: enrich:<module_id> per unenriched module)
+         │  [Guard: every_module_enriched]
+         ▼
+setup.completed (terminal)
+----
+
+In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `dispatch:enrich-<module_id>` links (or direct `enrich:<module_id>` submission links for single-module repositories) with free parameters `responsibility:text[10..240]`, `purpose:text[20..600]`, and `key_packages:list<text>`. The state cannot transition to `setup.completed` until the **`every_module_enriched`** guard evaluates to `true`.
+
+== Declarative Recipe Engine & Tier-1 Init Routing
+_See Requirement link:../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
+
+Recipes define repeatable, structured plan templates for recurring engineering campaigns (such as `recipe-code-review`, `recipe-security-audit`, `recipe-simplify-codebase`, `recipe-agentfile-hygiene`, `recipe-lesson-cleanup`, `recipe-doc-verify`, `recipe-verify-ascii-diagrams`, `recipe-cui-logging-enforce`).
+
+=== Declarative Recipe Descriptor Schema
+
+Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local recipes (`.plan/recipes/<recipe_id>.json` + `.plan/recipes/<recipe_id>.md`) are defined as declarative data structures:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/recipe-descriptor-v1.json",
+  "title": "RecipeDescriptor",
+  "type": "object",
+  "required": [
+    "format_version",
+    "recipe_id",
+    "display_name",
+    "required_domains",
+    "matching",
+    "target_harvester",
+    "deliverable_template"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "recipe_id": { "type": "string", "pattern": "^recipe-[a-z0-9-]+$" },
+    "display_name": { "type": "string", "minLength": 3, "maxLength": 100 },
+    "required_domains": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Domains that must be active in .plan/marshal.json for this recipe to be eligible."
+    },
+    "skill_uri": {
+      "type": "string",
+      "pattern": "^skill://pm/recipe/[a-z0-9-]+$"
+    },
+    "matching": {
+      "type": "object",
+      "required": ["keywords", "aspect_tags", "min_score"],
+      "additionalProperties": false,
+      "properties": {
+        "keywords": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "minimum": 0.1, "maximum": 10.0 },
+          "description": "Weighted keyword/phrase triggers for Tier-1 init scoring."
+        },
+        "aspect_tags": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["audit", "review", "refactor", "hygiene", "documentation", "logging", "diagrams", "lessons"] }
+        },
+        "min_score": { "type": "number", "minimum": 1.0 }
+      }
+    },
+    "parameters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type", "required"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["text", "int", "enum", "module_list", "glob"] },
+          "enum_values": { "type": "array", "items": { "type": "string" } },
+          "required": { "type": "boolean" },
+          "default_value": { "type": ["string", "integer", "null"] }
+        }
+      }
+    },
+    "target_harvester": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "discovered_modules",
+            "module_packages",
+            "markdown_sections",
+            "ascii_diagram_blocks",
+            "stalled_lessons",
+            "footprint_diff",
+            "project_script"
+          ]
+        },
+        "script_job_id": {
+          "type": ["string", "null"],
+          "description": "Required when kind == 'project_script'."
+        }
+      }
+    },
+    "deliverable_template": {
+      "type": "object",
+      "required": ["granularity", "profile", "title_pattern", "steps"],
+      "additionalProperties": false,
+      "properties": {
+        "granularity": {
+          "type": "string",
+          "enum": ["per_target", "per_module", "single_plan_wide"]
+        },
+        "profile": {
+          "type": "string",
+          "enum": ["implementation", "module_testing", "verification", "documentation"]
+        },
+        "title_pattern": { "type": "string" },
+        "steps": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
+----
+
+=== Tier-1 Init Routing & Deterministic Deliverable Generation
+
+1. *Domain Exclusion Rule*: Any recipe whose `required_domains` set is not a subset of the project's active domains in `.plan/marshal.json` is excluded prior to scoring.
+2. *Explicit Choice Beats Heuristic Match*: If the operator starts a plan with an explicit `--recipe <recipe_id>` parameter, Tier-1 keyword scoring is bypassed and the plan routes directly to `init.recipe-selected`.
+3. *Tier-1 Deterministic Keyword & Aspect Scoring*: During `phase-1-init` (ahead of light/deep planning-lane routing), the server tokenizes `request.md`, classifies request aspects, and scores all domain-eligible recipes. If one or more recipes meet or exceed `matching.min_score`, the engine transitions to `init.recipe-candidate` offering:
+   * `use_recipe:<recipe_id>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for secondary matches), and
+   * `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
+4. *Server-Side Target Harvesting & Deliverable Generation*:
+   When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`) and verifying coverage at completion.
+
+=== Pre-Submission Self-Review Surfacer Contract (`ext-self-review-*`)
+
+During `phase-6-finalize`, the pre-submission structural self-review step runs deterministic candidate detectors over the plan's realized diff to surface high-risk patterns (unvalidated boundary inputs, asymmetric function pairs, description-vs-body mismatches, stale ordinal prose, unguarded flags) as structured facts for model review:
+
+* **Not Run Is Not Clean Invariant**: When no self-review surfacer is registered for any of the plan's active domains, the server records `"status": "not_run: no_surfacer_resolved"` in the finalize ledger—never `"clean"` or `"passed"`. Every active surfacer records its `scope_statement`, `structural_limit`, and `delta_coverage`; a detector class with zero matching files in the diff is recorded as `unapplicable`, never counted toward measured clean coverage.
+* **Delta Round Narrowing Invariant**: On subsequent finalize iterations after a fix, delta self-review rounds narrow only the candidate file set to files modified since the previous reviewed `worktree_sha`, never narrowing the hunk basis against the plan's base commit. If the base commit or previous `worktree_sha` is unresolvable, the step fails closed with an explicit error rather than silently widening or skipping. A delta round alone can never close the step if a prior full-round finding remains unresolved.
+
+== Out-of-Process Project Script Jobs (`project_script`) & Domain Workers
+_See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+
+To support repository-specific automation (`finalize-step-*` skills that ship executable checks, custom `recipe-*` target harvesters) and third-party/organization domain workers (custom build-log parsers, marker scanners, or module discovery for languages not compiled into `pm-mcp`) without compromising the GraalVM native-image closed world, `PM-MCP` provides a permanent **`project_script`** job type in the Job Runtime (see link:job-runtime.adoc[Job Runtime Specification]).
+
+=== Division of Authority: Server vs. `project_script`
+
+[source,text]
+----
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PM-MCP Daemon (Authoritative State & Security Boundary)                 │
+│  • Owns workflow state machine, step ordering, gating, and locks        │
+│  • Verifies script path, interpreter hash, and SHA-256 against enrolment│
+│  • Serializes closed JSON input payload; spawns isolated process group  │
+│  • Validates stdout against strict output JSON Schema                   │
+│  • Persists findings/facts into .plan/ stores atomically                │
+└───────────────────┬─────────────────────────────────▲───────────────────┘
+                    │ stdin: ProjectScriptInput JSON  │ stdout: ProjectScriptOutput JSON
+                    ▼                                 │
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Out-of-Process `project_script` Subprocess (Stateless Fact Producer)    │
+│  • Runs in sanitized environment (no provider credentials)              │
+│  • Reads worktree files read-only; NEVER writes to .plan/ stores        │
+│  • Returns structured facts, candidate findings, or parsed log records  │
+└─────────────────────────────────────────────────────────────────────────┘
+----
+
+1. *No Direct Store Mutation*: A `project_script` subprocess is a stateless fact producer. It **must never** write directly to `.plan/plans/`, `.plan/orchestrator/`, or `marshal.json`. All persistence is performed by the daemon after validating the script's JSON output.
+2. *Operator Enrolment Precondition*: Every `project_script` (and its runtime interpreter, such as a pinned `python3` binary) must be enrolled by the operator in `~/.plan-marshall/mcp/enrolments.json` with its repository-relative script path, expected SHA-256 content hash, maximum timeout, and allowed step/worker binding (`finalize_step`, `recipe_harvester`, `log_parser`, `module_discovery`, `edge_resolver`). If a script file is modified in the working tree without re-enrolment, the verify-not-resolve digest check rejects execution with job outcome `refused`.
+
+=== Normative Input & Output JSON Schemas for `project_script`
+
+==== Standard Input Payload (`stdin`)
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/project-script-input-v1.json",
+  "title": "ProjectScriptInput",
+  "type": "object",
+  "required": [
+    "format_version",
+    "job_id",
+    "worker_kind",
+    "workspace_root",
+    "worktree_path",
+    "worktree_sha",
+    "parameters",
+    "changed_files"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "job_id": { "type": "string" },
+    "plan_id": { "type": ["string", "null"] },
+    "worker_kind": {
+      "type": "string",
+      "enum": ["finalize_step", "recipe_harvester", "log_parser", "module_discovery", "edge_resolver"]
+    },
+    "workspace_root": { "type": "string" },
+    "worktree_path": { "type": "string" },
+    "worktree_sha": { "type": "string" },
+    "base_commit_sha": { "type": ["string", "null"] },
+    "parameters": {
+      "type": "object",
+      "description": "Validated step or recipe parameters declared in the descriptor's parameter schema."
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "log_file_path": {
+      "type": ["string", "null"],
+      "description": "Populated when worker_kind == 'log_parser'."
+    }
+  }
+}
+----
+
+==== Standard Output Payload (`stdout`)
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/project-script-output-v1.json",
+  "title": "ProjectScriptOutput",
+  "type": "object",
+  "required": ["format_version", "status", "summary", "facts", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "indeterminate"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "facts": {
+      "type": "object",
+      "description": "Worker-kind-specific structured facts (e.g. harvested targets, discovered modules, or edges)."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "severity", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "column": { "type": ["integer", "null"], "minimum": 1 },
+          "category": { "type": "string" },
+          "rule_id": { "type": ["string", "null"] },
+          "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
+          "message": { "type": "string", "minLength": 1, "maxLength": 1000 }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
+----
+
+== Three-Way Configuration Split (`marshal.json`, Enrolment, Server State)
+_See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
+
+In the legacy architecture, `.plan/marshal.json` and `.plan/run-configuration.json` mixed declarative project settings, frozen extension hook snapshots (`skill_domains`), overridable shell commands (`verify_command`), language-server argument vectors, and learned runtime timeouts inside workspace files that the model's file/shell tools could modify.
+
+`PM-MCP` enforces a fundamental security invariant: **Nothing that decides what binary or argument vector executes on the host may be read from a file the model can write.** Configuration and operational state are partitioned across three strictly separated stores.
+
+=== Configuration Partition Matrix
+
+[cols="2,2,2,3"]
+|===
+|Tier & Store Location |Git-Tracked? |Writer Authority |Permitted Contents
+
+|*Tier 1: Project Configuration* +
+`.plan/marshal.json`
+|Yes (committed to repository)
+|Daemon via validated setup/config hypermedia links; Domain `config_defaults` seeded write-once.
+|Project metadata (`project.base_branch`), workflow posture & `*_without_asking` knobs, loop-back caps, effort role overrides (`plan.*.effort.*`, `orchestrator.effort.*`), active domain IDs (`domains.enabled`), `build_map` routes, non-secret provider selection and base URLs/origins (VCS=1, CI<=1, Sonar/other), `{tool}.acceptable_warnings`, coverage thresholds, and architecture module enrichment metadata.
+
+|*Tier 2: Operator Enrolment & Machine Config* +
+`~/.plan-marshall/mcp/enrolments.json` +
+`~/.plan-marshall/mcp/machine-config.json`
+|No (machine-local, outside workspace)
+|Human operator exclusively via `pm-mcp enrol` / `pm-mcp config` CLI (`0600` permissions; unreachable from any MCP tool or plan link).
+|Enrolled project root paths, pinned build wrappers (`./mvnw`, `./gradlew`, `./pw`) and SHA-256 digests, enrolled host tools (`npm`, `git`, `gh`, `glab`, `python3`, language server binaries) with absolute paths and SHA-256 digests, canonical & discovery argument template allowlists, `project_script` digests and schemas, CLI provider `verify_command` overrides, and the machine-global build slot cap.
+
+|*Tier 3: Server-Managed State* +
+`.plan/local/mcp-state/` +
+`.plan/plans/<id>/mcp/`
+|No (git-ignored daemon runtime state)
+|Daemon exclusively (internal state stores and journals).
+|Adaptive build timeouts (`timeouts.json`), historical CI durations, commit-keyed module discovery cache (`discovery-cache.json`), verification timestamps, active/completed job records and logs, crash-replay journals, and interaction audit logs.
+|===
+
+=== Tier 1: Git-Tracked Project Configuration (`.plan/marshal.json`)
+
+1. *Elimination of Frozen `skill_domains` Snapshots*:
+   During migration from legacy `marshal.json`, frozen hook outputs stored under `skill_domains.{key}` (skill lists, globs, recipes) are treated as derived legacy artifacts and stripped. The compiled-in domain descriptors in `pm-mcp` are authoritative; `.plan/marshal.json` retains only `domains.enabled` (list of active domain IDs) and explicit operator parameter overrides.
+2. *Write-Once Domain Defaults*:
+   When a domain is enabled, its `config_defaults` map is merged into `.plan/marshal.json` using write-once semantics: existing project keys are never overwritten.
+3. *Provider Cardinality & Origin Pinning*:
+   Provider declarations in `.plan/marshal.json` enforce category cardinality: exactly `1` version-control provider (`github` or `gitlab`), at most `1` CI provider, and `0..N` code-quality/issue providers (such as `sonar`). For token-lane REST providers (`PM-CRED-2`), `.plan/marshal.json` stores the non-secret `base_url` (which must use `https://`), establishing the single issuing origin to which the daemon's REST client restricts authentication headers (forbidding cross-origin or HTTP downgrade redirects).
+
+=== Tier 2: Enrolled Argument Templates & Slot Cap (`~/.plan-marshall/mcp/`)
+
+To prevent argument injection without requiring the operator to re-enrol the project every time a new module is added, build enrolment binds wrappers and host tools to **typed argument templates** defined by domain support:
+
+[source,json]
+----
+{
+  "canonical_templates": {
+    "maven": {
+      "module-tests": ["test", "-pl", "{module}"],
+      "quality-gate": ["verify", "-DskipTests", "-pl", "{module}"],
+      "verify": ["verify", "-P{profile}", "-pl", "{module}"]
+    }
+  }
+}
+----
+
+* **Typed Placeholder Validation at Job Time**: When the daemon constructs a build job, it substitutes `{module}` and `{profile}` and validates them against its own cached module discovery snapshot (`{module}` must be a discovered module path/coordinate in the repository; `{profile}` must be a profile declared in that module's build descriptor).
+* **Forbidden Free Flags**: Arbitrary user- or model-supplied flags—specifically `-D`, `-f`, `--file`, `-s`, `--settings`, `--init-script`, or shell metacharacters—are never accepted in canonical build jobs.
+* **Machine-Wide Slot Cap & Source Discrimination**: `machine-config.json` holds `max_concurrent_builds`. On every build submission, the scheduler resolves the cap and reports both the value and its resolution `source` (`machine_config`, `default`, `invalid`, or `unreadable`); `invalid` and `unreadable` configuration files are surfaced explicitly in diagnostics and never silently folded into `"default"`.
+
+=== Tier 3: Adaptive Build Timeouts & Crash-Replay State
+
+The daemon maintains learned operational metrics and job journals in Tier 3 server state:
+
+1. *Adaptive Timeout Learning (`timeouts.json`)*:
+   * **Keying**: Keyed by the canonical normalized argument vector `(build_system, canonical_verb, module_id, sorted_profiles)`.
+   * **Smoothing & Multiplier**: Given observed successful run durations, the server maintains an exponentially smoothed baseline $T_{\text{learned}} = 0.8 \times T_{\max} + 0.2 \times T_{\min}$ and sets the execution timeout to:
+     $$T_{\text{limit}} = \max\left(T_{\text{engine\_floor}},\; \lceil 1.25 \times T_{\text{learned}} \rceil\right)$$
+   * **Engine Floors & Invariants**: Per-engine minimum floors (Maven/Gradle: `120s`, npm/pyproject: `60s`) are never violated, even if an explicit bound is configured. Durations from `killed`, `cancelled`, or `timed_out` runs are **never** incorporated into $T_{\text{learned}}$.
+2. *Gate Honesty & Examined Population Tracking*:
+   Before a green build or quality gate clears open findings in `findings.jsonl`, the server's compiled log and report parsers verify that:
+   * For Maven and Gradle, the build log explicitly contains the engine's terminal success marker (e.g., `BUILD SUCCESS` / `BUILD SUCCESSFUL`) in addition to exit code `0`.
+   * The tool examined a non-empty file/test population capable of reaching the finding's file and category (e.g., `mypy` gates run with `--no-incremental` / cache disabled so untouched files with broken cross-module types are not skipped).
+3. *Crash Replay & Atomic Fate Recording*:
+   Every spawned job is recorded in the daemon's write-ahead job journal prior to `ProcessBuilder.start()`. Request status (`running`) is never treated as terminal fate; terminal fate (`succeeded`, `failed`, `timed_out`, `cancelled`, `killed`, `indeterminate`) is written atomically at process termination. If the daemon restarts while a job record is still `running`, journal replay marks the orphaned job `killed` ("do not retry blindly") and attaches no synthetic error findings.

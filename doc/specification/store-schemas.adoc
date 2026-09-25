@@ -17,6 +17,7 @@ _See Requirements:_
 
 * _link:../Requirements.adoc#PM-ARCH-6[PM-ARCH-6: Filesystem State Persistence & Cache-Only Process Memory]_
 * _link:../Requirements.adoc#PM-IMPL-2[PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output]_
+* _link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7: Data Store Invariants, Footprint Reconciliation & Lock Ordering]_
 * _link:../Requirements.adoc#PM-MIG-3[PM-MIG-3: Cross-Runtime File Lock & Shared Store Interoperability]_
 * _link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
 
@@ -314,3 +315,39 @@ Configures machine-wide concurrency limits and daemon idle timeouts (`PM-SVC-1`,
   }
 }
 ----
+
+== Data Layer Integrity & Concurrency Invariants (`PM-IMPL-7`)
+
+=== Store Digest Verification Against Out-of-Band Edits
+
+Because `.plan/` files reside in the repository working tree where an agent with filesystem write access could modify them directly outside the MCP server:
+- On every write to a plan store (`status.json`, `references.json`, `TASK-*.json`, `findings.jsonl`, `outline.md`), the server computes the SHA-256 digest of the written file and records it in `status.json -> store_digests`.
+- On every subsequent read or transition, the engine verifies the current file SHA-256 against `store_digests`. Any mismatch triggers an immediate `store_tampered` transition block requiring operator resolution.
+
+=== Three-Way File Footprint Reconciliation (`references.json`)
+
+The `references.json` store tracks three distinct file-footprint sets for a plan:
+
+1. *Declared Footprint (`declared_files`)*: Files explicitly listed during refinement/outline.
+2. *Structured-Derived Footprint (`derived_files`)*: Re-derived by set union over the solution outline's structured deliverables and partitioned into two disjoint keys:
+   - `expected_modifications`: Files the plan intends to create, modify, or delete.
+   - `read_only_references`: Files inspected for context that must remain unmodified.
+3. *Realized Footprint (`realized_files`)*: Captured from the worktree via a `git` job (`git diff --name-status` + untracked files).
+
+Pairwise reconciliation computes the **symmetric difference in both directions** ($A \setminus B$ and $B \setminus A$) across all three sets so that two equal-sized but disjoint file sets are reported as 100% disagreeing rather than matching by count.
+
+=== Fail-Closed Lesson Carry-Back Veto on Plan Deletion
+
+When the operator invokes plan deletion (`delete-plan` via elicitation or CLI):
+1. The server scans the plan directory for any lessons created or carried during the plan's execution.
+2. It executes `restore-from-plan` against the main-anchored global lesson store, producing a 4-state outcome (`restored`, `already_present`, `no_lessons`, `failed`) plus a store-resolution discriminator confirming the main store was resolved and scanned.
+3. If any carried lesson fails to land in the main-anchored store, the deletion is **vetoed fail-closed** and the plan directory is preserved intact.
+
+=== Lock-Free Snapshot Reads & Global Lock Acquisition Order
+
+- *Lock-Free Snapshot Reads*: Because every store update uses atomic write-and-rename (`<file>.tmp.<uuid>` -> `<file>`), all read-only operations (`pm_state`, `pm_plans`, `pm_epics`, `pm://` resources) read the current inode snapshot directly without acquiring file locks.
+- *Global Lock Hierarchy*: Whenever a transition must acquire locks across multiple scopes, locks are acquired strictly in the following order to prevent deadlocks:
+  1. `plan.lock` (Plan-scoped lock in `.plan/.../plans/<plan_id>/`)
+  2. `epic.lock` (Epic-scoped lock in `.plan/orchestrator/<epic_id>/`)
+  3. `machine` locks (`~/.plan-marshall/mcp/locks/{merge,review-bot,build-slots}.lock`)
+

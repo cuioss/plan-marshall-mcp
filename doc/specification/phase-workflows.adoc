@@ -1,0 +1,1083 @@
+= Phase Workflows & Finalize Specification
+:toc: left
+:toclevels: 3
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Phase Workflows & Finalize
+
+== Overview
+
+This document specifies the end-to-end phase state machines (Phases 1–6), transition guards, Q-Gate validation loop, change-type and scope-deviation contracts, Phase 5 envelope execution and verification sweep, Phase 6 finalize step ordering bands, `FinalizeStepDescriptor` schema, verdict currency rules, pre-merge review barrier, and cross-plan merge mutex for *plan-marshall-mcp* (`PM-MCP`).
+
+In `PM-MCP`, the prose-driven orchestrator loops, phase handshake files (`handshakes.toon`), and intra-phase step-recording rituals (`mark-step-done`, `assert-step-recorded`) of the legacy script architecture are replaced by deterministic server-owned state machines defined in `classpath:/workflows/*.pmwf` and executed by `pm-mcp-core`.
+
+== Traceability
+
+_See Requirements:_
+
+* _link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+* _link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+* _link:../Requirements.adoc#PM-WF-10[PM-WF-10: Phase 1–4 Planning Invariants, Lane Ratchet & Artifact Gates]_
+* _link:../Requirements.adoc#PM-WF-11[PM-WF-11: Q-Gate Validation Loop, Change-Type & Scope-Deviation Contracts]_
+* _link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+* _link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+* _link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+
+== Status: PLANNED
+
+== Phase 1–4 Planning State Machines & Guards
+_See Requirement link:../Requirements.adoc#PM-WF-10[PM-WF-10: Phase 1–4 Planning Invariants, Lane Ratchet & Artifact Gates]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+
+=== Lifecycle Topology (Phases 1–4)
+
+The planning lifecycle is a server-enforced state machine spanning `phase-1-init`, `phase-2-refine`, `phase-3-outline`, and `phase-4-plan`. Sub-states that previously lived only in the orchestrating model's conversation context (`refine.awaiting_answers`, `outline.review`, Q-Gate iteration counters, and re-dispatch counters) are persisted in `mcp/status.json` so that any session restart or `/clear` resumes at the exact sub-state via `pm_state(plan_id)`.
+
+[source,text]
+----
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 1: init (pm_start)                                                         │
+│  init.classify -> [init.awaiting_user] -> init.ready                             │
+│  (Plan source resolution, phantom-ID guard, recipe match, initial lane routing)  │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │ (clean-tree guard; recipe shortcut -> Phase 3)
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 2: refine                                                                  │
+│  refine.baseline-reconcile -> refine.analyze -> [refine.awaiting_answers (<=1x)] │
+│  -> [refine.qgate (<=3x)] -> refine.ready                                        │
+│  (5 quality dimensions + module mapping, widen-only domains, pr_title authored)  │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │ (artifact gate: clarified_request + pr_title)
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 3: outline                                                                 │
+│  outline.detect-change-type -> { outline.light | outline.deep }                  │
+│  outline.light --(cap > 25 | band > 8 | premise/cross-cutting)--> outline.deep   │
+│  -> outline.validate (intent markers, file-type buckets, narrow domains once)    │
+│  -> [outline.qgate (<=3x)] -> outline.review (Operator Approval Gate)            │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │ (artifact gate: validated solution_outline.md
+                                         │  + operator approval via elicitation/CLI)
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 4: plan                                                                    │
+│  plan.derive-tasks (DAG cycle check, profile mapping, skill resolution)          │
+│  -> plan.describe-tasks -> plan.pack-envelopes -> plan.compose-manifest          │
+│  -> [plan.qgate (<=3x)] -> execute.worktree-init                                 │
+└──────────────────────────────────────────────────────────────────────────────────┘
+----
+
+=== Phase 1 (`init`): Plan Sources, Phantom-ID Refusal & Classifiers
+
+==== Plan Source Contracts
+
+`pm_start` initializes the plan directory (`.plan/local/plans/<plan_id>/`), `request.md`, `references.json`, and `mcp/status.json` from one of four closed plan sources (`PlanSource`):
+
+[cols="1,2,4"]
+|===
+|Source (`plan_source`) |Input Parameters |Server Initialization & Verification Behavior
+
+|`request`
+|`description`, optional `slug`, `base_branch`
+|Writes `original_input` to `request.md`, runs the deterministic recipe scorer (`auto_route_recipe`) ahead of the planning-lane router, detects initial domains from narrative path tokens, and checks for sibling plan collisions.
+
+|`issue`
+|`issue_number`, optional `slug`, `base_branch`
+|Spawns an enrolled CI provider job to fetch the issue title and body into `request.md` (passing untrusted external content through the deterministic ingestion validator), records `issue_number` in `references.json`, and schedules asynchronous CI mirror jobs to post clarified requirements and the approved outline back to the issue after Phase 2 and Phase 3 transitions.
+
+|`lesson`
+|`lesson_id`, optional `slug`, `base_branch`
+|Resolves the lesson in the main-anchored lesson store (`manage-lessons`), executes a deterministic *source premise check* verifying that cited files and symbols in the lesson still exist in the current tree (transitioning to `init.awaiting_user` with obsolescence options if the premise is already resolved or invalid), and atomically moves/retires the lesson file into the plan's lifecycle scope. If the plan is later deleted via `delete-plan`, the server enforces a fail-closed *lesson carry-back veto* that restores the lesson to the main-anchored corpus and refuses plan deletion if restoration fails.
+
+|`recipe`
+|`recipe_id`, optional `recipe_params`, `base_branch`
+|Binds the plan to a registered recipe definition (`skill://pm/recipe/<name>/SKILL.md`), appends a mandatory UTC timestamp suffix to `plan_id` (`<recipe-slug>-YYYYMMDD-HHMMSS`) to prevent git branch and worktree collisions across repeated runs of the same recipe, sets `confidence = 100` and `planning_lane = deep` (`track = complex`), and skips Phase 2 quality analysis and Phase 3 change-type/Q-Gate steps.
+|===
+
+==== Plan ID Derivation & Phantom-ID Refusal Guard
+
+The server derives or validates `plan_id` against a strict lexical grammar before creating any directory on disk:
+
+1. *Canonical Slug Pattern*: `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$` (with recipe plans suffixed by `-\d{8}-\d{6}`).
+2. *Phantom-ID Refusal*: The validator explicitly rejects any candidate `plan_id` or `slug` matching either:
+   * A lesson identifier pattern (`^\d{4}-\d{2}-\d{2}-\d{2}-\d{3}$`), or
+   * A UUID / hex-digest pattern (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$` or bare 32/40/64-char hex strings).
++
+Rejecting these shapes prevents callers from accidentally passing a lesson ID or dispatch/session UUID into `plan_id` and creating a phantom plan directory.
+
+==== Deterministic Init Classifiers & Workflow Settings
+
+During `init.classify`, the engine executes pure, model-free classifiers in a fixed order:
+
+1. *Recipe Match before Lane Routing*: When `plan_source == request` and `auto_route_recipe == true`, the registry-wide recipe scorer evaluates the request narrative first. An explicit `recipe` source selection is never overridden by the scorer.
+2. *Initial Planning-Lane Router*: Computes the initial `planning_lane` (`light` or `deep`) and pre-route `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`).
+3. *Sibling Collision Detector*: Scans live plans for overlapping target modules or affected file paths; if an overlap is found, transitions to `init.awaiting_user` to resolve the collision (`proceed`, `rename`, or `abort`).
+4. *Workflow Settings Resolution*: Reads project workflow configuration from `.plan/marshal.json` (`init_without_asking`, `plan_without_asking`, `execute_without_asking`, `auto_route_recipe`, `confidence_threshold`, `compatibility`, `simplicity`, and execution posture `minimal | standard | full`) to determine which interactive states are entered vs auto-advanced.
+
+=== Routine User Interaction vs Operator-Authorizing Decisions
+_See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+
+`PM-MCP` separates interactive questions into two security classes with distinct transport rules:
+
+[cols="2,2,2,3"]
+|===
+|Interaction Class |Target States & Decisions |Permitted Channels |Fallback & Audit Semantics
+
+|*Routine User Dialogue* (Non-Authorizing)
+|Existing plan collision (`replace`, `resume`, `abort`), obsolete lesson premise (`close`, `continue`), recipe selection, ambiguous domain selection, sibling plan collision, execution posture choice (`minimal`, `standard`, `full`), Phase 2 request clarifications (`refine.awaiting_answers`), Phase 3 design clarifications (`outline.awaiting_answers`), Q-Gate iteration exhaustion (`*.qgate-exhausted`).
+|1. Host MCP Elicitation (preferred) +
+2. Model-relayed `submit` link (`answer_questions`) when host elicitation is unsupported or unavailable.
+|The plan persists a `<phase>.awaiting_user` (or `<phase>.awaiting_answers`) state carrying a typed `questions` schema in `facts`. When answered via the model-relayed `submit` link, the transition succeeds and records `channel: "model_relayed"` in `audit.jsonl`.
+
+|*Operator-Authorizing Decisions* (Gate-Forcing / Privileged)
+|1. Solution outline approval (`outline.review` -> `phase-4-plan`) +
+2. Scope-deviation `accept` (`execute.deviation-review`) +
+3. Handshake or baseline drift override +
+4. Bare-transition artifact-gate exemption (`--allow-bare-transition`) +
+5. Pre-rebase overlap override & pre-merge consent +
+6. Pre-merge barrier / coverage-gap / red-CI / bot-demotion grants +
+7. Plan deletion (`delete-plan`)
+|1. Host MCP Elicitation +
+2. Authenticated Operator CLI (`pm-mcp operator ...`)
+|*Strict Link Omission (`PM-WF-3`)*: No model-invocable `submit` or `noop` link is ever emitted to approve or force these gates. If the host does not support MCP elicitation, the state transitions to `<phase>.blocked`, emits the exact `pm-mcp operator` command in `facts.operator_command`, and offers only a `wait` link until the operator acts.
+|===
+
+==== Typed Question Envelope Schema (`*.awaiting_user`)
+
+Sub-agents operating in leaf `execution-context` scopes are forbidden from prompting the user in-leaf or blocking on `escalate`. Instead, a sub-agent completes its analysis pass using its best judgment and includes a batched question list in its `submit` payload (`refine_prompt` or `outline_prompt`). Each question conforms to the following Java record and TOON tabular structure:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.dialogue;
+
+import java.util.List;
+
+public record UserQuestion(
+    String id,
+    String header,
+    String question,
+    List<String> options,
+    String recommended,
+    boolean allowFreeText
+) {}
+----
+
+Every option string in `options` is authored as a two-sided contract whose label explicitly names the workflow branch selected when chosen, with the `recommended` option listed first.
+
+=== Phase 2 (`refine`): Quality Aggregation, Domain Widening & Bounded Re-Dispatch
+
+==== Phase Entry & Baseline Reconciliation
+
+At `phase-2-refine` entry, the engine caches loop-invariant inputs (`request.md`, `references.json`, `module_mapping.toon`, and the architecture overview) so they are read once per phase rather than re-read inside the confidence loop. When a base branch is configured, `refine.baseline-reconcile` runs a non-mutating `git merge-tree` probe against upstream and classifies drift into three outcomes:
+
+* `no_overlap`: Upstream commits touch disjoint files; advances directly to `refine.analyze`.
+* `overlap_no_content_conflict`: Overlapping files merge cleanly; records `auto_reconcilable: true` without mutating the tree (deferring the actual rebase to Phase 5/6) and advances to `refine.analyze`.
+* `overlap_with_content_conflict`: Content conflicts exist; emits blocking Q-Gate findings so the conflict is absorbed during request refinement.
+
+==== Five Quality Dimensions & Fixed-Weight Confidence Aggregation
+
+During `refine.analyze`, the dispatched refine sub-agent executes source-premise verification (checking cited files, flags, and APIs against the codebase) and proposed-fix verification (constructing a semantic probe to verify whether a proposed fix resolves the stated symptom), maps affected modules, estimates scope (`none`, `surgical`, `single_module`, `multi_module`, `broad`), authors a conventional-commit `pr_title` ($\le 72$ characters, distinct from the human plan `title`), and submits raw scores (`0..100`) for the five quality dimensions plus architectural module mapping.
+
+The server-side `ConfidenceAggregator` computes the overall confidence deterministically using fixed weights (zero LLM arithmetic):
+
+[cols="2,1,4"]
+|===
+|Dimension |Fixed Weight |Verification Criteria
+
+|`correctness`
+|20%
+|Technical validity of referenced modules, APIs, flags, source premises, and proposed fixes against the live architecture.
+
+|`completeness`
+|20%
+|Presence of clear scope boundaries, acceptance criteria, test expectations, and cross-module dependencies.
+
+|`consistency`
+|20%
+|Absence of internal contradictions or conflicting constraints across request sections and architecture rules.
+
+|`non_duplication`
+|10%
+|Absence of redundant or overlapping requirement statements.
+
+|`ambiguity`
+|20%
+|Single unambiguous interpretation of terminology, target scope, and measurable outcomes (`100` = unambiguous).
+
+|`module_mapping`
+|10%
+|Confidence in mapping the request to concrete project modules and dependency directions.
+|===
+
+$$\text{confidence} = \lfloor 0.20 \cdot S_{\text{corr}} + 0.20 \cdot S_{\text{comp}} + 0.20 \cdot S_{\text{cons}} + 0.10 \cdot S_{\text{nondup}} + 0.20 \cdot S_{\text{ambig}} + 0.10 \cdot S_{\text{mod}} \rfloor$$
+
+* Any omitted dimension defaults to `0` and is recorded in `missing_dimensions` (never silently ignored).
+* The aggregated score is persisted to `status.metadata.confidence` and compared against `confidence_threshold` (configured in `.plan/marshal.json -> /plan/phase-2-refine/confidence_threshold`, default: `95`).
+* The server also validates that `compatibility` (`breaking | deprecation | smart_and_ask`, mandatory with no fallback) and `simplicity` (`lean | pragmatic | defensive`, defaulting to `lean`) are resolved and persisted.
+
+==== Widen-Only Domain Re-Merge
+
+Once concrete `affected_files` are identified in `refine.analyze`, the server runs `domain-detect` over those file paths (`file_globs` and `always_on` inclusion legs) and computes the set union with the existing `references.domains`:
+
+$$\text{domains}_{\text{new}} = \text{domains}_{\text{cached}} \cup \text{detect}(\text{affected\_files})$$
+
+* *Monotonic Widening Invariant*: Phase 2 may **only widen** `references.domains`, never narrow it, ensuring convergence across refine iterations. If `affected_files` produce zero narrative or glob matches, `domain-detect` returns all offerable domains under `reason = "over_provisioned_resolve"`; that temporary over-provisioning is narrowed exactly once in Phase 3 after deliverables are declared.
+
+==== Single-Batch Clarification & Re-Dispatch Ceiling
+
+If $\text{confidence} < \text{confidence\_threshold}$:
+
+1. The sub-agent submits its best-judgment `clarified_request` alongside a single batched `refine_prompt` containing at most 4 clarification questions prioritized by `Correctness > Consistency > Completeness > Ambiguity > Non-Duplication`.
+2. The engine persists the questions in `mcp/status.json`, transitions to `refine.awaiting_answers`, and collects the user's answers in one batch.
+3. Upon receiving the answers, the engine writes the `## Clarifications` and `## Clarified Request` sections, increments `refine_redispatch_count` in `mcp/status.json`, and re-dispatches `refine.analyze` **at most once** (`refine_redispatch_count <= 1`).
+4. If the second pass still yields $\text{confidence} < \text{confidence\_threshold}$, the engine does **not** loop again; it flags `low_confidence_manual_review: true` in `facts` and advances to `outline` (where `outline.review` gates progression before task creation).
+
+=== One-Way Planning Lane Ratchet (`light` -> `deep`)
+
+`PM-MCP` routes Phase 3 (`outline`) along one of two structural lanes stored in `status.metadata.planning_lane`, which deterministically drives the legacy `track` field (`light => simple`, `deep => complex`):
+
+[cols="1,2,4"]
+|===
+|Lane |Target Scope |Discovery & Execution Contract
+
+|`light`
+|Bounded, localized changes (`scope_estimate` in `{surgical, single_module}` with known target files)
+|Executes in a single collapsed scoping envelope (`outline.light`) with a strictly bounded file read set: +
+- *Total Read Set Cap*: **25 files** (`cap = 25`), restricted to declared `affected_files` plus their 1-hop dependency neighbors. +
+- *Per-Step Discovery Band*: **8 files** (`band = 8`) maximum read expansion within a single discovery step.
+
+|`deep`
+|Codebase-wide, multi-module, architectural, or uncertain changes
+|Executes full domain discovery, ADR progressive-disclosure scan (`manage-adr scan`), consumer sweeps for symbol renames/deletions, and full Q-Gate verification (`outline.deep`).
+|===
+
+==== Lane Ratchet Rules
+
+1. *Unknown Scope Bias*: At initial routing, an unknown or unresolved `scope_estimate` biases fail-safe to `deep`. Conversely, an unset `change_type` does **not** force `deep` when `scope_estimate` and target files are bounded.
+2. *One-Way Escalation (`light -> deep`)*: While in `outline.light`, the engine transitions via an explicit ratchet edge to `outline.deep` (locking `planning_lane = "deep"` and `track = "complex"` permanently for the plan) whenever either trigger fires:
+   * *Deterministic Budget Trigger*: The sub-agent's file-read counter exceeds `cap = 25` total files or `band = 8` files in a discovery band.
+   * *Judgment Escalation Trigger*: The sub-agent submits `outcome = escalate_to_deep` because discovery revealed a false request premise, cross-module ripple effects, or public symbol deletions requiring a full consumer sweep.
+3. *No Down-Ratchet*: No transition exists from `deep` to `light`. Even if Phase 3 discovery later narrows `scope_estimate` from `multi_module` to `surgical` (which may enable the Q-Gate surgical bypass), `planning_lane` remains `deep`.
+
+=== Phase 3 (`outline`): Validation Rules & `outline.review` Gate
+
+When the model submits the solution outline (`solution_outline.md`) in `outline.light` or `outline.deep`, the server-side `OutlineValidator` enforces four structural invariants before accepting the transition:
+
+==== 1. Per-File Intent Marker Validation
+
+Every entry under a deliverable's `**Affected files:**` list must carry an explicit trailing parenthesized intent marker from a closed 4-value enum:
+
+[cols="1,2,3"]
+|===
+|Intent Marker |Syntax Example |Pre-Execution `files_exist` Gate Semantics
+
+|`read`
+|``- `src/main/java/Foo.java` (read)``
+|Consulted as read-only reference; file **must exist** on disk prior to execution. Recorded in `references.json` under read-only references, disjoint from expected modifications.
+
+|`write-new`
+|``- `src/main/java/Bar.java` (write-new)``
+|Created fresh by the deliverable; file **must not exist** on disk prior to execution (flags a Q-Gate finding if already present).
+
+|`write-replace`
+|``- `src/main/java/Baz.java` (write-replace)``
+|Modified in place; file exists on disk and is recorded in the declared modification footprint.
+
+|`delete`
+|``- `src/main/java/Old.java` (delete)``
+|Removed by the deliverable; file **must exist** on disk prior to execution and triggers the whole-tree verification gate in Phase 5.
+|===
+
+Any `Affected files` line lacking a valid `(read|write-new|write-replace|delete)` suffix is rejected immediately with `rejected.reason = "invalid_link_args"`. Furthermore, if a deliverable changes a default value, constant, or enum member, the *value-change test-sweep rule* requires all existing test files asserting the old value (discovered identifier-first) to be listed in `Affected files` with `(write-replace)`.
+
+==== 2. Six-Bucket File-Type Classifier & `module_testing` Profile Requirement
+
+For each deliverable, the server classifies its write-intent `Affected files` via the domain build extensions into one of six closed file-type buckets and validates the deliverable's declared `profiles[]`:
+
+[cols="1,2,3"]
+|===
+|File-Type Bucket |Path Composition |Mandatory `profiles[]` Assignment
+
+|`production_only`
+|Production source files only
+|`[implementation, module_testing]` — `module_testing` is **mandatory**.
+
+|`test_only`
+|Test source files only
+|`[module_testing]` only.
+
+|`mixed_code`
+|Production and test source files (no docs)
+|`[implementation, module_testing]` — `module_testing` is **mandatory**.
+
+|`mixed_with_docs`
+|Production/test source files plus documentation files
+|`[implementation, module_testing]`, with `module_testing` scoped strictly to the code/test paths.
+
+|`documentation_only`
+|Documentation or markdown files only
+|`[implementation]` only — `module_testing` is **prohibited**.
+
+|`unknown`
+|Unclaimed file extension or path
+|*Blocks Deliverable*: Emits a blocking finding requiring path correction or build-extension mapping; never silently falls back to `documentation_only`.
+|===
+
+==== 3. Single Domain Narrowing Pass
+
+Immediately after `solution_outline.md` passes structural validation, the server re-derives the plan's active domain set from the union of all deliverables' declared footprints (`Affected files`) and narrows `references.domains` **exactly once**. This removes any temporary over-provisioned domains introduced during Phase 2's widen-only union before Phase 4 resolves task skills.
+
+==== 4. Persisted `outline.review` State (Surviving `/clear`)
+
+Once the outline and its Q-Gate pass complete, the engine transitions to `outline.review` *while remaining in `phase-3-outline`* (never marking Phase 3 `done` prior to approval). Because `outline.review` is persisted in `mcp/status.json`:
+
+* A session compaction or `/clear` resumes directly at `outline.review` via `pm_state(plan_id)`.
+* Unless `plan_without_asking == true` is configured in `.plan/marshal.json`, advancing from `outline.review` to `phase-4-plan` is an *operator-authorizing decision* requiring MCP elicitation or `pm-mcp operator approve-outline`.
+* If the operator requests changes during `outline.review`, the operator's feedback is persisted as pending Q-Gate findings (`phase = 3-outline`) and the state transitions back to `outline.deep` / `outline.light` to revise the outline.
+
+=== Phase 4 (`plan`): Task Derivation, DAG Validation & Manifest Resolver
+
+Phase 4 transforms the approved structured deliverables in `solution_outline.md` into executable `TASK-NNN.json` files, dispatch envelopes, and the per-plan execution manifest (`execution.toon`).
+
+==== Deterministic Task Derivation & DAG Cycle Detection
+
+1. *Profile-to-Task Mapping*: For each deliverable $D_i$ in `solution_outline.md`, the engine generates one task per declared profile in fixed intra-deliverable order (`implementation` $\rightarrow$ `module_testing` $\rightarrow$ `verification`), copying the deliverable's `Intent gloss` verbatim into each derived task's description.
+2. *Dependency DAG Construction & Cycle Rejection*: Inter-deliverable `depends:` declarations map the head task of $D_i$ to the tail task of each prerequisite deliverable $D_j$. `TaskGraphValidator` runs Kahn's topological sort and depth-first cycle detection over the complete task graph; any self-dependency, unresolved deliverable reference, or cycle (`TASK-A -> ... -> TASK-A`) fails validation before any task file is written.
+3. *Two-Tier Skill Resolution*: Each task is assigned `skills[]` (`skill://pm/...` URIs) by combining system persona skills (`skill://pm/core`, profile vocabulary skill) with domain-resolved skills for the deliverable's `(domain, module, profile)` tuple.
+4. *Atomic Non-Idempotent Task Creation*: All derived tasks are persisted in a single atomic batch (`batch-add`). Task creation is strictly non-idempotent: once `tasks/TASK-*.json` files exist for the plan, the engine omits the task-creation link on any re-entry into Phase 4, preventing duplicate task generation.
+5. *Envelope Bin-Packing*: `EnvelopePacker` groups topologically ordered tasks into context-budget-bounded dispatch envelopes (`envelope-1..M`) so that related tasks (such as a deliverable's `implementation` and `module_testing` pair) share one leaf sub-agent context window without exceeding host token limits.
+
+==== Shared Execution Manifest & Posture Preview Resolver
+
+Both the Phase 1/Phase 4 *posture preview* and the Phase 4 *execution manifest composition* (`execution.toon`) invoke the same deterministic `ExecutionManifestResolver`:
+
+* *Posture Lattice*: `minimal` $\sqsubset$ `standard` $\sqsubset$ `full`.
+* *Floor Immunity*: Core and derived-state workflow steps (`push`, `branch-cleanup`, `record-metrics`, `emit-landing`, `archive-plan`, and mandatory freshness/quality gates) carry floor immunity: an operator or config override setting a floor-immune step to `off` is ignored and recorded as a diagnostic note in `facts`.
+* *Prune Predicates*: Conditional steps (such as `sonar-roundtrip`, `automatic-review`, `adr-propose`, or `architecture-refresh`) evaluate their provider availability and footprint prune predicates; an unresolved `ask` seed is dropped only when its backing provider is unconfigured.
+
+=== Planning Transition Guards & Real-World Invariants
+
+Every phase transition out of Phases 1, 2, 3, and 4 executes a deterministic server-side guard pipeline replacing the legacy `phase_handshake.py` script:
+
+[cols="2,1,4"]
+|===
+|Guard / Invariant |Scope |Enforcement Rule
+
+|*Artifact Gate*
+|Exits from Phases 2, 3, 4
+|Refuses transition unless the phase's mandatory artifacts exist and pass schema validation: +
+- Exit Phase 2: `request.md` contains `## Clarified Request` and `status.metadata.pr_title` is non-empty. +
+- Exit Phase 3: `solution_outline.md` exists, passes `OutlineValidator`, and `outline.review` is approved. +
+- Exit Phase 4: $\ge 1$ `tasks/TASK-*.json` exists, DAG is acyclic, and `execution.toon` is composed. +
+Bypassing the artifact gate (`--allow-bare-transition`) is restricted exclusively to the operator channel with a mandatory audit reason.
+
+|*Clean Main Checkout Guard* (`git status --porcelain`)
+|All planning transitions (Phases 1–4)
+|Planning phases may write **only** inside `.plan/local/plans/<plan_id>/`. Before completing any planning transition, the daemon runs `git status --porcelain` on the main checkout. Any modified, staged, or untracked path outside `.plan/` (keyed strictly on whether the file is git-tracked) blocks the transition and enters `<phase>.footprint-violation`.
+
+|*`.plan/marshal.json` Recovery Guard*
+|All planning transitions
+|If `.plan/marshal.json` is dirty in the working tree during a planning phase, the server **never** silently discards or commits it. The plan transitions to `<phase>.blocked` and prompts the operator via elicitation/CLI to either commit the config change or restore the file.
+
+|*Outside-World Invariants* (`main_sha`, `worktree_path`, `config_hash`)
+|Phase entries (Phases 2–6)
+|Verifies `main_sha` baseline drift, `.plan/marshal.json` `config_hash`, and worktree consistency: when `use_worktree == true`, `worktree_path` must be empty in Phases 1–4 and must resolve to a live git worktree in Phases 5–6 (no deferred-window carve-out). Drift is never auto-rationalized; loop-back re-entry drift is auto-accepted exactly once, and worktree refusal errors are never bypassed.
+
+|*Store Integrity & Digest Guard*
+|Every `pm_state` / `pm_do` read
+|Every server write to `.plan/` stores (`status.json`, `references.json`, `findings.jsonl`, `TASK-*.json`) records a SHA-256 content digest. If the model edits files under `.plan/` directly via host file tools, the digest mismatch is detected on the next MCP call and rejected with `store_tampered`.
+
+|*Blocking Findings Guard* (`pending_findings_blocking_count == 0`)
+|Exits from Phases 2, 3, 4, 5
+|Refuses phase exit while any Q-Gate or verification finding with `blocking == true` remains in `resolution == "pending"`.
+|===
+
+---
+
+== Q-Gate Validation, Change-Type & Scope-Deviation Contracts
+_See Requirement link:../Requirements.adoc#PM-WF-11[PM-WF-11: Q-Gate Validation Loop, Change-Type & Scope-Deviation Contracts]_
+
+=== Q-Gate Validation Loop
+
+Quality Gate (`Q-Gate`) validation runs at the tail of Phases 2, 3, and 4 to catch structural defects (narrative-vs-code drift, missing consumer sweeps, invalid CLI flags, tier deltas, architecture mismatches, and unresolved lesson citations) before advancing to the next phase.
+
+==== Modes, Iteration Ceiling & Content-Hash Rerun Gate
+
+[cols="1,3"]
+|===
+|Parameter / Rule |Normative Specification
+
+|*Configuration Modes* (`q_gate_validation`)
+|Configured per phase in `.plan/marshal.json`: +
+- `off`: Q-Gate validation is skipped completely. +
+- `once` (default): Runs one validation pass and one remediation pass if blocking findings are emitted. +
+- `until_clean`: Iterates validation and remediation until `pending_findings_blocking_count == 0` or the iteration ceiling is reached.
+
+|*Iteration Ceiling* (`max_qgate_iterations = 3`)
+|The Q-Gate auto-loop runs **at most 3 iterations** per phase (`qgate_iteration` persisted in `mcp/status.json`, range `0..3`).
+
+|*Content-Hash Rerun Gate*
+|Before running Q-Gate validators on iteration $k$, the engine computes `sha256(target_artifact)` (`request.md` in Phase 2, `solution_outline.md` in Phase 3, `TASK-*.json` bundle in Phase 4) and compares it to `status.qgate_last_evaluated_hash`. If the hash is identical and `pending_findings_blocking_count == 0`, the engine short-circuits and exits the Q-Gate loop immediately without re-running validators.
+
+|*Surgical Bypass Predicate*
+|In Phase 3 (`outline`), when `q_gate_validation != off`, Q-Gate validation is automatically bypassed (logging `(phase-3-outline:qgate-bypass)` to the audit log) if and only if all three conditions hold: +
+1. `scope_estimate == "surgical"` +
+2. `change_type` $\in \{\text{"bug\_fix"}, \text{"tech\_debt"}, \text{"verification"}\}$ +
+3. `deliverable_count == 1`
+
+|*Exit & Exhaustion Semantics*
+|The loop exits to the next state (`refine.ready`, `outline.review`, or `execute.worktree-init`) as soon as `pending_findings_blocking_count == 0`. (In Phase 2 lesson-derived plans, `stale` narrative-vs-code findings are non-blocking signals preserved for Phase 3 confirmation, whereas `invalid` findings are blocking.) If `pending_findings_blocking_count > 0` after iteration 3, the plan transitions to `<phase>.qgate-exhausted` (`*.awaiting_user`), requiring the user/operator to override, edit, or abort.
+|===
+
+=== Single-Writer `change_type` Contract
+
+`change_type` classifies the intent of a plan and its deliverables using a closed 6-value enumeration orthogonal to `domain` and `profile`:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.classification;
+
+public enum ChangeType {
+    FEATURE("feature", 1),
+    BUG_FIX("bug_fix", 2),
+    TECH_DEBT("tech_debt", 3),
+    ENHANCEMENT("enhancement", 4),
+    VERIFICATION("verification", 5),
+    ANALYSIS("analysis", 6);
+
+    private final String wireName;
+    private final int priorityOrder;
+
+    ChangeType(String wireName, int priorityOrder) {
+        this.wireName = wireName;
+        this.priorityOrder = priorityOrder;
+    }
+
+    public String wireName() { return wireName; }
+    public int priorityOrder() { return priorityOrder; }
+}
+----
+
+==== Single-Writer Heuristic vs Judgment Fallback
+
+To prevent conflicting writes between deterministic heuristics and model judgment, `status.metadata.change_type` enforces a strict *single-writer* protocol at the start of Phase 3 (`outline.detect-change-type`):
+
+1. *Deterministic Heuristic First (`ChangeTypeHeuristic`)*: Scores `clarified_request` (falling back to `original_input`) against fixed keyword tables, applying compound-intent guards and `bug_fix`-vs-`tech_debt` object disambiguation.
+   * If a single `ChangeType` wins with $\text{confidence} \ge 0.70$ and no top-two score tie, `ChangeTypeHeuristic` persists `status.metadata.change_type` and advances directly to lane routing (`ambiguous = false`).
+   * If no keyword fires, the top two scores tie, or $\text{confidence} < 0.70$, `ChangeTypeHeuristic` returns `ambiguous = true` and **writes nothing** to `status.json`.
+2. *Judgment Fallback (`submit`)*: Only when `ambiguous == true` does the engine enter `outline.classify-change-type`, offering a `submit` link (`change_type:enum[feature|bug_fix|tech_debt|enhancement|verification|analysis],rationale:text[1..500]`) guided by `skill://pm/outline/detect-change-type/SKILL.md`. The submitted value becomes the single authoritative write to `status.metadata.change_type`.
+
+==== Plan-vs-Deliverable Scope Reconciliation & Classification Validation
+
+* *Scope Disagreement Refusal*: Every deliverable in `solution_outline.md` declares its own deliverable-scoped `change_type`, while `status.metadata.change_type` holds the plan-scoped classification. `OutlineValidator` and `ExecutionManifestResolver` reconcile the two scopes and **refuse** incompatible combinations:
+  - A deliverable with `change_type: verification` or `analysis` is read-only by definition; if any of its `Affected files` carries a mutating intent (`write-new`, `write-replace`, `delete`), or if a plan classified as `verification`/`analysis` contains mutating deliverables, validation fails closed with `change_type_scope_disagreement`.
+* *Flag-Not-Block Classification Validation*: When `scope_estimate` is updated in Phase 2 or Phase 3, `classification-validate` checks for narrow-over-large mismatches (for example, `change_type == bug_fix` paired with `scope_estimate == broad`). Mismatches emit an advisory warning fact in `facts.classification_warning` but never block a transition.
+
+=== Scope-Deviation Contract
+
+When an executing leaf sub-agent in Phase 5 (`execute`) discovers that completing a task requires modifying files outside the deliverable's declared `Affected files` or violating a declared architectural constraint, it must never silently widen its footprint or soften the deliverable requirements.
+
+==== Deviation Submission & Batching Mechanics
+
+1. *Decide Before Logging or Mutating*: The sub-agent invokes the entity-scoped `deviate:TASK-NNN` (`submit`) link with a structured `ScopeDeviationRequest`:
++
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.deviation;
+
+import java.util.List;
+
+public record ScopeDeviationRequest(
+    String taskId,
+    String deliverableId,
+    List<String> unplannedFiles,
+    String deviationSummary,
+    String impactAssessment,
+    DeviationDisposition recommendedDisposition
+) {}
+
+public enum DeviationDisposition {
+    HOLD("hold"),
+    ACCEPT("accept"),
+    SPLIT("split");
+
+    private final String wireName;
+    DeviationDisposition(String wireName) { this.wireName = wireName; }
+    public String wireName() { return wireName; }
+}
+----
+2. *Task Blocking & Envelope Batching*: Submitting a deviation marks `TASK-NNN` as `blocked` before any out-of-scope file write or decision-log entry occurs. If an envelope encounters multiple deviations across independent tasks in its pass, all pending `ScopeDeviationRequest` records are batched into a single operator escalation state (`execute.deviation-review`).
+3. *Three Closed Operator Dispositions*: The operator resolves each deviation through MCP elicitation or `pm-mcp operator resolve-deviation` using one of three deterministic branches:
+
+[cols="1,2,4"]
+|===
+|Disposition |Required Operator Input |Deterministic Server Side Effects
+
+|`hold`
+|Optional guidance note (`text[0..1000]`)
+|Refuses the scope expansion. The declared footprint in `references.json` remains unchanged; `TASK-NNN` is returned to `pending` (with the hold constraint attached) so the sub-agent either implements strictly within the declared files or reports `infeasible`.
+
+|`accept`
+|**Mandatory** `rationale: text[1..2000]`
+|Persists the operator's `rationale` in `mcp/status.json` (`accepted_deviations[]`), appends `unplannedFiles` into the declared modification footprint in `references.json`, writes a `[DEVIATION:ACCEPT]` audit entry, unblocks `TASK-NNN`, and deterministically renders the deviation description and operator `rationale` into the Pull Request body's `## Scope Deviations` section during `create-pr` (order `20`).
+
+|`split`
+|Lesson title/summary (`text[1..1000]`)
+|Keeps the current deliverable's footprint unchanged, creates a new tracked lesson in the main-anchored lesson store (`manage-lessons`) capturing the deferred work, records the new `lesson_id` in `references.json`, and unblocks `TASK-NNN` with the out-of-scope portion excised.
+|===
+
+---
+
+== Phase 5 Execute & Verification Sweep
+_See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+
+=== Worktree Materialization & Envelope Execution Loop
+
+At Phase 5 entry (`execute.worktree-init`), the daemon creates the plan's feature branch and isolated git worktree at `.plan/local/worktrees/<plan_id>/` and executes the write-ahead move journal (`move-journal.json`, see link:move-journal.adoc[Move Journal Specification]) to relocate `.plan/local/plans/<plan_id>/` into `.plan/local/worktrees/<plan_id>/.plan/plans/<plan_id>/`.
+
+[source,text]
+----
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 5: execute                                                                 │
+│                                                                                  │
+│  execute.worktree-init                                                           │
+│    │ (branch + worktree created; plan dir relocated via move-journal.json)       │
+│    ▼                                                                             │
+│  execute.dispatch-ready ──(dispatch:envelope-M)──► Leaf Sub-Agent (entity scope) │
+│    ▲                                                 │                           │
+│    │ (next task in envelope)                         ▼                           │
+│    │                                          submit:TASK-NNN                    │
+│    │                                          (server verifies diff, obfuscation,│
+│    │                                           footprint, task verify commands)  │
+│    │                                                 │                           │
+│    │                          ┌──────────────────────┴────────────────────┐      │
+│    │                          │ Last task of deliverable (Chain Tail)?    │      │
+│    │                          └──────────┬─────────────────────┬──────────┘      │
+│    │                                 No  │                     │ Yes             │
+│    └─────────────────────────────────────┘                     ▼                 │
+│                                                   execute.chain-tail-commit      │
+│                                                   (git commit + change ledger +  │
+│                                                    module-scoped build job)      │
+│                                                                │                 │
+│    ┌───────────────────────────────────────────────────────────┘                 │
+│    │ (all envelopes completed; or file relocation forces whole-tree sweep)       │
+│    ▼                                                                             │
+│  execute.verify-sweep (manifest.phase_5.verification_steps)                      │
+│    ├──► [triage_required] ──► execute.verification-feedback (remediate & re-run) │
+│    └──► [all green] ──► execute.exit-barrier (Pending-Tasks + Freshness Gates)   │
+│                           │                                                      │
+│                           ▼                                                      │
+│                     Phase 6: finalize                                            │
+└──────────────────────────────────────────────────────────────────────────────────┘
+----
+
+==== Task Envelope Execution & Independent Server Verification
+
+1. *Envelope Dispatch*: `execute.dispatch-ready` offers `dispatch:envelope-M` (`form: dispatch`) paired with `returned:<dispatch_id>` (`form: submit`). The dispatched sub-agent calls `pm_state(plan_id, entity="envelope-M", dispatch_id)` and receives only the current active task (`TASK-NNN`) and its resolved `skill://pm/...` URIs.
+2. *Independent Verification on `submit:TASK-NNN`*: The server never trusts a sub-agent's self-reported completion. When `submit:TASK-NNN` is invoked, the daemon independently verifies:
+   * *Non-Empty Diff & Footprint Check*: For write-intent tasks, verifies that `git status --porcelain` in the worktree contains changes, that no files outside the worktree were touched, and that modified paths match the deliverable's declared `Affected files` (`verify_failure_scope` / scope-creep check). Batched destructive `git checkout` commands are forbidden.
+   * *Obfuscation & Marker Check*: Scans modified lines for prohibited suppression comments, `TODO`/`FIXME` markers, or rewrite markers.
+   * *Independent Command Re-Run*: Executes the task's declared verification command via the daemon's build runner and verifies a passing verdict artifact.
+3. *Context Budget Yield & Infeasibility*:
+   * If a sub-agent approaches its context window limit before finishing all tasks in `envelope-M`, it invokes `yield:envelope-M` (`budget_yield`); the server splits the remaining unstarted tasks of `envelope-M` into a new envelope `envelope-(M+1)` with a fresh `dispatch_id`.
+   * If a task is genuinely impossible as specified, the sub-agent submits `infeasible:TASK-NNN` with evidence. `infeasible` is terminal for that deliverable and transitions the plan to `execute.blocked` (operator escalation); substituting a weaker deliverable under the same name is strictly prohibited.
+
+=== Per-Deliverable Chain-Tail Commit & Module Build
+
+Individual tasks never run `git commit`. When the last task belonging to deliverable $D_i$ (the *chain tail*) passes independent verification:
+
+1. *Chain-Tail Commit*: The server transitions the envelope to `execute.chain-tail-commit`, runs a git commit job in the worktree using the submitted commit message (or deterministic conventional-commit fallback), and appends a `kind = "change"` entry to the plan's change ledger (`change-ledger.jsonl`) stamped with the new `worktree_sha`.
+2. *Per-Deliverable Module Build*: Immediately after the chain-tail commit, the server spawns a module-scoped build job (`canonical = "module-tests"`, scoped to $D_i$'s module) and records a `kind = "build"` entry in `change-ledger.jsonl`.
+   * If the module build passes, the envelope advances to the next deliverable's tasks (or completes the envelope).
+   * If the module build fails, the envelope transitions immediately to `execute.verification-feedback` (`triage_required`).
+
+=== Whole-Tree Verification Gates & `triage_required` Routing
+
+Once all task envelopes reach completion, `execute.verify-sweep` runs the end-of-phase verification pipeline declared in `manifest.phase_5.verification_steps` (ordered by the `ext-point-build-verify-step` descriptors: `module-tests`, `quality-gate`, `coverage`, and domain `arch-gate`):
+
+* *Footprint-Driven Scope & Relocation Override*: The server compares the realized git footprint (`references.json:realized_footprint`) against project modules to scope build executions. However, if any deliverable in the plan performed a **file relocation or deletion** (any `Affected files` entry with `delete` intent or a git rename `R`), the server unconditionally forces a **whole-tree build and verification sweep** across all modules to catch broken cross-module imports or references.
+* *`triage_required` -> Verification-Feedback Transition*: Whenever any per-deliverable module build or end-of-phase verification step fails, the engine ingests the parsed build/test/arch-gate failures into `findings.jsonl`, sets the phase sub-state to `execute.verification-feedback` (`triage_required`), and offers a `dispatch:verify-feedback` link (or inline `fix` links) that diagnoses the root cause against `verify_failure_scope`, applies the fix, commits, and re-enters `execute.verify-sweep`.
+
+=== Phase 5 Exit Barrier: Dual Freshness & Pending-Tasks Gates
+
+Transitioning from `phase-5-execute` to `phase-6-finalize` is governed by an atomic dual-gate barrier in `execute.exit-barrier`. **Both gates are always evaluated together before acting on either** so a single diagnostics payload surfaces all reasons if both fail:
+
+1. *Pending-Tasks & Clean-Tree Gate*:
+   * Every `tasks/TASK-*.json` record in the plan must have `status == "completed"` (`pending_count == 0`, `in_progress_count == 0`, `blocked_count == 0`).
+   * The worktree must have zero uncommitted modifications (`git status --porcelain` is empty).
+2. *Worktree Freshness Gate (`worktree_sha`)*:
+   * Freshness is keyed strictly on `worktree_sha` — the composite SHA-256 digest of `HEAD` commit SHA plus staged index, unstaged working-tree diff, and untracked file paths/contents — never on `HEAD` commit SHA alone (which would misclassify an unbuilt dirty tree as fresh).
+   * The gate queries the change ledger (`change-ledger.jsonl`) and reads the explicit closed-enum `status` member (`fresh`, `exempt`, `stale`, `undecidable`), never inferring freshness from a process exit code or from `"not stale"`:
+     - `fresh`: Every required build notation for the realized footprint has a passing `kind = "build"` ledger entry whose recorded `worktree_sha` equals the current live `worktree_sha`, and every ledger row matches a registered build notation of the project.
+     - `exempt`: The realized footprint touches exclusively non-buildable documentation/markdown paths (`documentation_only` across the entire plan), verified against the build extension path classifiers.
+     - `stale` / `undecidable`: Fails the barrier with an explicit `stale_reason` (`tree_modified_since_build`, `missing_module_build`, `unrecognized_build_notation`, or `ledger_unreadable`), routing back to `execute.verify-sweep`.
+
+---
+
+== Phase 6 Finalize Step Ordering Bands & Descriptor Contract
+_See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+
+=== Finalize Step Ordering Bands
+
+The Phase 6 (`finalize`) pipeline is a banded integer `order` space partitioned around the single `push` barrier (`order = 11`) and the `branch-cleanup` merge gate (`order = 70`).
+
+==== Band Allocation Summary
+
+[cols="2,1,2,4"]
+|===
+|Band Name |`order` Range |Owner |Semantic Role & Insertion Guarantee
+
+|*Settle — Pre-Push*
+|`1..10`
+|Shared bundle + project-local (densely packed at `3..10`)
+|Prepares, reviews, mutates source, refreshes architecture, and runs the final local quality gate before pushing. `pre-push-quality-gate` (`10`) is strictly the last step before `push` (`11`). Adding a new step inside `3..10` requires a deliberate re-spacing of the sub-cluster.
+
+|*Push Barrier*
+|`11`
+|Shared bundle (fixed)
+|Single branch push (`default:push`). Verifies the `worktree_sha` freshness gate, clean working tree, and remote branch parity before pushing.
+
+|*Settle — Post-Push & Concurrent Wait Region*
+|`12..69`
+|Shared majors (`20`, `22`, `30`, `40`, `62`) + interior gaps (`12..19`, `23..29`, `31..39`, `41..61`, `63..69`)
+|Opens the PR (`20`), enters the composite concurrent wait region (`22..40`: CI verification, automatic review bots, Sonar analysis) with the unified triage hook, and proposes ADRs (`62`). Any source fix via unified triage or loop-back re-enters the Settle band.
+
+|*Merge Gate*
+|`70`
+|Shared bundle (fixed)
+|`default:branch-cleanup` — evaluates the pre-merge review barrier, acquires the cross-plan merge mutex, rebases onto base, merges via safe-merge or merge-queue, destroys the worktree (`destroys: [worktree]`), and relocates the plan directory back to the main checkout via `move-journal.json`.
+
+|*Post-Merge Operational*
+|`71..899`
+|Project-local / third-party
+|Post-merge operational actions that do not mutate tracked source and are not backward-looking reports. (Legacy `deploy-target` at `81` and `sync-plugin-cache` at `85` are obsolete for `PM-MCP`'s own distribution.)
+
+|*Post-Run Review*
+|`900..999`
+|Shared bundle (`991..999`) + reserved gap (`900..989`)
+|Backward-looking analysis and reporting steps (`post_run_review: true`, `mutates_source: false`) that depend on post-merge evidence: `lessons-capture` (`991`), `preference-emitter` (`992`), `record-metrics` (`998`), `phase-breakdown` (`999`).
+
+|*Terminal Emission*
+|`1000..1099`
+|Shared bundle (reserved)
+|`default:emit-landing` (`1000`) — emits the machine-readable landing envelope to the orchestrator epic inbox after all metrics and post-run reports complete.
+
+|*Terminus*
+|`1100`
+|Shared bundle (fixed)
+|`default:archive-plan` (`1100`) — archives/moves the completed plan directory (`destroys: [plan-directory]`). Strictly the highest `order` in the pipeline.
+|===
+
+==== Normative Step Catalogue across Ordering Bands
+
+[cols="1,2,2,1,1,1,3"]
+|===
+|Order |Step Identifier |Band |`mutates_source` |`head_dependent` |`reads` / `destroys` |PM-MCP Execution Mechanics & Operator Gates
+
+|`3`
+|`default:sync-baseline`
+|Settle (`<11`)
+|`true`
+|`false`
+|`reads: [worktree]`
+|Git fetch + rebase job onto target base branch (`advances_main_via_rebase: true`). Records `action`, `upstream_commit_count`, `work_performed`. Escalates to operator if overlap exceeds rebase conflict threshold.
+
+|`4`
+|`project:lessons-housekeeping`
+|Settle (`<11`)
+|`true`
+|`true`
+|—
+|Optional project-local step retiring resolved lessons before simplify/review.
+
+|`5`
+|`default:simplify`
+|Settle (`<11`)
+|`true`
+|`true`
+|—
+|Dispatches leaf sub-agent (`skill://pm/finalize/simplify`) to simplify touched code; server commits any edits via git job and re-stamps ledger.
+
+|`6`
+|`project:plugin-doctor`
+|Settle (`<11`)
+|`true`
+|`true`
+|`reads: [worktree]`
+|Optional project-local quality check over worktree paths (`verdict_inputs` scoped to bundle paths).
+
+|`7`
+|`default:security-audit`
+|Settle (`<11`)
+|`true`
+|`true`
+|—
+|Dispatches leaf security-audit sub-agent over the plan footprint; server commits remediations or files findings.
+
+|`8`
+|`default:self-review` (`pre-submission-self-review`)
+|Settle (`<11`)
+|`true`
+|`true`
+|—
+|Server deterministically surfaces structural self-review candidates (`requires_prompt_fields: [candidates]`, delta-anchored to previous `head_at_completion`); model submits verdict and fixes.
+
+|`9`
+|`default:architecture-refresh`
+|Settle (`<11`)
+|`true`
+|`true`
+|—
+|Runs module/dependency discovery job, followed by a judgment `submit` when structural topology changed (operator prompt in prompt mode).
+
+|`10`
+|`default:pre-push-quality-gate`
+|Settle (`<11`)
+|`false`
+|`true`
+|`reads: [worktree]`
+|Runs build jobs per affected bundle, whole-tree compile, test-compile, and module-test divergence checks. Strictly last in the `<11` Settle band.
+
+|`11`
+|`default:push`
+|Push (`11`)
+|`false`
+|`false`
+|—
+|Verifies `worktree_sha` freshness gate (`fresh` or `exempt`), clean working tree, and branch parity (idempotent `already_pushed` skip; never pushes a merged/deleted branch), then runs git push job.
+
+|`20`
+|`default:create-pr`
+|Concurrent Wait (`20..40`)
+|`false`
+|`false`
+|—
+|Model submits PR body (with deterministic `pr_title` from Phase 2 and any `accepted_deviations` from Phase 5 injected by the server), followed by CI provider job creating or updating the PR. Records `pr_number`.
+
+|`22`
+|`default:ci-verify`
+|Concurrent Wait (`20..40`)
+|`false`
+|`true`
+|—
+|Monitors CI workflow runs against pushed `HEAD` (`verdict_inputs: []` — remote state). Applies deterministic CI failure taxonomy (`compile_failure`, `test_failure`, `lint_failure`, `infra_flake`, `not_triggered`). Hard CI failure immediately short-circuits `finalize.concurrent-wait` (`PM-WF-9`).
+
+|`30`
+|`default:automatic-review`
+|Concurrent Wait (`20..40`)
+|`false`
+|`true`
+|—
+|Tracks configured review bots (CodeRabbit, Copilot, Gemini, Codex) against pushed `HEAD` (`verdict_inputs: []`). Coordinates cross-plan review-bot rate windows, awaits bot completion buffer, and ingests comments into `findings.jsonl`. A red review arm still executes its finding ingestion pass.
+
+|`40`
+|`default:sonar-roundtrip`
+|Concurrent Wait (`20..40`)
+|`false`
+|`true`
+|—
+|Polls SonarQube/SonarCloud quality gate and new-code issues for the PR (`verdict_inputs: []`), recording `count_status`, `new_code_issue_count`, `issues_fetched`, and `work_performed`. A red Sonar arm still executes its finding ingestion pass.
+
+|_Hook_
+|*Unified Triage Hook* (`finalize.triage`)
+|Concurrent Wait (`20..40`)
+|_Conditional_
+|—
+|—
+|Triggered whenever `ci-verify`, `automatic-review`, or `sonar-roundtrip` files open findings. For producers declaring a `verification_profile`, runs an adversarial refutation sub-state (`ext-point-verify`) first. Model submits `triage:F-n` (`disposition: enum[FIX|SUPPRESS|ACCEPT]`, `reply_text`). `FIX` transitions via `loop_back` to Phase 5 (if cross-task) or settles in-branch and re-runs from the Settle band; server transmits replies/dismissals to GitHub/GitLab/Sonar.
+
+|`62`
+|`default:adr-propose`
+|Post-Wait Settle (`62`)
+|`true`
+|`true`
+|—
+|Deterministic signal gate checks whether architectural decisions were recorded; if triggered, offers a `submit` link to author/update an ADR and re-settles before merge.
+
+|`70`
+|`default:branch-cleanup`
+|Merge Gate (`70`)
+|`false`
+|`false`
+|`destroys: [worktree]`
+|Evaluates the Pre-Merge Review Barrier, acquires the Cross-Plan Merge Mutex, rebases onto base (`advances_main_via_rebase: true`), awaits post-rebase CI/review, executes closed merge (`safe-merge` or `merge-queue`), removes worktree, and runs `move-journal.json` to relocate the plan directory back to `.plan/local/plans/<plan_id>/`. Records `action`, `upstream_commit_count`, `merge_mechanism`, `merge_state`, `work_performed`, `cleanup_owed`.
+
+|`991`
+|`default:lessons-capture`
+|Post-Run (`>70`)
+|`false`
+|`false`
+|—
+|`post_run_review: true`. Signal gate checks for deviations, rework, or findings; if triggered, dispatches leaf sub-agent to extract candidate lessons (plus opt-in `plan-retrospective` and `review-retrospective`).
+
+|`992`
+|`default:preference-emitter`
+|Post-Run (`>70`)
+|`false`
+|`false`
+|—
+|`post_run_review: true`. Emits observed operator preference signals from elicitation choices.
+
+|`998`
+|`default:record-metrics`
+|Post-Run (`>70`)
+|`false`
+|`false`
+|_Produces `metrics`_
+|`post_run_review: true`. Aggregates phase durations from `audit.jsonl` and sub-agent token usage from `returned:<dispatch_id>` reports (`unmeasured` when omitted by host, never `0`). Records `total_tokens`, `total_wall_seconds`, `any_phase_missing_end_time`.
+
+|`999`
+|`default:phase-breakdown`
+|Post-Run (`>70`)
+|`false`
+|`false`
+|`reads: [metrics]`
+|`post_run_review: true`. Renders the per-phase duration and token breakdown table from `record-metrics` facts.
+
+|`1000`
+|`default:emit-landing`
+|Terminal Emission (`>70`)
+|`false`
+|`false`
+|`reads: [metrics]`
+|Writes the structured landing envelope (`merge_state`, `cleanup_owed`, `pr_number`, `total_tokens`, `total_wall_seconds`, realized footprint) to the parent epic's append-only inbox (`.plan/orchestrator/<epic_id>/inbox/`). Records `work_performed`.
+
+|`1100`
+|`default:archive-plan`
+|Terminus (`1100`)
+|`false`
+|`false`
+|`destroys: [plan-directory]`
+|Moves the completed plan directory to `.plan/local/archive/<plan_id>/` and transitions the workflow to the immutable `completed` terminal state.
+|===
+
+=== Java `FinalizeStepDescriptor` Record Schema & Static Checks
+
+Every built-in, bundle, or project-local finalize step is represented in `pm-mcp-core` by an immutable `FinalizeStepDescriptor` record capturing all ten step descriptor facts:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.finalize;
+
+import java.util.List;
+import java.util.Set;
+
+public record FinalizeStepDescriptor(
+    String name,
+    int order,
+    boolean defaultOn,
+    Set<String> presets,
+    String description,
+    boolean mutatesSource,
+    boolean headDependent,
+    List<String> verdictInputs,
+    boolean advancesMainViaRebase,
+    boolean postRunReview,
+    List<String> reads,
+    List<String> destroys,
+    List<String> recordsFacts,
+    List<String> requiresPromptFields
+) {
+    public static final int PUSH_ORDER = 11;
+    public static final int PRE_PUSH_QUALITY_GATE_ORDER = 10;
+    public static final int MERGE_GATE_ORDER = 70;
+    public static final int POST_RUN_MIN_ORDER = 900;
+    public static final int TERMINUS_ARCHIVE_ORDER = 1100;
+}
+----
+
+==== Build-Time & Startup Static Invariant Verification (`FinalizePipelineValidator`)
+
+`FinalizePipelineValidator` validates the complete registered `List<FinalizeStepDescriptor>` at build time (via JUnit tests) and at daemon startup, failing closed on any violation:
+
+1. *Order Uniqueness (No Collisions)*:
+   For all distinct descriptors $A \neq B$, $A.\text{order}() \neq B.\text{order}()$. Tie-breaking by list insertion order is strictly forbidden.
+2. *Pre-Push Quality Gate Placement*:
+   `default:pre-push-quality-gate` must have $\text{order} == 10$, `default:push` must have $\text{order} == 11$, and no step may occupy an order between them.
+3. *Source-Mutation Before Merge Gate (`mutatesSource`)*:
+   Every descriptor with `mutatesSource == true` must satisfy $\text{order} < \text{branchCleanup.order}()$ (`70`). Every step with $\text{order} \ge 70$ must explicitly declare `mutatesSource == false` (supported at runtime by the post-run source guard, which checks `git status --porcelain` after every post-merge step to detect stray tracked writes).
+4. *Post-Run Review & Source-Mutation Mutual Exclusion (`P1 \land P2`)*:
+   No descriptor may declare both `postRunReview == true` and `mutatesSource == true`. Every descriptor with `postRunReview == true` must satisfy $900 \le \text{order} < 1000$.
+5. *`reads` / `destroys` Data-Dependency Ordering*:
+   * For every artifact token $X \in A.\text{reads}()$ and any step $D$ with $X \in D.\text{destroys}()$, $A.\text{order}() < D.\text{order}()$ (no read-after-destroy: e.g., all `reads: [worktree]` steps precede `branch-cleanup` at `70`; all steps precede `archive-plan` at `1100` which `destroys: [plan-directory]`).
+   * For `X == "metrics"`, every consumer declaring `reads: [metrics]` (`phase-breakdown` at `999`, `emit-landing` at `1000`) must satisfy $\text{order} > \text{recordMetrics.order}()$ (`998`).
+6. *Anchor & Fact Contract Completeness*:
+   * `verdictInputs` may be non-empty only when `headDependent == true`. Remote-state steps (`ci-verify`, `automatic-review`, `sonar-roundtrip`) and open-ended repository steps must have `verdictInputs.isEmpty() == true`.
+   * Every step whose `done` outcome is reachable through a no-op/skipped branch as well as a work-performing branch must include `"work_performed"` in `recordsFacts`, and every `done` transition branch of that step must emit `work_performed=true|false`.
+   * Every non-exempt prompt field (`requiresPromptFields`, excluding the generic set `{name, plan_id, skills, workflow, instructions, WORKTREE, caller_phase, iteration, producer, session_id}`) must match the step's prompt template and input parameter schema in both directions ($\exists$ no orphan declaration, $\forall$ no undeclared field).
+
+=== Re-Entry & `head_at_completion` Verdict Currency Rules
+
+When Phase 6 re-enters after a loop-back from Phase 5, an in-branch settle commit, a `sync-baseline` rebase, or a session resume, the engine decides for each step whether to `SKIP` (preserving its prior `done` verdict) or `RE_FIRE`.
+
+==== Fail-Closed `head_at_completion` Anchor Obligation
+
+* Every step with `headDependent == true` must record `head_at_completion: "<40-hex-sha>"` in `mcp/status.json` when transitioning to `done`.
+* Any attempt to record `done` for a `headDependent == true` step without a valid `head_at_completion` SHA is **refused** (`error: "missing_head_at_completion"`).
+* On re-entry, if a step's persisted record lacks `head_at_completion`, the engine reports the prior record as `unverified` and unconditionally re-fires the step.
+
+==== Deterministic Verdict Currency Algorithm (`VerdictCurrencyEvaluator`)
+
+For a `headDependent == true` step $S$ with recorded `head_at_completion` $= H_{\text{rec}}$ and current worktree `HEAD` $= H_{\text{cur}}$:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.finalize;
+
+import java.util.List;
+import java.util.Set;
+
+public enum CurrencyVerdict {
+    CURRENT_SAME_HEAD,
+    PRESERVED_INPUTS_UNAFFECTED,
+    STALE_MISSING_ANCHOR,
+    STALE_REBASE_ADVANCED,
+    STALE_UNSCOPED_HEAD_CHANGE,
+    STALE_INPUTS_MODIFIED
+}
+
+public final class VerdictCurrencyEvaluator {
+
+    public CurrencyVerdict evaluate(
+            FinalizeStepDescriptor step,
+            String recordedHeadSha,
+            String currentHeadSha,
+            boolean rebaseReplayedCommits,
+            Set<String> changedRepoRelativePaths) {
+
+        if (recordedHeadSha == null || recordedHeadSha.isBlank()) {
+            return CurrencyVerdict.STALE_MISSING_ANCHOR;
+        }
+        if (recordedHeadSha.equals(currentHeadSha) && !rebaseReplayedCommits) {
+            return CurrencyVerdict.CURRENT_SAME_HEAD;
+        }
+        if (rebaseReplayedCommits) {
+            // A non-noop rebase (action == "rebased", upstream_commit_count > 0)
+            // replays history onto a new base tip and re-stales all head-dependent verdicts.
+            return CurrencyVerdict.STALE_REBASE_ADVANCED;
+        }
+        List<String> globs = step.verdictInputs();
+        if (globs == null || globs.isEmpty()) {
+            // Fail-closed default: absence of verdict_inputs never means "matches nothing".
+            return CurrencyVerdict.STALE_UNSCOPED_HEAD_CHANGE;
+        }
+        boolean anyInputTouched = changedRepoRelativePaths.stream()
+            .anyMatch(path -> matchesAnyFnmatchGlob(path, globs));
+        return anyInputTouched
+            ? CurrencyVerdict.STALE_INPUTS_MODIFIED
+            : CurrencyVerdict.PRESERVED_INPUTS_UNAFFECTED;
+    }
+}
+----
+
+* *No Re-Stamp on Preserve Invariant*: When `VerdictCurrencyEvaluator` returns `PRESERVED_INPUTS_UNAFFECTED` (because `git diff --name-only <H_rec>..<H_cur>` touched zero paths matching `step.verdictInputs()`), the step is skipped and its persisted `head_at_completion` **remains $H_{\text{rec}}$** — it is **never** overwritten with $H_{\text{cur}}$. Keeping $H_{\text{rec}}$ ensures that subsequent commits are always diffed against the cumulative range since the step actually executed.
+* *Rebase vs No-Op Rebase*: A step declaring `advancesMainViaRebase == true` (`sync-baseline`, `branch-cleanup`) invalidates downstream verdicts (`STALE_REBASE_ADVANCED`) **only** when it actually replayed commits (`action == "rebased"` and `upstream_commit_count > 0`). When the branch was already up-to-date (`work_performed == false`), `HEAD` does not change and existing verdicts remain current.
+
+=== Pre-Merge Review Barrier & Operator Merge Authorization Grants
+
+Inside `default:branch-cleanup` (`order = 70`), immediately before executing the merge command (`pr safe-merge` or `merge-queue` enqueue), the engine enforces the fail-closed **Pre-Merge Review Barrier**.
+
+==== Two Fail-Closed Barrier Predicates
+
+Both predicates must evaluate to `true` against the current worktree `HEAD` SHA ($H_{\text{cur}}$):
+
+1. *Predicate 1 — Zero Unhandled Review Comments*:
+   Every finding in `findings.jsonl` originating from `automatic-review`, `ci-verify`, or `sonar-roundtrip` must have a persisted, terminal triage disposition (`FIX`, `SUPPRESS`, or `ACCEPT`) whose outbound response or dismissal has been transmitted to the provider (`response_transmitted == true`).
+2. *Predicate 2 — Required-Bot Participation on Current `HEAD`*:
+   Every review bot configured as required in the project's review-bot registry must have a verified participation record for $H_{\text{cur}}$ with `completion_state == "completed"`.
+   * An `unknown`, `pending`, `rate_limited`, `timed_out`, or `not_triggered` bot state **never** satisfies Predicate 2 and **never** automatically mints a merge grant.
+
+==== Operator Merge Authorization Record (`MergeAuthorizationRecord`)
+
+When either barrier predicate fails (or when coverage-gap or red-CI overrides are requested), the plan cannot merge unless an admissible `MergeAuthorizationRecord` exists in `mcp/status.json`.
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.finalize;
+
+import java.time.Instant;
+
+public enum MergeGapClass {
+    UNHANDLED_COMMENTS("unhandled_comments"),
+    BOT_TIMED_OUT("bot_timed_out"),
+    BOT_RATE_LIMITED("bot_rate_limited"),
+    BOT_NOT_TRIGGERED("bot_not_triggered"),
+    RED_CI_OVERRIDE("red_ci_override"),
+    COVERAGE_GAP("coverage_gap");
+
+    private final String wireName;
+    MergeGapClass(String wireName) { this.wireName = wireName; }
+    public String wireName() { return wireName; }
+}
+
+public record MergeAuthorizationRecord(
+    String grantId,
+    String planId,
+    String headSha,
+    MergeGapClass gapClass,
+    String operatorChannel,
+    String operatorRationale,
+    Instant grantedAt
+) {
+    public boolean isAdmissibleFor(String currentHeadSha, MergeGapClass activeGapClass) {
+        return this.headSha != null
+            && this.headSha.equals(currentHeadSha)
+            && this.gapClass == activeGapClass;
+    }
+}
+----
+
+* *Operator-Only Minting*: Grants are minted exclusively through the authenticated operator channel (MCP elicitation or `pm-mcp operator authorize-merge --plan <plan_id> --head <sha> --gap-class <class> --rationale <text>`). Free-text lines in `decision.log` are never accepted as authorization evidence.
+* *Route on `admissible`, Never on Boolean `authorized`*: The barrier checks `grant.isAdmissibleFor(currentHeadSha, activeGapClass)`. A grant minted for an earlier commit $H_1$ or for `BOT_RATE_LIMITED` is inadmissible if `HEAD` advances to $H_2$ (e.g., after rebase) or if the active failure is `UNHANDLED_COMMENTS`.
+
+=== Cross-Plan Merge Mutex, FIFO Admission Queue & Epic Plan Emission
+_See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+
+==== Cross-Plan Merge Mutex & FIFO Admission Queue
+
+When multiple plans execute concurrently across worktrees of the same repository, `default:branch-cleanup` (`order = 70`) serializes their rebase-and-merge critical sections through the daemon-owned **Cross-Plan Merge Mutex** (`MergeMutexManager`), backed on disk by `.plan/local/locks/merge-mutex.json` for coexistence with legacy Python sessions (`PM-MIG-3`):
+
+[source,text]
+----
+Plan A (branch-cleanup) ──► [Enqueue FIFO] ──► [Acquire Holder Slot]
+                                                      │
+                        ┌─────────────────────────────┴─────────────────────────────┐
+                        │ Widened Critical Section:                                 │
+                        │  1. git fetch + rebase onto base (worktree-rebase-to)     │
+                        │  2. Post-rebase CI / re-review check                      │
+                        │     └─► If async wait required: RELEASE slot & keep FIFO  │
+                        │  3. Pre-merge barrier check (last gate before merge)      │
+                        │  4. Closed merge dispatch (safe-merge | merge-queue)      │
+                        └─────────────────────────────┬─────────────────────────────┘
+                                                      ▼
+                                            [Release Mutex & Pop]
+----
+
+1. *FIFO Admission Queue*: Plans requesting the merge mutex enter an ordered FIFO `admission_queue[]` keyed by `plan_id` and `enqueued_at`. A plan may acquire the active `holder` slot only when it is at the head of the FIFO queue and `holder == null`.
+2. *Widened Hold across Rebase-to-Merge*: Unlike a narrow lock around `gh pr merge`, the merge mutex is acquired **before** `branch-cleanup` rebases the feature branch onto `main` and held through the merge execution so a sibling plan cannot land a conflicting commit on `main` between rebase and merge.
+3. *Mandatory Release on Every Wait & Abort*: A plan must **never** hold the merge mutex while blocked in an asynchronous wait (`wait:finalize.concurrent-wait` for post-rebase CI, review-bot rate-window wait, merge-queue landing wait, or operator elicitation/escalation) or on abort. Entering any `wait` or `escalate` state inside `branch-cleanup` atomically releases `holder = null` while preserving the plan's FIFO queue position, allowing ready sibling plans to merge without head-of-line blocking.
+4. *Atomic Stale-Holder & Budget Reclaim*: Reaping runs inside the same atomic lock transaction as admission. An active `holder` is forcibly reclaimed if and only if it is provably stale:
+   * The holding `plan_id` no longer exists or is in a terminal state (`completed`, `aborted`), or
+   * The holder's lease budget (`lease_expires_at`, default 15 minutes without a heartbeat transition) has expired and no active git/CI job for that plan is running in the daemon.
+5. *Closed Merge Dispatch Set*: `branch-cleanup` executes merges exclusively through one of two closed mechanisms: direct `safe-merge` (squash/merge via enrolled CI provider when branch is up-to-date and green) or `merge-queue` enqueue (when repository merge queue is enabled, transitioning to `finalize.merge-queue-wait` after releasing the mutex).
+
+==== Epic Plan Emission (`emit:<plan_id>`)
+
+Orchestrator epics (`scope: epic`) manage multi-plan workstreams stored in `.plan/orchestrator/<epic_id>/` (`status.json` header and per-plan `.plan/orchestrator/<epic_id>/queue/<plan_id>.json` files).
+
+* *Never Dispatch a Plan as a Sub-Agent*: Because sub-agents are single-level leaf workers (`PM-WF-5`) and every plan dispatches its own leaf sub-agents during Phases 2–6, an epic **never** offers a `dispatch` link to launch a plan and **never** executes a plan inline.
+* *Surface Disjointness Gate*: When building the epic representation, the server evaluates expected file-surface disjointness across all currently `launched` and `running` sibling plans. An `indeterminate` surface is treated fail-closed as **not disjoint** (never eligible for parallel emission).
+* *`emit:<plan_id>` Transition (`rel: emit`)*: For each staged plan whose dependencies are `completed` and whose surface is disjoint from active plans, the epic state offers `emit:<plan_id>`. Following `emit:<plan_id>`:
+  1. Updates `.plan/orchestrator/<epic_id>/queue/<plan_id>.json` atomically (`status = "launched"`) under the epic lock.
+  2. Returns the exact operator bootstrap command (`pm-mcp enter --client <client> --plan <plan_id>`) in `facts.launch_command`. Note that `auto_emit` only pre-selects the emission candidate; it never spawns a background plan session automatically.
+  3. Transitions the epic's view of `<plan_id>` from `launched` to `running` automatically as soon as the operator runs `pm-mcp enter` and the daemon writes `.plan/local/plans/<plan_id>/mcp/entry.json`.

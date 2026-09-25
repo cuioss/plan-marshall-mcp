@@ -111,3 +111,78 @@ Concurrent asynchronous operations during finalization must be coordinated throu
 * The system must immediately short-circuit the composite wait upon detecting a hard failure in any constituent job (such as a red CI pipeline): cancel all remaining pending wait jobs, and transition the representation directly to a failure state providing `fix` and `loop_back` links.
 
 See the link:specification/hypermedia-format.adoc[Hypermedia Format Specification] and link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
+
+[#PM-WF-10]
+=== PM-WF-10: Phase 1–4 Planning Invariants, Lane Ratchet & Artifact Gates
+
+Planning phases (`phase-1-init` through `phase-4-plan`) must enforce deterministic artifact gates, main-checkout cleanliness, and a one-way planning lane ratchet.
+
+* The system must support multiple plan initialization sources in `pm_start` (`request`, `issue` fetched via CI job, `lesson` with premise check and file relocation, and `recipe` with a deterministic timestamp suffix), while rejecting phantom plan IDs shaped like UUIDs or lesson IDs.
+* The system must enforce a clean primary checkout (`git status --porcelain` outside git-ignored `.plan/local/`) at every planning phase transition and transition to an operator-blocked state (`*.blocked`) if `.plan/marshal.json` has uncommitted modifications.
+* The system must refuse transitions out of `phase-2-refine`, `phase-3-outline`, or `phase-4-plan` unless the phase's required artifact exists and passes structural validation (with `--allow-bare-transition` exemptions restricted to the operator channel).
+* The system must enforce a one-way planning lane ratchet (`light` -> `deep`): the light lane enforces a bounded read set (cap 25 files, band 8 modules), unknown scope estimates bias to `deep`, and light-to-deep escalation executes as a first-class engine transition.
+* The system must ensure `phase-2-refine` only widens active skill domains, `phase-3-outline` narrows them at most once, and a pull-request title is present from `phase-2-refine` onward.
+* The system must compute `phase-4-plan` task derivation (profile mapping, dependency DAG cycle detection, skill resolution, and atomic task creation) deterministically over structured deliverables, using the same resolver for posture preview and execution manifest composition.
+
+See the link:specification/phase-workflows.adoc[Phase Workflows Specification] for implementation details.
+
+[#PM-WF-11]
+=== PM-WF-11: Q-Gate Validation Loop, Change-Type & Scope-Deviation Contracts
+
+Quality gates, change-type classification, and scope-deviation handling must be governed by deterministic server validators and closed enumerations.
+
+* The system must enforce a single writer for `change_type` (a closed enum of six values), falling back to a guided judgment `submit` link when the deterministic heuristic is ambiguous, and refusing transitions when plan-level scope and deliverable-level scope disagree.
+* The system must execute Q-Gate validation loops (`off`, `once`, `until_clean`) in the engine with a hard cap of 3 iterations, a content-hash rerun gate, an immediate exit when pending blocking findings reach zero, and a deterministic surgical-change bypass predicate.
+* When an executing sub-agent encounters a scope deviation, the system must require a structured deviation submission (`hold`, `accept`, or `split`), transition the task to a blocked state awaiting batched operator consent via elicitation, require a persisted rationale included in the PR body for `accept`, and automatically seed a lesson for `split`.
+
+See the link:specification/phase-workflows.adoc[Phase Workflows Specification] for implementation details.
+
+[#PM-WF-12]
+=== PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation
+
+The workflow engine must distinguish routine informational user choices from security- or scope-authorizing operator decisions.
+
+* The system must model routine user interactions during planning (such as existing-plan handling, recipe choice, ambiguous domain selection, sibling collision resolution, posture selection, and batched refine clarifications) as `*.awaiting_user` states with typed question schemas, asking clarifications in a single batch and allowing at most one refine re-dispatch.
+* Where a host does not support MCP elicitation for routine non-authorizing choices, the system may accept answers relayed by the model and must record the relay provenance in the audit log.
+* For authorizing decisions (outline approval in `outline.review`, scope-deviation acceptance, handshake drift override, pre-merge authorization, and plan deletion), the system must strictly require MCP elicitation or the operator CLI (`PM-SEC-3`), never accepting model-relayed approvals.
+
+See the link:specification/phase-workflows.adoc[Phase Workflows Specification] and link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+
+[#PM-WF-13]
+=== PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier
+
+Phase 6 (`phase-6-finalize`) must execute steps according to compile-time-verified ordering bands, preserve valid step verdicts across rebases, and gate branch merge on a fail-closed barrier.
+
+* The system must organize finalize steps into five strict ordering bands verified at build time against order collisions, read-after-destroy hazards, and mutual exclusions:
+  ** *Settle band (`order < 11`)*: `sync-baseline` (3), `simplify` (5), `security-audit` (7), `self-review` (8), `architecture-refresh` (9), `pre-push quality gate` (10).
+  ** *Push boundary (`order == 11`)*: `push` (11), gated on working-tree build freshness.
+  ** *Concurrent wait & triage region (`11 < order < 70`)*: `create-pr` (20), `ci-verify` (22), `automatic-review` (30), `sonar-roundtrip` (40), unified finding triage (`triage:F-n`), and `adr-propose` (62).
+  ** *Merge gate (`order == 70`)*: `branch-cleanup` (70).
+  ** *Post-run band (`order > 70`)*: `lessons-capture` (991), `preference-emitter` (992), `record-metrics` (998), `phase-breakdown` (999), `emit-landing` (1000), and `archive-plan` (1100).
+* The system must record `head_at_completion` for every completed finalize step and evaluate verdict currency (`verdict_currency`) across rebases so a step verdict is retained when a `HEAD` advance does not touch its declared `verdict_inputs`.
+* The system must enforce a fail-closed pre-merge review barrier in `branch-cleanup` (70); any operator merge authorization grant must be cryptographically bound to both the current `HEAD` SHA and the specific gap class.
+
+See the link:specification/phase-workflows.adoc[Phase Workflows Specification] for implementation details.
+
+[#PM-WF-14]
+=== PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution
+
+Sub-agent dispatches must pack tasks into context-budgeted envelopes, track dispatch lifecycles through explicit `dispatch_id` return links, and resolve model/effort levels from a role registry.
+
+* The system must bin-pack implementation tasks at plan time into context-sized *task envelopes* (`pack-envelopes`); each task `submit` within an envelope must return the representation of the envelope's next pending task.
+* The system must assign a unique `dispatch_id` to every rendered `dispatch` link, mark it claimed on the first entity call carrying that ID, and require the dispatching session to report sub-agent completion via a `returned:<dispatch_id>` link carrying `status`, `display_detail`, and host `token_usage`.
+* The system must record missing sub-agent token usage as `unmeasured` (never as `0`), flag any reported `success` where the target entity was not submitted, and allow safe re-dispatch of unconfirmed dispatches.
+* The system must resolve the sub-agent effort level (levels 1–7 and `inherit`) from a hierarchical role registry (`plan.<phase>.effort.<subkey>` -> phase default -> plan default -> `inherit`, with an orchestrator `max` clamp) rendered via the active client profile and local `effort-ladder.json`, and must never emit a variant name that is not installed.
+
+See the link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification] and link:specification/client-profiles.adoc[Client Profiles Specification] for implementation details.
+
+[#PM-WF-15]
+=== PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex
+
+Orchestrator epics and concurrent plans must coordinate safely across sessions without sub-agent nesting violations or merge races.
+
+* The system must expose staged epic plans via an `emit:<plan_id>` link that returns the operator entry command rather than dispatching a full plan as a sub-agent, observing the child plan's `running` state from its `mcp/entry.json` record.
+* The system must serialize concurrent plan rebases and merges across all sessions on the machine through a daemon-owned, FIFO-ordered merge mutex (`~/.plan-marshall/mcp/locks/merge.lock`) that holds across the rebase-to-merge critical section, automatically releases whenever the plan enters a wait state, and reclaims expired lock budgets.
+
+See the link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification] and link:specification/phase-workflows.adoc[Phase Workflows Specification] for implementation details.
+

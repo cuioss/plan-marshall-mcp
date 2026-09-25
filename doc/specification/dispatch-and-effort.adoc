@@ -1,0 +1,791 @@
+= Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Sub-Agent Dispatch, Effort Resolution & Epic Emission (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document specifies the deterministic sub-agent dispatch lifecycle, task envelope bin-packing algorithms, post-return observability protocol, non-blocking sub-agent question batching, effort role resolution and 7-level capability ladder, read-only untrusted content ingestion (`execution-context-reader`), and epic plan emission (`emit:<plan>`) for *plan-marshall-mcp* (`PM-MCP`).
+
+In the legacy script-and-prose architecture, sub-agent orchestration relied on prose conventions for task sizing, unverified return summaries, and static build-time agent variant files that lacked MCP tool declarations. `PM-MCP` replaces these mechanisms with server-owned envelope entities, tracked `dispatch_id` lifecycles paired with `returned:<dispatch_id>` transitions, server-resolved effort roles, a strict two-family agent boundary (`execution-context` workers vs. MCP-free `execution-context-reader` extractors), and operator-mediated epic plan emission.
+
+== Traceability
+
+_See Requirements:_
+
+* _link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint]_
+* _link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+* _link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+* _link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+* _link:../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
+
+== Status: PLANNED
+
+== Task Envelope Bin-Packing & Sequential Task Yield
+_See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+During Phase 4 (`plan`), the workflow engine does not dispatch sub-agents per individual task. Instead, it computes a deterministic context cost for each planned task, packs compatible tasks into bounded execution envelopes (`envelope-1`, `envelope-2`, ...), and dispatches one leaf sub-agent per envelope.
+
+=== The 10K Context Budget Rule & Cost Sizing (`derive-cost-size`)
+
+Sub-agent context quality degrades when a single worker session accumulates excessive file reads, skill definitions, and intermediate edit diffs. To prevent mid-task context exhaustion while avoiding the cold-start overhead of spawning a separate sub-agent for every trivial change ("bundle rather than iterate"), the engine enforces a **10,000-token active working budget** (`ENVELOPE_BUDGET_TOKENS = 10_000`) for task bin-packing.
+
+For every planned task $t$, the `derive-cost-size` function computes an estimated token cost $\text{cost}(t)$ and maps it to a discrete T-shirt size class (`XS`, `S`, `M`, `L`, `XL`):
+
+$$\text{cost}(t) = B_{\text{profile}}(t) + (N_{\text{files}}(t) \times 900) + (N_{\text{steps}}(t) \times 600) + (N_{\text{skills}}(t) \times 750)$$
+
+where:
+
+* $B_{\text{profile}}(t)$ is the base overhead of the task's execution profile (`implementation`: `1800`, `module_testing`: `2000`, `verification`: `1200`, `documentation`: `1400`).
+* $N_{\text{files}}(t)$ is the number of target and reference files bound to the task.
+* $N_{\text{steps}}(t)$ is the number of sequential sub-steps within the task.
+* $N_{\text{skills}}(t)$ is the count of distinct domain vocabulary skills (`skill://pm/domain/...`) resolved for the task's profile and module.
+
+[cols="1,2,2,3"]
+|===
+|Cost Size |Estimated Token Range |Normalized Weight |Packing Constraint
+
+|`XS`
+|$\text{cost}(t) \le 2,500$
+|`2,000`
+|Packable with compatible tasks up to `10,000` budget and at most `4` tasks per envelope.
+
+|`S`
+|$2,500 < \text{cost}(t) \le 4,500$
+|`4,000`
+|Packable with compatible tasks up to `10,000` budget and at most `3` tasks per envelope.
+
+|`M`
+|$4,500 < \text{cost}(t) \le 7,500$
+|`6,500`
+|Packable with at most one `XS` or `S` task sharing the exact same module and profile (`\le 10,000`).
+
+|`L`
+|$7,500 < \text{cost}(t) \le 10,000$
+|`10,000`
+|Solo envelope only (`max_tasks = 1`). Never combined with other tasks.
+
+|`XL`
+|$\text{cost}(t) > 10,000$
+|`10,000+`
+|Solo envelope only (`max_tasks = 1`); triggers a plan-phase warning advising deliverable decomposition if $N_{\text{files}}(t) > 6$.
+|===
+
+=== Deterministic Envelope Packing Algorithm (`pack-envelopes`)
+
+Given the ordered sequence of tasks $T = [t_1, t_2, \dots, t_n]$ produced during Phase 4 (`plan`), `pack-envelopes` partitions $T$ into an ordered list of `TaskEnvelope` records while preserving topological dependency order:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.dispatch;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+
+public final class EnvelopePacker {
+
+    public static final int ENVELOPE_BUDGET_TOKENS = 10_000;
+    public static final int MAX_TASKS_PER_ENVELOPE = 4;
+
+    public enum CostSize {
+        XS(2_000, 4),
+        S(4_000, 3),
+        M(6_500, 2),
+        L(10_000, 1),
+        XL(12_000, 1);
+
+        private final int normalizedTokens;
+        private final int maxTasksInEnvelope;
+
+        CostSize(int normalizedTokens, int maxTasksInEnvelope) {
+            this.normalizedTokens = normalizedTokens;
+            this.maxTasksInEnvelope = maxTasksInEnvelope;
+        }
+
+        public int normalizedTokens() { return normalizedTokens; }
+        public int maxTasksInEnvelope() { return maxTasksInEnvelope; }
+    }
+
+    public record PlannedTaskSummary(
+            String taskId,
+            String moduleId,
+            String profile,
+            String role,
+            Set<String> skillUris,
+            CostSize costSize,
+            int estimatedTokens,
+            List<String> dependsOnTaskIds
+    ) {}
+
+    public record PackedEnvelope(
+            String envelopeId,
+            String moduleId,
+            String profile,
+            String role,
+            List<String> taskIds,
+            List<String> unionSkillUris,
+            int totalNormalizedTokens
+    ) {}
+
+    public List<PackedEnvelope> packEnvelopes(List<PlannedTaskSummary> orderedTasks) {
+        List<PackedEnvelope> envelopes = new ArrayList<>();
+        List<PlannedTaskSummary> currentBatch = new ArrayList<>();
+        int currentBudget = 0;
+        int currentMaxTasks = MAX_TASKS_PER_ENVELOPE;
+
+        for (PlannedTaskSummary task : orderedTasks) {
+            CostSize size = task.costSize();
+            int weight = size.normalizedTokens();
+
+            boolean compatibleWithCurrent = !currentBatch.isEmpty()
+                    && canShareEnvelope(currentBatch.getFirst(), task)
+                    && (currentBatch.size() + 1) <= Math.min(currentMaxTasks, size.maxTasksInEnvelope())
+                    && (currentBudget + weight) <= ENVELOPE_BUDGET_TOKENS;
+
+            if (!compatibleWithCurrent && !currentBatch.isEmpty()) {
+                envelopes.add(sealEnvelope(envelopes.size() + 1, currentBatch, currentBudget));
+                currentBatch.clear();
+                currentBudget = 0;
+                currentMaxTasks = MAX_TASKS_PER_ENVELOPE;
+            }
+
+            currentBatch.add(task);
+            currentBudget += weight;
+            currentMaxTasks = Math.min(currentMaxTasks, size.maxTasksInEnvelope());
+        }
+
+        if (!currentBatch.isEmpty()) {
+            envelopes.add(sealEnvelope(envelopes.size() + 1, currentBatch, currentBudget));
+        }
+        return List.copyOf(envelopes);
+    }
+
+    private boolean canShareEnvelope(PlannedTaskSummary first, PlannedTaskSummary candidate) {
+        // Tasks share an envelope only when they target the same module, execution profile, and effort role
+        return first.moduleId().equals(candidate.moduleId())
+                && first.profile().equals(candidate.profile())
+                && first.role().equals(candidate.role());
+    }
+
+    private PackedEnvelope sealEnvelope(int index, List<PlannedTaskSummary> batch, int budget) {
+        PlannedTaskSummary head = batch.getFirst();
+        List<String> taskIds = batch.stream().map(PlannedTaskSummary::taskId).toList();
+        List<String> skills = batch.stream()
+                .flatMap(t -> t.skillUris().stream())
+                .distinct()
+                .sorted()
+                .toList();
+        return new PackedEnvelope(
+                "envelope-" + index,
+                head.moduleId(),
+                head.profile(),
+                head.role(),
+                taskIds,
+                skills,
+                budget
+        );
+    }
+}
+----
+
+=== Sequential Task Yield Within an Envelope
+
+When a sub-agent is spawned for an envelope (`entity = "envelope-N"`), it interacts with the daemon exclusively at `scope = "entity"`. The sub-agent never receives all task bodies upfront in its dispatch prompt; instead, the server yields tasks one at a time as hypermedia state representations:
+
+[source,text]
+----
+Parent Session                     PM-MCP Daemon                    Sub-Agent (envelope-1)
+──────┬───────                     ──────┬──────                    ──────────┬───────────
+      │ pm_state(scope="plan")           │                                    │
+      │─────────────────────────────────►│                                    │
+      │◄─────────────────────────────────│                                    │
+      │ Representation with              │                                    │
+      │ dispatch:envelope-1 (dsp-01)     │                                    │
+      │ + returned:dsp-01                │                                    │
+      │                                  │                                    │
+      │ Spawn Sub-Agent (host_tool)      │                                    │
+      │──────────────────────────────────────────────────────────────────────►│
+      │                                  │ pm_state(scope="entity",           │
+      │                                  │   entity="envelope-1")             │
+      │                                  │◄───────────────────────────────────│
+      │                                  │ [Marks dsp-01 CLAIMED]             │
+      │                                  │───────────────────────────────────►│
+      │                                  │ Yield TASK-1 state + submit:TASK-1 │
+      │                                  │                                    │
+      │                                  │ pm_do(scope="entity",              │
+      │                                  │   link="submit:TASK-1", args={...})│
+      │                                  │◄───────────────────────────────────│
+      │                                  │ [Persists TASK-1 completion]       │
+      │                                  │───────────────────────────────────►│
+      │                                  │ Yield TASK-2 state + submit:TASK-2 │
+      │                                  │                                    │
+      │                                  │ pm_do(scope="entity",              │
+      │                                  │   link="submit:TASK-2", args={...})│
+      │                                  │◄───────────────────────────────────│
+      │                                  │ [Persists TASK-2; seals envelope-1]│
+      │                                  │───────────────────────────────────►│
+      │                                  │ State: envelope.completed (links[])│
+      │◄──────────────────────────────────────────────────────────────────────│
+      │ Sub-agent returns {status, display_detail, token_usage}               │
+      │                                  │                                    │
+      │ pm_do(scope="plan",              │                                    │
+      │   link="returned:dsp-01", ...)   │                                    │
+      │─────────────────────────────────►│                                    │
+      │                                  │ [Verifies envelope-1 completed]    │
+      │◄─────────────────────────────────│                                    │
+      │ Next envelope or verification    │                                    │
+----
+
+1. *Initial Yield (`start`)*: The sub-agent invokes `pm_state(scope="entity", plan_id="<plan_id>", entity="envelope-N")`. The server transitions the active `dispatch_id` for `envelope-N` from `UNCLAIMED` to `CLAIMED` and returns the state representation for the first uncompleted task $t_1$ (`state: "envelope.task.active"`, `facts.task_id: "TASK-1"`, `links: [submit:TASK-1, escalate:TASK-1]`).
+2. *Sequential Advancement on `submit`*: When the sub-agent completes task $t_i$ and invokes `pm_do(scope="entity", link="submit:TASK-i", args={...})`, the engine atomically persists task $t_i$'s result in the plan store and advances the envelope cursor to $t_{i+1}$. If $i < k$, the `pm_do` call immediately returns the representation for task $t_{i+1}$ without returning to the parent session.
+3. *Terminal Envelope Completion*: When the final task $t_k$ in `envelope-N` is submitted, `pm_do` transitions the entity to the terminal state `envelope.completed` with an empty `links` table (`links[0]{rel,link,form,free}:`). The sub-agent then exits and returns its completion summary to the parent session.
+
+== Dispatch Observability & Return Protocol
+_See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+Because MCP servers do not directly spawn host sub-agents—the host session executes its native agent-spawning tool (`Task` in Claude Code, `task` in OpenCode, `invoke_subagent` in Antigravity)—the server cannot observe sub-agent termination, harness cancellation, or token consumption unless the dispatching session reports the outcome back through a paired hypermedia link.
+
+=== `dispatch_id` Generation & Lifecycle States
+
+Every time the workflow engine renders a representation offering a `dispatch:<entity>` link (including concurrent fan-out dispatches such as per-module architecture enrichment), it allocates or reuses an active `dispatch_id` and pairs the dispatch link with a corresponding `returned:<dispatch_id>` transition link in the parent representation:
+
+* *Identifier Format*: `dsp-<plan_or_epic_id>-<4_digit_seq>-<6_hex_nonce>` (e.g., `dsp-auth-refactor-0003-8f2a1c`).
+* *Audit Logging on Render*: One `[DISPATCH]` audit record is written per firing (never per role lookup). A re-dispatch after an unconfirmed or failed run allocates a new `dispatch_id` and writes a new `[DISPATCH]` record.
+
+[cols="1,2,3"]
+|===
+|Lifecycle State |Trigger |Server Invariants
+
+|`UNCLAIMED`
+|Representation containing `dispatch:<entity>` is rendered and persisted.
+|The sub-agent has not yet contacted the daemon. If the parent session calls `pm_state` again before the sub-agent claims the dispatch, the same `dispatch_id` remains active unless explicitly superseded by `redispatch:<entity>`.
+
+|`CLAIMED`
+|First entity-scoped `pm_state` or `pm_do` call arrives targeting `entity` (or carrying `dispatch_id`).
+|Records `claimed_at` timestamp. Confirms the host actually launched the sub-agent and the sub-agent has MCP connectivity.
+
+|`RETURNED`
+|Parent session invokes `pm_do` on `returned:<dispatch_id>` after the sub-agent finishes.
+|Records `returned_at`, `reported_status`, `display_detail`, and `token_usage` (`measured` integer or `"unmeasured"`). Cross-checks entity state before advancing the parent workflow.
+
+|`SUPERSEDED`
+|Parent session invokes `redispatch:<entity>` on an `UNCLAIMED` or aborted dispatch, or a loop-back iteration creates a new envelope.
+|Any subsequent `pm_do` or `pm_state` referencing a `SUPERSEDED` `dispatch_id` is rejected immediately with `reason: "stale_dispatch_id"`.
+|===
+
+=== Normative Schema for `returned:<dispatch_id>`
+
+In the parent representation, every active `dispatch:<entity>` link is accompanied by a `returned:<dispatch_id>` link with `rel = "submit"` and `form = "submit"`:
+
+[source,text]
+----
+links[2]{rel,link,form,free}:
+  dispatch,dispatch:envelope-1,dispatch,-
+  submit,returned:dsp-auth-refactor-0001-4b9c10,submit,"status:enum[success|error|loop_back|blocked|harness_cancellation],display_detail:text[1..80],token_usage:int[1..10000000]?"
+----
+
+When the sub-agent finishes (or fails/cancels in the host harness), the parent session invokes `pm_do` on `returned:<dispatch_id>` with the following JSON Schema for `args`:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/dispatch-return-args-v1.json",
+  "title": "DispatchReturnArgs",
+  "type": "object",
+  "required": ["status", "display_detail"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "success",
+        "error",
+        "loop_back",
+        "blocked",
+        "harness_cancellation"
+      ],
+      "description": "Terminal status reported by the sub-agent or observed by the host harness."
+    },
+    "display_detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[\\x20-\\x7E]+(?<!\\.)$",
+      "description": "Concise single-line ASCII summary (1..80 chars) without a trailing period."
+    },
+    "token_usage": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 10000000,
+      "description": "Total tokens consumed by the sub-agent if reported by the host; omit or pass null when unmeasured."
+    }
+  }
+}
+----
+
+=== Post-Return Integrity Invariants
+
+The workflow engine enforces four non-negotiable post-return invariants when processing `returned:<dispatch_id>`:
+
+1. *Unmeasured Token Usage Never Fabricates Zero*:
+   If `token_usage` is omitted or `null` in `returned:<dispatch_id>`, the server persists `"token_usage": "unmeasured"` in the dispatch ledger and phase metrics store (`metrics.json`). It **must never** record `0`, because a zero token count corrupts cost aggregations and masks missing host telemetry.
+2. *Submit-Before-Return Verification (No Synthesized Submissions)*:
+   When `returned:<dispatch_id>` is called with `status: "success"`, the server inspects the persisted state of the target `entity`:
+   * If the entity reached its required terminal submission state (e.g., `envelope.completed`, or the expected outline/triage artifact was submitted via `pm_do`), the return succeeds and advances the parent workflow.
+   * If the entity has **not** recorded its required `submit` transition (for example, the sub-agent edited files or answered in prose and returned `"success"` without calling `pm_do(link="submit:...")`), the server **never synthesizes a missing submission**. Instead, it marks the dispatch record `INCOMPLETE_SUBMISSION`, logs an attribution defect in the audit log, and transitions the parent state to `<phase>.dispatch-incomplete` offering `resume:<entity>` (to complete or re-dispatch after inspecting disk state) and `escalate`.
+3. *No Blind Retry on Unconfirmed Dispatches*:
+   When a dispatch fails to return (`harness_cancellation`, empty return, or host crash) or remains `UNCLAIMED` / `CLAIMED` without completion, the server never retries the sub-agent blindly. It inspects the worktree (`worktree_sha`) and entity store on disk first, exposes the observed partial progress (e.g., tasks $t_1$ completed, $t_2$ pending in `envelope-1`) in `facts`, and issues a fresh `dispatch_id` only for the remaining uncompleted tasks in the envelope.
+4. *Citations-Only Return for Read-Only Workers*:
+   Read-only worker dispatches (such as deep-lane codebase exploration or verification sweeps) persist their detailed findings and component assessments via entity-scoped `submit` links during execution and return only aggregate counts in `display_detail` (e.g., `"3 modules analyzed, 2 findings recorded"`), keeping raw findings out of the parent orchestrator's context window.
+
+== Sub-Agent Question Batching & Non-Blocking Escalation
+_See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+Sub-agents operating at `scope = "entity"` are strictly forbidden from directly prompting the human operator or blocking in an interactive wait loop.
+
+=== Architectural Rationale
+
+1. *Turn and Lock Conservation*: A sub-agent blocked waiting for human input holds an active host sub-session and prevents parallel sibling sub-agents from completing their fan-out batch.
+2. *Host Elicitation Limitations*: Agent hosts (Claude Code, OpenCode, Antigravity) do not reliably route MCP elicitation requests or interactive user-question modals originating from inside background/child sub-agents to the top-level terminal UI.
+3. *Single Bounded Escalation Guarantee*: Collecting ambiguities across all sub-agents in a phase allows the parent session to present a single, consolidated question batch to the operator rather than interrupting the user piecemeal.
+
+=== Prompt Envelopes & Entity Escalation Protocol
+
+When a sub-agent encounters an ambiguity or requires an operator decision during `phase-2-refine`, `phase-3-outline`, or `phase-5-execute`, it follows one of two non-blocking paths:
+
+1. *Best-Judgment Completion with Attached Prompt Envelopes (`refine_prompt`, `outline_prompt`, `escalate_ask`)*:
+   In planning and outline states (`refine`, `outline`), the sub-agent completes its draft artifact using its best engineering judgment and includes structured open questions in the `questions` array of its `submit` link payload. Each question conforms to the `BatchedQuestionEnvelope` schema below, where every selectable option carries a canonical `branch_key` enum value bound to a downstream workflow transition.
+2. *Immediate Entity-Scoped `escalate` (`status: "blocked"`)*:
+   In execution states (`execute`) where a task cannot safely proceed without an authoritative decision (e.g., an undeclared scope deviation or contradictory interface contract), the sub-agent invokes `pm_do(scope="entity", link="escalate:<task_id>", args={"question": "...", "options": [...]})`. The server persists the pending question in the plan store and immediately transitions the entity to `envelope.blocked` (an immutable terminal state for that dispatch). The sub-agent returns `status: "blocked"` to the parent session.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/batched-question-envelope-v1.json",
+  "title": "BatchedQuestionEnvelope",
+  "type": "object",
+  "required": ["question_id", "prompt_kind", "source_entity", "question_text", "options"],
+  "additionalProperties": false,
+  "properties": {
+    "question_id": {
+      "type": "string",
+      "pattern": "^Q-[0-9]{1,3}$"
+    },
+    "prompt_kind": {
+      "type": "string",
+      "enum": ["refine_prompt", "outline_prompt", "escalate_ask"]
+    },
+    "source_entity": {
+      "type": "string"
+    },
+    "question_text": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "default_assumption": {
+      "type": ["string", "null"],
+      "description": "Best-judgment assumption applied by the sub-agent if the operator accepts defaults."
+    },
+    "options": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["branch_key", "label", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "branch_key": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,31}$",
+            "description": "Deterministic enum key bound to a state transition or parameter assignment."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 240
+          },
+          "recommended": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    }
+  }
+}
+----
+
+=== Parent Session Aggregation (`*.awaiting_answers`)
+
+When the parent session processes `returned:<dispatch_id>` for all dispatches in the current state and the plan store contains one or more unresolved `BatchedQuestionEnvelope` records:
+
+1. The engine transitions the parent plan to `<phase>.awaiting_answers` (e.g., `refine.awaiting_answers`, `outline.awaiting_answers`, `execute.awaiting_answers`).
+2. The representation exposes the consolidated questions in `facts.pending_questions` and offers an `answer_questions` link (accepting a map of `question_id -> branch_key` via MCP elicitation or model-relayed user answers for non-authorizing clarifications, as governed by `PM-SEC-3`).
+3. Submitting `answer_questions` resolves the batched questions in one transition and advances the plan (or re-dispatches the unblocked envelope with a new `dispatch_id`).
+
+== Role Registry, Effort Level Ladder (Levels 1–7) & Variant Installation
+_See Requirements link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution], link:../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
+
+`PM-MCP` decouples workflow dispatch states from concrete LLM model identifiers through a two-stage resolution pipeline:
+
+1. **Role Resolution**: Maps a workflow state's semantic `role` to an abstract **Effort Level** (`1`..`7` or `"inherit"`).
+2. **Ladder & Variant Resolution**: Maps the abstract Effort Level and the scope's recorded `client_id` (`mcp/entry.json`) to an installed per-client agent variant pinning the runtime-specific `model` and `effort` parameters.
+
+=== Semantic Role Registry & Lookup Hierarchy
+
+Every `dispatch` state in the Workflow DSL declares a canonical role key. Role keys are partitioned into two top-level namespaces:
+
+* **Plan Roles (`plan.<phase>.effort.<subkey>`)**: Used by plan-scoped dispatches across phases 1 through 6.
+* **Orchestrator Roles (`orchestrator.effort.<subkey>`)**: Used by epic-scoped analysis dispatches (landing analysis, spec corpus re-grounding, workstream decomposition).
+
+[cols="2,2,1,3"]
+|===
+|Canonical Role Key |Phase / Scope |Built-in Default Level |Responsibility
+
+|`plan.phase-1-init.effort.reader`
+|`init`
+|`2`
+|Untrusted external issue/PR/web content extraction (`execution-context-reader`).
+
+|`plan.phase-2-refine.effort.clarifier`
+|`refine`
+|`3`
+|Codebase-grounded requirement gap analysis and question generation.
+
+|`plan.phase-3-outline.effort.light_outliner`
+|`outline`
+|`4`
+|Bounded localized solution outline generation (light lane).
+
+|`plan.phase-3-outline.effort.deep_explorer`
+|`outline`
+|`3`
+|Read-only module/dependency survey in deep-lane outline fan-out.
+
+|`plan.phase-3-outline.effort.deep_synthesizer`
+|`outline`
+|`5`
+|Architectural synthesis and deliverable structuring (deep lane).
+
+|`plan.phase-4-plan.effort.task_planner`
+|`plan`
+|`4`
+|Deliverable-to-task decomposition and verification step binding.
+
+|`plan.phase-5-execute.effort.implementer`
+|`execute`
+|`4`
+|Production code implementation envelope execution.
+
+|`plan.phase-5-execute.effort.module_tester`
+|`execute`
+|`4`
+|Unit and integration test authoring envelope execution.
+
+|`plan.phase-5-execute.effort.verifier`
+|`execute`
+|`3`
+|End-of-phase verification sweep and arch-gate assessment.
+
+|`plan.phase-6-finalize.effort.self_reviewer`
+|`finalize`
+|`5`
+|Pre-submission structural self-review and security audit evaluation.
+
+|`plan.phase-6-finalize.effort.triager`
+|`finalize`
+|`4`
+|PR review comment and Sonar finding disposition triage.
+
+|`orchestrator.effort.decomposer`
+|`orchestrate`
+|`5`
+|Epic workstream decomposition and dependency graph staging.
+
+|`orchestrator.effort.landing_analyzer`
+|`orchestrate`
+|`3`
+|Completed plan landing analysis and ledger reconciliation.
+
+|`orchestrator.effort.spec_reviewer`
+|`orchestrate`
+|`4`
+|Staged specification re-grounding against repository `HEAD`.
+|===
+
+==== Deterministic Role Lookup Algorithm
+
+When resolving the target level for a role key, the engine evaluates the project configuration (`.plan/marshal.json`) using the following precedence chain:
+
+1. **For Plan Roles (`plan.<phase>.effort.<subkey>`)**:
+   $$\text{resolve}(phase, subkey) = \text{config}[\texttt{plan.}\langle phase\rangle\texttt{.effort.}\langle subkey\rangle] \;\ COALESCE\; \text{config}[\texttt{plan.}\langle phase\rangle\texttt{.effort.default}] \;\ COALESCE\; \text{config}[\texttt{plan.effort.default}] \;\ COALESCE\; \text{builtInDefault}(phase, subkey) \;\ COALESCE\; \texttt{"inherit"}$$
+2. **For Orchestrator Roles (`orchestrator.effort.<subkey>`) with `max` Clamp**:
+   $$\text{raw}(subkey) = \text{config}[\texttt{orchestrator.effort.}\langle subkey\rangle] \;\ COALESCE\; \text{config}[\texttt{orchestrator.effort.default}] \;\ COALESCE\; \text{builtInDefault}(\texttt{"orchestrator"}, subkey) \;\ COALESCE\; \texttt{"inherit"}$$
+   If $\text{config}[\texttt{orchestrator.effort.max}]$ is configured as an integer $M \in [1..7]$ and $\text{raw}(subkey)$ resolves to an integer level $L$, the effective level is clamped to $\min(L, M)$. Orchestrator dispatches must always name their `orchestrator.effort.<subkey>` role explicitly so the `max` clamp can never be bypassed.
+3. **Unknown Role Key Fallback**:
+   If a workflow or override references an unrecognized `<subkey>`, the resolver logs a structured configuration warning (`WARN_UNKNOWN_EFFORT_ROLE`) and falls back to `<phase>.effort.default` -> `plan.effort.default` -> `"inherit"`. An unknown role key **never** blocks a dispatch.
+
+=== The 7-Level Effort Ladder & Alias Gating (`effort-ladder.json`)
+
+The effort ladder maps abstract levels `1` through `7` (plus `"inherit"`) to concrete model identifiers and reasoning/thinking effort levels per client runtime (`claude`, `opencode`, `antigravity`).
+
+* **Default Ladder**: Compiled into each client profile (`classpath:/profiles/<client_id>.json`).
+* **Machine-Local Override**: Operators may customize model pins or enable frontier alias tiers in `.plan/local/effort-ladder.json` or `~/.plan-marshall/mcp/effort-ladder.json`.
+* **Alias Gating of Levels 6 and 7**: Levels `1` through `5` and `"inherit"` are always enabled by default. Levels `6` and `7` represent high-cost frontier reasoning tiers (`opus-high`, `opus-max` / ultra extended thinking) and are **alias-gated**: they are only active when `alias_gates.level_6_enabled` or `alias_gates.level_7_enabled` is `true` in the active ladder configuration and the corresponding variant file is installed. If a role resolves to level `6` or `7` while its alias gate is disabled, the resolver clamps the level down to `5` (or the highest installed level $\le 5$).
+* **Installed Variant Invariant**: The resolver enforces the strict invariant: *Never name an agent variant in a `dispatch` link that was not installed in the client bundle*.
+
+[cols="1,2,2,2,3"]
+|===
+|Level |Tier Classification |Claude Code Default (`model` / `effort`) |Antigravity / OpenCode Default |Typical Workload
+
+|`1`
+|Mechanical / Fast-Low
+|`haiku` / `low`
+|`flash_lite` / `low`
+|Deterministic formatting, simple marker lookups.
+
+|`2`
+|Fast-Standard
+|`haiku` / `medium`
+|`flash` / `medium`
+|Reader extraction (`execution-context-reader`), lightweight inventory scans.
+
+|`3`
+|Standard-Low
+|`sonnet` / `low`
+|`pro` / `low`
+|Verification sweeps, landing analysis, bounded refinement checks.
+
+|`4`
+|Standard-Medium
+|`sonnet` / `medium`
+|`pro` / `medium`
+|Default implementation, module testing, task planning, PR finding triage.
+
+|`5`
+|Standard-High
+|`sonnet` / `high`
+|`pro` / `high`
+|Deep-lane architectural synthesis, pre-submission structural self-review, security audits.
+
+|`6`
+|Frontier-High *(Alias-Gated)*
+|`opus` / `high`
+|`pro` / `high` (or frontier alias)
+|Complex multi-module refactoring and cross-cutting concurrency design.
+
+|`7`
+|Frontier-Max *(Alias-Gated)*
+|`opus` / `max`
+|`pro` / `max` (or frontier alias)
+|Hardest architectural deadlocks and formal protocol verification.
+
+|`inherit`
+|Session-Inherited
+|*(omitted — inherits parent model)*
+|`inherit`
+|Fallback when operator prefers uniform session-wide model selection.
+|===
+
+==== Normative `effort-ladder.json` Schema
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/effort-ladder-v1.json",
+  "title": "EffortLadderConfig",
+  "type": "object",
+  "required": ["format_version", "client_id", "alias_gates", "levels"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "client_id": {
+      "type": "string",
+      "enum": ["claude", "opencode", "antigravity", "neutral"]
+    },
+    "alias_gates": {
+      "type": "object",
+      "required": ["level_6_enabled", "level_7_enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "level_6_enabled": { "type": "boolean", "default": false },
+        "level_7_enabled": { "type": "boolean", "default": false }
+      }
+    },
+    "levels": {
+      "type": "object",
+      "required": ["1", "2", "3", "4", "5", "6", "7", "inherit"],
+      "additionalProperties": false,
+      "patternProperties": {
+        "^([1-7]|inherit)$": {
+          "type": "object",
+          "required": ["variant_suffix", "model", "effort", "installed"],
+          "additionalProperties": false,
+          "properties": {
+            "variant_suffix": {
+              "type": "string",
+              "enum": ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "inherit"]
+            },
+            "model": {
+              "type": ["string", "null"],
+              "description": "Concrete model identifier or null for 'inherit'."
+            },
+            "effort": {
+              "type": ["string", "null"],
+              "enum": ["low", "medium", "high", "max", null]
+            },
+            "installed": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+----
+
+=== Per-Client Variant Installation (`execution-context`)
+
+Because agent hosts such as Claude Code and OpenCode load sub-agent definitions from static files at session startup and bind model/effort settings plus allowed tool lists in agent frontmatter, `pm-mcp client install --client <client>` generates and installs the per-level variant files into the host's agent directory:
+
+* **Worker Family Variants**: `execution-context-l1` through `execution-context-l7` (for enabled levels) and `execution-context-inherit`.
+* **Reader Family Variants**: `execution-context-reader-l2` and `execution-context-reader-inherit`.
+* **Mandatory MCP Tool Inclusion**: Every installed `execution-context` worker variant **must** include the `PM-MCP` tool surface (`mcp__plan-marshall__pm_state`, `mcp__plan-marshall__pm_do`, `mcp__plan-marshall__pm_build`, `mcp__plan-marshall__pm_lsp`, `mcp__plan-marshall__pm_skill` or host-equivalent wildcard `mcp__plan-marshall__*`) alongside host file/shell tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`). Without these MCP tool permissions, a sub-agent cannot execute `start: pm_state(...)` or submit its work via `pm_do`.
+* **Concise Universal Worker Body**: The prompt body of every `execution-context-*` variant is reduced to a deterministic 5-step execution loop:
+  1. Load `skill://pm/core` and every URI listed in `skills[]`.
+  2. Call the exact `start: pm_state(...)` command from the dispatch prompt.
+  3. Perform the judgment or code/test authoring required by the returned state representation.
+  4. Follow `pm_do(scope="entity", link="...", args={...})` until the entity representation reaches a terminal state (`links[0]`).
+  5. Return `{status, display_detail, token_usage}` to the caller without asking the user questions or spawning sub-agents.
+* **Persona & Execution Lane Flattening**:
+  - *Personas*: The server resolves persona DAGs (`composes:` and `profiles:` with cycle rejection) at representation-build time, flattening them into `skills[]` URIs (`skill://pm/core` + `skill://pm/domain/...`). The legacy 1,500-line `persona-plan-marshall-agent` is stripped of Bash/CLI hygiene rules (roughly two-thirds of its volume) and distilled into `skill://pm/core`.
+  - *Execution Lanes*: Execution postures (`minimal ⊏ standard ⊏ full`, selected at `phase-1-init`) prune optional workflow elements server-side while enforcing **floor immunity** (a lane override of `off` on core or derived-state elements is ignored and noted in diagnostics; an unresolved `ask` element is dropped only when its external provider is absent).
+
+== Reader Agent Family (`execution-context-reader`)
+_See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+
+When a workflow ingests untrusted external content—such as external web pages, GitHub/GitLab issue descriptions, pull request review comments from third-party contributors, or external static analysis messages—`PM-MCP` isolates the untrusted payload inside the **`execution-context-reader`** agent family.
+
+=== Two-Boundary Containment Architecture
+
+[source,text]
+----
+Untrusted External Source (Web / Issue / PR Body)
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────────┐
+│ Boundary 1: Reader Sub-Agent (execution-context-reader)  │
+│  • Tools: Read, Grep, Glob, WebFetch, WebSearch ONLY     │
+│  • NO MCP Tools (no pm_do, pm_state, pm_build, pm_start) │
+│  • NO Write, Edit, or Bash tools                         │
+│  • Output: Structured candidate JSON/text in response    │
+└─────────────────────────────┬────────────────────────────┘
+                              │ Plain-text response to parent session
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│ Parent Orchestrator Session                              │
+│  • Treats reader output as opaque untrusted candidate    │
+│  • Calls pm_do(link="ingest_candidates:<dispatch_id>",   │
+│                args={candidates, status, display_detail})│
+└─────────────────────────────┬────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│ Boundary 2: Deterministic Server-Side Validator (PM-MCP) │
+│  • Enforces strict JSON schema & length/charset bounds   │
+│  • Strips executable/prompt-injection directives         │
+│  • Persists validated records to findings/references     │
+└──────────────────────────────────────────────────────────┘
+----
+
+=== Normative Reader Constraints
+
+1. *Strict Read-Only Host Tool Allowlist*:
+   Installed `execution-context-reader` variants declare only read-only host tools (`Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch` or client-profile equivalents). `Write`, `Edit`, `MultiEdit`, `Bash`, and `Task`/`invoke_subagent` are strictly excluded.
+2. *Zero MCP Tools*:
+   Reader variants are provisioned with **zero `pm_*` MCP tools**. Unlike worker sub-agents, a reader sub-agent does not call `pm_state` or `pm_do`. Instead, the server embeds the extraction schema and target source locators directly inside the rendered `dispatch` prompt's `reader_contract` block. Even if adversarial prompt injection inside an issue body or web page hijacks the reader sub-agent's instructions, the sub-agent has no tool capable of mutating workflow state, modifying files, or executing shell commands.
+3. *Deterministic Server Validator Seam*:
+   The reader sub-agent returns its extracted candidate records as structured text to the dispatching parent session. The parent session relays that candidate payload into the paired server validation link (e.g., `ingest_candidates:<dispatch_id>`), which simultaneously records the `returned:<dispatch_id>` observability metrics and runs the compiled deterministic validator before writing any candidate to `references.json` or `findings.jsonl`.
+4. *Separation from Citations-Only Rule*:
+   Reader containment is a security boundary (`PM-SEC-1`) and must never be conflated with the citations-only context-conservation rule used by trusted read-only worker sub-agents.
+
+== Orchestrator Epic Plan Emission (`emit:<plan>`) & Epic Coordination
+_See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+
+An orchestrator epic (`scope = "epic"`) decomposes a multi-plan initiative into workstreams and staged plan specifications, tracks cross-plan dependencies and surface disjointness, reconciles landing outcomes, and coordinates shared repository locks.
+
+=== Why Epics Emit Plans Rather Than Dispatching Sub-Agents
+
+A plan (`scope = "plan"`) is a top-level workflow that dispatches its own leaf sub-agents (`scope = "entity"`). Under the single-level leaf constraint (`PM-WF-5`), a sub-agent can never spawn child sub-agents. Consequently, an epic **must never** invoke a child plan via a `dispatch` link or launch it inline.
+
+Instead, the epic state machine exposes the **`emit:<plan_id>`** hypermedia link (`rel = "emit"`, `form = "submit"`):
+
+1. *Surface Disjointness Gate*:
+   While building the epic representation, the server computes the expected file/module footprint surface of every staged plan waiting in the workstream queue against all currently live (`launched` or `running`) plans. A single server-side reader evaluates expected surfaces; an `indeterminate` surface is **never** treated as disjoint, and `absent`, `unlistable`, and `unreadable` surfaces remain distinct states (ADR-019). Only plans whose expected surface is provably disjoint from all active plans (and whose prerequisite plans have `shipped`) have an `emit:<plan_id>` link rendered.
+2. *Emission Transition (`launched`, Never `running`)*:
+   When the model follows `pm_do(scope="epic", link="emit:<plan_id>", args={})`, the server atomically updates the plan's queue row `.plan/orchestrator/<epic_id>/queue/<plan_id>.json` to `status: "launched"` (with `emitted_at` timestamp) and returns the exact operator entry command in `facts.emitted_command`:
++
+[source,text]
+----
+pm-mcp enter --client claude --plan <plan_id> --from-epic <epic_id>
+----
++
+The invariant *Emit is not running, and `auto_emit` never automates the start* is strictly enforced: `auto_emit` only pre-renders eligible `emit:<plan_id>` commands in the representation; only the human operator starts the new plan session.
+3. *Automatic Observation of `running` via Child `mcp/entry.json`*:
+   When the operator runs the emitted entry command in a new host session, `pm-mcp enter` writes `.plan/plans/<plan_id>/mcp/entry.json` (recording `--from-epic <epic_id>`). The daemon immediately observes the creation of the child plan's entry record and transitions the epic's queue row for `<plan_id>` from `launched` to `running` without requiring manual status updates in the epic session.
+
+=== Git-Distributed Epic Ledger & Per-File Store Layout (ADR-024)
+
+To allow epic state to merge cleanly across worktrees and machines via Git without monolithic file conflicts, the daemon persists epic state under `.plan/orchestrator/<epic_id>/` using a strict per-concern file split:
+
+[cols="2,2,3"]
+|===
+|Path |Writer Discipline |Contents & Invariants
+
+|`status.json`
+|Daemon only (atomic write-and-rename under epic lock).
+|Epic header metadata, active workflow state (`orchestrate.*`), workstream definitions, and `format_version`.
+
+|`queue/<PLAN-ID>.json`
+|Daemon only (exclusive create `CREATE_NEW` on addition; row-local read-modify-write on update).
+|One file per staged plan tracking the 10-state plan vocabulary partitioned into `live` (`staged`, `ready`, `launched`, `running`, `blocked`), `terminal.shipped` (`merged`, `completed`), and `terminal.closed_unshipped` (`abandoned`, `superseded`, `split`). Executing child plans **never** write to `queue/` directly.
+
+|`inbox.jsonl`
+|Append-only via plan-scope outbox link; claim-on-consumption under epic lock.
+|Structured cross-scope envelopes written by executing child plans (scope deviations, blocker reports, landing notifications). Supports only three valid in-place status mutations (`pending` -> `claimed` -> `processed`) and distinguishes the three empty states (`no_file`, `empty_file`, `all_processed`).
+
+|`resume_anchor.md`
+|Daemon-rendered markdown artifact.
+|Human- and clone-readable queue overview and resumption summary. Regenerated automatically on merge conflict; regeneration refuses with an explicit diagnostic if any `queue/<PLAN-ID>.json` source file is unreadable.
+|===
+
+=== Server-Derived Landing Facts, Spec Re-Grounding & Cross-Plan Locks
+
+1. *Server-Derived Landing Facts (`n/a` vs. `unknown`)*:
+   When a child plan reaches `completed` and merges, the daemon derives objective landing facts directly from the git commit history, plan audit log, and realized footprint store (commits merged, files changed, tasks completed, loop-back count, test/coverage deltas). Values that do not apply to the plan's profile are recorded as `"n/a"`, while values that could not be read due to missing artifacts are recorded as `"unknown"`—degraded answers are never folded into `"n/a"`. The model in the epic session submits only the semantic landing analysis and downstream impact judgment via `submit_landing:<plan_id>`.
+2. *Specification Corpus Re-Grounding*:
+   When reviewing staged specifications against repository `HEAD`, the epic workflow offers read-only analysis dispatches (or an inline fallback link) whose entity scope exposes only a draft `submit` link (enforcing no direct ledger writes). Every persisted re-grounding claim verdict is explicitly labeled `observed` or `hypothesis`, where every `hypothesis` must name the specific repository file or artifact that confirms or refutes it.
+3. *Fixed Lock Hierarchy & Cross-Plan Coordination Primitives*:
+   * **Lock-Free Snapshot Reads & Fixed Lock Order**: All representation and resource reads execute against atomic filesystem snapshots without holding scope locks during long-running script or build jobs. Whenever an operation mutates multiple scopes, locks are acquired in a strict global order: **`plan` lock -> `epic` lock -> `machine` lock**.
+   * **FIFO Merge Mutex & Review-Bot Rate Window**: The daemon serializes PR merge execution across concurrent plans via a fair FIFO admission queue (`merge-mutex`) and coordinates shared review-bot rate-window claims (e.g., CodeRabbit hourly windows) in machine state.
+   * **FIFO Build Limiter with Atomic Reaping**: Machine-wide build concurrency is bounded by the slot cap in `~/.plan-marshall/mcp/machine-config.json`. Stale slot reaping executes inside the same atomic state transition as new job admission, and the FIFO queue never drops a submitted build.
