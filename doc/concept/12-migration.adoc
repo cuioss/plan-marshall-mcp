@@ -13,7 +13,7 @@ The migration is incremental. plan-marshall's executor already dispatches every 
 
 === Stage 1 — Daemon and executor adapter
 
-The PM-MCP daemon replaces `marshalld` on the host with three job types: `build`, `git` (xref:07-build-execution.adoc#_git_jobs[Git jobs]) and `script`. A script job runs a not-yet-ported plan-marshall script as a subprocess with the host's Python, `git` and `gh`, under the same verification as every other job.
+The PM-MCP daemon replaces `marshalld` on the host with three job types: `build`, `git` (xref:07-build-execution.adoc#_git_jobs[Git jobs]) and `script`. A script job runs a not-yet-ported plan-marshall script as a subprocess with the host's Python, `git` and `gh`, under the same verification as every other job. It sets `PLAN_BASE_DIR` to the plan-state root the daemon resolved for the plan, so plan-marshall's path resolution (`file_ops.get_base_dir`, which otherwise walks up from the working directory, ADR-002) never depends on the job's working directory — also when the job runs in the plan's worktree.
 
 PM-MCP exposes the existing executor as tools and runs each call as a script job. The entry points call `pm-mcp enter`, which writes the entry record and makes PM-MCP the owner of the plan (<<_coexistence>>). Skills stay as they are but replace `python3 .plan/execute-script.py …` Bash calls with tool calls. PM-MCP itself contains no interpreter (xref:10-technology.adoc#_native_binary[Native binary]).
 
@@ -29,7 +29,7 @@ Result: build commands disappear from skills; build output leaves context.
 
 === Stage 3 — Hypermedia pilot: finalize
 
-The finalize phase is the pilot for the workflow engine. It has the clearest state machine, the most gates, and the highest defect rate. `pm_state(plan_id)` returns finalize representations with links; the finalize skills shrink to vocabulary skills. The pilot starts once the stores finalize writes — status, tasks, findings, references — are ported, because the engine writes only through Java stores under the plan's lock (xref:16-implementation.adoc#_transition_order[Transition order]).
+The finalize phase is the pilot for the workflow engine. It has the clearest state machine, the most gates, and the highest defect rate. `pm_state(plan_id)` returns finalize representations with links; the finalize skills shrink to vocabulary skills, which PM-MCP serves from this stage on through its skill tools (xref:04-skill-model.adoc#_delivery[Delivery]), since representations name them. The pilot starts once the stores finalize writes — status, tasks, findings, references — are ported, because the engine writes only through Java stores under the plan's lock (xref:16-implementation.adoc#_transition_order[Transition order]).
 
 Exit criteria: finalize runs end-to-end through links only, with no model-composed calls, and resume after `/clear` works from `pm_state` alone.
 
@@ -43,16 +43,33 @@ The warm LSP pool replaces per-call language servers; selected upstream MCP serv
 
 === Stage 6 — Skill serving and distribution switch
 
-Vocabulary skills are served by PM-MCP and translated per client profile; the filesystem skill corpus, the plugin-cache distribution chain and the build-time multi-target generation are retired for plan-marshall's process skills.
+All vocabulary skills are served by PM-MCP and translated per client profile; the filesystem skill corpus, the plugin-cache distribution chain and the build-time multi-target generation are retired for plan-marshall's process skills.
 
 == Coexistence
 
 During migration both models coexist:
 
-* the state store is shared, and each plan has exactly one owner at a time. Entering a plan through PM-MCP writes its entry record (xref:15-client-profiles.adoc#_persistence[Persistence]) and makes PM-MCP the owner: from then on the daemon performs every write to that plan under the plan's lock. A legacy script writes the plan state directly, so the daemon holds the plan's lock for the whole duration of every script job on that plan; script jobs on one plan never overlap each other or a transition. The Python executor refuses write operations on a plan that has an entry record. The operator releases a plan back to the current model by dropping its entry record through the operator CLI;
+* the state store is shared, and each plan has exactly one owner at a time. Entering a plan through PM-MCP writes its entry record (xref:15-client-profiles.adoc#_persistence[Persistence]) and makes PM-MCP the owner: from then on the daemon performs every write to that plan under the plan's lock. A legacy script writes the plan state directly, so the daemon holds the plan's lock for the whole duration of every script job on that plan; script jobs on one plan never overlap each other or a transition. The Python executor refuses write operations on a plan that has an entry record; this guard does not exist in plan-marshall yet and is added there before stage 1 ships (<<_plan_marshall_prerequisites>>). The operator releases a plan back to the current model by dropping its entry record through the operator CLI;
 * each stage switches a clearly bounded surface; no stage requires the next one;
 * the current distribution remains available until stage 6 completes;
 * PM-MCP is a native executable without interpreter from the first stage (xref:10-technology.adoc#_native_binary[Native binary]).
+
+== plan-marshall prerequisites
+
+Some steps need changes in plan-marshall first; each is a pull request there, released before the PM-MCP step that relies on it:
+
+[cols="2,1,3"]
+|===
+|Change in plan-marshall |Before |Content
+
+|Entry-record guard
+|Stage 1
+|The executor refuses write operations on a plan whose `mcp/` directory holds an entry record (`execute-script.py.template`). The writers outside the executor — the build hook and the merge lock, which write `status.json` directly — check the same record (xref:workflow-analysis/06-data-layer.adoc[Data Layer]).
+
+|TOON stores to JSON
+|Ported stores
+|The auxiliary stores still written as TOON are converted to JSON, so each store has one format on the shared tree (xref:16-implementation.adoc#_plan_marshalls_current_stores[plan-marshall's current stores]).
+|===
 
 == Measurement
 
