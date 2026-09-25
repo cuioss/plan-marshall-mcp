@@ -1,0 +1,92 @@
+= Local Endpoint Authentication
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../README.adoc[Concept] » xref:README.adoc[Discussions] » Local Endpoint Authentication
+
+How the daemon's loopback endpoints authenticate their callers, behind the decision in xref:../09-security.adoc#_hardening[Hardening]. The earlier design derived short-lived MCP tokens from a signing secret in the credential store; it is replaced by a cookie file.
+
+== Question
+
+The endpoint listens on `127.0.0.1` only and validates `Origin` and `Host`. What does an additional credential on top of that protect, and which form of it is worth its cost?
+
+== Threats
+
+[cols="2,1,3"]
+|===
+|Threat |Credential needed? |Reasoning
+
+|Web pages: DNS rebinding, cross-site requests to `127.0.0.1`
+|No
+|The `Host` check rejects rebound names and the `Origin` check rejects foreign pages. An MCP request is a `POST` with a JSON body and an `Accept` header, which a browser cannot send cross-site without a preflight the server never grants.
+
+|Processes of the same user, including a shell the model drives
+|Cannot help
+|Whatever a helper can read or derive, another process of the same user can too. This holds for every local credential; the residual risk is recorded in xref:../09-security.adoc#_local_attack_surface[Local attack surface].
+
+|Other OS users on the same machine
+|Yes
+|Loopback is reachable by every local user. Only something the other user cannot read keeps them out.
+
+|The port reached from elsewhere by accident: `ssh -R`, IDE port forwarding, a container on the host network, a forwarded dev container port
+|Yes
+|Whoever reaches the forwarded port holds no credential.
+
+|Team or remote deployments
+|Yes, but a different one
+|Reachable beyond the machine, the endpoint needs real identities: OAuth through TokenSheriff (<<_later_tokensheriff>>).
+|===
+
+A local credential therefore guards against two things: other OS users and a leaked port. It does nothing against the local user, who is the only party that actually uses the machine.
+
+== Variants
+
+[cols="1,3,3"]
+|===
+|Variant |For |Against
+
+|A. Signed short-lived token (earlier design)
+|Tokens expire within minutes; the signing secret sits in the OS credential store.
+|Expiry buys nothing locally: `pm-mcp token` hands a fresh token to any caller of the same user. Costs a signing secret, credential-store access from the native binary (Keychain through Java FFM, still unverified), token derivation and renewal, and a rotation command.
+
+|B. Cookie file
+|A random secret per daemon start in a file only the user can read — the pattern of X11's MIT cookie and Jupyter's runtime files. Keeps out other users and a leaked port; needs no credential store, no signing, no expiry.
+|Readable by every process of the user — the same as A in practice.
+
+|C. No authentication
+|Nothing to build.
+|A single `ssh -R` or forwarded port exposes the whole MCP surface, including jobs that run builds. Other users on shared hosts reach it too.
+
+|D. Unix domain socket with file permissions
+|The operating system authenticates; no secret at all.
+|Quarkus supports domain sockets only with Netty native transports, which are not available in native executables (xref:../10-technology.adoc#_native_binary[Native binary]). Hosts connecting over HTTP need TCP anyway.
+
+|E. Peer credential lookup on loopback TCP
+|Identifies the connecting process's user without a secret.
+|Needs `/proc/net/tcp` on Linux and `libproc` on macOS: platform code, racy, and not available through Quarkus.
+
+|F. MCP OAuth on loopback
+|Follows the MCP authorization specification.
+|An authorization server on the developer's machine adds a component without adding a trust boundary: the same user operates both sides.
+|===
+
+== Decision
+
+Variant B, the cookie file:
+
+* At every start the daemon generates 32 random bytes and writes them, before it accepts a connection, to `run/cookie` in its instance directory (xref:../11-distribution.adoc#_server_installation[Server installation]). The file has mode `0600`, the directory `0700`; the daemon refuses to start if either is readable by others or owned by another user.
+* `pm-mcp token` reads the cookie and prints `Authorization: Bearer <cookie>`; `pm-mcp serve --stdio` sends it on every request. After a daemon restart the cookie changes, the host receives HTTP 401, runs the header helper again and retries; the relay rereads the file.
+* The daemon compares the header with the cookie in constant time. The MCP endpoint and the LSP proxy endpoint require it; the read-only install endpoint does not (xref:../11-distribution.adoc#_install_endpoint[Install endpoint]).
+* A development daemon has its own instance directory and therefore its own cookie.
+* The helper keeps its second role: it starts the daemon on demand, which is what makes a plain HTTP entry in the host configuration work.
+
+== The operator token stays
+
+The operator CLI keeps its own token in the credential store, and the cookie grants no operator action. Here the credential does protect something: on macOS the Keychain item is bound to the `pm-mcp` binary, so only `pm-mcp operator` reads it, and only after the interactive confirmation on a terminal that a shell driven by the model cannot give. A cookie would let any process of the user call the operator routes directly and skip that confirmation. With the file store as fallback the guard is weaker (xref:../08-credentials.adoc#_protection[Protection]).
+
+== Later: TokenSheriff
+
+Once the endpoint is reachable beyond the machine — team or remote deployments, the enterprise setting — the daemon validates bearer tokens issued by the organisation's identity provider offline with `token-sheriff-validation`: signature against the provider's keys, issuer, audience, expiry and scopes, without a call to the provider per request (xref:../10-technology.adoc#_security_libraries[Security libraries]).
+
+The switch leaves the clients unchanged: both carry `Authorization: Bearer …`, obtained by the same header helper. Only the helper's source of the token — cookie file or identity provider — and the daemon's authentication mechanism differ, selected by configuration. Real identities then also allow attributing calls to a person rather than to the machine's user.

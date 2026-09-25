@@ -118,11 +118,11 @@ The model reaches no operator action through PM-MCP's MCP surface. A model with 
 
 == Local attack surface
 
-* Hosts obtain the MCP token through `pm-mcp token` as a header helper, or connect through `pm-mcp serve --stdio`; no host configuration or environment contains a PM-MCP token. A model with unrestricted shell access runs as the operator's user and could run `pm-mcp token` itself; the MCP token grants exactly what the MCP surface offers.
-* The daemon's MCP endpoint binds to `127.0.0.1` only, validates `Origin` and `Host` on every request, rejects unexpected values with HTTP 403, and requires a short-lived MCP token (<<_hardening>>).
-* The operator CLI authenticates with a separate operator token; the MCP token grants no operator action.
-* The LSP proxy endpoint (xref:06-services.adoc#lsp[LSP]) is protected like the MCP endpoint: loopback only, `Origin` and `Host` validation, token.
-* The install endpoint for client bundles (xref:11-distribution.adoc#_install_endpoint[Install endpoint]) is read-only and serves no secret: loopback only, `Origin` and `Host` validation, no token. Writing a bundle — entry commands, hooks, permission rules — happens only through `pm-mcp client`, which shows every change and asks for confirmation on a terminal; the daemon never writes into a client's configuration itself.
+* Hosts obtain the cookie through `pm-mcp token` as a header helper, or connect through `pm-mcp serve --stdio`; no host configuration or environment contains it. A model with unrestricted shell access runs as the operator's user and could read the cookie itself; the cookie grants exactly what the MCP surface offers.
+* The daemon's MCP endpoint binds to `127.0.0.1` only, validates `Origin` and `Host` on every request, rejects unexpected values with HTTP 403, and requires the daemon's cookie (<<_hardening>>).
+* The operator CLI authenticates with a separate operator token from the credential store; the cookie grants no operator action.
+* The LSP proxy endpoint (xref:06-services.adoc#lsp[LSP]) is protected like the MCP endpoint: loopback only, `Origin` and `Host` validation, cookie.
+* The install endpoint for client bundles (xref:11-distribution.adoc#_install_endpoint[Install endpoint]) is read-only and serves no secret: loopback only, `Origin` and `Host` validation, no cookie. Writing a bundle — entry commands, hooks, permission rules — happens only through `pm-mcp client`, which shows every change and asks for confirmation on a terminal; the daemon never writes into a client's configuration itself.
 * MCP sessions are never used for authentication; every request is authenticated on its own.
 * Projects must be enrolled explicitly by the operator before PM-MCP acts on them.
 * The audit log records every call and every build with scope, client identity, caller session and outcome; a mismatch between declared and self-reported client identity is recorded and reported.
@@ -132,19 +132,19 @@ The model reaches no operator action through PM-MCP's MCP surface. A model with 
 Endpoint::
 * `quarkus.http.host=127.0.0.1` is set explicitly. The Quarkus default in production binds all interfaces, which would also switch off the rebinding check.
 * The MCP Server extension's DNS rebinding check (`quarkus.mcp.server.http.dns-rebinding-check.enabled`) rejects foreign `Origin` values. A route filter additionally accepts only the `Host` values `127.0.0.1:<port>` and `localhost:<port>`.
-* A custom `HttpAuthenticationMechanism` validates the bearer token in constant time, and the HTTP permission `authenticated` covers `/mcp/*`; no request reaches a tool unauthenticated.
+* A custom `HttpAuthenticationMechanism` compares the bearer value with the cookie in constant time, and the HTTP permission `authenticated` covers `/mcp/*`; no request reaches a tool unauthenticated.
 
-Short-lived tokens::
-A signing secret is kept in the credential store (xref:08-credentials.adoc#_pm_mcps_own_secrets[PM-MCP's own secrets]). `pm-mcp token` derives a fresh MCP token with a lifetime of minutes from it on every connection, and `pm-mcp serve --stdio` renews its own. A host that receives HTTP 401 runs the header helper again and retries; Claude Code does so automatically.
+Cookie::
+At every start the daemon generates a random 256-bit cookie and writes it, before accepting a connection, to `run/cookie` in its instance directory (xref:11-distribution.adoc#_server_installation[Server installation]) — file mode `0600`, directory `0700`; it refuses to start if either is readable by others or owned by another user. `pm-mcp token` prints it as `Authorization: Bearer <cookie>`, `pm-mcp serve --stdio` sends it on every request. After a restart the cookie changes; a host that receives HTTP 401 runs the header helper again and retries, as Claude Code does automatically, and the relay rereads the file. The cookie keeps out other OS users and anyone who reaches a forwarded port; against processes of the same user no local credential helps (xref:discussions/local-endpoint-authentication.adoc[Local Endpoint Authentication]).
 
-Local token instead of MCP OAuth::
-The MCP authorization specification (OAuth 2.1) is a SHOULD for HTTP transports. The loopback endpoint deliberately uses the local token instead: an authorization server on the developer's machine would add a component without adding a trust boundary. Deployments reachable beyond the machine use OAuth through TokenSheriff (xref:10-technology.adoc#_security_libraries[Security libraries]).
+Cookie instead of MCP OAuth::
+The MCP authorization specification (OAuth 2.1) is a SHOULD for HTTP transports. The loopback endpoint deliberately uses the cookie instead: an authorization server on the developer's machine would add a component without adding a trust boundary. Deployments reachable beyond the machine validate bearer tokens of the organisation's identity provider offline through TokenSheriff; clients keep sending `Authorization: Bearer …` through the same header helper (xref:10-technology.adoc#_security_libraries[Security libraries]).
 
 Process confinement::
 * The daemon runs as the developer's user, without a container around it.
 * On Linux it always runs under systemd confinement — as the OS service unit, or, when started on demand, through `systemd-run --user` with the same properties: `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, and `ProtectHome=read-only` with write access only to the enrolled project roots, `~/.plan-marshall/` and the caches the enrolled wrappers use. Enrolling a project updates the write paths. Its subprocesses — build, git and script jobs and language servers — inherit the confinement.
 * On macOS there is no supported equivalent; the unconfined daemon is a residual risk.
-* Every git and script job receives an environment allowlist, as build jobs do; the daemon's own tokens never reach a subprocess.
+* Every git and script job receives an environment allowlist, as build jobs do; the cookie and the operator token never reach a subprocess.
 
 Error handling::
 Tool results and MCP errors never contain stack traces, internal exceptions or tokens. A failure reports a closed-enum reason and the id of its audit record; the details are in the audit log only. Paths appear only where a representation needs them as facts.
@@ -159,7 +159,7 @@ Audit::
 The audit log records every call with its full parameters, scope, client identity and outcome. Secrets and tokens are redacted before a record is written.
 
 Credentials::
-Provider credentials, the signing secret for MCP tokens and the operator token are handled as described in xref:08-credentials.adoc[Credential Handling]: the OS credential store first, the file store in `~/.plan-marshall/credentials/` as fallback, secrets entered only by the operator. PM-MCP puts no credential into a host's configuration, the model's environment or the model's context; a shell the model drives can still read a store readable by the user, a residual risk described in xref:08-credentials.adoc#_protection[Protection].
+Provider credentials and the operator token are handled as described in xref:08-credentials.adoc[Credential Handling]: the OS credential store first, the file store in `~/.plan-marshall/credentials/` as fallback, secrets entered only by the operator. PM-MCP puts no credential into a host's configuration, the model's environment or the model's context; a shell the model drives can still read a store readable by the user, a residual risk described in xref:08-credentials.adoc#_protection[Protection].
 
 No token passthrough::
 PM-MCP accepts no token that was not issued to PM-MCP, and never forwards a token it received to an upstream service. The MCP proxy authenticates to each upstream server with its own credentials for that server (xref:06-services.adoc#mcp-proxy[MCP proxy]).
