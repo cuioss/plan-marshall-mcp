@@ -1,0 +1,585 @@
+= Client Profiles & Bundle Manifest Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Client Profiles & Bundle Manifest (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document specifies the data-driven client profile schema, on-the-fly placeholder rendering rules, three-tier environment identity detection and mismatch auditing, neutral fallback profile behavior, and embedded client bundle `manifest.json` schema for *plan-marshall-mcp* (`PM-MCP`). By translating vocabulary skills, sub-agent dispatch payloads, and host tool idioms at request time from the scope's persisted `mcp/entry.json` record, a single `pm-mcp` daemon serves Claude Code, OpenCode, Antigravity, and unknown MCP hosts concurrently without static per-runtime corpus generation.
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-4[PM-CLIENT-4: Neutral Fallback Profile for Unknown Clients]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy]_
+* _See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
+
+== Status: PLANNED
+
+== Normative Client Profile JSON Schema
+_See Requirement link:../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy]_
+
+Client profiles are declarative JSON documents compiled into `pm-mcp-core` under `classpath:/profiles/<client_id>.json` (`claude.json`, `opencode.json`, `antigravity.json`, `neutral.json`) and validated against the following JSON Schema (Draft 2020-12):
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/client-profile-v1.json",
+  "title": "ClientProfile",
+  "description": "Declarative runtime profile governing on-the-fly skill rendering, sub-agent dispatch, and bundle generation.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Version of the client profile schema."
+    },
+    "client_id": {
+      "type": "string",
+      "enum": ["claude", "opencode", "antigravity", "neutral"],
+      "description": "Canonical identifier of the client runtime."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "min_daemon_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.-]+)?$"
+    },
+    "tools": {
+      "type": "object",
+      "description": "Mapping of abstract host capabilities to runtime-specific tool names and parameter idioms.",
+      "properties": {
+        "read_file": { "type": "string" },
+        "write_file": { "type": "string" },
+        "edit_file": { "type": "string" },
+        "search_code": { "type": "string" },
+        "find_files": { "type": "string" },
+        "run_shell": { "type": "string" },
+        "ask_user": { "type": "string" },
+        "spawn_agent": { "type": ["string", "null"] },
+        "idioms": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "disposition": { "type": "string", "enum": ["rewrite", "preserve", "omit"] },
+              "replacement": { "type": "string" }
+            },
+            "required": ["disposition"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_code",
+        "find_files",
+        "run_shell",
+        "ask_user",
+        "spawn_agent"
+      ],
+      "additionalProperties": false
+    },
+    "skill_loading": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["tool_call", "mcp_skills_extension", "view_file"],
+          "description": "Primary mechanism used by the model to load vocabulary skills."
+        },
+        "load_directive_template": {
+          "type": "string",
+          "description": "Template rendered when a skill references another skill (e.g. 'pm_skill(uri=\"{{uri}}\")')."
+        },
+        "schema_residency": {
+          "type": "string",
+          "enum": ["resident", "on_demand"]
+        },
+        "preload_tools": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^pm_[a-z0-9_]+$" },
+          "default": ["pm_start", "pm_state", "pm_do"]
+        }
+      },
+      "required": ["mode", "load_directive_template", "schema_residency", "preload_tools"],
+      "additionalProperties": false
+    },
+    "dispatch": {
+      "type": "object",
+      "properties": {
+        "supported": {
+          "type": "boolean",
+          "description": "True if the host's sub-agents inherit MCP server access and can execute entity-scoped links."
+        },
+        "host_tool": {
+          "type": ["string", "null"],
+          "description": "Name of the host's sub-agent invocation tool (e.g. 'Agent', 'task', 'invoke_subagent')."
+        },
+        "agent_variants": {
+          "type": "object",
+          "properties": {
+            "level_1": { "type": "string" },
+            "level_2": { "type": "string" },
+            "level_3": { "type": "string" },
+            "level_4": { "type": "string" }
+          },
+          "required": ["level_1", "level_2", "level_3", "level_4"],
+          "additionalProperties": false
+        },
+        "params_template": {
+          "type": "object",
+          "description": "Key-value template for host_tool parameters using {{agent_variant}} and {{model}} placeholders."
+        }
+      },
+      "required": ["supported", "host_tool", "agent_variants", "params_template"],
+      "additionalProperties": false
+    },
+    "commands": {
+      "type": "object",
+      "properties": {
+        "prefix": { "type": "string" },
+        "format": { "type": "string", "enum": ["markdown", "toml", "json", "none"] },
+        "user_dir": { "type": ["string", "null"] },
+        "project_dir": { "type": ["string", "null"] },
+        "entries": {
+          "type": "object",
+          "properties": {
+            "plan": { "type": "string" },
+            "epic": { "type": "string" },
+            "steward": { "type": "string" }
+          },
+          "required": ["plan", "epic", "steward"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["prefix", "format", "user_dir", "project_dir", "entries"],
+      "additionalProperties": false
+    },
+    "models": {
+      "type": "object",
+      "description": "Abstract complexity tier mapping to runtime model IDs and reasoning effort.",
+      "properties": {
+        "level_1": { "$ref": "#/$defs/modelPin" },
+        "level_2": { "$ref": "#/$defs/modelPin" },
+        "level_3": { "$ref": "#/$defs/modelPin" },
+        "level_4": { "$ref": "#/$defs/modelPin" }
+      },
+      "required": ["level_1", "level_2", "level_3", "level_4"],
+      "additionalProperties": false
+    },
+    "connection": {
+      "type": "object",
+      "properties": {
+        "transport": {
+          "type": "string",
+          "enum": ["streamable_http", "stdio_relay"]
+        },
+        "headers_helper": {
+          "type": ["string", "null"]
+        },
+        "idle_timeout_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 7200
+        },
+        "bounded_wait_seconds": {
+          "type": "integer",
+          "minimum": 15,
+          "maximum": 3600
+        },
+        "progress_resets_timeout": {
+          "type": "boolean"
+        },
+        "elicitation_supported": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "transport",
+        "headers_helper",
+        "idle_timeout_seconds",
+        "bounded_wait_seconds",
+        "progress_resets_timeout",
+        "elicitation_supported"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "client_id",
+    "display_name",
+    "min_daemon_version",
+    "tools",
+    "skill_loading",
+    "dispatch",
+    "commands",
+    "models",
+    "connection"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "modelPin": {
+      "type": "object",
+      "properties": {
+        "model_id": { "type": "string" },
+        "effort": { "type": "string", "enum": ["low", "medium", "high", "max", "inherit"] }
+      },
+      "required": ["model_id", "effort"],
+      "additionalProperties": false
+    }
+  }
+}
+----
+
+=== Profile Override Hierarchy
+
+At runtime, the daemon resolves a client profile by merging three layers in order of increasing precedence:
+
+1. *Compiled Binary Baseline* (`classpath:/profiles/<client_id>.json`): Authoritative defaults shipped with the `pm-mcp` binary.
+2. *Machine-Wide Operator Overrides* (`~/.plan-marshall/mcp/conf/profiles/<client_id>.json`): Optional partial JSON override allowing the operator to customize `models` pins or `connection.bounded_wait_seconds` across all repositories on the workstation.
+3. *Project-Level Overrides* (`.plan/marshal.json` -> `client_profiles.<client_id>`): Optional repository-scoped `models` overrides. Project-level configuration is strictly restricted to overriding `models`; attempts to override `connection`, `dispatch.host_tool`, or security properties from `.plan/marshal.json` are ignored and logged to `audit.jsonl`.
+
+== On-the-Fly Placeholder Rendering Rules
+_See Requirement link:../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
+
+Vocabulary skill templates (`SKILL.md`), hypermedia `dispatch` blocks, and operator guidance strings are authored once in canonical placeholder notation and rendered on the fly by `ClientProfileRenderer` using the `client` recorded in the scope's `mcp/entry.json`.
+
+=== Normative Placeholder Syntax & Resolution Table
+
+[cols="2,2,2,2,2"]
+|===
+|Canonical Placeholder |`claude` Resolution |`opencode` Resolution |`antigravity` Resolution |`neutral` Resolution
+
+|`{{tool:read_file}}`
+|`Read`
+|`read`
+|`view_file`
+|`the host file-read tool`
+
+|`{{tool:write_file}}`
+|`Write`
+|`write`
+|`write_to_file`
+|`the host file-create tool`
+
+|`{{tool:edit_file}}`
+|`Edit`
+|`edit`
+|`replace_file_content`
+|`the host file-edit tool`
+
+|`{{tool:search_code}}`
+|`Grep`
+|`grep`
+|`grep_search`
+|`the host code-search tool`
+
+|`{{tool:find_files}}`
+|`Glob`
+|`glob`
+|`find_by_name`
+|`the host file-search tool`
+
+|`{{tool:run_shell}}`
+|`Bash`
+|`bash`
+|`run_command`
+|`the host shell tool`
+
+|`{{tool:ask_user}}`
+|`AskUserQuestion`
+|`question`
+|`ask_question`
+|`direct user prompt`
+
+|`{{skill_load:<uri>}}`
+|`pm_skill(uri="<uri>")`
+|`pm_skill(uri="<uri>")`
+|`pm_skill(uri="<uri>")`
+|`pm_skill(uri="<uri>")`
+
+|`{{command:plan}}`
+|`/plan-marshall:plan-marshall`
+|`/plan-marshall`
+|`/plan-marshall`
+|`pm-mcp enter --client neutral plan`
+
+|`{{model:level_3}}`
+|`claude-sonnet-4-6`
+|`anthropic/claude-sonnet-4-6`
+|`inherit`
+|`default`
+|===
+
+=== Rendering Invariants
+
+1. *Zero Unresolved Placeholders*: If any `{{...}}` token in a skill template fails to resolve against the active `ClientProfile`, `ClientProfileRenderer` fails closed and logs a template defect rather than emitting raw `{{...}}` syntax to the model.
+2. *Per-Variant SHA-256 Digest*: The `_meta.sha256` digest published by `pm_skills` / `pm_skill` and the MCP Skills extension is computed *after* rendering the skill for `(project_config, client_id, daemon_version)`. Each client sees a stable, deterministic SHA-256 digest for its rendered variant.
+3. *Dispatch Suppression When Unsupported*: When `profile.dispatch.supported == false` (such as on the `neutral` profile or a host whose sub-agents lack MCP access), the workflow engine automatically suppresses `form: dispatch` links and instead serves the entity's task links directly in the main plan scope.
+
+== Three-Tier Environment Detection Matrix & Mismatch Auditing
+_See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
+
+_See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit]_
+
+_See Requirement link:../Requirements.adoc#PM-CLIENT-4[PM-CLIENT-4: Neutral Fallback Profile for Unknown Clients]_
+
+Client identity is advisory routing and rendering metadata, never a security credential. To prevent silent profile corruption and provide full forensic visibility, PM-MCP evaluates and logs three independent identity tiers on every `pm-mcp enter` execution and every MCP tool request.
+
+=== The Three Identity Tiers
+
+1. *Tier 1 — Declared Entry Identity (`declared_client`)*:
+   * Supplied explicitly via `pm-mcp enter --client <client_id> <entry> [plan_id | epic_id]` by the installed client bundle's entry command.
+   * Persisted in `<scope_dir>/mcp/entry.json` alongside `workspace_root`, `client_version`, `client_session`, and `entered_at`.
+2. *Tier 2 — Detected Environment & Protocol Signature (`detected_client`)*:
+   * *At Entry (`pm-mcp enter`)*: Evaluated by inspecting the process environment inherited from the host shell against the deterministic signature matrix below.
+   * *At Tool Call (`/mcp`)*: Evaluated from the MCP protocol `clientInfo.name` and `clientInfo.version` fields when present in the request or initialization metadata (`absent` when omitted by stateless callers).
+3. *Tier 3 — Authenticated OS Principal (`os_principal`)*:
+   * The operating system effective user ID (`uid`) and username owning the local process and authenticating with `~/.plan-marshall/mcp/cookie`.
+
+=== Normative Environment & Protocol Detection Matrix
+
+[cols="1,2,2,2,2"]
+|===
+|Profile ID |Environment Signatures (`pm-mcp enter`) |Session ID Env Var |MCP `clientInfo.name` Prefix |Default Connection Mode
+
+|`claude`
+|`CLAUDECODE=1` OR `AI_AGENT` matches `^claude-code.*`
+|`CLAUDE_CODE_SESSION_ID`
+|`claude-code` / `claude`
+|`streamable_http` (`headersHelper: "pm-mcp token"`)
+
+|`opencode`
+|`OPENCODE=1` OR `AI_AGENT` matches `^opencode.*`
+|`OPENCODE_SESSION_ID`
+|`opencode`
+|`stdio_relay` (`pm-mcp serve --stdio`)
+
+|`antigravity`
+|`ANTIGRAVITY_AGENT=1` OR `ANTIGRAVITY_CLI_ALIAS` present OR `AI_AGENT` matches `^antigravity.*`
+|`ANTIGRAVITY_CONVERSATION_ID`
+|`antigravity` / `google-antigravity`
+|`stdio_relay` or `streamable_http`
+
+|`neutral`
+|None of the above matched (`detected_client: "unknown"`)
+|_None_
+|_Any unknown or absent_
+|`stdio_relay`
+|===
+
+=== Mismatch Resolution & Audit Behavior
+
+[cols="2,2,3"]
+|===
+|Scenario |Active Profile Selected |Audit & Representation Effect
+
+|`declared_client == detected_client` (e.g., both `claude`)
+|`claude`
+|`audit.jsonl` records `identity_match: "exact"`. No warning in representation.
+
+|`pm-mcp enter` has `declared_client: "claude"`, but environment matches `opencode` or `unknown`
+|`claude` (honors explicit `--client`, never switches silently)
+|`audit.jsonl` records `event: "client_identity_mismatch"`, `declared_client`, `detected_client`, `os_principal`. `pm-mcp enter` prints a mismatch notice; representations include `profile_warning: client_identity_mismatch`.
+
+|MCP tool call carries `clientInfo.name: "opencode"`, but `mcp/entry.json` has `client: "claude"`
+|`claude` (persisted `entry.json` remains authoritative until re-entered)
+|`audit.jsonl` records the cross-client call mismatch. The returned TOON representation includes `profile_warning: client_identity_mismatch` and `facts.recorded_client: claude` so the calling session sees it has not entered the plan with its own client bundle.
+
+|Unrecognized client or `--client neutral`
+|`neutral`
+|`mcp/entry.json` records `"client": "neutral"`. Every representation includes `profile_warning: neutral_fallback`; all host-specific `dispatch` links are replaced with inline `submit` task links, and skill loading uses `pm_skill`.
+|===
+
+== Embedded Client Bundle `manifest.json` Schema
+_See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
+
+The `pm-mcp` binary embeds the templates for all supported client bundles and serves rendered manifests and files from the running daemon at `GET /clients/{client}/bundle?scope=user|project` (link:daemon-endpoint.adoc[Daemon Endpoint Specification]).
+
+=== Normative `manifest.json` JSON Schema (Draft 2020-12)
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/client-bundle-manifest-v1.json",
+  "title": "ClientBundleManifest",
+  "description": "Manifest of files and shared configuration keys owned by PM-MCP for a specific client and installation scope.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "client_id": {
+      "type": "string",
+      "enum": ["claude", "opencode", "antigravity"]
+    },
+    "bundle_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.-]+)?$"
+    },
+    "daemon_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.-]+)?$"
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["user", "project"]
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 hex digest over the canonicalized 'files' and 'shared_configs' arrays."
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "bundle_path": {
+            "type": "string",
+            "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$",
+            "description": "Relative path used to fetch the file from GET /clients/{client}/files/{bundle_path}."
+          },
+          "target_path": {
+            "type": "string",
+            "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$",
+            "description": "Target path relative to the user home directory (scope=user) or repository root (scope=project)."
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["command", "agent", "hook", "skill_stub"]
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 hex digest of the exact UTF-8 file content."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["0644", "0755"]
+          }
+        },
+        "required": ["bundle_path", "target_path", "kind", "sha256", "mode"],
+        "additionalProperties": false
+      }
+    },
+    "shared_configs": {
+      "type": "array",
+      "description": "Shared host configuration files where PM-MCP merges only specific owned JSON/TOML keys.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "target_path": {
+            "type": "string",
+            "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["json", "toml"]
+          },
+          "owned_keys": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "description": "Dotted key path owned by PM-MCP (e.g. 'mcpServers.plan-marshall')."
+            }
+          },
+          "entries": {
+            "type": "object",
+            "description": "Map from each owned_key to the JSON value to merge into target_path."
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 hex digest of the canonicalized 'entries' object."
+          }
+        },
+        "required": ["target_path", "format", "owned_keys", "entries", "sha256"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "client_id",
+    "bundle_version",
+    "daemon_version",
+    "scope",
+    "manifest_sha256",
+    "files",
+    "shared_configs"
+  ],
+  "additionalProperties": false
+}
+----
+
+=== Concrete `manifest.json` Example (`claude`, `scope=project`)
+
+[source,json]
+----
+{
+  "schema_version": 1,
+  "client_id": "claude",
+  "bundle_version": "1.0.0",
+  "daemon_version": "1.0.0",
+  "scope": "project",
+  "manifest_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "files": [
+    {
+      "bundle_path": "commands/plan-marshall.md",
+      "target_path": ".claude/commands/plan-marshall.md",
+      "kind": "command",
+      "sha256": "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+      "mode": "0644"
+    },
+    {
+      "bundle_path": "agents/execution-context-level-3.md",
+      "target_path": ".claude/agents/plan-marshall-execution-context-level-3.md",
+      "kind": "agent",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "mode": "0644"
+    }
+  ],
+  "shared_configs": [
+    {
+      "target_path": ".mcp.json",
+      "format": "json",
+      "owned_keys": ["mcpServers.plan-marshall"],
+      "entries": {
+        "mcpServers.plan-marshall": {
+          "type": "http",
+          "url": "http://127.0.0.1:49152/mcp",
+          "headersHelper": "pm-mcp token"
+        }
+      },
+      "sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+    }
+  ]
+}
+----
+
+=== Ownership & Digest Verification on Install/Update/Remove
+
+1. *Install Record Persistence*: When `pm-mcp client install` or `update` applies a manifest, it records the installed `bundle_version`, `scope`, target root, and the `sha256` of every written file and `shared_configs` key in `~/.plan-marshall/mcp/state/client-installs.json`.
+2. *Modification Conflict Protection*: During `pm-mcp client update` or `remove`, before overwriting or deleting any file in `files[]`, `pm-mcp client` computes the current on-disk file's SHA-256 and compares it with the `sha256` recorded in `client-installs.json`. If the user has modified the file (digest mismatch), `pm-mcp client` skips overwriting that file, reports the conflict on the terminal, and preserves the user's changes unless `--force` is confirmed interactively.
+3. *Surgical Shared Configuration Merging*: For `shared_configs[]`, `pm-mcp client` parses the existing JSON/TOML file, updates or removes *only* the JSON pointers listed in `owned_keys`, and preserves all other MCP servers, hooks, and settings owned by the user.

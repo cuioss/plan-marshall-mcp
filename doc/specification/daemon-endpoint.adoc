@@ -1,0 +1,281 @@
+= Daemon Endpoint & Transport Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Daemon Endpoint & Transport (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document specifies the network transport, endpoint hardening, authentication mechanisms, client bundle distribution routes, and stdio relay contract for the *plan-marshall-mcp* (`PM-MCP`) native daemon (`pm-mcp`). It defines how the single per-machine daemon binds exclusively to the loopback interface, authenticates local callers via a per-start random 256-bit cookie, blocks DNS rebinding and cross-origin browser attacks, serves version-locked client bundles, and bridges hosts via `pm-mcp token` and `pm-mcp serve --stdio`.
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-ARCH-2[PM-ARCH-2: Local-by-Design & Zero External Cloud Dependency]_
+* _See Requirement link:../Requirements.adoc#PM-ARCH-3[PM-ARCH-3: MCP Transport & Endpoint Modes]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Loopback Endpoint Hardening & Cookie Authentication]_
+* _See Requirement link:../Requirements.adoc#PM-DIST-2[PM-DIST-2: Authenticated Loopback Bundle Endpoint & Client Installer]_
+
+== Status: PLANNED
+
+== Loopback HTTP Socket Binding & Process Coordination
+_See Requirement link:../Requirements.adoc#PM-ARCH-2[PM-ARCH-2: Local-by-Design & Zero External Cloud Dependency]_
+
+_See Requirement link:../Requirements.adoc#PM-ARCH-3[PM-ARCH-3: MCP Transport & Endpoint Modes]_
+
+=== Loopback Interface Binding (`127.0.0.1`)
+
+The `pm-mcp` daemon exposes its HTTP server strictly on the IPv4 loopback address `127.0.0.1`. Binding to wildcard addresses (`0.0.0.0`, `::`) or non-loopback network interfaces is prohibited in local daemon mode.
+
+[cols="2,2,3"]
+|===
+|Configuration Property |Normative Value |Enforcement Rule
+
+|`quarkus.http.host`
+|`127.0.0.1`
+|Hardcoded in compiled application defaults and verified at startup before the Vert.x HTTP server opens its listening socket. If overridden to any value other than `127.0.0.1` in local cookie-authenticated mode, the daemon aborts startup with exit code `78` (`EX_CONFIG`).
+
+|`quarkus.http.port`
+|`0` (dynamic) or configured port (`1024..65535`)
+|Defaults to an OS-assigned ephemeral loopback port unless pinned in `~/.plan-marshall/mcp/conf/pm-mcp.properties` via `pm.mcp.http.port`.
+
+|`quarkus.mcp.server.http.root-path`
+|`/mcp`
+|Exposes the MCP Streamable HTTP transport (`POST /mcp`, `GET /mcp`, `DELETE /mcp`).
+|===
+
+=== Runtime Lock, PID, and Port Files
+
+To guarantee that at most one daemon instance runs per `PM_MCP_BASE` directory (default `~/.plan-marshall/mcp/`), startup follows a strict file-locking and publication sequence:
+
+[source,text]
+----
+~/.plan-marshall/mcp/                (mode 0700, owned by current UID)
+├── daemon.lock                      (mode 0600, exclusive FileChannel.lock())
+├── daemon.pid                       (mode 0600, ASCII decimal OS PID + LF)
+├── daemon.port                      (mode 0600, ASCII decimal TCP port + LF)
+└── cookie                           (mode 0600, 64-char lowercase hex secret)
+----
+
+NOTE: When the installation layout uses the `run/` subdirectory (`~/.plan-marshall/mcp/run/`), the daemon maintains canonical files at `~/.plan-marshall/mcp/{daemon.lock,daemon.pid,daemon.port,cookie}` and mirrors or symlinks them into `run/` so all CLI modes (`token`, `serve --stdio`, `client`, `enter`, `operator`) resolve a single authoritative location.
+
+==== Startup Sequence
+
+1. *Directory Verification*: Verify that `~/.plan-marshall/mcp/` exists, is owned by the current OS effective user ID (`geteuid()`), and has POSIX permissions `0700` (`drwx------`). If group or other permissions are set (`(mode & 0077) != 0`), or ownership differs, abort immediately before opening sockets.
+2. *Exclusive Lock Acquisition*: Open `~/.plan-marshall/mcp/daemon.lock` with `StandardOpenOption.CREATE`, `StandardOpenOption.WRITE`, set mode `0600`, and acquire a non-blocking exclusive OS file lock via `FileChannel.tryLock()`.
+   * If `tryLock()` returns `null` (held by an active daemon), inspect `daemon.port` and probe `GET http://127.0.0.1:<port>/health/live`. If reachable, exit `0` (for `daemon start`) or report already running.
+   * If `tryLock()` succeeds, any prior `daemon.pid`, `daemon.port`, and `cookie` files from an unclean shutdown are unlinked before proceeding.
+3. *Cookie Generation*: Generate and atomically write the per-start random 256-bit cookie to `~/.plan-marshall/mcp/cookie` with mode `0600` (see <<_per_start_cookie_generation_storage>>).
+4. *Socket Bind*: Bind the Vert.x HTTP server to `127.0.0.1:<port>`.
+5. *Publication*: Write the current process ID (`ProcessHandle.current().pid()`) to `daemon.pid` and the bound TCP port to `daemon.port` via atomic write-and-rename (`daemon.port.tmp` -> `daemon.port`, mode `0600`).
+6. *Graceful Drain & Shutdown*: On `SIGTERM`, `SIGINT`, or `pm-mcp daemon stop`, the daemon stops accepting new job submissions, waits for active subprocess jobs to complete (unless `--force` is specified), unlinks `daemon.port`, `daemon.pid`, and `cookie`, and releases `daemon.lock`.
+
+== Per-Start Cookie Authentication
+_See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Loopback Endpoint Hardening & Cookie Authentication]_
+
+=== Per-Start Cookie Generation & Storage
+
+At every daemon start, before the HTTP listener accepts incoming connections, the daemon generates an ephemeral 256-bit authentication secret:
+
+* *Entropy Source*: `java.security.SecureRandom` (non-blocking OS CSPRNG).
+* *Size & Encoding*: 32 random bytes (256 bits) encoded as 64 lowercase ASCII hexadecimal characters (`^[0-9a-f]{64}$`), with no trailing whitespace or newline required on parse (trimmed on read).
+* *File Path*: `~/.plan-marshall/mcp/cookie`.
+* *File Creation & Permissions*: Created in the same directory as `~/.plan-marshall/mcp/cookie.tmp` using `PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))` (`0600`) prior to writing any secret bytes, flushed with `FileChannel.force(true)`, and atomically renamed to `~/.plan-marshall/mcp/cookie`.
+* *Startup Permission Audit*: Before accepting any HTTP request, the daemon re-stats `~/.plan-marshall/mcp/cookie` and `~/.plan-marshall/mcp/`. If either path is owned by another UID or has any group/world permission bits set (`0077`), the daemon logs a security fault to `audit.jsonl`, deletes the cookie file, and terminates with exit code `77` (`EX_NOPERM`).
+* *Lifecycle*: The cookie lives in memory and in `~/.plan-marshall/mcp/cookie` only for the lifetime of the daemon process. Restarting the daemon generates a new 256-bit value, automatically invalidating all tokens held by existing HTTP clients or stdio relays.
+
+=== Constant-Time `Authorization: Bearer <cookie>` Validation
+
+Every request to `/mcp/*`, `/clients/*`, and `/lsp/*` is authenticated independently (stateless per-request authentication; MCP session identifiers are never trusted for authentication).
+
+==== Validation Algorithm
+
+Implemented as a Quarkus `HttpAuthenticationMechanism` with priority above all route handlers:
+
+1. Extract the HTTP `Authorization` request header.
+2. Verify that exactly one `Authorization` header is present and starts with the case-sensitive prefix `"Bearer "` (7 ASCII bytes).
+3. Extract the bearer token substring following `"Bearer "` and verify its length is exactly 64 ASCII characters.
+4. Convert both the candidate token string and the daemon's active 64-character hex cookie into `byte[]` arrays using `StandardCharsets.US_ASCII`.
+5. Compare the two 64-byte arrays in constant time using `java.security.MessageDigest.isEqual(candidateBytes, activeCookieBytes)`:
++
+[source,java]
+----
+public boolean verifyCookie(String authorizationHeader) {
+    if (authorizationHeader == null || !authorizationHeader.startsWith("Bearer ")) {
+        return false;
+    }
+    String token = authorizationHeader.substring("Bearer ".length());
+    byte[] provided = token.getBytes(StandardCharsets.US_ASCII);
+    byte[] expected = this.activeCookieAsciiBytes; // 64 bytes
+    return MessageDigest.isEqual(provided, expected);
+}
+----
+6. If validation fails:
+   * Record an authentication failure event in `~/.plan-marshall/mcp/logs/audit.jsonl` (recording remote loopback port, target path, and reason `cookie_invalid` or `cookie_missing`, without logging the candidate token value).
+   * Return `HTTP 401 Unauthorized` with header `WWW-Authenticate: Bearer realm="pm-mcp"` and body:
++
+[source,json]
+----
+{
+  "error": "unauthorized",
+  "reason": "invalid_or_missing_cookie"
+}
+----
+
+NOTE: Operator routes (`/operator/*`) do *not* accept the daemon cookie. They require the separate operator token retrieved from the OS credential store (plus the PBKDF2-verified operator passphrase when Keychain binary-ACL binding is unavailable).
+
+== Strict `Host` and `Origin` Header Filtering
+_See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Loopback Endpoint Hardening & Cookie Authentication]_
+
+To prevent DNS rebinding attacks and cross-site requests originating from web browsers, a highest-priority Vert.x `@RouteFilter(1000)` executes before authentication and before the MCP transport layer on every HTTP request.
+
+=== `Host` Header Validation Rules
+
+1. Every HTTP/1.1 request must include exactly one `Host` header (or `:authority` pseudo-header in HTTP/2).
+2. The `Host` header value must exactly match one of the two permitted loopback literals for the daemon's active bound port `<port>`:
+   * `127.0.0.1:<port>`
+   * `localhost:<port>`
+3. Any request with a missing `Host` header, a port-less `Host` header, an IPv6 literal, or any domain name other than `127.0.0.1:<port>` or `localhost:<port>` (for example, `evil.rebind.attacker.com:<port>`) is rejected immediately with `HTTP 403 Forbidden`.
+
+=== `Origin` Header Rejection Rules
+
+1. Standard MCP clients (`Claude Code`, `OpenCode`, `Antigravity`, `pm-mcp serve --stdio`, and `pm-mcp client`) do not send browser `Origin` headers.
+2. Additionally, `quarkus.mcp.server.http.dns-rebinding-check.enabled=true` is enforced.
+3. If an incoming HTTP request contains an `Origin` header:
+   * Any browser-originated scheme (`http://...`, `https://...`, `ws://...`, `wss://...`, `file://...`) or the opaque origin literal `"null"` is rejected immediately with `HTTP 403 Forbidden`.
+4. All `Host` and `Origin` rejections are logged to `audit.jsonl` with `event: "http_security_reject"`, `reason: "invalid_host" | "forbidden_origin"`, and the offending header value, returning:
+
+[source,json]
+----
+{
+  "error": "forbidden",
+  "reason": "origin_or_host_rejected"
+}
+----
+
+[source,text]
+----
+Incoming HTTP Request on 127.0.0.1:<port>
+  │
+  ├─► [1. Host / Origin Filter (@RouteFilter)]
+  │     ├── Host ∉ {"127.0.0.1:<port>", "localhost:<port>"} ──► HTTP 403 Forbidden
+  │     └── Origin header present (browser / "null")        ──► HTTP 403 Forbidden
+  │
+  ├─► [2. Cookie Authentication (HttpAuthenticationMechanism)]
+  │     └── !MessageDigest.isEqual(Bearer, cookie)          ──► HTTP 401 Unauthorized
+  │
+  └─► [3. Route Dispatch]
+        ├── /mcp/*      ──► MCP Streamable HTTP Transport
+        ├── /clients/*  ──► Read-Only Client Bundle Endpoint
+        └── /lsp/*      ──► Warm LSP Proxy Endpoint
+----
+
+== Authenticated Client Bundle Endpoints (`/clients/<client>/`)
+_See Requirement link:../Requirements.adoc#PM-DIST-2[PM-DIST-2: Authenticated Loopback Bundle Endpoint & Client Installer]_
+
+The running daemon is the single version authority for client bundles. It serves embedded client bundles over read-only loopback routes protected by the `Host`/`Origin` filter and `Authorization: Bearer <cookie>` authentication.
+
+=== Endpoint Routes & Contracts
+
+[cols="2,1,2,3"]
+|===
+|HTTP Method & Path |Query Params |Response Content-Type |Normative Contract
+
+|`GET /clients`
+|None
+|`application/json`
+|Returns the list of supported client profiles compiled into the running daemon, with `daemon_version`, `bundle_version`, and `manifest_sha256` per client.
+
+|`GET /clients/{client}/bundle`
+|`scope=user\|project` (required)
+|`application/json`
+|Renders and returns the normative `manifest.json` (see link:client-profiles.adoc[Client Profiles Specification]) for `{client}` (`claude`, `opencode`, `antigravity`) at the requested installation scope (`user` or `project`). Returns `HTTP 404` if `{client}` is unknown or `HTTP 400` if `scope` is missing/invalid.
+
+|`GET /clients/{client}/files/{path+}`
+|`scope=user\|project` (optional)
+|`application/octet-stream` or `text/plain; charset=utf-8`
+|Returns the exact byte stream of a single bundle file whose `bundle_path` matches `{path+}` in `{client}`'s manifest, along with response header `X-PM-Content-SHA256: <hex_digest>`.
+|===
+
+=== Path Traversal & Integrity Guards on `/clients/{client}/files/{path+}`
+
+1. `{path+}` is validated against the closed set of `bundle_path` entries declared in `{client}`'s compiled bundle manifest.
+2. Any `{path+}` containing `..`, leading `/`, backslashes `\`, null bytes, or any path not present in the in-memory bundle manifest is rejected with `HTTP 400 Bad Request` (or `HTTP 404 Not Found`) without touching the filesystem.
+3. All bundle assets are served directly from immutable resources compiled into the `pm-mcp` native image.
+
+=== `pm-mcp client` Installer Interaction
+
+The `pm-mcp client` CLI subcommands (`install`, `update`, `remove`, `status`) consume `/clients/*` as follows:
+
+1. Ensure the daemon is running and matches the binary version on disk (starting or restarting the daemon on demand if needed).
+2. Read `~/.plan-marshall/mcp/cookie` and attach `Authorization: Bearer <cookie>` and `Host: 127.0.0.1:<port>` to every HTTP `GET` request.
+3. Fetch `GET /clients/{client}/bundle?scope={user|project}`, verify the manifest schema, and fetch each referenced file via `GET /clients/{client}/files/{bundle_path}`.
+4. Compute the SHA-256 digest of every downloaded file byte payload and verify it matches the `sha256` field in `manifest.json`.
+5. Display the planned additions, modifications, removals, hooks, and shared configuration key merges (`mcpServers.plan-marshall`) on the operator's terminal and require interactive confirmation before writing to disk.
+
+== `pm-mcp token` Header Helper Contract
+_See Requirement link:../Requirements.adoc#PM-ARCH-3[PM-ARCH-3: MCP Transport & Endpoint Modes]_
+
+_See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Loopback Endpoint Hardening & Cookie Authentication]_
+
+MCP hosts that support dynamic HTTP header generation (such as Claude Code via `"headersHelper": "pm-mcp token"`) invoke `pm-mcp token` prior to opening an HTTP connection or after receiving `HTTP 401 Unauthorized`.
+
+=== Execution Flow
+
+1. *Resolve Instance Directory*: Locate `PM_MCP_BASE` (`$PLAN_MARSHALL_HOME/mcp` or `~/.plan-marshall/mcp/`).
+2. *Daemon Liveness & Version Check*:
+   * Read `daemon.port` and `cookie` if present, and send an authenticated health/version probe (`GET http://127.0.0.1:<port>/mcp/version`).
+   * If the daemon is not running (`daemon.lock` not held or connection refused), spawn `pm-mcp daemon start` in the background and await readiness (up to 5 seconds).
+   * If the running daemon reports a version older than the `pm-mcp` binary executing `pm-mcp token`, trigger `pm-mcp daemon restart` (which drains active jobs and starts the updated binary) and await the new `cookie` and `daemon.port`.
+3. *Output Format*:
+   * Read the 64-character hex string from `~/.plan-marshall/mcp/cookie`.
+   * Write the exact single-line HTTP header to `stdout`:
++
+[source,text]
+----
+Authorization: Bearer <64-char-hex-cookie>
+----
+   * Exit with status code `0`. No diagnostic logs may be written to `stdout`.
+4. *Failure Handling (`daemon_unavailable`)*:
+   * If the daemon cannot be started or fails permission checks, write a single structured error line to `stderr`:
++
+[source,text]
+----
+error: daemon_unavailable — run 'pm-mcp daemon status' or 'pm-mcp operator doctor' to diagnose
+----
+   * Exit with non-zero status code (`69` / `EX_UNAVAILABLE`).
+
+== `pm-mcp serve --stdio` Relay Contract
+_See Requirement link:../Requirements.adoc#PM-ARCH-3[PM-ARCH-3: MCP Transport & Endpoint Modes]_
+
+For MCP hosts that do not support dynamic HTTP header helpers on Streamable HTTP connections, `pm-mcp serve --stdio` provides a zero-state stdio-to-HTTP relay within the same native binary.
+
+=== Relay Architecture & Invariants
+
+* *Stateless Pipe*: The relay process holds no workflow engine, no state store caches, and no tool definitions. Every JSON-RPC message is forwarded to the single machine-wide daemon over loopback HTTP.
+* *On-Demand Daemon Bootstrapping*: On startup, `pm-mcp serve --stdio` performs the exact same daemon liveness and binary version parity check as `pm-mcp token`, starting or draining-and-restarting the daemon before reading the first JSON-RPC request from `stdin`.
+
+=== Wire Forwarding & Transparent Re-Authentication Protocol
+
+1. *Inbound (`stdin` -> Loopback HTTP)*:
+   * Read newline-delimited UTF-8 JSON-RPC 2.0 messages (`JSONRPCRequest`, `JSONRPCNotification`, `JSONRPCResponse` for server-initiated elicitation/ping) from `stdin`.
+   * Forward each message as an HTTP `POST` request to `http://127.0.0.1:<port>/mcp` with headers:
+     - `Host: 127.0.0.1:<port>`
+     - `Authorization: Bearer <cookie>`
+     - `Content-Type: application/json`
+     - `Accept: application/json, text/event-stream`
+2. *Outbound (Loopback HTTP -> `stdout`)*:
+   * When the daemon responds with `Content-Type: application/json`, write the single-line JSON-RPC payload followed by `\n` to `stdout` and flush immediately.
+   * When the daemon responds with `Content-Type: text/event-stream` (for example, during a progress-notifying `wait` link call or server-initiated elicitation), parse each SSE `data:` frame and write the encapsulated JSON-RPC message followed by `\n` to `stdout` and flush immediately.
+3. *Transparent Cookie Rotation & Daemon Restart Recovery*:
+   * If a forwarded `POST /mcp` request receives `HTTP 401 Unauthorized` or `ConnectException` (because the daemon restarted on upgrade or idle timeout), the relay:
+     a. Runs the on-demand daemon start/discovery sequence to re-read `~/.plan-marshall/mcp/daemon.port` and `~/.plan-marshall/mcp/cookie`.
+     b. Retries the failed HTTP request once with the refreshed port and cookie.
+   * If the retry fails, the relay emits a standard JSON-RPC error response for requests carrying an `id` (`code: -32000`, `message: "daemon_unavailable"`, `data: {"reason": "daemon_unavailable", "diagnose": "pm-mcp daemon status"}`) to `stdout` and logs details to `stderr`.
+4. *Lifecycle Termination*:
+   * When `stdin` reaches `EOF` (host session closed), the relay closes its active HTTP connections cleanly and exits with code `0`. Active daemon jobs (`pm_build`, CI watches) continue running in the daemon unaffected.

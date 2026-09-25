@@ -1,0 +1,76 @@
+== Client Profiles & Dynamic Translation (PM-CLIENT)
+
+[#PM-CLIENT-1]
+=== PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence
+
+Every interaction with `PM-MCP` is associated with an agent runtime identity established at the session entry point and persisted with the active plan or epic scope.
+
+* Every user-invoked entry command (configuration wizard, plan lifecycle, epic orchestration) must execute `pm-mcp enter --client <client> <entry> [plan_id | epic_id]` in the host's shell prior to the first MCP tool call.
+* The client identity passed via `--client` (e.g., `claude`, `opencode`, `antigravity`) must be treated strictly as advisory routing and rendering metadata used to format representations, skill syntax, and host tool names, never as an authenticated security credential.
+* Upon executing `pm-mcp enter`, the daemon must persist an entry record (`mcp/entry.json`) inside the target plan or epic directory containing `client`, `client_version`, `client_session`, `entry`, `workspace_root`, and `entered_at`; the `mcp/` directory must remain local to the machine and excluded from git tracking.
+* For new plan entries where no `plan_id` exists yet, the daemon must write a project-level entry record and atomically relocate it into the plan's `mcp/` directory upon `pm_start`.
+* All subsequent MCP tool calls within that plan or epic scope (including calls from dispatched sub-agents and `pm_state` calls after `/clear` or compaction) must resolve the client profile from `mcp/entry.json` without requiring the model to pass client identity parameters.
+* Re-entering an existing plan or epic from the same or a different client runtime must overwrite `mcp/entry.json`, hand over rendering to the new client profile, and record the handover event in the audit log.
+
+See the link:specification/client-profiles.adoc[Client Profiles & Dynamic Translation Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+
+[#PM-CLIENT-2]
+=== PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation
+
+Instead of generating static per-runtime copies of the skill corpus at build time, `PM-MCP` must dynamically translate all model-facing artifacts per request using declarative client profiles.
+
+* The system must translate vocabulary skills, state representations, hypermedia links, and sub-agent dispatch envelopes on the fly according to the active scope's client profile across the following dimensions:
+** *Host Tool Names*: Translating canonical tool references to runtime-native names (e.g., `Read` -> `view_file` in Antigravity or `read` in OpenCode; `AskUserQuestion` -> `ask_question` or `question`).
+** *Skill Load Directives*: Rendering skill invocation syntax for the client's native discovery mechanism (`pm_skills` tool call, MCP Skills protocol, or `view_file` stub).
+** *Command Names*: Formatting user-invocable entry point commands using the client's namespace conventions.
+** *Tool Idioms*: Rewriting, preserving, or rewording runtime-specific idioms according to registered profile dispositions.
+** *Models & Effort Levels*: Mapping abstract task complexity levels to runtime-specific model identifiers and thinking/effort parameters.
+** *Sub-Agent Dispatch*: Resolving `dispatch` links into the host's sub-agent invocation tool, agent variant name, and parameter structure (or omitting dispatch links where a host's sub-agents cannot reach MCP servers).
+* Dynamic profile rendering must compute deterministic per-client skill digests so each client runtime observes a stable, verifiable skill catalogue.
+
+See the link:specification/client-profiles.adoc[Client Profiles & Dynamic Translation Specification] and link:specification/mcp-tools.adoc[MCP Tools & Resources Specification] for implementation details.
+
+[#PM-CLIENT-3]
+=== PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit
+
+To prevent silent profile misrouting and maintain non-repudiable operational auditability, the system must cross-check declared client identities against host environment signatures and MCP handshake metadata.
+
+* `pm-mcp enter` must inspect the inherited process environment against per-client detection rules defined in the client profiles (such as `AI_AGENT`, `CLAUDECODE=1`, and `CLAUDE_CODE_SESSION_ID`).
+* Every audit log entry must record three distinct identity tiers:
+** *Tier 1 (Declared Client)*: The advisory identity passed via `--client` (or recorded in `mcp/entry.json`).
+** *Tier 2 (Detected Environment)*: The runtime signature detected from process environment variables or MCP `clientInfo` metadata (`unknown` if unrecognized, `absent` if omitted on stateless MCP requests).
+** *Tier 3 (Authenticated OS Principal)*: The verified local operating system user principal owning the connection.
+* If the detected environment signature or MCP `clientInfo` disagrees with the recorded `mcp/entry.json` identity, the system must:
+** Record the discrepancy (`identity_mismatch=true`) in the audit log and notify the operator.
+** Flag the mismatch prominently in the returned state representation so a session that lost ownership of a plan does not silently act on a foreign client profile.
+** Preserve the persisted `mcp/entry.json` profile without silently mutating it during a regular tool call.
+
+See the link:specification/client-profiles.adoc[Client Profiles & Dynamic Translation Specification] and link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+
+[#PM-CLIENT-4]
+=== PM-CLIENT-4: Neutral Fallback Profile for Unknown Clients
+
+Connections originating from unrecognized or unprofiled MCP clients must degrade gracefully and visibly to a standard, host-agnostic interaction mode.
+
+* When a session enters with an unrecognized client identity (`unknown`) or connects without a matching client profile, the system must serve the session using a built-in *neutral profile*.
+* Under the neutral profile, the system must:
+** Emit links and instructions referencing only `PM-MCP`'s own standard MCP tools (`pm_start`, `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skills`).
+** Omit all host-specific native tool names, shell idioms, and sub-agent `dispatch` links (converting sub-agent steps to inline sequential steps).
+** Explicitly mark the state representation as operating on the `neutral` profile so capability degradation is immediately visible to both the model and the operator.
+
+See the link:specification/client-profiles.adoc[Client Profiles & Dynamic Translation Specification] for implementation details.
+
+[#PM-CLIENT-5]
+=== PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy
+
+Client profiles must be governed as versioned, schema-validated data artifacts embedded in the binary and extensible via local configuration overrides.
+
+* Every client profile definition must be a declarative JSON document carrying an explicit integer `schema_version` (`profile_version`), minimum compatible daemon version, and `bundle_version` with file digest mappings.
+* Each profile must declare the client's transport mode (Streamable HTTP with `headersHelper` vs `pm-mcp serve --stdio`), supported protocol capabilities (MCP Skills extension, progress notification idle-timer reset, tool-call timeout bounds, MCP elicitation), and tool schema loading mode (resident vs on-demand preloading of `pm_start`, `pm_state`, and `pm_do`).
+* The daemon must resolve client profiles using a three-tier override hierarchy (from lowest to highest precedence):
+** Built-in profiles compiled into the `pm-mcp` binary.
+** Operator machine-level overrides in `<PM_MCP_BASE>/conf/profiles/<client>.json`.
+** Project-level overrides in `.plan/conf/profiles/<client>.json`.
+* All profile documents and overrides must be validated against the closed client profile JSON Schema at daemon startup; malformed profiles must be rejected with a structured diagnostic error.
+
+See the link:specification/client-profiles.adoc[Client Profiles & Dynamic Translation Specification] for implementation details.

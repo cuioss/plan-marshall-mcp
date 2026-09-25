@@ -1,0 +1,301 @@
+= plan-marshall-mcp Requirements
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+== Overview
+
+This document defines the normative functional and non-functional requirements for *plan-marshall-mcp* (`PM-MCP`): a local Model Context Protocol (MCP) server and native host daemon (`pm-mcp`) that replaces prose-enforced workflow instructions and shell-invoked Python scripts with a server-owned hypermedia state machine (HATEOAS), warm platform services, and verified native execution.
+
+For technical implementation blueprints, wire protocols, data schemas, and formal grammars, see the link:Specification.adoc[Technical Specification]. For delivery staging, see the link:roadmap.adoc[Roadmap]. For historical background and evaluated alternatives, see link:workflow-analysis/README.adoc[Workflow and Contract Analysis] and link:discussions/README.adoc[Discussions].
+
+=== Requirement Authoring Conventions (SMART)
+
+All requirements in this document set follow the SMART criteria:
+
+* *Specific*: Each requirement uses unambiguous normative statements ("The system must...") defining exact behavior, inputs, outputs, and constraints.
+* *Measurable*: Acceptance criteria specify observable, testable outcomes (latency bounds, HTTP status codes, closed outcome enumerations, digest checks).
+* *Achievable*: Grounded in the selected technology stack (Java 25+, Quarkus native image, OS credential stores, MCP specification).
+* *Relevant*: Directly addresses identified cost, reliability, or security limitations of the script-and-prose architecture.
+* *Traceable*: Identified by a stable hierarchical anchor `[#PM-<DOMAIN>-<NUM>]` with bidirectional links to technical specifications in `doc/specification/` and verification gates in `doc/roadmap.adoc`.
+
+=== Requirement Prefix Taxonomy
+
+Project umbrella prefix: `PM-`
+
+[cols="1,2,3,3"]
+|===
+|Prefix |Domain |Requirement Module |Primary Technical Specifications
+
+|`PM-ARCH`
+|Core Architecture
+|link:requirements/01-architecture.adoc[01-architecture.adoc]
+|link:specification/daemon-endpoint.adoc[daemon-endpoint.adoc], link:specification/filesystem-layout.adoc[filesystem-layout.adoc], link:specification/move-journal.adoc[move-journal.adoc]
+
+|`PM-WF`
+|Hypermedia Workflow Engine
+|link:requirements/02-workflow.adoc[02-workflow.adoc]
+|link:specification/hypermedia-format.adoc[hypermedia-format.adoc], link:specification/workflow-dsl.adoc[workflow-dsl.adoc]
+
+|`PM-SKILL`
+|Skill Generation & Delivery
+|link:requirements/03-skills.adoc[03-skills.adoc]
+|link:specification/mcp-tools.adoc[mcp-tools.adoc], link:specification/client-profiles.adoc[client-profiles.adoc]
+
+|`PM-TOOL`
+|MCP Tool & Resource Surface
+|link:requirements/04-tools.adoc[04-tools.adoc]
+|link:specification/mcp-tools.adoc[mcp-tools.adoc], link:specification/hypermedia-format.adoc[hypermedia-format.adoc]
+
+|`PM-SVC`
+|Platform Services (Build, LSP, Proxy)
+|link:requirements/05-services.adoc[05-services.adoc]
+|link:specification/job-runtime.adoc[job-runtime.adoc], link:specification/mcp-tools.adoc[mcp-tools.adoc]
+
+|`PM-EXEC`
+|Build & Subprocess Execution
+|link:requirements/06-execution.adoc[06-execution.adoc]
+|link:specification/job-runtime.adoc[job-runtime.adoc], link:specification/store-schemas.adoc[store-schemas.adoc]
+
+|`PM-CRED`
+|Credential Management
+|link:requirements/07-credentials.adoc[07-credentials.adoc]
+|link:specification/daemon-endpoint.adoc[daemon-endpoint.adoc], link:specification/filesystem-layout.adoc[filesystem-layout.adoc]
+
+|`PM-SEC`
+|Security & Trust Boundaries
+|link:requirements/08-security.adoc[08-security.adoc]
+|link:specification/daemon-endpoint.adoc[daemon-endpoint.adoc], link:specification/job-runtime.adoc[job-runtime.adoc]
+
+|`PM-TECH`
+|Technology Stack & Performance
+|link:requirements/09-technology.adoc[09-technology.adoc]
+|link:specification/daemon-endpoint.adoc[daemon-endpoint.adoc], link:specification/job-runtime.adoc[job-runtime.adoc]
+
+|`PM-DIST`
+|Distribution & Client Bundles
+|link:requirements/10-distribution.adoc[10-distribution.adoc]
+|link:specification/client-profiles.adoc[client-profiles.adoc], link:specification/daemon-endpoint.adoc[daemon-endpoint.adoc]
+
+|`PM-MIG`
+|Migration & Coexistence
+|link:requirements/11-migration.adoc[11-migration.adoc]
+|link:specification/store-schemas.adoc[store-schemas.adoc], link:specification/filesystem-layout.adoc[filesystem-layout.adoc]
+
+|`PM-TEST`
+|Quality Gates & Verification
+|link:requirements/12-testing.adoc[12-testing.adoc]
+|link:specification/store-schemas.adoc[store-schemas.adoc], link:specification/workflow-dsl.adoc[workflow-dsl.adoc]
+
+|`PM-CLIENT`
+|Client Profiles & Identity
+|link:requirements/13-client-profiles.adoc[13-client-profiles.adoc]
+|link:specification/client-profiles.adoc[client-profiles.adoc]
+
+|`PM-IMPL`
+|Implementation Modules & Stores
+|link:requirements/14-implementation.adoc[14-implementation.adoc]
+|link:specification/workflow-dsl.adoc[workflow-dsl.adoc], link:specification/store-schemas.adoc[store-schemas.adoc], link:specification/hypermedia-format.adoc[hypermedia-format.adoc]
+|===
+
+== Motivation & System Context
+
+=== Limitations of the Script-and-Prose Architecture
+
+Today, plan-marshall ships as a marketplace of Markdown skills and Python scripts executed via a generated proxy (`python3 .plan/execute-script.py {bundle}:{skill}:{script} ...`) through the host's Bash tool. While functional, this architecture incurs structural costs that motivate `plan-marshall-mcp`:
+
+* *Process rules enforced by prose*: Workflow ordering, finalize gates, and operator-only boundaries live in Markdown instructions. Rules such as "never invent arguments" or "never `--force` the freshness gate" can be misread, ignored, or lost during context compaction.
+* *Model-assembled CLI calls*: The model composes every script invocation from prose (plan ID, worktree path, step name, CLI flags), making malformed or stale arguments a recurring defect class.
+* *Resident context overhead*: Whole-phase workflow documents remain in model context across turns even when only a single state transition is relevant.
+* *Bash as transport*: Routing every operation through Bash requires shell-hygiene rules, PreToolUse hooks, and host permission allowlists solely to police the transport channel.
+* *Skill and script drift*: Skills (loaded from plugin cache) and scripts (resolved via generated executors) travel through separate mechanisms and can diverge across updates.
+* *Multi-stage distribution chain*: Source bundles -> target runtime generator -> `target/{runtime}/` -> dist branch -> marketplace install -> plugin cache -> executor regeneration -> host restart.
+* *Cold language servers*: LSP queries spawn and tear down a language server per invocation across sub-agents.
+* *Static runtime translation*: Supporting Claude Code, OpenCode, and Antigravity requires static build-time corpus translation per runtime.
+
+=== Architectural Shift
+
+[cols="2,3"]
+|===
+|Problem |PM-MCP Requirement & Design Response
+
+|Rules enforced by prose
+|The workflow state machine executes inside the server (`PM-WF`); invalid transitions are omitted from representations and rejected on execution.
+
+|Model assembles CLI calls
+|The server returns valid transitions as hypermedia links (`PM-WF-2`); the model supplies only a `link` identifier and judgment parameters (`args`) via `pm_do`.
+
+|Resident context overhead
+|Only the active state's representation and targeted vocabulary skill enter model context (`PM-SKILL-1`).
+
+|Bash as transport
+|All plan-marshall operations execute as typed MCP tool calls (`PM-TOOL-1`); only the initial entry bootstrap (`pm-mcp enter`) runs in the host shell.
+
+|Skill/script drift
+|Skills, state transitions, and tool schemas are served from a single versioned binary (`PM-DIST-1`).
+
+|Cold LSP startups
+|The daemon maintains a warm, shared language server pool (`PM-SVC-2`).
+
+|Static runtime translation
+|The daemon translates tool names, dispatch conventions, and skill references on the fly using data-driven client profiles (`PM-CLIENT-2`).
+|===
+
+Judgment remains strictly with the model: refining requests, authoring solution outlines, implementing code, triaging findings, and composing commit/PR descriptions. PM-MCP narrows the model's workflow obligations to supplying those judgment artifacts as free parameters of hypermedia links.
+
+=== System Overview & Glossary
+
+[source,text]
+----
+ Machine (the developer's computer)
+ ┌─────────────────────────────────────────────────────────────────────────────────┐
+ │                                                                                 │
+ │ Host: Claude Code          Host: OpenCode             Host: Antigravity         │
+ │ ┌──────────────────────┐   ┌──────────────────────┐   ┌──────────────────────┐  │
+ │ │ Session              │   │ Session              │   │ Session              │  │
+ │ │   model (PM)         │   │   model (PM)         │   │   model (PM)         │  │
+ │ │   sub-agents         │   │   sub-agents         │   │   sub-agents         │  │
+ │ │   entry point        │   │   entry point        │   │   entry point        │  │
+ │ │ ↳ client=claude      │   │ ↳ client=opencode    │   │ ↳ client=antigravity │  │
+ │ └──────────┬───────────┘   └──────────┬───────────┘   └──────────┬───────────┘  │
+ │            │ HTTP                     │ stdio (pm-mcp serve)     │ HTTP or stdio│
+ │            └──────────────────────────┬──────────────────────────┘              │
+ │                                       ▼                                         │
+ │ ┌─────────────────────────────────────────────────────────────────────────────┐ │
+ │ │ PM-MCP daemon (one per machine, native on the host)                         │ │
+ │ │ workflow engine · state store · skill generator + client profiles           │ │
+ │ │ build server · LSP pool · MCP proxy · audit                                 │ │
+ │ │ plans (plan_id) · epics (epic_id) · enrolled projects                       │ │
+ │ └──────────────────────────────────────┬──────────────────────────────────────┘ │
+ │                                        │ jobs                                   │
+ │                 ┌──────────────────────▼──────────────────────┐                 │
+ │                 │ Subprocesses on the host                    │                 │
+ │                 │ builds (./mvnw, ./gradlew, ./pw …), git,    │                 │
+ │                 │ scripts, language servers                   │                 │
+ │                 └──────────────────────┬──────────────────────┘                 │
+ │                                        ▼                                        │
+ │                              worktrees of enrolled projects                     │
+ └─────────────────────────────────────────────────────────────────────────────────┘
+ Operator: enrols projects, answers escalations, takes operator-only actions
+----
+
+[cols="1,3"]
+|===
+|Term |Definition
+
+|Machine
+|The developer's workstation running one PM-MCP daemon and any number of agent hosts.
+
+|Host
+|An agent runtime connecting to MCP servers and hosting the model (e.g., Claude Code, OpenCode, Antigravity).
+
+|Session
+|A single conversation instance within a host. Multiple sessions across one or more hosts interact with PM-MCP concurrently.
+
+|Sub-agent
+|A child session spawned through a `dispatch` link; operates within the parent plan or epic scope and inherits its recorded client identity.
+
+|PM
+|The model participant operating within a host session.
+
+|Operator
+|The human developer responsible for the machine and its repositories. Enrols projects, resolves escalations, and performs privileged actions exclusively via MCP elicitation or the operator CLI.
+
+|`pm-mcp`
+|The single native executable deployed on the host, providing daemon execution, control verbs, `pm-mcp token`, `pm-mcp serve --stdio`, `pm-mcp enter`, `pm-mcp client`, and operator CLI commands.
+
+|Daemon
+|The long-lived per-machine `pm-mcp` server process owning the workflow engine, state stores, build scheduler, warm LSP pool, MCP proxy, and audit log.
+
+|Entry point & Entry call
+|A user-invoked command in the client bundle that executes `pm-mcp enter --client <client>` to record the client identity and workspace root in the plan or epic entry record.
+
+|Representation
+|The TOON-formatted state payload returned by the server describing the current state of a plan or epic, relevant domain facts, and valid hypermedia links.
+
+|Link & Link ID
+|A valid state transition offered in a representation (`rel`, `link` identifier such as `push` or `triage:F-12`, and free parameter names), invoked via `pm_do`.
+
+|Job
+|A build, git, CI, or script subprocess managed by the daemon on the host, verified against project enrolment and tracked via `wait` links.
+
+|Enrolment
+|The operator-authorized registration of a project root, its pinned build wrappers/tools, SHA-256 digests, and allowed execution arguments.
+|===
+
+include::requirements/01-architecture.adoc[]
+
+include::requirements/02-workflow.adoc[]
+
+include::requirements/03-skills.adoc[]
+
+include::requirements/04-tools.adoc[]
+
+include::requirements/05-services.adoc[]
+
+include::requirements/06-execution.adoc[]
+
+include::requirements/07-credentials.adoc[]
+
+include::requirements/08-security.adoc[]
+
+include::requirements/09-technology.adoc[]
+
+include::requirements/10-distribution.adoc[]
+
+include::requirements/11-migration.adoc[]
+
+include::requirements/12-testing.adoc[]
+
+include::requirements/13-client-profiles.adoc[]
+
+include::requirements/14-implementation.adoc[]
+
+== Appendix: Verification Gates & Risk Register (Non-Normative)
+
+=== Technical Verifications Required During Implementation
+
+Each verification item below specifies the deterministic fallback if the primary technical assumption fails during spike testing:
+
+1. *Quarkus Native Image Dependency Set*: Verify Quarkus MCP Server extension, `cui-http`, and `TokenSheriff` under GraalVM native image (`PM-TECH-1`, `PM-TECH-3`). _Fallback_: Supply explicit native-image reachability metadata or replace incompatible library components; native compilation of `pm-mcp` is non-negotiable.
+2. *LSP4J under GraalVM Native Image*: Verify LSP4J JSON-RPC protocol reflection and dynamic proxy registration (`PM-SVC-2`, `PM-TECH-3`). _Fallback_: Replace LSP4J with a minimal Jackson-based JSON-RPC client for the closed set of LSP operations used by PM-MCP.
+3. *Linux systemd Confinement against Real Builds*: Verify `systemd-run --user` read-only filesystem confinement with real project builds using wrapper caches, Testcontainers, and Docker Compose (`PM-SEC-5`, `PM-TECH-4`). _Fallback_: Enrol additional explicit write paths in project enrolment (`~/.plan-marshall/mcp/`); never disable confinement.
+4. *macOS Keychain Access from Native Binary*: Verify `Security.framework` access via Java FFM from the `pm-mcp` native executable (`PM-CRED-2`). _Fallback_: Use the encrypted/permission-guarded file credential store (`~/.plan-marshall/credentials/`) and require interactive operator confirmation via CLI.
+5. *Linux Secret Service via D-Bus Unix Socket*: Verify `org.freedesktop.secrets` over JDK `UnixDomainSocketAddress` under native image (`PM-CRED-2`). _Fallback_: Fall back to `~/.plan-marshall/credentials/` with `0600` permissions.
+6. *Dynamic Header Helper Support per Host*: Verify which hosts support dynamic bearer token injection (`headersHelper` in Claude Code) vs requiring the `pm-mcp serve --stdio` relay (`PM-ARCH-3`, `PM-DIST-3`).
+7. *Host Extension Manager Loopback Installation*: Verify native plugin/bundle installation from the authenticated `/clients/<client>/` loopback endpoint per runtime (`PM-DIST-2`).
+8. *MCP Call Idle Timeouts & Progress Reset*: Verify per-host tool call timeout thresholds and whether MCP progress notifications reset the timer (`PM-IMPL-4`).
+
+=== Tracked Architectural Risks & Mitigations
+
+[cols="1,2,2"]
+|===
+|Risk |Impact |Normative Mitigation
+
+|MCP Framework Maturity
+|Quarkus MCP Server extension is outside official SDK tiers; draft MCP extensions (Skills, Tasks) may evolve.
+|Own job scheduling (`PM-SVC-1`) and tool-based skill delivery (`PM-SKILL-3`) as baseline; treat protocol extensions as optional enhancements.
+
+|Host Capability Variance
+|Progress notifications, sub-agent MCP inheritance, and elicitation support vary across Claude Code, OpenCode, and Antigravity.
+|Baseline interaction uses standard MCP tools (`PM-TOOL-1`), bounded wait links (`PM-IMPL-4`), and operator CLI fallback (`PM-SEC-3`).
+
+|Model Out-of-Sequence Calls or Invalid Arguments
+|Because `pm_do` accepts free parameters in an `args` map, the host cannot pre-validate link-specific arguments via static JSON Schema.
+|Server re-validates every transition and parameter against persisted state (`PM-WF-6`) and returns a structured parameter validation error plus fresh representation on mismatch.
+
+|Judgment Quality Regression
+|Replacing full-phase Markdown documents with concise state representations could omit implicit guidance.
+|Pair every judgment state with a focused static vocabulary skill (`PM-SKILL-1`) and measure outline/triage quality before retiring legacy phases (`PM-MIG-4`).
+
+|Daemon Single Point of Failure
+|A daemon crash interrupts all active sessions on the machine.
+|Persist all workflow and job state in the filesystem (`PM-ARCH-6`), drain or recover jobs on restart (`PM-ARCH-8`), and ensure idempotent transitions.
+
+|Upstream Proxy Trust Laundering
+|Untrusted content from proxied external MCP servers could be mistaken for authoritative PM-MCP state.
+|Attach provenance metadata (`_meta`), mark proxied output untrusted, and forbid re-serving upstream skills (`PM-SVC-3`, `PM-SEC-1`).
+|===

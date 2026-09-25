@@ -1,0 +1,97 @@
+== Security & Trust Model (PM-SEC)
+
+[#PM-SEC-1]
+=== PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment
+
+The security architecture of `PM-MCP` enforces a strict dual-boundary security model separating the host runtime from the MCP server, and contains untrusted content encountered during execution.
+
+* The system must enforce a two-boundary security model comprising:
+** An internal PM-MCP tool boundary where all state transitions are closed enumerations, parameters are schema-validated, workspace access is server-confined, job execution is verified against operator enrolment, and operator capabilities are omitted.
+** An external host tool boundary governing the AI model's native file and shell access outside PM-MCP's direct control.
+* The system must enforce that read-only sub-agents (reader and researcher agents) receive zero PM-MCP modification tools, preventing untrusted or speculative reasoning paths from altering plan state.
+* The system must tag all external content—including repository code, build definitions, pull request comments, review-bot outputs, and responses from upstream MCP servers—with provenance metadata (`_meta.source`) and treat it as untrusted.
+* The system must prohibit state machine transitions derived solely from untrusted external content; external review-bot comments or CI statuses may create findings or trigger verification checks, but must never directly mark a quality gate green or bypass a merge barrier.
+* The system must process untrusted external text through a restricted extraction parser whose output is strictly validated against a closed JSON schema prior to incorporation into plan stores.
+* The system must record the repository state of the main checkout and active worktrees at task start, and verify realized changes at task submit and before commit; any change detected outside the assigned worktree must transition the plan into a `*.footprint-violation` state with an explanatory finding and restrict offered links to `fix` and `escalate`.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+
+[#PM-SEC-2]
+=== PM-SEC-2: Workspace Confinement & Path Traversal Prevention
+
+To prevent unauthorized file modifications or cross-project data leakage, all PM-MCP file and repository operations must be strictly confined to the enrolled repository root and its active worktrees.
+
+* The system must resolve the canonical repository root at session entry (`pm-mcp enter`) and persist it in the scope's entry record (`mcp/entry.json`).
+* The system must cross-check client-declared MCP roots with the process working directory at entry, report any discrepancy in the audit log, and apply the narrower root set.
+* The system must canonicalize all paths (resolving all symbolic links) for every filesystem, git, and build operation, asserting that the target path resides within the enrolled workspace root or a live linked git worktree whose git common directory resolves to that root.
+* The system must reject any path traversal attempt (including directory traversal sequences `..`, absolute paths outside the workspace, or symlinks pointing outside the root) with an explicit `path_traversal_rejected` error outcome and an HTTP 403 status where applicable.
+* The system must forbid AI models from specifying raw filesystem paths for state manipulation; all target scopes (`plan_id`, `epic_id`) must be resolved server-side from persisted state.
+* The system must require explicit operator approval for cross-project access (such as multi-repo epic landing or dependency verification); such access must be requested via an `escalate` link, approved exclusively by the operator via elicitation or operator CLI, limited to enrolled projects, scoped to a specific access level (read or read-write) and execution lifetime, and recorded in the audit log.
+
+See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+
+[#PM-SEC-3]
+=== PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)
+
+Privileged operations that alter machine configuration, security posture, or project boundaries must be strictly isolated from the AI model's capability surface.
+
+* The system must exclude all operator-only capabilities—including project enrolment, forcing quality gates, overriding merge barriers, deleting plan directories, and approving cross-project access—from the MCP tool surface and link emissions.
+* The system must reject any attempt to execute operator-only actions via `pm_do` regardless of supplied arguments.
+* The system must provide exactly two isolated channels for operator decisions, neither of which routes through the AI model:
+** MCP Elicitation: Direct interactive user prompts supported by compliant host runtimes that return answers straight to PM-MCP without model interception.
+** Operator CLI (`pm-mcp operator <action>`): An interactive command-line interface communicating over the loopback endpoint using the privileged operator token and requiring terminal confirmation (TTY).
+* The system must transition a plan or epic into a `*.blocked` state whenever an operator decision is required, displaying the pending request and matching CLI command, and offering only a `wait` link until resolved.
+* The system must protect the operator token using the OS credential store (macOS Keychain access control list restricted to `pm-mcp`); when operating on platforms lacking application-level access control (Linux Secret Service or file store), the system must require a salted PBKDF2 operator passphrase entered interactively without terminal echo.
+* The system must enforce exponential rate-limiting on operator passphrase verification failures and log all privileged authentication attempts to the audit log.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/mcp-tools.adoc[MCP Tools & Resources Specification] for implementation details.
+
+[#PM-SEC-4]
+=== PM-SEC-4: Loopback Endpoint Hardening & Cookie Authentication
+
+The local daemon HTTP endpoints must be fortified against DNS rebinding, cross-origin requests, and unauthorized local process access.
+
+* The system must bind the daemon HTTP listener exclusively to `127.0.0.1` (`quarkus.http.host=127.0.0.1`), refusing external interface binding in all deployment profiles.
+* The system must enable DNS rebinding protection and enforce request header validation via a dedicated route filter that accepts only `Host` headers matching `127.0.0.1:<port>` or `localhost:<port>`, immediately rejecting foreign or missing Host headers with HTTP 403 Forbidden.
+* The system must validate the `Origin` header on every incoming HTTP request, rejecting any request carrying an untrusted or non-loopback origin with HTTP 403 Forbidden.
+* The system must generate a cryptographically secure random 256-bit ephemeral cookie at every daemon startup and write it to `~/.plan-marshall/mcp/run/cookie` with POSIX file mode `0600` (directory mode `0700`); the daemon must refuse to start if file permissions are insecure or if ownership does not match the active user.
+* The system must authenticate all requests to `/mcp/*` and `/clients/*` by verifying the `Authorization: Bearer <cookie>` header using a constant-time comparison mechanism.
+* The system must enforce that the client bundle installation endpoint (`/clients`) adheres to the identical loopback binding, Host/Origin validation, and bearer cookie authentication as the MCP tool endpoint.
+* The system must treat MCP sessions as stateless with respect to authentication, verifying the bearer cookie on every individual HTTP request.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+
+[#PM-SEC-5]
+=== PM-SEC-5: Subprocess Environment Sanitization & Linux Filesystem Confinement
+
+Subprocesses spawned by PM-MCP for builds, git operations, CI queries, and legacy scripts must be executed with sanitized environments and OS-level confinement.
+
+* The system must spawn all subprocesses directly via operating system process creation APIs without invoking intermediate system shells (`/bin/sh` or `/bin/bash`), and place each job in its own distinct process group.
+* The system must filter subprocess environments against a strict allowlist of necessary variables (`PATH`, `HOME`, toolchain paths); the daemon cookie, operator tokens, and credential secrets must never be exported to child environments.
+* The system must pass free-text parameters (such as commit messages, PR descriptions, and outline text) via standard input (`stdin`) or temporary files, never interpolating free text into command-line arguments.
+* The system must execute all subprocesses on Linux under systemd user confinement (`systemd-run --user` or systemd user service), enforcing:
+** `NoNewPrivileges=yes`
+** `ProtectSystem=strict`
+** `PrivateTmp=yes`
+** `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+** `ProtectHome=read-only`, with explicit read-write bind mounts restricted to enrolled project roots, `~/.plan-marshall/`, and declared build toolchain caches.
+* The system must dynamically update systemd write paths whenever a project is enrolled or removed.
+* The system must document the absence of equivalent unprivileged sandboxing on macOS as an accepted residual platform risk.
+
+See the link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+
+[#PM-SEC-6]
+=== PM-SEC-6: Security Audit Trail & Tamper-Evident Logging
+
+The system must maintain an append-only, tamper-evident audit record of all security-relevant operations, authentication events, and identity assertions.
+
+* The system must record every tool invocation, state machine transition, job submission, credential access, and operator action to an append-only JSONL audit log (`~/.plan-marshall/mcp/logs/audit.jsonl`).
+* The system must record three distinct identity layers for every audited operation:
+** The declared client identity (`--client` parameter from entry point).
+** The detected environment signature (runtime environment variables such as `CLAUDECODE`, `AI_AGENT`, session IDs).
+** The authenticated operating system user principal running the process.
+* The system must explicitly flag any discrepancy between declared client identity and detected environment signature (`identity_mismatch=true`) in the audit log and return a warning in the state representation.
+* The system must redact all sensitive credentials, bearer cookies, passwords, and tokens before writing entries to daemon logs or the audit log.
+* The system must sanitize error responses returned to AI models, suppressing internal exception traces, stack traces, and local system paths, returning only closed-enum error codes and the unique audit record identifier for operator diagnostics.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] for implementation details.

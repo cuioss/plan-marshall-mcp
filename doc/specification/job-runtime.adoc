@@ -1,0 +1,142 @@
+= Job Runtime Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Job Runtime
+
+== Overview
+
+This document specifies the technical design, process management, security controls, and output parsers for the PM-MCP **Job Runtime**. The runtime manages native host subprocesses for builds, git operations, CI command-line integrations (`gh`, `glab`), and migration script wrappers under strict operator enrolment (`PM-EXEC-1`..`PM-EXEC-5`).
+
+== Traceability
+_See Requirements:_
+
+* _link:../Requirements.adoc#PM-EXEC-1[PM-EXEC-1: Wrapper-First Execution & Enrolled Host Tools]_
+* _link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
+* _link:../Requirements.adoc#PM-EXEC-3[PM-EXEC-3: Python Interpreter Pinning & Hash Verification]_
+* _link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4: Direct Host Subprocess Management & Process-Group Isolation]_
+* _link:../Requirements.adoc#PM-EXEC-5[PM-EXEC-5: Native Git & CI CLI Job Execution]_
+* _link:../Requirements.adoc#PM-SEC-2[PM-SEC-2: Workspace Confinement & Path Traversal Prevention]_
+* _link:../Requirements.adoc#PM-SEC-5[PM-SEC-5: Subprocess Environment Sanitization & Linux Filesystem Confinement]_
+* _link:../Requirements.adoc#PM-TECH-4[PM-TECH-4: Operating System Platform Integration (macOS & Linux)]_
+
+== Status: PLANNED
+
+== Verify-Not-Resolve Execution Pipeline
+
+Before spawning any subprocess, the runtime validates the job request through a deterministic three-stage verification pipeline:
+
+```
+  Job Request (Scope, Executable, Argv, WorkingDir)
+                       │
+                       ▼
+       ┌───────────────────────────────┐
+       │ 1. Working Directory Check    │ ──► Mismatch: REFUSED (outside enrolled tree)
+       └───────────────┬───────────────┘
+                       │ Valid (Root or linked worktree)
+                       ▼
+       ┌───────────────────────────────┐
+       │ 2. Executable & Digest Check  │ ──► Mismatch: REFUSED (unpinned tool / digest drift)
+       └───────────────┬───────────────┘
+                       │ Valid (Exact path & SHA-256 match)
+                       ▼
+       ┌───────────────────────────────┐
+       │ 3. Argument Schema Validation │ ──► Mismatch: REFUSED (illegal flag / unquoted space)
+       └───────────────┬───────────────┘
+                       │ Valid
+                       ▼
+             Spawn Subprocess (Direct)
+```
+
+1. *Working Directory Confinement*:
+   The working directory must resolve canonically to the project's enrolled root or a live linked git worktree verified via `git worktree list --porcelain`. Arbitrary paths are rejected with outcome `refused`.
+2. *Verify-Not-Resolve Executable Resolution*:
+   The runtime *never* searches the system `PATH`.
+   - *Wrapper Jobs (`mvnw`, `gradlew`, `pw`)*: The wrapper must be committed at the root of the tree, must match an enrolled wrapper name, and its SHA-256 content hash must match the enrolled hash.
+   - *Host Tools (`git`, `gh`, `glab`, `python3`, `npm`)*: The runtime invokes the exact absolute path recorded in `enrolments.json` after verifying that the file's current SHA-256 matches the enrolment record.
+3. *Argument Schema Validation*:
+   The argument vector (`argv`) is checked against a closed allowlist schema per tool type. Shell meta-characters (`|`, `;`, `&`, `$`, `` ` ``, `>`, `<`) are never evaluated because execution bypasses `/bin/sh` entirely.
+
+== Subprocess Lifecycle & Process-Group Isolation
+
+Every job runs as a direct child of the PM-MCP daemon inside its own isolated operating system process group.
+
+[source,java]
+----
+ProcessBuilder pb = new ProcessBuilder(verifiedArgv);
+pb.directory(verifiedWorkingDir.toFile());
+// Environment sanitization
+pb.environment().clear();
+pb.environment().putAll(sanitizedEnvAllowlist);
+// Direct output redirection to job log file
+pb.redirectOutput(jobLogPath.toFile());
+pb.redirectErrorStream(true);
+Process process = pb.start();
+----
+
+=== Process Termination & Cancellation Protocol
+
+When a job exceeds its configured timeout (`PM-EXEC-4`) or when the user/client calls `cancel`:
+
+1. *SIGTERM Escalation*:
+   The daemon sends `SIGTERM` to the entire process group (using Java `ProcessHandle.descendants()` and native OS `kill(-pid, SIGTERM)` via Java FFM).
+2. *Grace Period*:
+   The daemon waits up to 5,000 milliseconds for all child processes in the group to exit cleanly.
+3. *SIGKILL Cleanup*:
+   If any process remains alive after the grace period, the daemon issues `kill(-pid, SIGKILL)` to immediately terminate the remaining group.
+4. *Closed-Enum Outcome Assignment*:
+   - If cancelled by request: outcome is `cancelled`.
+   - If wall-clock elapsed time exceeded limit: outcome is `timed_out`.
+   - If daemon crashed while job was running: recorded as `killed` upon restart recovery.
+
+== Linux Filesystem Confinement (`systemd-run`)
+
+On Linux hosts with systemd (`PM-SEC-5`), the runtime wraps subprocess execution in a transient user scope:
+
+[source,bash]
+----
+systemd-run --user --scope --quiet \
+  --property=ProtectSystem=strict \
+  --property=ProtectHome=read-only \
+  --property=ReadWritePaths="<worktree-path> ~/.m2/repository ~/.gradle/caches /tmp" \
+  --property=PrivateTmp=true \
+  -- <verified-executable> <argv...>
+----
+
+This prevents rogue build scripts, poisoned dependencies, or test fixtures from writing outside the project tree, package caches, and temporary directories.
+
+== Native Build Output Parsers
+
+When a build completes with a non-zero exit code or compiler warnings, the runtime extracts structured diagnostics without calling external Python scripts (`PM-IMPL-6`):
+
+[cols="1,2,2"]
+|===
+|Build System |Parser Strategy |Diagnostic Extractions
+
+|*Maven*
+|Regex stream scanner for `\[ERROR\]` lines and compiler plugin reports (`javac`, `maven-compiler-plugin`).
+|File path, line number, column number, error message, compiler diagnostic code.
+
+|*Gradle*
+|Scanner for `e: <path>:(line, col): <message>` Kotlin/Java errors and Gradle task execution failures.
+|Task name, source file, line/col, stack summary.
+
+|*npm / ESLint*
+|Direct structured JSON parser when invoked with `--format json` or regex parser over standard TAP/Unix lint stream.
+|Rule ID, severity (`error`/`warning`), file path, line/col, repair message.
+
+|*Python / Pytest*
+|JUnit XML / Cobertura report parser or regex scanner over standard traceback blocks.
+|Test class, test method, failure type, file path, line number, failure diff.
+|===
+
+=== Unparseable Output Fallback (`failed_unparsed`)
+
+If a build fails (exit code != 0) but the output parser cannot extract any structured diagnostic errors:
+- The job outcome is classified as `failed_unparsed` (never folded into normal `failed`).
+- The full raw log is preserved at `~/.plan-marshall/mcp/logs/jobs/<job_id>.log`.
+- The representation exposes a `link` to view the raw log or escalate to the operator, preventing the model from hallucinating non-existent compiler errors.

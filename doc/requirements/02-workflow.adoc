@@ -1,0 +1,113 @@
+== Hypermedia Workflow Engine (PM-WF)
+
+[#PM-WF-1]
+=== PM-WF-1: Hypermedia State Representation (HATEOAS)
+
+The system must model all plan and orchestrator workflows as hypermedia state machines adhering strictly to HATEOAS principles. Clients discover valid operations exclusively through server-generated representations and links.
+
+* The system must return workflow states as TOON-formatted text representations containing: `scope` (`plan` or `epic`), `plan_id` or `epic_id`, `state` (dotted closed-enum), `summary` (single-line human-readable status), optional `guidance` (URI to a static vocabulary skill), `facts` (minimal key-value pairs required for model judgment), and `links` (list of valid transitions).
+* The system must advance the workflow exclusively via link-follow transitions, where each followed link immediately returns the subsequent state representation to form an unbroken transition chain.
+* The system must omit large artifacts, raw build outputs, and detailed task definitions from `facts`, exposing them instead as read-only MCP resource URIs (`pm://...`).
+* The system must emit an empty `links` list only when a plan or epic reaches an immutable terminal state (`completed`, `abandoned`).
+* The system must ensure that the model requires no advance knowledge of the state machine graph, never composes CLI commands from prose instructions, and never encounters transitions that are invalid in the current state.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format Specification] for implementation details.
+
+[#PM-WF-2]
+=== PM-WF-2: Closed Link Relation Grammar & Link Forms
+
+State transitions must be structured as hypermedia forms using a closed vocabulary of link relations and typed parameter declarations.
+
+* The system must restrict link relations (`rel`) strictly to the closed enumeration: `next` (default forward transition), `alt` (alternative forward path), `retry` (repeat after transient failure), `fix` (remediation sub-state), `submit` (hand judgment artifact to server), `dispatch` (sub-agent invocation), `wait` (monitor asynchronous operation), `escalate` (request operator intervention), and `abort` (defined early termination).
+* The system must structure each offered link as a hypermedia form consisting of: `rel` (relation from closed enumeration), `link` (transition identifier optionally qualified by entity, e.g. `push`, `triage:F-12`, `wait:b-2291`), and `free` (comma-separated list of typed parameters required from model judgment).
+* The system must execute all transitions through a single uniform MCP tool verb: `pm_do(scope, link, args)`.
+* The system must derive all execution context (worktree paths, git branch names, build commands, and upstream parameters) server-side from the `link` identifier and persisted state, requiring the model to supply only judgment values via `args`.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format Specification] and link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
+
+[#PM-WF-3]
+=== PM-WF-3: Capability Enforcement by Link Omission
+
+The hypermedia engine must enforce workflow capabilities and security boundaries primarily by omitting forbidden transitions from state representations.
+
+* The system must enforce capability and privilege boundaries by omitting unauthorized transitions from the `links` list of generated representations.
+* The system must never emit operator-only transitions (forcing gate evaluations, overriding merge barriers, deleting plans, or modifying project enrolment) as links in model-facing representations.
+* The system must restrict privileged and operator-only actions exclusively to the authenticated operator channel (MCP elicitation or operator CLI).
+* The system must independently evaluate and reject any transition call targeting an unoffered or omitted link, returning a structured rejection alongside the current valid representation.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL Specification] and link:specification/hypermedia-format.adoc[Hypermedia Format Specification] for implementation details.
+
+[#PM-WF-4]
+=== PM-WF-4: Entity-Scoped Links & Fine-Grained Concurrency
+
+Transitions operating on sub-components of a plan must address entities explicitly, ensuring safe concurrency across parallel sessions and sub-agents.
+
+* The system must allow links to address specific sub-entities of a plan or epic by embedding the entity identifier within the link string (e.g. `triage:F-12`, `task:T-3`, `wait:b-2291`).
+* The system must execute validation, state mutation, and persistence as a single atomic operation under the mutual exclusion lock of the target plan or epic.
+* The system must validate entity-scoped transitions against the current persisted state of that specific entity, rejecting stale transitions (such as triaging an already resolved finding) while allowing concurrent operations on distinct entities.
+* The system must guarantee idempotent side effects for state transitions: attempting an already completed external action (such as pushing an up-to-date branch) must report success without redundant side effects, and requesting a build for a running worktree must join the active job.
+* The system must handle replayed or stale links (resulting from context compaction or `/clear`) safely by rejecting the stale transition and returning the current valid state representation without raising fatal MCP protocol errors.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL Specification] and link:specification/hypermedia-format.adoc[Hypermedia Format Specification] for implementation details.
+
+[#PM-WF-5]
+=== PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint
+
+Sub-agents must be dispatched as single-level leaf workers using rendered host commands, tracked deterministically by unique dispatch identifiers.
+
+* The system must package tasks during Phase 4 (`plan`) into envelopes sized for single sub-agent context limits, delivering each envelope's current task within the sub-agent's state representation.
+* The system must format `dispatch` links with fully rendered host execution structures, supplying `host_tool`, `params`, and a structured `prompt` body specifying `name`, `dispatch_id`, `plan_id` or `epic_id`, `entity`, `skills[]`, `WORKTREE`, and initial state command `start: pm_state(...)`.
+* The system must enforce the single-level leaf constraint: sub-agents operating within entity scopes are terminal workers and must never receive `dispatch` links or spawn child sub-agents.
+* The system must require sub-agents to persist deliverables via their own `submit` links and return a structured completion status to the parent session: `status` (`success`, `error`, `loop_back`, `blocked`), `display_detail` (maximum 80 ASCII characters, no trailing period), and optional `token_usage`. Missing token usage must be recorded as unmeasured rather than zero.
+* The system must track sub-agent lifecycles using unique `dispatch_id` tokens: mark the dispatch claimed upon the sub-agent's first entity-scoped call, re-offer unconfirmed or timed-out dispatches with a new `dispatch_id`, and immediately reject submissions referencing superseded `dispatch_id` tokens.
+* The system must equip reader sub-agents (used for untrusted external content ingestion) with strictly read-only capabilities and zero MCP transition tools, requiring candidate data to be passed as plain text to the dispatching session for server-side schema validation.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL Specification] and link:specification/client-profiles.adoc[Client Profiles Specification] for implementation details.
+
+[#PM-WF-6]
+=== PM-WF-6: Independent Server-Side Transition & Parameter Validation
+
+The workflow engine must strictly validate all transition attempts and free parameters server-side, treating client calls as untrusted input.
+
+* The system must validate every incoming `pm_do` invocation against the persisted state of the addressed scope independently of how the client constructed the request.
+* The system must verify that the requested link ID exists within the set of valid transitions for the current state and that any addressed entity is currently in an accepting sub-state.
+* The system must validate all supplied free parameters (`args`) against the link's closed JSON schema, enforcing `additionalProperties: false` and strict type conformity.
+* The system must reject any invalid transition or malformed parameter payload with a structured validation error payload that includes the rejection cause and the current, unmutated state representation.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
+
+[#PM-WF-7]
+=== PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds
+
+Remediation loops from finalize back to execution must be strictly bounded and confined to active worktrees.
+
+* The system must allow `loop_back` transitions returning a plan from Phase 6 (`finalize`) to Phase 5 (`execute`) only while the plan remains located within its dedicated worktree.
+* The system must eliminate `loop_back` transitions by link omission immediately once the plan passes the pre-merge barrier and relocates back to the main checkout.
+* The system must allocate fresh, additive remediation tasks and envelopes within the worktree for each loop-back iteration, never reopening previously completed tasks, and must assign fresh dispatch IDs to preserve additive metric accounting.
+* The system must enforce an automated loop-back iteration cap governed by project configuration (`.plan/marshal.json -> phase-6-finalize.max_iterations`, default: 3).
+* The system must transition the plan to `finalize.loop-limit-reached` when the iteration ceiling is exhausted, offering exclusively an `escalate` link requiring operator intervention.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
+
+[#PM-WF-8]
+=== PM-WF-8: Asynchronous Job Links & Wait Transitions
+
+Long-running subprocesses and external provider waits must be modeled as asynchronous jobs with bounded polling transitions.
+
+* The system must transition immediately to an asynchronous running state (`*.running`) upon initiating a long-running subprocess (builds, CI status checks, review-bot rate windows, merge queues), returning a representation containing `wait:<job_id>` and `cancel:<job_id>` links.
+* The system must implement the `wait` link transition as a bounded blocking operation that returns either the completed outcome representation or an updated running representation with fresh progress metrics.
+* The system must support extended wait intervals with periodic MCP progress notifications when the client profile indicates host support and the request includes a progress token.
+* The system must restrict asynchronous job outcomes to a closed enumeration: `succeeded`, `failed`, `refused`, `cancelled`, `timed_out`, `killed`, and `indeterminate`.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format Specification] and link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details.
+
+[#PM-WF-9]
+=== PM-WF-9: Composite Wait States & Short-Circuit Failure Handling
+
+Concurrent asynchronous operations during finalization must be coordinated through unified composite wait states with immediate failure short-circuiting.
+
+* The system must represent concurrent finalize operations (such as parallel CI pipeline execution and automated review-bot analysis) as a single unified composite state (`finalize.concurrent-wait`).
+* The system must display discrete progress facts for all concurrent operations within the composite representation's `facts` block (e.g. `ci: running`, `review: pending`) and expose a single composite wait transition `wait:finalize.concurrent-wait`.
+* The system must immediately short-circuit the composite wait upon detecting a hard failure in any constituent job (such as a red CI pipeline): cancel all remaining pending wait jobs, and transition the representation directly to a failure state providing `fix` and `loop_back` links.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format Specification] and link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.

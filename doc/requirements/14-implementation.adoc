@@ -1,0 +1,81 @@
+== Implementation Architecture & Core Subsystems (PM-IMPL)
+
+[#PM-IMPL-1]
+=== PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly
+
+To guarantee fast unit test execution, clean architectural boundaries, and framework independence, the repository must separate domain logic from the Quarkus runtime assembly.
+
+* The codebase must be structured into at least three primary build modules:
+** `pm-mcp-core` (*Plain Java*): Contains all workflow primitives, the workflow DSL parser/validator/diagram generator, the hypermedia state engine, JSON/JSONL state stores, the TOON encoder, and client profile translation logic. It must depend only on Jackson and `cui-java-tools`, with zero dependencies on Quarkus, CDI, or MCP libraries.
+** `pm-mcp-server` (*Quarkus Assembly*): Wires `pm-mcp-core` into the daemon via CDI producers, exposing MCP tools, HTTP endpoints (including `/clients`), CLI subcommands, native-image reflection registrations (`@RegisterForReflection`), and integration tests (`*IT`).
+** `pm-mcp-dist` (*Packaging*): Produces platform release archives, installation layouts, control scripts, OS service templates, and CycloneDX SBOMs.
+* Dependency direction must flow strictly from `pm-mcp-server` to `pm-mcp-core`; `pm-mcp-core` must define service interfaces (e.g., job execution, plan locking) implemented by `pm-mcp-server`.
+* Unit tests in `pm-mcp-core` (`test -pl pm-mcp-core`) must execute directly on the JVM without Quarkus augmentation, and an automated build test in `pm-mcp-server` must verify that every persisted Java record in `pm-mcp-core` is registered for GraalVM native reflection.
+* Both modules must share a unified `LogRecord` numbering registry defined in `pm-mcp-core` and independently satisfy project test coverage minimums.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL & State Machine Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+
+[#PM-IMPL-2]
+=== PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output
+
+The system must separate internal persistence formats from model-facing wire representations, optimizing disk storage for schema evolution and wire output for token efficiency.
+
+* All server-owned machine state must be persisted as canonical JSON documents (one file per entity, such as `status.json`, `entry.json`, `references.json`, `TASK-NNN.json`) or append-only JSONL logs (`findings.jsonl`, `change-ledger.jsonl`, `audit.jsonl`) serialized via Jackson 2 over Java records.
+* Every persisted JSON document and JSONL record must carry a mandatory integer `format_version` attribute; the daemon must automatically migrate older store versions forward on startup before serving requests.
+* Narrative documents authored for human and model consumption (`request.md`, `outline.md`, `spec.md`, lessons, epic landings) must remain in standard Markdown format.
+* Model-facing tool results and state representations must be rendered into TOON format strictly at the MCP wire boundary from the underlying Java records.
+
+See the link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] and link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Representation Specification] for implementation details.
+
+[#PM-IMPL-3]
+=== PM-IMPL-3: Deterministic Native TOON Encoder
+
+`PM-MCP` must implement its own zero-reflection TOON encoder for model output, avoiding external runtime bytecode generation dependencies.
+
+* The system must implement a native, reflection-free TOON encoder in `pm-mcp-core` conforming to the TOON v4.1 specification for the subset emitted by `PM-MCP`: objects, tabular object arrays, inline primitive arrays, and deterministic string quoting/escaping.
+* The TOON encoder must be verified against official TOON v4.1 specification conformance test fixtures.
+* A reader for `plan-marshall`'s legacy TOON dialect (supporting tab-sniffed rows, embedded JSON cells, and block scalars) must be restricted strictly to test and migration utilities for differential test comparison and one-time store conversion, and must never be exposed in production request handling.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Representation Specification] for implementation details.
+
+[#PM-IMPL-4]
+=== PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives
+
+Because builds, CI runs, and review-bot windows exceed typical MCP tool call timeouts across hosts, the system must provide resilient hypermedia waiting primitives backed by persistent daemon jobs.
+
+* Every background job must execute independently inside the daemon and persist its state across client disconnects, exposing four hypermedia link primitives:
+** *Bounded Wait (`wait:<job_id>`)*: Blocks up to a configurable duration safely below the host's idle timeout (default 4 minutes) and returns either the completed job transition or the running state representation with updated progress and a fresh `wait` link.
+** *Progress Wait (`wait:<job_id>`)*: Activated automatically when *both* the active client profile declares that MCP progress notifications reset the host's idle timer *and* the incoming MCP request supplies a `progressToken`; emits progress notifications at least every 60 seconds and blocks until job completion or an extended upper bound (default 30 minutes).
+** *Composite Wait (`wait:<composite_id>`)*: Monitors a concurrent region of parallel jobs (such as `finalize.concurrent-wait` across CI runs and review-bot rate windows), unblocking when all member jobs settle or immediately short-circuiting to a failure state if any required job fails.
+** *Cancel (`cancel:<job_id>`)*: Terminates the target job process group and transitions the representation to the cancelled state.
+* The server must select between bounded wait and progress wait automatically without model involvement, and must omit separate polling tools in favor of bounded `wait` links.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Representation Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+
+[#PM-IMPL-5]
+=== PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation
+
+All plan phase lifecycles, finalize sequences, and epic workflows must be defined in a declarative domain-specific language (DSL) validated at build time and at daemon startup.
+
+* Every workflow operation must be encapsulated as a unit-testable Java primitive declaring a canonical name (e.g., `git.commit`, `ci.watch`), a typed parameter record, a sealed outcome enumeration (`ok`, `nothing_to_commit`, `hook_failed`), and explicit store/job side effects.
+* Workflow state machines must be authored in `PM-MCP`'s line-based workflow DSL supporting `state`, `skill`, `link <rel> <id> (<params>)`, `do <primitive>`, `auto <primitive>`, `job <primitive>`, `guard <primitive>`, `dispatch <envelope>`, `escalate <decision>`, `call <workflow>`, `<outcome> -> <state>`, and state migration rules (`migrate <old> -> <new>`).
+* Build-time unit tests and daemon startup initialization must validate every workflow DSL definition, failing closed if any check fails:
+** Every referenced primitive and vocabulary skill exists, and link free parameters match the primitive's parameter record.
+** Every sealed outcome of every invoked primitive is explicitly handled (compile-grade exhaustiveness).
+** Every state is reachable from the `start` state, every non-terminal state has at least one outbound transition, and all link identifiers are unique within a state.
+** Every state name present in a committed registry of previously released versions is either preserved or mapped via an explicit `migrate <old> -> <new>` rule.
+* A build-time generator must render every DSL workflow definition into Mermaid state diagrams and AsciiDoc state/link/outcome tables under `doc/`, and a CI test must fail if committed documentation drifts from the DSL definitions.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL & State Machine Specification] for implementation details.
+
+[#PM-IMPL-6]
+=== PM-IMPL-6: Native Build Output Parsers & Fallback Diagnostics
+
+To keep raw compiler and test logs out of model context while ensuring no build failure goes undiagnosed, `PM-MCP` must compile domain log parsers into the binary and provide a deterministic fallback for unparsed failures.
+
+* The system must include compiled Java build output parsers for supported domain toolchains (Maven, Gradle, npm/Jest/ESLint, Python pytest/ruff/mypy, and OpenRewrite) that extract structured error locations (file path, line, column, rule/message), test summaries, and coverage metrics into the build result representation.
+* If a build job exits with a non-zero status code but the domain parser extracts zero structured error items (for example, due to an early wrapper crash, network failure, or unrecognized toolchain output), the system must:
+** Record the build outcome with the distinct status `failed_unparsed` (never reporting an empty error list as a clean failure).
+** Attach the bounded tail of the raw build log (last 50 lines / 4 KB) and the `pm://plan/<plan_id>/log/<job_id>` resource URI directly in the representation so the model or operator can diagnose the root cause.
+
+See the link:specification/job-runtime.adoc[Job Runtime & Execution Specification] and link:specification/mcp-tools.adoc[MCP Tools & Resources Specification] for implementation details.

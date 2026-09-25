@@ -1,0 +1,105 @@
+== Core Architecture (PM-ARCH)
+
+[#PM-ARCH-1]
+=== PM-ARCH-1: Process Ownership & Single Daemon Process
+
+The system must strictly divide responsibilities between deterministic process execution and probabilistic model judgment. All state tracking, transition sequencing, gate evaluations, and command assembly belong to the system, while the model is tasked exclusively with judgment-based contributions.
+
+* The system must execute all workflow state machines, state transitions, quality gate evaluations, and command assembly inside the `pm-mcp` daemon, confining model contributions exclusively to judgment artifacts (request clarification, solution outline authoring, code implementation, finding triage, and commit/pull request descriptions).
+* The system must execute as exactly one long-lived native daemon process per machine, running under the operating system privileges of the local developer user.
+* The system must enforce single-daemon mutual exclusion across all sessions and projects using a filesystem lock file within `~/.plan-marshall/mcp/` and local TCP loopback port acquisition.
+* The system must compile workflow definitions, state stores, tools, client profiles, vocabulary skills, and background services into a single native binary, guaranteeing that all components operate on an identical release version without runtime drift.
+* The system must reject any architecture where process ordering, transition permissions, or parameter assembly depend on prose instructions or client-side prompt compliance.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+
+[#PM-ARCH-2]
+=== PM-ARCH-2: Local-by-Design & Zero External Cloud Dependency
+
+The system must operate entirely on the developer's workstation, directly interacting with local repository trees and worktrees without reliance on cloud intermediaries.
+
+* The system must execute all services, workflow transitions, and state management locally on the developer's workstation without requiring remote infrastructure, cloud-hosted backends, or telemetry reporting.
+* The system must enforce workspace confinement, restricting all file reads, file modifications, and process executions strictly to the enrolled project root directory and its active linked worktrees.
+* The system must reject any operation attempting to access or modify filesystem paths outside the enrolled project boundary unless explicitly authorized by the human operator through the operator channel.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+
+[#PM-ARCH-3]
+=== PM-ARCH-3: MCP Transport & Endpoint Modes
+
+The daemon must expose its capabilities via Model Context Protocol (MCP) endpoints adhering strictly to loopback security and host connectivity requirements.
+
+* The system must bind its MCP HTTP transport exclusively to the loopback IP address `127.0.0.1`, rejecting configurations that attempt to bind to `0.0.0.0` or non-loopback network interfaces.
+* The system must validate the `Host` and `Origin` HTTP headers on every incoming HTTP connection, immediately returning HTTP 403 Forbidden for any unexpected or external origin to prevent DNS rebinding attacks.
+* The system must generate a cryptographically random authentication cookie at every daemon startup, persist it to a file with strict owner-only permissions (`0600`) in `~/.plan-marshall/mcp/`, and validate it on every request.
+* The system must support Direct Streamable HTTP transport mode, allowing hosts to authenticate dynamically via a client-executed token helper (`pm-mcp token`) without persisting credentials in host configuration files or environment variables.
+* The system must provide a stateless stdio relay mode via `pm-mcp serve --stdio` that bridges stdio-only MCP clients directly to the daemon's loopback HTTP endpoint without maintaining local state or tool definitions.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+
+[#PM-ARCH-4]
+=== PM-ARCH-4: Stateless Requests & Explicit Scope Addressing
+
+The system must operate without transport-level session state, evaluating every request entirely from explicit scope identifiers and persisted filesystem records.
+
+* The system must process every MCP tool invocation statelessly, maintaining no protocol-level session state across calls in compliance with sessionless MCP standards.
+* The system must require every stateful workflow invocation to carry an explicit logical scope identifier (`plan_id` or `epic_id`) and, when addressing an entity-specific transition, the entity identifier within the link ID.
+* The system must resolve the client runtime identity (`client`) and the target project root (`project`) exclusively from the scope's persisted entry record (`entry.json`), rejecting client-supplied working directory or client-type overrides.
+* The system must answer every workflow query and validate every transition entirely from persisted filesystem state, guaranteeing zero state loss across host restarts, context window compactions (`/clear`), or daemon restarts.
+* The system must restrict unscoped tool requests strictly to global project discovery and initial plan instantiation (`pm_plans`, `pm_epics`, `pm_start`).
+
+See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
+
+[#PM-ARCH-5]
+=== PM-ARCH-5: Worktree-Bound Plan Location & Main-Bound Orchestrator Location
+
+Plan execution state must be isolated inside worktrees to protect the main checkout, while orchestrator state remains anchored to the repository's main tree.
+
+* The system must locate a plan's state directory within the main checkout's `.plan/local/plans/<plan_id>/` prior to worktree allocation, and relocate it into the worktree's `.plan/local/worktrees/<plan_id>/.plan/` during active execution.
+* The system must ensure that the repository's main checkout working tree remains clean and unaffected by uncommitted plan execution artifacts at all times.
+* The system must isolate all mutations to git-tracked orchestrator state (epic ledgers, inbox messages, and landing records) within dedicated worktrees, incorporating changes into the main branch strictly through standard branch merges.
+* The system must automatically resolve the current filesystem location of any plan directory from its `plan_id` without requiring the client or model to provide filesystem paths.
+* The system must pass the plan's resolved absolute directory path as the `PLAN_BASE_DIR` environment variable to all executed subprocesses and script adapters.
+
+See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+
+[#PM-ARCH-6]
+=== PM-ARCH-6: Filesystem State Persistence & Cache-Only Process Memory
+
+All durable workflow and coordinator data must reside in structured filesystem stores, with process memory functioning strictly as a transient cache.
+
+* The system must persist all authoritative workflow states, tasks, findings, references, locks, build jobs, and audit events directly in filesystem files formatted as JSON or JSONL.
+* The system must treat all in-memory daemon data structures as disposable caches, ensuring that any daemon crash, restart, or eviction leaves persistent state intact and uncorrupted.
+* The system must store credentials exclusively within the operating system credential store or its permission-guarded fallback file store (`~/.plan-marshall/credentials/`), keeping secrets in daemon memory only for the duration of the active request.
+* The system must include a mandatory `format_version` integer property in every persisted JSON and JSONL state file.
+* The system must automatically validate and migrate forward legacy file formats upon daemon startup before accepting incoming workflow requests.
+
+See the link:specification/store-schemas.adoc[Store Schemas Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+
+[#PM-ARCH-7]
+=== PM-ARCH-7: Atomic Plan State Relocation Across Worktrees
+
+Directory moves between the main checkout and plan worktrees must occur atomically under mutual exclusion to prevent data loss or inconsistency during transitions.
+
+* The system must create all plan worktrees within the repository's `.plan/local/worktrees/` directory, guaranteeing that worktree directories and main repository plan directories reside on the same filesystem volume to allow atomic renames.
+* The system must acquire the plan-specific lock file prior to initiating any directory move between `.plan/local/plans/<plan_id>/` and `.plan/local/worktrees/<plan_id>/.plan/`.
+* The system must record every directory relocation in a write-ahead journal (`move-journal.json`) before modifying filesystem paths.
+* The system must relocate the plan's entry record (`entry.json`) atomically alongside the plan directory during all worktree creation, worktree destruction, and plan finalization operations.
+* The system must inspect `move-journal.json` during daemon startup and automatically roll back or complete any interrupted directory move before processing new requests.
+
+See the link:specification/move-journal.adoc[Move Journal Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+
+[#PM-ARCH-8]
+=== PM-ARCH-8: Daemon Lifecycle, Crash Recovery & Job Drain
+
+The daemon must support reliable lifecycle management across on-demand and service modes, providing graceful shutdown draining and crash recovery.
+
+* The system must automatically start the `pm-mcp` daemon when an entry point (`pm-mcp token`, `pm-mcp serve --stdio`, `pm-mcp enter`) detects that the loopback endpoint is unresponsive.
+* The system must support operator control verbs (`pm-mcp daemon start`, `stop`, `restart`, `status`, `run`) and corresponding shell script wrappers (`bin/start.sh`, `bin/stop.sh`, `bin/run.sh`, `bin/status.sh`).
+* The system must terminate an on-demand daemon instance after a configurable idle timeout once all client connections, running subprocess jobs, and warm language servers have ceased activity.
+* The system must support registration as an operating system service (`launchd` on macOS, `systemd --user` on Linux) executing `pm-mcp daemon run` with automatic restart on failure and idle shutdown disabled.
+* The system must drain running jobs before stopping or restarting: queued jobs remain queued, active subprocesses run to completion, and no new jobs are initiated during the drain window.
+* The system must verify the binary version on disk during every client entry call and initiate a graceful drain and restart if a newer binary version is detected.
+* The system must recover state following an ungraceful crash or kill by inspecting persisted state files and `move-journal.json`, recording interrupted jobs as `killed` without blind re-execution.
+
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/move-journal.adoc[Move Journal Specification] for implementation details.

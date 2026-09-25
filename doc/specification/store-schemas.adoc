@@ -1,0 +1,316 @@
+= Store Schemas Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Store Schemas
+
+== Overview
+
+This document defines the normative JSON and JSONL storage schemas for *plan-marshall-mcp* (`PM-MCP`). Every persisted file includes an explicit `format_version` integer enabling deterministic forward migration on daemon startup (`PM-IMPL-2`) and safe coexistence with legacy Python scripts during staged migration (`PM-MIG-3`).
+
+== Traceability
+_See Requirements:_
+
+* _link:../Requirements.adoc#PM-ARCH-6[PM-ARCH-6: Filesystem State Persistence & Cache-Only Process Memory]_
+* _link:../Requirements.adoc#PM-IMPL-2[PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output]_
+* _link:../Requirements.adoc#PM-MIG-3[PM-MIG-3: Cross-Runtime File Lock & Shared Store Interoperability]_
+* _link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
+
+== Status: PLANNED
+
+== Format Versioning & Atomic Write Discipline
+
+1. *Version Envelope*:
+   Every JSON store root object and every JSONL header/record must declare `"format_version": 1` (positive integer). When the daemon opens a store with a lower `format_version`, it upgrades the structure in memory and writes the migrated store atomically. If a store has a `format_version` higher than the binary supports, the daemon refuses to mutate the store and requests a binary upgrade.
+2. *Atomic Write-and-Rename*:
+   All JSON file updates are written to a sibling temporary file (`<filename>.tmp.<uuid>`), flushed to disk (`FileChannel.force(true)`), and atomically renamed over the target file (`StandardCopyOption.ATOMIC_MOVE`, `StandardCopyOption.REPLACE_EXISTING`).
+3. *Cross-Runtime File Locking*:
+   During migration stages where legacy Python scripts and the Java daemon share `.plan/` stores (`PM-MIG-3`), all read-modify-write operations acquire an OS-level advisory lock (`flock` / `fcntl` via companion `.lock` files) with a 10-second acquisition timeout and exponential backoff.
+
+== Scope Entry Record (`mcp/entry.json`)
+
+Written by `pm-mcp enter --client <client>` when a session enters a plan or epic. Read on every subsequent MCP call within that scope (`PM-CLIENT-1`).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/entry.json",
+  "title": "ScopeEntryRecord",
+  "type": "object",
+  "required": [
+    "format_version",
+    "scope_type",
+    "scope_id",
+    "client_id",
+    "workspace_root",
+    "entered_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "scope_type": {
+      "type": "string",
+      "enum": ["plan", "epic"]
+    },
+    "scope_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$"
+    },
+    "client_id": {
+      "type": "string",
+      "enum": ["claude", "opencode", "antigravity", "neutral"]
+    },
+    "client_session_id": {
+      "type": ["string", "null"]
+    },
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical absolute path of the repository main checkout"
+    },
+    "environment_match_tier": {
+      "type": "string",
+      "enum": ["MATCHED", "UNVERIFIED", "CONTRADICTED"]
+    },
+    "entered_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
+----
+
+== Workflow State Store (`mcp/status.json`)
+
+Tracks the authoritative state machine position, phase, active jobs, loop-back iteration counters, and composite wait facts for a plan or epic (`PM-WF-1`, `PM-WF-7`, `PM-WF-9`).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/status.json",
+  "title": "WorkflowStatusStore",
+  "type": "object",
+  "required": [
+    "format_version",
+    "scope_type",
+    "scope_id",
+    "phase",
+    "state",
+    "location",
+    "finalize_iteration",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "scope_type": {
+      "type": "string",
+      "enum": ["plan", "epic"]
+    },
+    "scope_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$"
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "phase-1-init",
+        "phase-2-refine",
+        "phase-3-outline",
+        "phase-4-plan",
+        "phase-5-execute",
+        "phase-6-finalize",
+        "completed",
+        "orchestrator"
+      ]
+    },
+    "state": {
+      "type": "string",
+      "description": "Fully qualified workflow state ID (e.g. 'finalize.concurrent-wait')"
+    },
+    "location": {
+      "type": "string",
+      "enum": ["MAIN_CHECKOUT", "WORKTREE"],
+      "description": "Loop-back transitions are permitted only while location == WORKTREE"
+    },
+    "worktree_path": {
+      "type": ["string", "null"]
+    },
+    "branch_name": {
+      "type": ["string", "null"]
+    },
+    "finalize_iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Current loop-back iteration count, bounded by marshal.json phase-6-finalize.max_iterations"
+    },
+    "active_jobs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["job_id", "kind", "status", "started_at"],
+        "properties": {
+          "job_id": { "type": "string" },
+          "kind": { "type": "string", "enum": ["build", "git", "ci", "script", "bot_poll"] },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "succeeded", "failed", "failed_unparsed", "refused", "cancelled", "timed_out", "killed", "indeterminate"]
+          },
+          "started_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "facts": {
+      "type": "object",
+      "description": "State-specific facts rendered into the TOON representation (e.g., ci_status, bot_status)"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
+----
+
+== Findings Ledger Record (`findings.jsonl`)
+
+Each line in `findings.jsonl` is a standalone JSON object representing a finding from code review, static analysis, Sonar, or PR review bots (`PM-WF-4`).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/finding-record.json",
+  "title": "FindingRecord",
+  "type": "object",
+  "required": [
+    "format_version",
+    "finding_id",
+    "source",
+    "severity",
+    "status",
+    "summary",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "finding_id": { "type": "string", "pattern": "^F-[0-9]+$" },
+    "source": { "type": "string", "enum": ["sonar", "github_pr", "gitlab_mr", "self_review", "arch_gate", "compiler"] },
+    "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
+    "status": { "type": "string", "enum": ["open", "triaged_fix", "triaged_dismiss", "resolved"] },
+    "file_path": { "type": ["string", "null"] },
+    "line": { "type": ["integer", "null"], "minimum": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "disposition_rationale": { "type": ["string", "null"] },
+    "fix_task_id": { "type": ["string", "null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": ["string", "null"], "format": "date-time" }
+  }
+}
+----
+
+== Project Enrolment Store (`~/.plan-marshall/mcp/enrolments.json`)
+
+Stores operator-authorized project roots, build wrappers, and pinned host tool SHA-256 digests (`PM-EXEC-2`, `PM-EXEC-3`). Written exclusively via the operator channel.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/enrolments.json",
+  "title": "ProjectEnrolmentStore",
+  "type": "object",
+  "required": ["format_version", "projects"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "projects": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["project_root", "enrolled_at", "wrappers", "host_tools"],
+        "additionalProperties": false,
+        "properties": {
+          "project_root": {
+            "type": "string",
+            "description": "Canonical absolute path to repository root"
+          },
+          "enrolled_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "wrappers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "relative_path", "sha256", "allowed_goals"],
+              "properties": {
+                "name": { "type": "string", "enum": ["mvnw", "gradlew", "pw"] },
+                "relative_path": { "type": "string" },
+                "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                "allowed_goals": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          },
+          "host_tools": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "executable_path", "sha256"],
+              "properties": {
+                "name": { "type": "string", "enum": ["git", "gh", "glab", "python3", "npm", "npx"] },
+                "executable_path": { "type": "string", "description": "Resolved absolute path (no PATH lookup at runtime)" },
+                "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                "version": { "type": "string" }
+              }
+            }
+          },
+          "linux_extra_write_paths": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
+----
+
+== Machine Configuration Store (`~/.plan-marshall/mcp/machine-config.json`)
+
+Configures machine-wide concurrency limits and daemon idle timeouts (`PM-SVC-1`, `PM-ARCH-8`).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/machine-config.json",
+  "title": "MachineConfigStore",
+  "type": "object",
+  "required": ["format_version", "max_build_slots", "idle_timeout_seconds", "loopback_port"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "max_build_slots": { "type": "integer", "minimum": 1, "maximum": 16, "default": 2 },
+    "idle_timeout_seconds": { "type": "integer", "minimum": 60, "default": 1800 },
+    "loopback_port": { "type": "integer", "minimum": 1024, "maximum": 65535, "default": 49152 },
+    "max_lsp_instances": { "type": "integer", "minimum": 1, "maximum": 8, "default": 3 }
+  }
+}
+----

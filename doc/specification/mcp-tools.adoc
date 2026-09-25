@@ -1,0 +1,535 @@
+= MCP Tool & Resource Surface Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » MCP Tool & Resource Surface (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document defines the normative Model Context Protocol (MCP) tool schemas, resource URI templates, skill delivery surface, and error/result envelope contracts for *plan-marshall-mcp* (`PM-MCP`). It specifies the JSON Schema (Draft 2020-12) definitions for the core workflow verbs (`pm_start`, `pm_state`, `pm_do`), orthogonal service tools (`pm_build`, `pm_lsp`), and tool-based skill retrieval (`pm_skill`, `pm_skills`, `pm_skill_file`), alongside the strict separation between MCP protocol faults (`isError: true`) and domain workflow failure states (`isError: false`).
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_start, pm_state, pm_do)]_
+* _See Requirement link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2: Orthogonal Service Capability Tools (pm_build, pm_lsp)]_
+* _See Requirement link:../Requirements.adoc#PM-TOOL-3[PM-TOOL-3: Read-Only MCP Resource URI Surface]_
+* _See Requirement link:../Requirements.adoc#PM-TOOL-4[PM-TOOL-4: Domain Failures as Valid Workflow States]_
+* _See Requirement link:../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+* _See Requirement link:../Requirements.adoc#PM-SKILL-3[PM-SKILL-3: Baseline MCP Tool Delivery & Optional Skills Extension]_
+
+== Status: PLANNED
+
+== Surface Design & Context Budget Discipline
+_See Requirement link:../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+
+=== Architectural Constraints
+
+1. *Small, Stable Verb Set*: PM-MCP exposes a fixed set of top-level MCP tools rather than one tool per workflow step or script. Across all phases and domains, the resident tool surface remains constant.
+2. *Portable Naming Convention*: Every tool name conforms to `^pm_[a-z0-9_]+$`, ensuring identical identifiers across Claude Code, OpenCode, Antigravity, and raw model tool-calling APIs without escaping or translation.
+3. *Closed Top-Level Schemas*: Every tool `inputSchema` conforms to JSON Schema Draft 2020-12 (`https://json-schema.org/draft/2020-12/schema`) and declares `"additionalProperties": false` at the top-level object boundary.
+4. *TOON Text Output Only (No `outputSchema`)*: Tools intentionally omit `outputSchema` and `structuredContent`. Every tool result is returned in a single MCP `TextContent` block (`type: "text"`) encoded in deterministic TOON (link:hypermedia-format.adoc[Hypermedia Format Specification]). This avoids resident output-schema token overhead while optimizing token density on every turn.
+5. *Zero Client-Supplied Filesystem Paths*: No workflow or service tool accepts absolute filesystem paths or worktree locations from the model. Worktrees, branches, and configuration files are resolved server-side from `plan_id` or `epic_id`.
+6. *On-Demand Preloading*: For hosts configured with `schema_residency: "on_demand"` in their client profile, the user entry command preloads `pm_start`, `pm_state`, and `pm_do` so workflow execution incurs zero schema-lookup round trips.
+
+== Core Workflow Tool Schemas (`pm_start`, `pm_state`, `pm_do`)
+_See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_start, pm_state, pm_do)]_
+
+=== `pm_start` — Initialize a Plan Scope
+
+Creates a new plan directory from an operator/user request following a plan-mode `pm-mcp enter` invocation, relocates the project-level `mcp/entry.json` record into `.plan/local/plans/<plan_id>/mcp/entry.json`, initializes `mcp/status.json`, and returns the initial TOON hypermedia representation.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_start",
+  "description": "Create a new plan from a request and return its initial hypermedia representation.",
+  "type": "object",
+  "properties": {
+    "request": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "description": "The full user request or problem statement for the new plan."
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+){0,7}$",
+      "maxLength": 64,
+      "description": "Optional short kebab-case slug used to derive the plan_id."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Optional parent orchestrator epic_id when launching a staged plan."
+    }
+  },
+  "required": ["request"],
+  "additionalProperties": false
+}
+----
+
+=== `pm_state` — Query Authoritative Hypermedia State
+
+Returns the current hypermedia representation (state, summary, guidance skill URI, domain facts, and valid links) for a `plan_id` or `epic_id`. When `entity` is supplied by a dispatched sub-agent, returns the leaf-scoped representation for that entity (e.g., task envelope `envelope-2` or finding `F-12`) and claims `dispatch_id` if provided.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_state",
+  "description": "Return the current TOON hypermedia representation and valid links for a plan, epic, or sub-agent entity.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Identifier of the target plan scope. Mutually exclusive with epic_id."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Identifier of the target orchestrator epic scope. Mutually exclusive with plan_id."
+    },
+    "entity": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$",
+      "description": "Optional entity identifier within the plan or epic (e.g., 'envelope-1', 'F-12') for sub-agent scope."
+    },
+    "dispatch_id": {
+      "type": "string",
+      "pattern": "^d-[0-9a-f]{4,16}$",
+      "description": "Optional dispatch tracking identifier supplied by a dispatched sub-agent on its initial call."
+    }
+  },
+  "oneOf": [
+    { "required": ["plan_id"] },
+    { "required": ["epic_id"] }
+  ],
+  "additionalProperties": false
+}
+----
+
+NOTE: Companion zero-argument discovery tools `pm_plans` and `pm_epics` accept `{"type": "object", "properties": {}, "additionalProperties": false}` and return a tabular TOON listing of active plans or epics in the enrolled workspace.
+
+=== `pm_do` — Follow a Hypermedia Link
+
+The sole state transition verb in PM-MCP. Executes the transition identified by `link` from the current representation of `plan_id` or `epic_id`, passing any judgment parameters in `args`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_do",
+  "description": "Follow a hypermedia link from the current representation with its required free parameters.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Identifier of the target plan scope. Mutually exclusive with epic_id."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Identifier of the target orchestrator epic scope. Mutually exclusive with plan_id."
+    },
+    "link": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*(:[A-Za-z0-9_.-]+)?$",
+      "maxLength": 128,
+      "description": "Link identifier from the current representation (e.g., 'push', 'triage:F-12', 'wait:b-2291', 'returned:d-0417')."
+    },
+    "args": {
+      "type": "object",
+      "default": {},
+      "description": "Free parameters required by the target link, validated server-side against the link's closed parameter schema."
+    },
+    "dispatch_id": {
+      "type": "string",
+      "pattern": "^d-[0-9a-f]{4,16}$",
+      "description": "Optional dispatch identifier when invoked by a dispatched leaf sub-agent."
+    }
+  },
+  "required": ["link"],
+  "oneOf": [
+    { "required": ["plan_id", "link"] },
+    { "required": ["epic_id", "link"] }
+  ],
+  "additionalProperties": false
+}
+----
+
+==== Two-Stage Schema Validation for `pm_do`
+
+1. *Stage 1 (MCP Protocol Boundary)*: Validates that the incoming payload conforms to the `pm_do` JSON Schema above (`additionalProperties: false`, valid `plan_id`/`epic_id`, syntactic `link` pattern, `args` is a JSON object).
+2. *Stage 2 (Workflow Engine Link Schema)*: Under the scope's exclusive lock, the engine resolves the active `LinkSpec` for `link` in the current state and validates `args` against the link's dynamically derived closed JSON Schema (`additionalProperties: false`, exact required free parameter keys, closed enum values, string length bounds, and integer ranges). If `args` fails Stage 2 validation or `link` is not offered in the current state, the engine returns `isError: false` with a structured `rejected` block and the fresh representation (see <<_protocol_errors_vs_domain_workflow_failure_states>>).
+
+== Orthogonal Service Capability Tool Schemas (`pm_build`, `pm_lsp`)
+_See Requirement link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2: Orthogonal Service Capability Tools (pm_build, pm_lsp)]_
+
+Service tools provide deterministic build execution and warm language-server intelligence during implementation without advancing the workflow state machine directly.
+
+=== `pm_build` — Enrolled Build Execution
+
+Submits or awaits a build job in the plan's worktree using one of the project's configured build verbs (`compile`, `test`, `module-tests`, `verify`, `quality`). The model never supplies shell commands or flags.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_build",
+  "description": "Execute a canonical project build verb in the plan's worktree via the daemon build server.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Plan scope whose worktree the build runs in."
+    },
+    "command": {
+      "type": "string",
+      "enum": ["compile", "test", "module-tests", "verify", "quality", "format-check"],
+      "description": "Closed build verb resolved against the project's domain configuration and enrolled wrapper."
+    },
+    "module": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$",
+      "description": "Optional logical module identifier discovered in the project (never an arbitrary filesystem path)."
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^b-[0-9a-f]{4,16}$",
+      "description": "Optional running build job_id when polling or waiting on a previously started ad-hoc build."
+    }
+  },
+  "required": ["plan_id", "command"],
+  "additionalProperties": false
+}
+----
+
+==== `pm_build` TOON Output Contract
+
+`pm_build` never returns raw console output. It returns a structured TOON result containing:
+
+* `job_id`: unique build job identifier (e.g., `b-2291`)
+* `status`: closed enum (`passed`, `failed`, `failed_unparsed`, `running`, `cancelled`, `timed_out`)
+* `worktree_sha`: 64-character SHA-256 freshness digest of `HEAD` + staged + unstaged + untracked files
+* `summary`: counts of total/passed/failed/skipped tests and compiler/linter errors
+* `failures`: tabular TOON array of located compiler errors or test failures (`file`, `line`, `column`, `rule_or_test`, `message`)
+* `log_uri`: `pm://plan/{plan_id}/builds/{job_id}/log`
+
+=== `pm_lsp` — Warm Language Server Operations
+
+Queries or applies verified workspace edits against the daemon's warm LSP pool keyed by `(worktree, language)`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_lsp",
+  "description": "Execute a language-server operation against the warm LSP pool for a plan's worktree.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Plan scope identifying the target worktree."
+    },
+    "op": {
+      "type": "string",
+      "enum": [
+        "workspace_symbol",
+        "document_symbol",
+        "definition",
+        "references",
+        "diagnostics",
+        "rename"
+      ],
+      "description": "Closed LSP operation to execute."
+    },
+    "file": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$",
+      "description": "Worktree-relative file path (required for document_symbol, definition, references, diagnostics, rename)."
+    },
+    "line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based line number (required for definition, references, rename)."
+    },
+    "character": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based column offset (required for definition, references, rename)."
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Symbol search query (required for workspace_symbol)."
+    },
+    "new_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+      "maxLength": 128,
+      "description": "Replacement identifier for 'rename' operation."
+    }
+  },
+  "required": ["plan_id", "op"],
+  "allOf": [
+    {
+      "if": { "properties": { "op": { "const": "workspace_symbol" } } },
+      "then": { "required": ["query"] }
+    },
+    {
+      "if": { "properties": { "op": { "enum": ["document_symbol", "diagnostics"] } } },
+      "then": { "required": ["file"] }
+    },
+    {
+      "if": { "properties": { "op": { "enum": ["definition", "references"] } } },
+      "then": { "required": ["file", "line", "character"] }
+    },
+    {
+      "if": { "properties": { "op": { "const": "rename" } } },
+      "then": { "required": ["file", "line", "character", "new_name"] }
+    }
+  ],
+  "additionalProperties": false
+}
+----
+
+== Skill Retrieval Tool Schemas (`pm_skill`, `pm_skills`, `pm_skill_file`)
+_See Requirement link:../Requirements.adoc#PM-SKILL-3[PM-SKILL-3: Baseline MCP Tool Delivery & Optional Skills Extension]_
+
+Because MCP host support for the `io.modelcontextprotocol/skills` extension is optional, PM-MCP provides baseline tool-based skill retrieval rendered on the fly for the scope's recorded client profile.
+
+=== `pm_skill` — Retrieve Vocabulary Skill Content
+
+Fetches a rendered `SKILL.md` document by its canonical skill URI or name, along with its SHA-256 digest and supporting file list.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_skill",
+  "description": "Retrieve a vocabulary skill document (SKILL.md) rendered for the active project and client profile.",
+  "type": "object",
+  "properties": {
+    "uri": {
+      "type": "string",
+      "pattern": "^(skill://pm/[a-z0-9/_-]+/SKILL\\.md|pm://skill/[a-z0-9/_-]+)$",
+      "description": "Canonical skill URI referenced in a state representation's 'skill' / 'guidance' field."
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Optional plan_id scope used to resolve the persisted client profile and project domain configuration."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Optional epic_id scope used to resolve the persisted client profile."
+    }
+  },
+  "required": ["uri"],
+  "additionalProperties": false
+}
+----
+
+=== Companion Catalogue & Supporting File Tools (`pm_skills`, `pm_skill_file`)
+
+* `pm_skills`: Accepts optional `plan_id` or `epic_id` (`additionalProperties: false`) and returns the tabular TOON catalogue of all vocabulary skills active for the project's enabled domains (`uri`, `name`, `description`, `sha256`).
+* `pm_skill_file`: Accepts required `uri` (`^skill://pm/[a-z0-9/_-]+/[a-zA-Z0-9_.-]+\.(md|adoc|json|toon)$`) and optional `plan_id`/`epic_id` (`additionalProperties: false`) to retrieve progressive-disclosure reference files linked from a `SKILL.md`.
+* *Optional MCP Skills Extension Parity*: The daemon simultaneously declares capability `io.modelcontextprotocol/skills` and serves the identical project-and-client-rendered catalogue via `skills/list`, `skills/get`, and `resources/read`.
+
+== Read-Only MCP Resource URI Surface
+_See Requirement link:../Requirements.adoc#PM-TOOL-3[PM-TOOL-3: Read-Only MCP Resource URI Surface]_
+
+Large artifacts, logs, and ledgers are never inlined into hypermedia representations; instead, representations emit `pm://` resource URIs that the model or host reads on demand via MCP `resources/read`.
+
+=== Normative Resource URI Templates
+
+[cols="2,1,1,3"]
+|===
+|URI Template |MIME Type |Scope |Payload Description
+
+|`pm://plan/{plan_id}/state` +
+_(alias: `pm://plans/{plan_id}`)_
+|`text/toon`
+|Plan
+|Current TOON hypermedia representation (identical to `pm_state(plan_id)`).
+
+|`pm://plan/{plan_id}/request`
+|`text/markdown`
+|Plan
+|The plan's `request.md` document.
+
+|`pm://plan/{plan_id}/outline` +
+_(alias: `pm://plans/{plan_id}/outline`)_
+|`text/markdown`
+|Plan
+|The validated solution outline (`outline.md`).
+
+|`pm://plan/{plan_id}/tasks/{task_id}` +
+_(alias: `pm://plans/{plan_id}/tasks/{n}`)_
+|`text/toon`
+|Plan
+|Structured definition, acceptance criteria, and step status for task `{task_id}` (e.g., `TASK-01`).
+
+|`pm://plan/{plan_id}/findings` +
+_(alias: `pm://plans/{plan_id}/findings`)_
+|`text/toon`
+|Plan
+|Tabular TOON projection of `findings.jsonl` for `{plan_id}`.
+
+|`pm://plan/{plan_id}/builds/{job_id}/log` +
+_(alias: `pm://plans/{plan_id}/builds/{job}/log`)_
+|`text/plain`
+|Plan
+|Complete raw console log output captured for build job `{job_id}`.
+
+|`pm://plan/{plan_id}/diagram`
+|`text/markdown`
+|Plan
+|Generated Mermaid/ASCII state machine diagram with the plan's active state highlighted.
+
+|`pm://epic/{epic_id}/state` +
+_(alias: `pm://epics/{epic_id}`)_
+|`text/toon`
+|Epic
+|Current TOON hypermedia representation of orchestrator epic `{epic_id}`.
+
+|`pm://epic/{epic_id}/spec`
+|`text/markdown`
+|Epic
+|The epic specification document (`spec.md`).
+
+|`pm://epic/{epic_id}/ledger`
+|`text/toon`
+|Epic
+|Tabular TOON projection of workstreams and staged/active plans from `ledger.jsonl`.
+
+|`pm://epic/{epic_id}/inbox`
+|`text/toon`
+|Epic
+|Unread and processed structured messages sent from executing plans (`inbox.jsonl`).
+
+|`pm://epic/{epic_id}/landings`
+|`text/toon`
+|Epic
+|Verified landing analysis records (`landings.jsonl`).
+
+|`pm://skill/{name}` +
+_(alias: `skill://pm/{name}/SKILL.md`)_
+|`text/markdown`
+|Project / Client
+|Client-profile-rendered vocabulary skill Markdown with `_meta.sha256` digest.
+|===
+
+== Protocol Errors (`isError: true`) vs Domain Workflow Failure States (`isError: false`)
+_See Requirement link:../Requirements.adoc#PM-TOOL-4[PM-TOOL-4: Domain Failures as Valid Workflow States]_
+
+A foundational invariant of PM-MCP is that *domain failures and transition rejections are workflow states, not MCP protocol errors*.
+
+=== Normative Classification Matrix
+
+[cols="2,1,2,3"]
+|===
+|Condition |MCP `isError` |Response Structure |Model Recovery Path
+
+|Valid transition succeeds (`pm_do`)
+|`false`
+|Next state's TOON representation (`state`, `facts`, `links`).
+|Follow one of the new `links`.
+
+|Build fails, tests fail, or quality gate turns red
+|`false`
+|TOON representation in a remediation state (e.g., `execute.verify.failed`, `finalize.ci-failed`) with structured failure facts and `fix`, `retry`, `loop_back`, or `escalate` links.
+|Inspect failure facts (or `log_uri`), apply code fixes, and follow `fix` / `retry` / `loop_back`.
+
+|Git push rejected (non-fast-forward) or merge conflict
+|`false`
+|TOON representation in `finalize.sync-required` or `finalize.conflict` with `sync` / `fix` / `escalate` links.
+|Follow the offered `sync` or `escalate` link.
+
+|Host tool modifies files outside the plan's worktree
+|`false`
+|TOON representation in `<phase>.footprint-violation` naming the offending files and offering `fix` and `escalate` links.
+|Revert unauthorized changes and follow `fix`, or `escalate` to operator.
+
+|Stale link followed, entity no longer in accepting state, or `args` fails link parameter validation
+|`false`
+|Authoritative *current* TOON representation plus a top-level `rejected` block (`reason`, `link`, `detail`).
+|Read the current representation and follow one of its valid `links` with corrected `args`.
+
+|Operator approval required or loop-back limit reached
+|`false`
+|TOON representation in `*.blocked` or `finalize.loop-limit-reached` offering `wait` or `escalate`.
+|Follow `escalate` or `wait` for operator action.
+
+|Malformed JSON-RPC, unknown tool name, or top-level tool `inputSchema` violation
+|`true`
+|Standard JSON-RPC / MCP `CallToolResult` with `isError: true`, closed `error_code: "schema_validation_failed"`, and `audit_id`.
+|Fix top-level tool invocation syntax.
+
+|Unknown `plan_id` / `epic_id`, unenrolled workspace, or internal daemon exception
+|`true`
+|MCP `CallToolResult` with `isError: true`, closed `error_code` (`scope_not_found`, `project_not_enrolled`, `internal_fault`), and `audit_id`.
+|Halt or invoke discovery (`pm_plans` / `pm_epics`) or notify operator with `audit_id`.
+|===
+
+=== Rejected Transition Representation (`isError: false`)
+
+When `pm_do` is called with a stale link or invalid free parameter `args`, the server returns `isError: false` with a `rejected` block prepended to the current authoritative representation:
+
+[source,toon]
+----
+scope: plan
+plan_id: PLAN-X
+state: finalize.push-barrier
+phase: finalize
+summary: tasks 11/11 done, freshness gate green, branch not pushed
+rejected:
+  link: commit
+  reason: invalid_link_args
+  detail: "parameter 'message' length 0 is below minimum 1"
+skill: skill://pm/finalize/push-barrier/SKILL.md
+facts:
+  branch: feature/PLAN-X
+  commits_ahead: 4
+  gate.freshness: green
+links[3]{rel,link,form,free}:
+  next,push,noop,""
+  alt,commit,submit,"message:text[1..2000]"
+  escalate,escalate,escalate,"reason:text[1..500]"
+----
+
+=== Sanitized Protocol Error Envelope (`isError: true`)
+
+When an actual MCP protocol or server error occurs (`isError: true`), the `TextContent` payload is strictly sanitized — stack traces, Java class names, filesystem paths, and credentials are never emitted:
+
+[source,toon]
+----
+error: true
+error_code: scope_not_found
+audit_id: aud-20260925-004192
+message: "Plan scope 'PLAN-UNKNOWN' does not exist in the enrolled workspace."
+----
+
+Closed `error_code` enumeration for `isError: true`:
+
+* `schema_validation_failed` — Top-level MCP tool arguments violated the tool's JSON Schema.
+* `scope_not_found` — Referenced `plan_id`, `epic_id`, or `entity` does not exist.
+* `project_not_enrolled` — The target repository is not enrolled in `~/.plan-marshall/mcp/enrolments.json`.
+* `entry_record_missing` — `pm_start` was called without a preceding `pm-mcp enter` record in the project.
+* `rate_limit_exceeded` — Client exceeded per-client tool call rate limits.
+* `internal_fault` — Unexpected daemon exception; full diagnostics are written exclusively to `audit.jsonl` under `audit_id`.

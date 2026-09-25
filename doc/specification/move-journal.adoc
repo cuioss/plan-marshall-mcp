@@ -1,0 +1,153 @@
+= Move Journal Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Move Journal
+
+== Overview
+
+This document specifies the technical design, data structures, and crash-recovery protocols for the PM-MCP **Write-Ahead Move Journal** (`move-journal.json`). It guarantees that relocating plan state directories between the repository primary checkout and dedicated git worktrees (`PM-ARCH-7`) is strictly atomic, crash-proof, and resilient against sudden process termination or machine power failures.
+
+== Traceability
+_See Requirements:_
+
+* _link:../Requirements.adoc#PM-ARCH-7[PM-ARCH-7: Atomic Plan State Relocation Across Worktrees]_
+* _link:../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Daemon Lifecycle, Crash Recovery & Job Drain]_
+
+== Status: PLANNED
+
+== Journal Data Schema (`move-journal.json`)
+
+Prior to performing any directory relocation on disk, the daemon writes and fsyncs `move-journal.json` at the current authoritative location of the plan.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/move-journal.json",
+  "title": "MoveJournalRecord",
+  "type": "object",
+  "required": [
+    "format_version",
+    "journal_id",
+    "plan_id",
+    "operation",
+    "source_path",
+    "target_path",
+    "phase_state",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "journal_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$"
+    },
+    "operation": {
+      "type": "string",
+      "enum": ["RELOCATE_TO_WORKTREE", "RELOCATE_TO_MAIN"]
+    },
+    "source_path": {
+      "type": "string",
+      "description": "Absolute canonical source directory path"
+    },
+    "target_path": {
+      "type": "string",
+      "description": "Absolute canonical target directory path"
+    },
+    "phase_state": {
+      "type": "string",
+      "enum": ["INITIALIZED", "SOURCE_LOCKED", "TARGET_PREPARED", "MOVED", "COMMITTED"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
+----
+
+== Relocation Protocol State Machine
+
+```
+   ┌─────────────┐
+   │ INITIALIZED │  (Acquire exclusive file lock on plan)
+   └──────┬──────┘
+          │ 1. Write journal (TARGET_PREPARED) & fsync
+          ▼
+┌──────────────────┐
+│ TARGET_PREPARED  │  (Target parent dirs created, same filesystem verified)
+└─────────┬────────┘
+          │ 2. Atomic Files.move(source, target, ATOMIC_MOVE)
+          ▼
+      ┌───────┐
+      │ MOVED │       (Directory successfully placed at target)
+      └───┬───┘
+          │ 3. Update status.json location pointer & fsync
+          ▼
+    ┌───────────┐
+    │ COMMITTED │     (Delete move-journal.json, release lock)
+    └───────────┘
+```
+
+=== Step-by-Step Protocol
+
+1. *Locking*:
+   Acquire exclusive file lock `plan.lock` in the plan directory.
+2. *Journal Creation (`TARGET_PREPARED`)*:
+   Verify that `source_path` and `target_path` reside on the same filesystem partition (`Files.getFileStore(source).equals(Files.getFileStore(target.getParent()))`).
+   Write `move-journal.json` to `source_path/move-journal.json` with `phase_state: "TARGET_PREPARED"`. Flush and sync to disk using `FileChannel.force(true)`.
+3. *Atomic Rename (`MOVED`)*:
+   Execute `java.nio.file.Files.move(sourcePath, targetPath, StandardCopyOption.ATOMIC_MOVE)`.
+   Because both paths reside within `<repo>/.plan/local/`, this executes as a single POSIX `rename(2)` syscall.
+4. *Commit & State Update (`COMMITTED`)*:
+   Update `status.json` inside the newly moved target directory: set `location: "WORKTREE"` (or `"MAIN_CHECKOUT"`), update `worktree_path`, and increment state update timestamp. Fsync `status.json`.
+5. *Journal Cleanup*:
+   Delete `target_path/move-journal.json` and release `plan.lock`.
+
+== Startup Crash Recovery Protocol
+
+Whenever the PM-MCP daemon starts up, or when a session calls `pm_state` for a plan, the recovery scanner checks for the presence of `move-journal.json` in:
+- `<workspace>/.plan/local/plans/<plan_id>/move-journal.json`
+- `<workspace>/.plan/local/worktrees/<plan_id>/.plan/plans/<plan_id>/move-journal.json`
+
+If an active journal is detected, recovery executes according to the following idempotent decision tree:
+
+[cols="1,2,3"]
+|===
+|Recorded `phase_state` |Physical Directory Condition |Recovery Action
+
+|`TARGET_PREPARED`
+|`source_path` exists on disk; `target_path` does *not* exist.
+|*Rollback*: Directory was not moved. Remove empty target parent directories if created. Delete `move-journal.json`. Log recovery event in `audit.jsonl`. Leave plan at `source_path`.
+
+|`TARGET_PREPARED`
+|`source_path` does *not* exist; `target_path` *does* exist.
+|*Roll-forward*: `rename(2)` completed immediately before crash, before journal was updated. Update `status.json` at `target_path` to reflect new location. Delete `move-journal.json`. Log recovery event.
+
+|`MOVED`
+|`target_path` exists on disk.
+|*Roll-forward*: Update `status.json` at `target_path` to reflect current location (`WORKTREE` or `MAIN_CHECKOUT`). Delete `move-journal.json`. Log recovery event.
+
+|Any state
+|Both `source_path` and `target_path` exist on disk simultaneously.
+|*Invariant Violation*: Raise immediate `indeterminate` operational alert to operator. Refuse automatic mutation. Provide operator CLI repair command `pm-mcp repair plan <plan_id>`.
+|===
+
+This recovery protocol guarantees zero lost work, zero duplicate directories, and deterministic location resolution across process restarts.

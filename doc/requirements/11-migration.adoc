@@ -1,0 +1,74 @@
+== Migration & Legacy Coexistence (PM-MIG)
+
+[#PM-MIG-1]
+=== PM-MIG-1: Six-Stage Incremental Seam Migration
+
+The transition from the legacy script-and-prose architecture to `PM-MCP` must proceed across six discrete, independently deployable migration stages.
+
+* The system must execute the architectural migration in six sequential stages:
+** *Stage 1 (Daemon & Executor Adapter)*: Replaces `marshalld` with the `pm-mcp` daemon; exposes legacy scripts via an executor adapter running `script` jobs with the host's Python interpreter (`PLAN_BASE_DIR` set explicitly to the resolved plan root); replaces Bash allowlists with MCP tool permissions.
+** *Stage 2 (Embedded Build Server)*: Moves build scheduling into `PM-MCP` under the common job contract; replaces `resolve-then-run` shell commands with `pm_build` returning structured diagnostics.
+** *Stage 3 (Hypermedia Pilot — Init)*: Executes Phase 1 (Init) end-to-end via the hypermedia state machine and ported Java stores (`status.json` and `references.json`); serves Phase 1 vocabulary skills dynamically.
+** *Stage 4 (Remaining Phases & Epics)*: Migrates Phases 2 through 6 (refine, outline, plan, execute with envelope dispatch, finalize) and epic orchestration in sequential phase order as their underlying stores are ported.
+** *Stage 5 (Warm LSP Pool & Upstream MCP Proxy)*: Activates the shared warm Language Server Protocol pool and proxies designated external MCP servers.
+** *Stage 6 (Skill Serving & Distribution Switch)*: Serves all vocabulary skills natively with on-the-fly profile translation; retires the filesystem skill corpus, plugin-cache distribution chain, and build-time multi-target generators.
+* Each migration stage must operate as a self-contained production release without requiring completion of subsequent stages.
+
+See the link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+
+[#PM-MIG-2]
+=== PM-MIG-2: Mutual Coexistence Guard Between Legacy Scripts and PM-MCP
+
+During the multi-stage migration period, legacy Python scripts and the `PM-MCP` daemon must enforce a strict single-owner mutual exclusion invariant per plan.
+
+* The system must enforce that each plan or epic has at most one active runtime owner at any given point in time.
+* Entering a plan via `pm-mcp enter` must write the entry record (`mcp/entry.json`), establishing `PM-MCP` as the exclusive authoritative owner of that plan.
+* The legacy Python executor (`execute-script.py.template`) and all direct state writers (including the build hook, merge lock, and `_status_core.py`) must check for the presence of `mcp/entry.json` (or `.plan/co-exist.lock`) prior to any state mutation and immediately refuse direct Python write invocations with an explicit ownership error when `PM-MCP` owns the plan.
+* When `PM-MCP` invokes an unported script via a `script` job during intermediate stages, the daemon must acquire and hold the plan's mutex lock for the entire duration of the subprocess execution, preventing overlapping script jobs or concurrent state transitions.
+* The system must provide an operator CLI command (`pm-mcp operator release-plan <plan_id>`) that safely removes the `mcp/entry.json` ownership marker and releases locks to return plan ownership to the legacy Python executor.
+
+See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification] and link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] for implementation details.
+
+[#PM-MIG-3]
+=== PM-MIG-3: Cross-Runtime File Lock & Shared Store Interoperability
+
+While legacy Python components and Java components coexist on the same repository checkout, both runtimes must adhere to identical locking protocols and data store formats.
+
+* The `PM-MCP` daemon and legacy Python scripts must interoperate over the shared `.plan/` state tree using compatible POSIX file-locking primitives (`O_EXCL` atomic lock creation and FIFO admission queues in `.plan/locks/`) and write-ahead move-journal recovery (`move-journal.json`).
+* All auxiliary stores previously persisted in the legacy `.toon` dialect (`work/metrics*.toon`, `work/fragment-*.toon`, `work/retro-fragments.toon`, `work/module_mapping.toon`, `work/deliverable-hashes.toon`, `work/lessons-consult.toon`, and `artifacts/ci-runs/{N}/manifest.toon`) must be converted to canonical JSON in `plan-marshall` prior to porting their owning scripts to Java.
+* Redesigned workflow stores (`execution.toon`, `handshakes.toon`, and `work/ci-precondition-cache.toon`) must be superseded directly by the `PM-MCP` workflow engine's JSON state rather than converted.
+* Every shared JSON and JSONL store must include a mandatory integer `format_version` field to ensure deterministic schema validation across both runtimes.
+
+See the link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+
+[#PM-MIG-4]
+=== PM-MIG-4: Stage Exit Criteria & Legacy Surface Retirement
+
+Advancement between migration stages and retirement of legacy components must be gated by objective verification criteria.
+
+* A ported store or primitive must not switch from Python to Java until:
+** 100% of differential equivalence tests pass against the Python baseline.
+** Dedicated JUnit 5 module tests meet coverage and contract requirements.
+** Parallel shadow execution on real plans records zero unexplained discrepancies.
+* The Stage 3 Hypermedia Pilot (Init) must satisfy the following exit criteria before Stage 4 commences:
+** The Init phase completes end-to-end exclusively via hypermedia links (`pm_start`, `pm_do`) with zero model-composed CLI invocations.
+** Session recovery after `/clear` or context compaction succeeds 100% of the time using `pm_state(plan_id)` alone.
+** Plans initialized by `PM-MCP` transition seamlessly into the legacy Phase 2 (Refine) workflow without state loss.
+* Legacy surfaces (such as `.plan/local/marshall-state.toon`, executor generators, and permission fixers) must be retired atomically alongside the stage that supersedes them.
+
+See the link:specification/workflow-dsl.adoc[Workflow DSL & State Machine Specification] and link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] for implementation details.
+
+[#PM-MIG-5]
+=== PM-MIG-5: Quantitative Rollback Triggers & Safe Reversion
+
+Every migration stage must be monitored against quantitative operational baselines and maintain a non-destructive rollback path.
+
+* The system must define and enforce quantitative rollback triggers across each migration stage; a stage must halt and revert if any of the following thresholds are breached:
+** Resident context billing weight (tokens multiplied by turns per plan) regresses relative to the legacy baseline.
+** Workflow-discipline defects (invented arguments, skipped steps, or out-of-order transitions) occur, or valid link submissions are erroneously rejected by `pm_do`.
+** Context recovery and resume accuracy after `/clear` or compaction drops below 100%.
+** Build execution duration or daemon dispatch overhead exceeds +/- 5% of the direct CLI baseline.
+** Unresolved state corruption or cross-runtime lock deadlocks are detected.
+* Upon triggering a rollback, executing `pm-mcp operator release-plan` must return plan ownership to the Python executor and allow immediate reactivation of the legacy distribution without loss of persisted plan state, tasks, or git commits.
+
+See the link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.

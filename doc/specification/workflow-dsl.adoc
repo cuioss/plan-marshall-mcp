@@ -1,0 +1,492 @@
+= Workflow DSL & Engine Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Workflow DSL & Engine (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document specifies the declarative Workflow Domain-Specific Language (DSL), Abstract Syntax Tree (AST) model, typed Java `Primitive<P, R>` execution contract, loop-back guard semantics, and automated diagram generation for *plan-marshall-mcp* (`PM-MCP`). The workflow engine and DSL reside in the plain-Java `pm-mcp-core` module with zero runtime framework dependencies and are assembled into the native daemon by `pm-mcp-server`.
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint]_
+* _See Requirement link:../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
+* _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+* _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
+* _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
+
+== Status: PLANNED
+
+== Module Boundary & Decoupled Core Architecture
+_See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
+
+The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP transport libraries:
+
+[cols="1,2,3"]
+|===
+|Module |Package Namespace |Responsibilities & Allowed Dependencies
+
+|`pm-mcp-core`
+|`de.cuioss.pm.mcp.core.workflow.*`
+|Contains the line-oriented DSL lexer/parser, immutable AST records, compile-time/startup static verifier, `Primitive<P, R>` SPI, deterministic state machine interpreter, and PlantUML/Mermaid/ASCII diagram generators. Depends *only* on the JDK (`java.base`) and `cui-java-tools` / Jackson annotations. Unit tests execute directly in JUnit 5 without Quarkus augmentation.
+
+|`pm-mcp-server`
+|`de.cuioss.pm.mcp.server.*`
+|Instantiates core engine services via CDI `@Produces`, binds concrete `Primitive` implementations to the daemon's job runner and state stores, registers persisted records via `@RegisterForReflection`, and maps `pm_start`, `pm_state`, and `pm_do` calls to the engine.
+|===
+
+== Formal EBNF Grammar for the Workflow DSL
+_See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
+
+Workflow definitions (`*.pmwf` resources compiled into the binary under `classpath:/workflows/`) conform to the following ISO/IEC 14977 Extended Backus-Naur Form (EBNF) grammar. The DSL is line-oriented; comments start with `#` and run to the end of the line.
+
+[source,ebnf]
+----
+workflow_file        = workflow_header ,
+                       [ scope_decl ] ,
+                       start_decl ,
+                       { migrate_decl } ,
+                       state_decl , { state_decl } ;
+
+workflow_header      = "workflow" , identifier , "version" , positive_int , EOL ;
+scope_decl           = "scope" , ( "plan" | "epic" | "entity" | "subworkflow" ) , EOL ;
+start_decl           = "start" , state_id , EOL ;
+migrate_decl         = "migrate" , state_id , "->" , state_id , EOL ;
+
+state_decl           = "state" , state_id , [ "terminal" ] , EOL ,
+                       [ phase_clause ] ,
+                       [ skill_clause ] ,
+                       [ facts_clause ] ,
+                       state_body ;
+
+phase_clause         = "phase" , identifier , EOL ;
+skill_clause         = "skill" , skill_path , EOL ;
+facts_clause         = "facts" , primitive_id , EOL ;
+
+state_body           = /* empty for terminal states */
+                     | auto_clause
+                     | job_clause
+                     | call_clause
+                     | link_clause , { link_clause } ;
+
+auto_clause          = "auto" , primitive_id , EOL ,
+                       outcome_transition , { outcome_transition } ;
+
+job_clause           = ( "job" | "composite_job" ) , primitive_id , EOL ,
+                       outcome_transition , { outcome_transition } ;
+
+call_clause          = "call" , identifier , EOL ,
+                       outcome_transition , { outcome_transition } ;
+
+link_clause          = "link" , relation , link_id_pattern ,
+                       [ "[" , link_form , "]" ] ,
+                       "(" , [ param_list ] , ")" , EOL ,
+                       [ guard_clause ] ,
+                       link_action ,
+                       outcome_transition , { outcome_transition } ;
+
+relation             = "next" | "alt" | "retry" | "fix" | "loop_back"
+                     | "submit" | "dispatch" | "wait" | "escalate"
+                     | "abort" | "emit" ;
+
+link_form            = "submit" | "wait" | "dispatch" | "escalate" | "noop" ;
+
+link_id_pattern      = action_id , [ ":" , ( entity_placeholder | identifier ) ] ;
+entity_placeholder   = "<" , identifier , ">" ;
+
+param_list           = param_decl , { "," , param_decl } ;
+param_decl           = identifier , ":" , type_spec , [ "?" ] ;
+
+type_spec            = "text" , [ int_range ]
+                     | "int" , [ int_range ]
+                     | "enum" , "[" , identifier , { "|" , identifier } , "]"
+                     | "list" , "<" , ( "text" | "int" | "enum" , "[" , identifier , { "|" , identifier } , "]" ) , ">" ;
+
+int_range            = positive_int_or_zero , ".." , positive_int ;
+
+guard_clause         = "guard" , guard_expr , EOL ;
+guard_expr           = guard_term , { "or" , guard_term } ;
+guard_term           = guard_factor , { "and" , guard_factor } ;
+guard_factor         = [ "not" ] , ( guard_atom | "(" , guard_expr , ")" ) ;
+guard_atom           = "in_worktree"
+                     | "loop_count_below_max"
+                     | "has_open_findings"
+                     | "all_tasks_completed"
+                     | "predicate:" , primitive_id ;
+
+link_action          = ( "do" , primitive_id , EOL )
+                     | ( "dispatch" , identifier , "level" , ( "1" | "2" | "3" | "4" ) , EOL )
+                     | ( "escalate" , identifier , EOL ) ;
+
+outcome_transition   = outcome_id , "->" , state_id , EOL ;
+
+state_id             = identifier , { "." , identifier } ;
+primitive_id         = identifier , "." , identifier ;
+skill_path           = "pm/" , identifier , { "/" , identifier } ;
+outcome_id           = identifier ;
+action_id            = identifier ;
+identifier           = lowercase_alpha , { lowercase_alpha | digit | "_" | "-" } ;
+positive_int         = nonzero_digit , { digit } ;
+positive_int_or_zero = "0" | positive_int ;
+EOL                  = [ "#" , { any_char_except_nl } ] , "\n" ;
+----
+
+=== Reference Workflow DSL Excerpt (`finalize.pmwf`)
+
+[source,text]
+----
+workflow finalize version 1
+scope plan
+start finalize.commit
+migrate finalize.push_wait -> finalize.push-barrier
+
+state finalize.commit
+  phase finalize
+  skill pm/finalize/commit-message
+  facts git.commit-status
+  link next commit [submit] (message: text 1..2000)
+    do git.commit
+      ok                -> finalize.push-barrier
+      nothing_to_commit -> finalize.concurrent-wait
+      hook_failed       -> finalize.commit-fix
+
+state finalize.push-barrier
+  phase finalize
+  skill pm/finalize/push-barrier
+  facts git.branch-status
+  link next push [noop] ()
+    guard in_worktree
+    do git.push
+      ok                -> finalize.concurrent-wait
+      already_pushed    -> finalize.concurrent-wait
+      rejected          -> finalize.sync-required
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate push_override
+      approved          -> finalize.concurrent-wait
+      denied            -> finalize.aborted
+
+state finalize.concurrent-wait
+  phase finalize
+  composite_job finalize.watch-ci-and-bots
+    all_green           -> finalize.merge-gate
+    findings_open       -> finalize.triage
+    ci_failed           -> finalize.ci-failed
+    bot_rate_limited    -> finalize.review-escalate
+
+state finalize.ci-failed
+  phase finalize
+  skill pm/finalize/ci-triage
+  facts ci.failure-summary
+  link loop_back loop_back [submit] (remediation_summary: text 1..2000)
+    guard in_worktree and loop_count_below_max
+    do plan.allocate-remediation-tasks
+      allocated         -> execute.dispatch-ready
+      limit_reached     -> finalize.loop-limit-reached
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate ci_failure_override
+      approved          -> finalize.merge-gate
+      denied            -> finalize.aborted
+
+state finalize.loop-limit-reached
+  phase finalize
+  facts plan.loop-status
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate loop_limit_extension
+      extended          -> execute.dispatch-ready
+      aborted           -> finalize.aborted
+
+state finalize.aborted terminal
+  phase aborted
+----
+
+== AST Node Model
+_See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
+
+_See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
+
+The parser produces an immutable tree of Java 25 `record` and `sealed interface` nodes in `de.cuioss.pm.mcp.core.workflow.ast`:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.ast;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+public record SourceLocation(String resourceName, int line, int column) {}
+
+public enum WorkflowScope { PLAN, EPIC, ENTITY, SUBWORKFLOW }
+
+public record StateMigration(String oldStateId, String newStateId, SourceLocation location) {}
+
+public record WorkflowDefinition(
+    String id,
+    int version,
+    WorkflowScope scope,
+    String startState,
+    List<StateMigration> migrations,
+    Map<String, StateNode> states,
+    SourceLocation location
+) {}
+
+public record StateNode(
+    String id,
+    String phase,
+    boolean terminal,
+    Optional<String> skillPath,
+    Optional<String> factsPrimitiveId,
+    StateBehavior behavior,
+    SourceLocation location
+) {}
+
+public sealed interface StateBehavior
+    permits StateBehavior.InteractiveLinks,
+            StateBehavior.AutoStep,
+            StateBehavior.JobStep,
+            StateBehavior.SubWorkflowCall,
+            StateBehavior.TerminalState {
+
+    record InteractiveLinks(List<LinkSpec> links) implements StateBehavior {}
+    record AutoStep(String primitiveId, List<OutcomeTransition> transitions) implements StateBehavior {}
+    record JobStep(String primitiveId, boolean composite, List<OutcomeTransition> transitions) implements StateBehavior {}
+    record SubWorkflowCall(String subWorkflowId, List<OutcomeTransition> transitions) implements StateBehavior {}
+    record TerminalState() implements StateBehavior {}
+}
+
+public record LinkSpec(
+    LinkRelation rel,
+    String idPattern,
+    LinkForm form,
+    List<ParamSpec> freeParams,
+    Optional<GuardExpr> guard,
+    LinkAction action,
+    List<OutcomeTransition> transitions,
+    SourceLocation location
+) {}
+
+public sealed interface LinkAction
+    permits LinkAction.ExecutePrimitive,
+            LinkAction.DispatchSubAgent,
+            LinkAction.EscalateDecision {
+
+    record ExecutePrimitive(String primitiveId) implements LinkAction {}
+    record DispatchSubAgent(String targetEntityKind, int level) implements LinkAction {}
+    record EscalateDecision(String decisionId) implements LinkAction {}
+}
+
+public sealed interface GuardExpr
+    permits GuardExpr.InWorktree,
+            GuardExpr.LoopCountBelowMax,
+            GuardExpr.HasOpenFindings,
+            GuardExpr.AllTasksCompleted,
+            GuardExpr.CustomPredicate,
+            GuardExpr.And,
+            GuardExpr.Or,
+            GuardExpr.Not {
+
+    record InWorktree() implements GuardExpr {}
+    record LoopCountBelowMax() implements GuardExpr {}
+    record HasOpenFindings() implements GuardExpr {}
+    record AllTasksCompleted() implements GuardExpr {}
+    record CustomPredicate(String primitiveId) implements GuardExpr {}
+    record And(GuardExpr left, GuardExpr right) implements GuardExpr {}
+    record Or(GuardExpr left, GuardExpr right) implements GuardExpr {}
+    record Not(GuardExpr operand) implements GuardExpr {}
+}
+
+public record OutcomeTransition(
+    String outcomeName,
+    String targetStateId,
+    SourceLocation location
+) {}
+----
+
+=== Static AST Verification Rules (Build-Time & Daemon Startup)
+_See Requirement link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint]_
+
+`WorkflowValidator` verifies every `WorkflowDefinition` both in JUnit build tests and at daemon startup (failing closed if any rule is violated):
+
+1. *Primitive Binding & Parameter Equivalence*: Every `primitiveId` in `do`, `auto`, `job`, `facts`, and `predicate:` must resolve to a registered `Primitive<P, R>`. For every `LinkSpec`, the declared `freeParams` list must exactly match the name, type, and constraints of the `Record` components annotated as `@FreeParam` on `P`.
+2. *Exhaustive Outcome Coverage*: For every `auto`, `job`, and `link` action backed by `Primitive<P, R>`, the set of `OutcomeTransition.outcomeName` entries must form an exact 1-to-1 bijection with the enum constants of `R` (`R.getEnumConstants()`). Missing or unknown outcome names fail validation with the source file and line number.
+3. *Graph Integrity*: `startState` and every `OutcomeTransition.targetStateId` must exist in `states`. Every `StateNode` must be reachable from `startState`. Every non-terminal `StateNode` must have at least one outgoing transition path to a `terminal` state.
+4. *Single-Level Leaf Sub-Agent Constraint (`PM-WF-5`)*: Any `WorkflowDefinition` with `scope == WorkflowScope.ENTITY` (or any state reachable within an entity sub-agent scope) is strictly forbidden from containing a `LinkSpec` with `form == LinkForm.DISPATCH` or `LinkAction.DispatchSubAgent`. Sub-agents are leaves and can never dispatch nested sub-agents.
+5. *Backwards-Compatible State Migration*: Every state name present in the committed `released-states.txt` baseline must either exist in `states` or appear as `oldStateId` in a `migrate <old> -> <new>` declaration whose target exists in `states`.
+
+== Typed Java `Primitive<P, R>` Interface & Transition Validation
+_See Requirement link:../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
+
+=== `Primitive<P, R>` SPI Contract
+
+Every deterministic server operation is encapsulated as a stateless Java `Primitive<P, R>` in `pm-mcp-core`:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.spi;
+
+import java.util.Map;
+import java.util.Optional;
+
+public interface PrimitiveOutcome {
+    String wireName();
+}
+
+public record PrimitiveResult<R extends Enum<R> & PrimitiveOutcome>(
+    R outcome,
+    Map<String, Object> updatedFacts,
+    Optional<String> spawnedJobId
+) {}
+
+public interface Primitive<P extends Record, R extends Enum<R> & PrimitiveOutcome> {
+
+    /**
+     * Canonical dotted primitive identifier (e.g., "git.commit", "git.push", "findings.triage").
+     */
+    String id();
+
+    /**
+     * Record class defining the free and state-resolved parameters.
+     */
+    Class<P> parameterType();
+
+    /**
+     * Closed enum class of all possible deterministic outcomes.
+     */
+    Class<R> outcomeType();
+
+    /**
+     * Execute the operation within the locked scope context and return one of the closed outcomes.
+     */
+    PrimitiveResult<R> execute(WorkflowExecutionContext context, P parameters);
+}
+----
+
+=== Concrete Primitive Example (`GitCommitPrimitive`)
+
+[source,java]
+----
+public final class GitCommitPrimitive
+        implements Primitive<GitCommitPrimitive.Params, GitCommitPrimitive.Outcome> {
+
+    public record Params(@FreeParam(minLength = 1, maxLength = 2000) String message) {}
+
+    public enum Outcome implements PrimitiveOutcome {
+        OK("ok"),
+        NOTHING_TO_COMMIT("nothing_to_commit"),
+        HOOK_FAILED("hook_failed");
+
+        private final String wireName;
+        Outcome(String wireName) { this.wireName = wireName; }
+        @Override public String wireName() { return wireName; }
+    }
+
+    @Override public String id() { return "git.commit"; }
+    @Override public Class<Params> parameterType() { return Params.class; }
+    @Override public Class<Outcome> outcomeType() { return Outcome.class; }
+
+    @Override
+    public PrimitiveResult<Outcome> execute(WorkflowExecutionContext ctx, Params params) {
+        // Executes git commit via the enrolled GitJobService in ctx.worktreePath()
+        ...
+    }
+}
+----
+
+=== Independent Server-Side Transition & Parameter Validation (`PM-WF-6`)
+
+When `pm_do(scope_id, link, args, dispatch_id)` arrives, the workflow engine executes a single atomic transaction under the scope's exclusive `FileChannel` lock:
+
+1. *Load Authoritative State*: Read `mcp/status.json` for `scope_id` (applying any `migrate` mapping if `status.json` references a legacy state) and resolve the active `StateNode`.
+2. *Verify Dispatch Claim (if `dispatch_id` present)*: If `dispatch_id` is superseded or expired, reject immediately with `reason: "superseded_dispatch_id"`.
+3. *Re-Compute Active Links & Guards*: Evaluate all `LinkSpec` entries on `StateNode`, expanding entity placeholders (`triage:<finding_id>`) against current persisted stores (`findings.jsonl`, `tasks/TASK-*.json`) and evaluating each link's `GuardExpr`.
+4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set (including any attempt to invoke an omitted operator transition or an already-closed entity), return `isError: false` with `rejected.reason = "link_not_available"` and the current representation.
+5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges). If validation fails, return `isError: false` with `rejected.reason = "invalid_link_args"` and the current representation.
+6. *Verify Workspace Footprint*: For task `submit` and git `commit` links, verify that no files outside the plan's worktree were dirtied by host tools; on violation, transition immediately to `<phase>.footprint-violation`.
+7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions`, persist the new `state` in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` steps if the target state is an `AutoStep`).
+
+== Worktree-Constrained Loop-Back & Iteration Bounds
+_See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+
+When a finalize step (CI failure, quality gate failure, or review finding triage) requires code changes, the workflow transitions from `finalize` back to `execute` via a `loop_back` link governed by three strict server-side invariants:
+
+=== 1. Worktree Confinement Guard (`in_worktree`)
+
+* Every `loop_back` link in `finalize.pmwf` declares `guard in_worktree and loop_count_below_max`.
+* `GuardExpr.InWorktree` evaluates to `true` if and only if `.plan/local/worktrees/<plan_id>/` exists, is a valid git worktree for the plan's branch, and the plan directory currently resides at `.plan/local/worktrees/<plan_id>/.plan/plans/<plan_id>/`.
+* Once the plan passes `finalize.merge-gate`, merges its branch, and relocates back to the primary checkout (`.plan/local/plans/<plan_id>/`), `InWorktree` evaluates to `false`. All `loop_back` links are automatically omitted from representations and rejected by `pm_do`.
+
+=== 2. Configuration Resolution & Iteration Counter Validation
+
+* The maximum number of automated finalize-to-execute loop-backs is configured in `.plan/marshal.json` under JSON pointer `/phase-6-finalize/max_iterations`:
++
+[source,json]
+----
+{
+  "phase-6-finalize": {
+    "max_iterations": 3
+  }
+}
+----
+* If `/phase-6-finalize/max_iterations` is omitted in `.plan/marshal.json`, the engine applies the normative default of `3` (valid configured range: `1..10`).
+* The plan's `mcp/status.json` persists `"finalize_iteration_count": <int>` (initialized to `0` when entering `finalize` for the first time).
+* `GuardExpr.LoopCountBelowMax` evaluates `status.finalizeIterationCount() < config.phase6Finalize().maxIterations()`.
+* When `plan.allocate-remediation-tasks` executes on a valid `loop_back`:
+  1. `finalize_iteration_count` is atomically incremented by `1` in `mcp/status.json`.
+  2. Fresh task files (`TASK-NNN.json`) and a fresh dispatch envelope (`envelope-M` with a new `dispatch_id`) are allocated in the worktree — completed tasks are never mutated or reopened.
+* If a finalize failure occurs when `finalize_iteration_count >= max_iterations`, `LoopCountBelowMax` evaluates to `false`, `loop_back` is omitted, and the state transitions to `finalize.loop-limit-reached`, which offers only `escalate` (requiring operator approval via elicitation or `pm-mcp operator` to grant additional iterations or abort).
+
+== Automated PlantUML, Mermaid, and ASCII Diagram Generation
+_See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
+
+Because workflow definitions are parsed into a typed `WorkflowDefinition` AST in `pm-mcp-core`, all visual documentation and runtime state inspection diagrams are generated deterministically from the AST by `WorkflowDiagramGenerator`.
+
+=== Supported Render Targets
+
+1. *PlantUML State Diagram (`renderPlantUml(WorkflowDefinition, Optional<String> activeState)`)*:
+   * Emits `@startuml` ... `@enduml` state diagrams grouping `StateNode` entries by `phase`, labeling transitions with `[rel] link_id / outcome`, and styling `activeState` with `#LightGreen` when rendering for a live plan.
+2. *Mermaid State Diagram (`renderMermaid(WorkflowDefinition, Optional<String> activeState)`)*:
+   * Emits `stateDiagram-v2` blocks embedded into AsciiDoc documentation under `doc/` and served via the MCP resource `pm://plan/{plan_id}/diagram`.
+3. *Deterministic ASCII Box-and-Transition Table (`renderAscii(WorkflowDefinition, Optional<String> activeState)`)*:
+   * Emits a right-border-aligned ASCII state boxes diagram and transition matrix for terminal output (`pm-mcp daemon status`, `pm-mcp-inspect`).
+
+=== Example Generated PlantUML & ASCII Output
+
+[source,plantuml]
+----
+@startuml
+hide empty description
+[*] --> finalize.commit
+state "finalize.commit" as finalize_commit : skill: pm/finalize/commit-message\nfacts: git.commit-status
+state "finalize.push-barrier" as finalize_push_barrier : skill: pm/finalize/push-barrier\nfacts: git.branch-status
+state "finalize.concurrent-wait" as finalize_concurrent_wait : composite_job: finalize.watch-ci-and-bots
+state "finalize.ci-failed" as finalize_ci_failed : skill: pm/finalize/ci-triage
+
+finalize_commit --> finalize_push_barrier : next:commit [submit] / ok
+finalize_commit --> finalize_concurrent_wait : next:commit [submit] / nothing_to_commit
+finalize_push_barrier --> finalize_concurrent_wait : next:push [noop] [in_worktree] / ok
+finalize_concurrent_wait --> finalize_ci_failed : job / ci_failed
+finalize_ci_failed --> execute_dispatch_ready : loop_back:loop_back [in_worktree && loop < max] / allocated
+finalize_ci_failed --> finalize_loop_limit_reached : loop_back:loop_back / limit_reached
+@enduml
+----
+
+[source,text]
+----
+┌───────────────────────────┬────────────┬────────────────────────────┬─────────────────────────────┐
+│ State                     │ Link (rel) │ Guard                      │ Outcome -> Next State       │
+├───────────────────────────┼────────────┼────────────────────────────┼─────────────────────────────┤
+│ *finalize.push-barrier    │ push (next)│ in_worktree                │ ok -> finalize.concurrent.. │
+│  (ACTIVE)                 │ escalate   │ -                          │ approved -> finalize.conc.. │
+└───────────────────────────┴────────────┴────────────────────────────┴─────────────────────────────┘
+----
+
+=== Build-Time Drift Gate
+
+A mandatory JUnit test (`WorkflowDiagramDriftTest`) in `pm-mcp-core` parses all `classpath:/workflows/*.pmwf` files, invokes `WorkflowDiagramGenerator`, and compares the output byte-for-byte against the committed diagram files in `doc/`. Any divergence fails the build, guaranteeing that workflow documentation can never drift from the executable state machine.

@@ -1,0 +1,391 @@
+= Hypermedia Format & TOON Encoding Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Hypermedia Format & TOON Encoding (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document defines the normative hypermedia state representation format (HATEOAS) and deterministic Token-Oriented Object Notation (TOON v4.1) encoding rules for *plan-marshall-mcp* (`PM-MCP`). Every call to `pm_start`, `pm_state`, or `pm_do` returns an authoritative state representation rendered in TOON containing the scope identifier, closed state and phase names, optional vocabulary skill URI, contextual facts, and the set of valid hypermedia links.
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-WF-1[PM-WF-1: Hypermedia State Representation (HATEOAS)]_
+* _See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+* _See Requirement link:../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job Links & Wait Transitions]_
+* _See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+* _See Requirement link:../Requirements.adoc#PM-IMPL-3[PM-IMPL-3: Deterministic Native TOON Encoder]_
+
+== Status: PLANNED
+
+== Normative TOON Representation Structure
+_See Requirement link:../Requirements.adoc#PM-WF-1[PM-WF-1: Hypermedia State Representation (HATEOAS)]_
+
+Every workflow state representation is serialized as a top-level TOON object with a fixed canonical field ordering.
+
+=== Canonical Top-Level Fields
+
+[cols="1,1,1,3"]
+|===
+|Field |Presence |Type |Normative Definition
+
+|`scope`
+|Required
+|Closed enum
+|`"plan"`, `"epic"`, or `"entity"` (when queried by a dispatched leaf sub-agent with `entity`).
+
+|`plan_id` / `epic_id`
+|Required (one of)
+|String
+|The addressed plan identifier (`plan_id`) or orchestrator epic identifier (`epic_id`).
+
+|`entity`
+|Conditional
+|String
+|Present iff `scope == "entity"` (e.g., `envelope-2`, `F-12`).
+
+|`state`
+|Required
+|Dotted enum
+|Closed-enum state name (`<phase>.<step>[.<substate>]`, e.g., `finalize.push-barrier`, `execute.verify.running`). Never a boolean.
+
+|`phase`
+|Required
+|Closed enum
+|Lifecycle phase (`init`, `refine`, `outline`, `plan`, `execute`, `finalize`, `completed`, `aborted`, or `orchestrate`).
+
+|`summary`
+|Required
+|String
+|Single-line human-readable status summary (`1..160` ASCII characters).
+
+|`skill`
+|Optional
+|URI String
+|URI of the vocabulary skill guiding model judgment in this state (`skill://pm/<area>/SKILL.md`, also aliased as `guidance` where configured). Omitted in purely deterministic states.
+
+|`rejected`
+|Optional
+|Object
+|Present only when the immediately preceding `pm_do` transition was rejected (`link`, closed-enum `reason`, and diagnostic `detail`).
+
+|`profile_warning`
+|Optional
+|Closed enum
+|Present when serving via the `"neutral_fallback"` profile or when a `"client_identity_mismatch"` is detected.
+
+|`facts`
+|Required
+|Object
+|Minimal key-value map of domain facts required to exercise judgment in `state`. Large payloads are referenced via `pm://` resource URIs.
+
+|`links`
+|Required
+|Tabular TOON array
+|`links[N]{rel,link,form,free}:` listing all transitions valid from `state`. Empty (`links[0]{rel,link,form,free}:`) only in terminal states.
+
+|`dispatch`
+|Conditional
+|Object
+|Present iff `links` contains a link with `form == "dispatch"`. Contains the pre-rendered host sub-agent invocation (`link`, `host_tool`, `params`, `prompt`).
+|===
+
+=== Canonical Representation Example
+
+[source,toon]
+----
+scope: plan
+plan_id: PLAN-2026-042
+state: finalize.push-barrier
+phase: finalize
+summary: tasks 11/11 done, freshness gate green, branch not pushed
+skill: skill://pm/finalize/push-barrier/SKILL.md
+facts:
+  branch: feature/PLAN-2026-042
+  commits_ahead: 4
+  gate.freshness: green
+  outline_uri: pm://plan/PLAN-2026-042/outline
+  worktree_sha: 8f3a1c9e2d4b6a0f1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1
+links[3]{rel,link,form,free}:
+  next,push,noop,""
+  alt,commit,submit,"message:text[1..2000]"
+  escalate,escalate,escalate,"reason:text[1..500]"
+----
+
+== The Five Normative Link Forms
+_See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job Links & Wait Transitions]_
+
+Every row in `links[N]{rel,link,form,free}:` belongs to one of five closed link forms (`submit`, `wait`, `dispatch`, `escalate`, `noop`). The `form` column defines the interaction mechanics expected from the caller.
+
+[cols="1,2,2,3"]
+|===
+|Link Form |Target Tool |`free` Column |Execution Semantics
+
+|`submit`
+|`pm_do(scope, link, args)`
+|Non-empty typed parameter list (e.g., `"outline:text[1..32768]"`, `"disposition:enum[fixed\|dismissed],rationale:text[1..1000]"`)
+|Submits model judgment artifacts or a sub-agent completion report (`returned:<dispatch_id>`) to the server. The server validates `args` against the link's closed schema before executing the backing primitive.
+
+|`wait`
+|`pm_do(scope, link, {})`
+|`""` (empty)
+|Monitors an asynchronous background job (`wait:<job_id>`) or composite wait state (`wait:<composite_id>`). Blocks up to the bounded wait interval (default 4 minutes) or progress-reset interval (default 30 minutes with 60s MCP progress notifications) and returns either the terminal state representation or an updated `*.running` representation.
+
+|`dispatch`
+|Host sub-agent tool (rendered in `dispatch.host_tool`) followed by `pm_do(scope, "returned:<dispatch_id>", args)`
+|`""` on the `dispatch` row; companion `returned:<dispatch_id>` link has `form: submit`
+|Instructs the orchestrating session to invoke its host sub-agent tool verbatim using `dispatch.host_tool`, `dispatch.params`, and `dispatch.prompt`. The sub-agent executes in leaf entity scope; once it finishes, the parent reports completion via `returned:<dispatch_id>`.
+
+|`escalate`
+|`pm_do(scope, link, args)` -> triggers MCP Elicitation or `*.blocked` operator wait
+|`"reason:text[1..500]"` (plus optional structured target parameters such as `target_project:text`)
+|Requests an operator decision that the model is not permitted to take. If the host supports MCP elicitation, prompts the user directly; otherwise transitions the scope to `<phase>.blocked`, emitting the `pm-mcp operator` CLI command in `facts` and offering only a `wait` link.
+
+|`noop`
+|`pm_do(scope, link, {})`
+|`""` (empty)
+|Triggers a deterministic server-side transition that requires zero free judgment parameters from the model (for example `push`, `cancel:<job_id>`, `sync`, or advancing a green gate).
+|===
+
+=== Sub-Agent Dispatch Block (`form: dispatch`)
+
+When a state offers a `dispatch` link, the representation includes a top-level `dispatch` object pre-rendered through the scope's client profile:
+
+[source,toon]
+----
+scope: plan
+plan_id: PLAN-2026-042
+state: execute.dispatch-ready
+phase: execute
+summary: envelope-2 ready for dispatch (3 tasks)
+links[2]{rel,link,form,free}:
+  dispatch,dispatch:envelope-2,dispatch,""
+  submit,returned:d-0417,submit,"status:enum[success|error|loop_back|blocked],display_detail:text[1..80],token_usage:int[0..10000000]?"
+dispatch:
+  link: dispatch:envelope-2
+  host_tool: Agent
+  params:
+    subagent_type: plan-marshall:execution-context-level-3
+  prompt: |
+    name: envelope-2
+    dispatch_id: d-0417
+    plan_id: PLAN-2026-042
+    entity: envelope-2
+    skills: [skill://pm/execute/task/SKILL.md, skill://pm/domain/java/core/SKILL.md]
+    WORKTREE: .plan/local/worktrees/PLAN-2026-042
+    start: pm_state(plan_id="PLAN-2026-042", entity="envelope-2", dispatch_id="d-0417")
+----
+
+== Closed Link Relation & Identifier Grammar
+_See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+
+=== Closed Link Relations (`rel`)
+
+Every link's `rel` column is drawn from a closed enumeration of 10 relation identifiers:
+
+[cols="1,1,3"]
+|===
+|`rel` Value |Allowed Forms |Semantic Meaning
+
+|`next`
+|`noop`, `submit`
+|Default forward transition along the primary workflow path.
+
+|`alt`
+|`noop`, `submit`
+|Alternative forward transition (e.g., selecting deep vs light outline lane, or re-committing before push).
+
+|`retry`
+|`noop`
+|Repeat the last failed deterministic operation (build, push, CI fetch) without changing code.
+
+|`fix`
+|`noop`, `submit`, `dispatch`
+|Enter a remediation sub-state or allocate fix tasks for a failed build or gate finding.
+
+|`loop_back`
+|`noop`, `submit`
+|Return from `finalize` to `execute` in the plan's worktree by allocating fresh remediation tasks (subject to `in_worktree` and `max_iterations`).
+
+|`submit`
+|`submit`
+|Deliver model-authored judgment output or sub-agent return status to the server.
+
+|`dispatch`
+|`dispatch`
+|Launch a leaf sub-agent for an entity envelope, module, or untrusted-content reader task.
+
+|`wait`
+|`wait`
+|Block on a running asynchronous job or composite wait state.
+
+|`escalate`
+|`escalate`
+|Request operator intervention or cross-project approval through the operator channel.
+
+|`abort`
+|`noop`, `submit`
+|Cancel a running job (`cancel:<job_id>`) or terminate the workflow in a defined `aborted` state.
+
+|`emit`
+|`noop`, `submit`
+|Epic-only relation: mark a staged plan in the epic ledger as launched and emit its `pm-mcp enter` bootstrap command.
+|===
+
+=== Link Identifier Grammar (`<action>` vs `<action>:<entity_id>`)
+
+Link identifiers (`link` column) are server-derived, stateless tokens governed by the following grammar:
+
+[source,ebnf]
+----
+link_id       = action_name , [ ":" , entity_id ] ;
+action_name   = lowercase_alpha , { lowercase_alpha | digit | "_" | "-" } ;
+entity_id     = ( alpha | digit ) , { alpha | digit | "_" | "." | "-" } ;
+----
+
+1. *Scope-Wide Link (`<action>`)*:
+   * Pattern: `^[a-z][a-z0-9_-]{0,63}$`
+   * Examples: `push`, `commit`, `refine`, `outline`, `escalate`, `loop_back`.
+   * Applies to the entire `plan_id` or `epic_id` scope.
+2. *Entity-Addressed Link (`<action>:<entity_id>`)*:
+   * Pattern: `^[a-z][a-z0-9_-]{0,63}:[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`
+   * Examples:
+     - `triage:F-12` (act on finding `F-12`)
+     - `submit:TASK-04` (submit completion of task `TASK-04`)
+     - `dispatch:envelope-2` (dispatch sub-agent for task envelope `envelope-2`)
+     - `returned:d-0417` (report return of sub-agent dispatch `d-0417`)
+     - `wait:b-2291` / `cancel:b-2291` (await or cancel build job `b-2291`)
+     - `wait:finalize.concurrent-wait` (await composite wait region)
+   * Validated against both the scope's state and the addressed `<entity_id>`'s state under the scope lock.
+
+=== Free Parameter Descriptor Grammar (`free` Column)
+
+The `free` column specifies the closed schema for `pm_do(..., args)` in compact human- and model-readable form:
+
+[source,ebnf]
+----
+free_spec     = "" | param_decl , { "," , param_decl } ;
+param_decl    = param_name , ":" , param_type , [ "?" ] ;
+param_name    = lowercase_alpha , { lowercase_alpha | digit | "_" } ;
+param_type    = "text" , [ "[" , int , ".." , int , "]" ]
+              | "int" , [ "[" , int , ".." , int , "]" ]
+              | "enum[" , enum_val , { "|" , enum_val } , "]"
+              | "list[" , scalar_type , "]" ;
+----
+
+NOTE: Boolean parameters are prohibited in workflow transitions to preserve explicit closed-enum intent (e.g., `decision:enum[approve|reject]` rather than `approved:bool`). A trailing `?` marks an optional parameter (such as `token_usage:int[0..10000000]?`).
+
+== Composite Wait Representation & Short-Circuit Semantics
+_See Requirement link:../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job Links & Wait Transitions]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+
+During Phase 6 (`finalize`), CI verification and automated PR review bots run concurrently after branch push. Rather than forcing the model to poll two separate jobs sequentially, the workflow engine exposes the composite wait state `finalize.concurrent-wait`.
+
+=== `finalize.concurrent-wait` Representation
+
+[source,toon]
+----
+scope: plan
+plan_id: PLAN-2026-042
+state: finalize.concurrent-wait
+phase: finalize
+summary: waiting on CI run (running) and review bot (pending), 00:02:15 elapsed
+facts:
+  branch: feature/PLAN-2026-042
+  pr_number: 184
+  ci_job_id: c-8810
+  ci_status: running
+  bot_job_id: r-8811
+  bot_status: pending
+  elapsed_seconds: 135
+links[2]{rel,link,form,free}:
+  wait,wait:finalize.concurrent-wait,wait,""
+  abort,cancel:finalize.concurrent-wait,noop,""
+----
+
+=== Closed Status Enumerations in `finalize.concurrent-wait`
+
+* `ci_status`: `running` | `passed` | `failed` | `not_triggered` | `cancelled`
+* `bot_status`: `pending` | `completed` | `not_configured` | `rate_limited` | `timed_out` | `cancelled`
+
+=== Deterministic Evaluation & Immediate Short-Circuit Matrix
+
+When the model follows `wait:finalize.concurrent-wait`, the daemon monitors both underlying jobs (`ci_job_id` and `bot_job_id`) concurrently and unblocks according to the following transition rules:
+
+[cols="1,1,2,3"]
+|===
+|`ci_status` |`bot_status` |Target State |Engine Action
+
+|`failed`
+|_Any (`pending`, `completed`, etc.)_
+|`finalize.ci-failed`
+|*Immediate Short-Circuit*: The daemon immediately unblocks `wait:finalize.concurrent-wait`, cancels any still-pending review-bot wait timer (`bot_job_id`), persists CI failure findings, and returns `finalize.ci-failed` with `fix`, `loop_back`, and `escalate` links.
+
+|`passed`
+|`completed` (0 open findings)
+|`finalize.merge-gate`
+|Both concurrent gates succeeded cleanly; advances directly to the pre-merge barrier.
+
+|`passed`
+|`completed` ($\ge 1$ open findings)
+|`finalize.triage`
+|Bot review findings were ingested into `findings.jsonl`; transitions to `finalize.triage` offering `triage:<finding_id>` links.
+
+|`passed`
+|`rate_limited` / `timed_out`
+|`finalize.review-escalate`
+|CI passed, but the review bot rate-window or timeout budget expired; offers `retry` and `escalate` links.
+
+|`running`
+|`pending` / `completed` (within wait bound)
+|`finalize.concurrent-wait`
+|Wait bound (4m default or 30m with progress) expired while CI is still running; returns updated `finalize.concurrent-wait` with incremented `elapsed_seconds` and fresh `wait:finalize.concurrent-wait` link.
+|===
+
+== Deterministic Native TOON Encoder Specification
+_See Requirement link:../Requirements.adoc#PM-IMPL-3[PM-IMPL-3: Deterministic Native TOON Encoder]_
+
+`pm-mcp-core` implements a dedicated, zero-reflection Java TOON encoder (`ToonEncoder`) conforming to the TOON v4.1 specification subset emitted by PM-MCP. Given identical input records, `ToonEncoder` produces byte-for-byte identical UTF-8 output across JVM and GraalVM native image executions.
+
+=== Encoding Rules
+
+1. *Character Encoding & Line Endings*:
+   * UTF-8 without BOM.
+   * Line separator is strictly `LF` (`\n`, `0x0A`); `CR` (`\r`) never appears outside escaped string literals.
+   * Every encoded document ends with a single trailing `\n`. No line may contain trailing spaces (`0x20`).
+2. *Indentation*:
+   * Exactly 2 ASCII spaces (`"  "`) per nesting level. Tabs (`\t`) are never used for indentation.
+3. *Key Ordering*:
+   * Top-level representation keys follow the fixed canonical order defined in <<_canonical_top_level_fields>>.
+   * Java `Record` types serialize components in their declared record component order.
+   * Dynamic `Map<String, ?>` containers (such as `facts`) sort keys in deterministic ASCII lexicographical order (`String::compareTo`).
+   * Keys with `null` or `Optional.empty()` values are omitted completely (never serialized as `key: null`).
+4. *Scalar Formatting & Quoting*:
+   * *Integers*: Base-10 ASCII digits (`-?[0-9]+`), no leading zeroes or thousands separators.
+   * *Strings (Unquoted)*: A string value is emitted unquoted if and only if it is non-empty, has no leading or trailing whitespace, contains no control characters (`0x00..0x1F`, `0x7F`), contains none of the reserved structural characters (`,`, `:`, `[`, `]`, `{`, `}`, `"`, `#`, `|`, `\`), and does not match the literals `true`, `false`, `null`, or a numeric literal.
+   * *Strings (Double-Quoted)*: All other single-line strings (including empty strings `""` and `free` parameter signatures containing `:` or `,`) are enclosed in `"` with deterministic backslash escaping:
+     - `\"` (`0x22`), `\\` (`0x5C`), `\n` (`0x0A`), `\r` (`0x0D`), `\t` (`0x09`), and `\uXXXX` for any other control character `< 0x20`.
+   * *Multiline Block Scalars (`|`)*: Strings containing embedded `\n` that represent prose or prompts (such as `dispatch.prompt`) are serialized using the literal block indicator `|` followed by `\n`, with each content line indented 2 spaces deeper than the enclosing key.
+5. *Inline Primitive Arrays*:
+   * Lists of scalar strings or integers (`List<String>`, `List<Integer>`) with $\le 8$ elements and no embedded newlines serialize inline as `key: [val1, val2, val3]`, applying scalar quoting per element.
+6. *Tabular Object Arrays*:
+   * Homogeneous lists of records (such as `links` and `failures`) serialize using the TOON v4.1 tabular header syntax:
++
+[source,text]
+----
+<field_name>[<row_count>]{<col_1>,<col_2>,...,<col_k>}:
+  <cell_1_1>,<cell_1_2>,...,<cell_1_k>
+  ...
+----
+   * `<row_count>` is the exact decimal count of rows (`0` or more).
+   * Column names `<col_i>` are separated by commas with no spaces.
+   * Each row is indented 2 spaces deeper than `<field_name>` and contains exactly `k` comma-separated cell values with no space after commas. Any cell containing a comma `,`, colon `:`, quote `"`, whitespace, or empty string `""` is double-quoted per Rule 4.
