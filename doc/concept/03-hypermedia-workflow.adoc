@@ -116,7 +116,7 @@ The relation vocabulary is closed and documented once, in a vocabulary skill:
 |Enter a remediation sub-state (e.g. a failed build, a quality-gate finding).
 
 |`submit`
-|Hand judgment output to the server (an outline, a triage decision, a task result).
+|Hand judgment output or sub-agent return report to the server (an outline, a triage decision, a task result, dispatch return).
 
 |`dispatch`
 |Start a sub-agent; the link comes with the rendered host call (<<dispatch>>).
@@ -248,12 +248,15 @@ Tracking::
 The server renders a dispatch but never sees the host run it. It therefore tracks every dispatch by its `dispatch_id`:
 +
 * The sub-agent's first call in the entity scope claims the dispatch.
-* The dispatching session reports the host's return through the link `returned:<dispatch_id>`: status, display detail and, where the host reports it, token usage. Missing usage is recorded as unmeasured, never as zero.
+* The dispatching session reports the host's return through a `submit` link with id `returned:<dispatch_id>`: free parameters `status` (closed enum: `success`, `error`, `loop_back`, `blocked`), `display_detail` (at most 80 ASCII characters, no trailing period), and optional `token_usage`. Missing usage is recorded as unmeasured, never as zero.
 * A dispatch that was never claimed, or was claimed but has neither returned nor submitted anything within a bound, is shown as `unconfirmed` in the dispatching session's representation, with a `dispatch` link that dispatches the same entity again — after a host timeout, a cancelled sub-agent or a crashed session.
 * A new dispatch supersedes the old `dispatch_id`. Submits under a superseded id are rejected, so a sub-agent presumed lost that is still running cannot write a second result.
 
 Hosts whose sub-agents cannot reach MCP servers::
 The client profile marks dispatch as unavailable. Representations then offer the work to the dispatching session itself instead of a `dispatch` link.
+
+Reader agents::
+A dedicated sub-agent pattern for ingesting untrusted external content (PR review comments, Sonar issues, web pages). By security design, reader agents are equipped with NO MCP tools (strictly read-only). They return candidate extracts in their text response to the dispatching session. The dispatching session submits this candidate data to the server via a validation link, where a deterministic server-side validator verifies the schema before persisting findings. Reader agents never receive direct write access or PM-MCP transition tools (xref:09-security.adoc#_untrusted_content[Untrusted content]).
 
 == Long-running operations
 
@@ -271,9 +274,21 @@ links[2]{rel,link,free}:
 
 Following the `wait` link blocks up to a bounded time and returns either the final representation or the same `running` representation with updated progress. When the host's client profile states that progress notifications keep a call alive and the call carries a progress token, the same link blocks longer and sends progress; otherwise it is the bounded wait (xref:16-implementation.adoc#_waiting_primitives[Waiting primitives]).
 
+Composite waits::
+When multiple operations run concurrently — notably the finalize wait region running CI verification and automated review bots in parallel — the engine represents them as a single composite state (e.g. `finalize.concurrent-wait`). The representation displays progress facts for all active jobs (`ci: running`, `review: pending`) and offers a single composite wait link `wait:finalize.concurrent-wait`. If a hard CI failure occurs, the engine immediately short-circuits: the pending review wait is cancelled, and the representation moves directly to a failure state with `fix` and `loop_back` links.
+
 == Resumption
 
 Resuming any plan or epic, after `/clear`, a compaction, a host restart or a daemon restart, is one call: `pm_state(plan_id)`. The resume anchor is server state. Nothing has to be re-derived from documents or memory.
+
+== Loop-back transitions
+
+[[loop-back]]
+When finalize triage, CI verification or quality gates determine that code fixes are required, a `loop_back` transition returns the plan to Phase 5 (`execute`):
+
+* *Worktree bound*: Loop-back is strictly only possible while the plan is active in its worktree. Once the plan passes the merge barrier and moves back to the main checkout (during branch cleanup), loop-back transitions are eliminated by link omission.
+* *Fresh remediation tasks*: Each loop-back allocates new fix tasks and envelopes in the worktree rather than reopening completed tasks. Sub-agents receive fresh task and dispatch IDs, so metrics accumulate additively without collision or duplicate counts.
+* *Iteration ceiling*: Automated loop-backs are capped by the project configuration (`.plan/marshal.json -> phase-6-finalize.max_iterations`, default: 3). If iterations reach this ceiling, the engine transitions to `finalize.loop-limit-reached` and offers only an `escalate` link for operator approval.
 
 == Epic orchestration
 

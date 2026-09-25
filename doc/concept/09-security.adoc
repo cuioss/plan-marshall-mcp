@@ -19,8 +19,8 @@ xref:README.adoc[Concept] » Security and Trust Model
 ----
 
 * The *operator* is trusted and is the only party allowed to take operator-only actions, including enrolment.
-* The *model* is trusted to exercise judgment within offered links, but is exposed to untrusted content and is therefore never given capabilities it could be tricked into using against the operator's intent.
-* *PM-MCP* is first-party, local software acting with the operator's permissions.
+* The *model* is trusted to exercise judgment within offered links and parameters, but is exposed to untrusted content (repository code, PR comments, web). Within PM-MCP's surface, it is never given capabilities it could be tricked into using against operator intent. However, the model retains the host's native file and shell tools outside PM-MCP's control (see <<_two_boundaries>>).
+* *PM-MCP* is first-party, local software acting with the operator's permissions, strictly enforcing its own tool, state and project boundaries.
 * *Repository code* — including build definitions, wrappers and git hooks — may have been edited by the model and is executed only as a build job or, for hooks, a git job.
 * *Upstream MCP servers* and all external content (PR comments, review bots, fetched web content) are untrusted.
 
@@ -49,16 +49,22 @@ Enforced by PM-MCP for every operation, independent of what the client declares:
 * build jobs run only in the root's worktrees (xref:07-build-execution.adoc[Build Execution]);
 * a refused access is a distinct state in the representation, with an `escalate` link to request approval.
 
-=== Host tools
+[[_two_boundaries]]
+=== Two boundaries and host tools
 
-The model implements with the host's file and shell tools. For them it receives the plan's worktree as a fact, and dispatched sub-agents receive it as `WORKTREE` (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]). PM-MCP does not confine these tools; it detects what they change:
+Security guarantees operate across two distinct boundaries:
 
+PM-MCP tool boundary::
+PM-MCP strictly enforces its own surface: closed-enum transitions, schema-validated parameters, server-side workspace confinement, job verification against enrolment, and omission of operator capabilities. The model cannot trick PM-MCP into arbitrary command execution, cross-project leakage without approval, or unauthorized workflow state transitions.
+
+Host tool boundary (residual risk)::
+The model implements with the host's file and shell tools. For them it receives the plan's worktree as a fact, and dispatched sub-agents receive it as `WORKTREE` (xref:03-hypermedia-workflow.adoc#dispatch[Sub-agent dispatch]). PM-MCP does *not* sandbox or confine these host tools; it detects what they change within the repository:
 * when a task starts, PM-MCP records the state of the root's main checkout and of its other worktrees;
 * at every task `submit` and before every commit, it compares the realised changes against that record;
 * changes outside the plan's worktree move the plan into a `*.footprint-violation` state with a finding naming the files, and `fix` and `escalate` links; the transition does not proceed;
 * the realised footprint of the plan's worktree is recorded with the plan.
 
-Changes outside the root's repository are not visible to PM-MCP.
+Changes outside the root's repository or host shell commands executed outside repository trees are not visible to PM-MCP. Confinement of host tools relies on host-level permission configurations and OS user privilege separation.
 
 === Access to other projects
 
@@ -125,10 +131,10 @@ Where the operator token is not protected by the Keychain, every operator action
 * The daemon's MCP endpoint binds to `127.0.0.1` only, validates `Origin` and `Host` on every request, rejects unexpected values with HTTP 403, and requires the daemon's cookie (<<_hardening>>).
 * The operator CLI authenticates with a separate operator token from the credential store; the cookie grants no operator action.
 * The LSP proxy endpoint (xref:06-services.adoc#lsp[LSP]) is protected like the MCP endpoint: loopback only, `Origin` and `Host` validation, cookie.
-* The install endpoint for client bundles (xref:11-distribution.adoc#_install_endpoint[Install endpoint]) is read-only and serves no secret: loopback only, `Origin` and `Host` validation, no cookie. Writing a bundle — entry commands, hooks, permission rules — happens only through `pm-mcp client`, which shows every change and asks for confirmation on a terminal; the daemon never writes into a client's configuration itself.
+* The install endpoint for client bundles (xref:11-distribution.adoc#_install_endpoint[Install endpoint]) is read-only and protected by the daemon's cookie: loopback only, `Origin` and `Host` validation, and bearer cookie authentication. `pm-mcp client` reads the cookie from the local runtime directory to fetch bundle manifests and files. Writing a bundle — entry commands, hooks, permission rules — happens only through `pm-mcp client`, which shows every change and asks for confirmation on a terminal; the daemon never writes into a client's configuration itself.
 * MCP sessions are never used for authentication; every request is authenticated on its own.
 * Projects must be enrolled explicitly by the operator before PM-MCP acts on them.
-* The audit log records every call and every build with scope, client identity, caller session and outcome; a mismatch between declared and self-reported client identity is recorded and reported.
+* Client identity declared at entry (`--client`) is advisory routing and rendering metadata, not an authenticated security identity. The audit log records every call and build with three distinct identity layers: declared client identity, detected environment signature, and authenticated OS user principal; any mismatch is recorded and reported.
 
 == Hardening
 
@@ -156,7 +162,7 @@ Limits::
 Every tool call has a timeout; work that takes longer is a job with a `wait` link. Results have a size cap, and larger data is referenced as a resource. Calls are rate-limited per client identity.
 
 Strict schemas::
-Every tool parameter schema is closed (`additionalProperties: false`). Free parameters have closed types, enumerations or length limits; anything else is rejected before the workflow engine sees it.
+At the MCP protocol boundary, top-level tools declare closed schemas (`additionalProperties: false`). For `pm_do`, whose free parameters depend dynamically on the addressed link, the MCP schema declares `args: object`, while the server strictly validates `args` against the link's closed schema (`additionalProperties: false`, closed types, enumerations, length limits) before dispatching to the workflow engine.
 
 Audit::
 The audit log records every call with its full parameters, scope, client identity and outcome. Secrets and tokens are redacted before a record is written.
