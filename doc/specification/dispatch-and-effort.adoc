@@ -527,7 +527,9 @@ Because agent hosts such as Claude Code and OpenCode load sub-agent definitions 
 == Reader Agent Family (`execution-context-reader`)
 _See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
 
-When a workflow ingests untrusted external content—such as external web pages, GitHub/GitLab issue descriptions, pull request review comments from third-party contributors, or external static analysis messages—`PM-MCP` isolates the untrusted payload inside the **`execution-context-reader`** agent family.
+When a workflow ingests untrusted free-form external content—such as external web pages or GitHub/GitLab issue descriptions—`PM-MCP` isolates the untrusted payload inside the **`execution-context-reader`** agent family. Pull request review comments and static-analysis messages are not dispatched to a reader per finding; they pass one batched deterministic validation pass (the same validator as Boundary 2) before triage, as in `plan-marshall` (`plan-marshall/workflow/verification-feedback.md`).
+
+The reader contract mirrors `plan-marshall` (ADR-003, `agents/execution-context-reader.md`, `untrusted-ingestion`), verified at commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. The containment boundary is the deterministic validator, not the reader's restricted tool surface: the tool surface only bounds the blast radius of a hijacked reader.
 
 === Two-Boundary Containment Architecture
 
@@ -538,7 +540,8 @@ Untrusted External Source (Web / Issue / PR Body)
                       ▼
 ┌──────────────────────────────────────────────────────────┐
 │ Boundary 1: Reader Sub-Agent (execution-context-reader)  │
-│  • Tools: Read, Grep, Glob, WebFetch, WebSearch ONLY     │
+│  • Tools: WebSearch, WebFetch, Read, Grep ONLY           │
+│  • WebFetch restricted to the domain allowlist           │
 │  • NO MCP Tools (no pm_do, pm_state, pm_build, pm_start) │
 │  • NO Write, Edit, or Bash tools                         │
 │  • Output: Structured candidate JSON/text in response    │
@@ -556,17 +559,20 @@ Untrusted External Source (Web / Issue / PR Body)
 ┌──────────────────────────────────────────────────────────┐
 │ Boundary 2: Deterministic Server-Side Validator (PM-MCP) │
 │  • Enforces strict JSON schema & length/charset bounds   │
-│  • Strips executable/prompt-injection directives         │
+│  • Rejects/clamps per closed schema (no extra keys)      │
+│  • Rejects URLs whose host fails the domain allowlist    │
 │  • Persists validated records to findings/references     │
 └──────────────────────────────────────────────────────────┘
 ----
 
 === Normative Reader Constraints
 
-1. *Strict Read-Only Host Tool Allowlist*: Installed `execution-context-reader` variants declare only read-only host tools (`Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch` or client-profile equivalents). `Write`, `Edit`, `MultiEdit`, `Bash`, and the host sub-agent tool (`Agent`/`task`/`invoke_subagent`/`spawn_agent`) are strictly excluded.
+1. *Strict Read-Only Host Tool Allowlist*: Installed `execution-context-reader` variants declare exactly `WebSearch`, `WebFetch`, `Read`, and `Grep` (or client-profile equivalents). `Write`, `Edit`, `MultiEdit`, `Bash`, and the host sub-agent tool (`Agent`/`task`/`invoke_subagent`/`spawn_agent`) are strictly excluded.
 2. *Zero MCP Tools*: Reader variants are provisioned with **zero `pm_*` MCP tools**. Unlike worker sub-agents, a reader sub-agent does not call `pm_state` or `pm_do`. Instead, the server embeds the extraction schema and target source locators directly inside the rendered `dispatch` prompt's `reader_contract` block. Even if adversarial prompt injection inside an issue body or web page hijacks the reader sub-agent's instructions, the sub-agent has no tool capable of mutating workflow state, modifying files, or executing shell commands.
 3. *Deterministic Server Validator Seam*: The reader sub-agent returns its extracted candidate records as structured text to the dispatching parent session. The parent session relays that candidate payload into the paired server validation link (e.g., `ingest_candidates:<dispatch_id>`), which simultaneously records the `returned:<dispatch_id>` observability metrics and runs the compiled deterministic validator before writing any candidate to `references.json` or `findings.jsonl`.
-4. *Separation from Citations-Only Rule*: Reader containment is a security boundary (`PM-SEC-1`) and must never be conflated with the citations-only context-conservation rule used by trusted read-only worker sub-agents.
+4. *Outbound Domain Allowlist*: `WebFetch` from a reader is restricted to the operator-maintained WebFetch domain allowlist (host permission rules installed by the client bundle). Because the reader holds untrusted input, file read access, and outbound fetch at once, the allowlist is what closes the exfiltration path for bytes read via `Read`.
+5. *Validator Duties*: The deterministic validator (a) enforces the extraction schema (`additionalProperties: false`, `maxLength`, `maxItems`, `pattern`) and rejects structural violations, (b) clamps over-long strings and arrays, and (c) re-checks every URL-bearing field against the same domain allowlist, rejecting unknown or red-flag hosts. It does not attempt to detect or strip prompt-injection text; only a `status: success` result is persisted.
+6. *Separation from Citations-Only Rule*: Reader containment is a security boundary (`PM-SEC-1`) and must never be conflated with the citations-only context-conservation rule used by trusted read-only worker sub-agents.
 
 == Orchestrator Epic Plan Emission (`emit:<plan>`) & Epic Coordination
 _See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
