@@ -82,9 +82,22 @@ Before spawning any subprocess, the runtime validates the job request through a 
 
 Every job runs as a direct child of the always-on `pm-mcp` runtime, independent of any host connection (link:runtime-model.adoc[Runtime & Interaction Model Specification]), inside its own isolated operating system process group (`PM-EXEC-4`, `PM-EXEC-5`, `PM-IMPL-1`).
 
+=== Process-Group Creation via the `job-exec` Shim
+
+Java's `ProcessBuilder` cannot place a child into a new process group or session (`setpgid`/`setsid`); a child started directly would inherit the runtime's own process group, and signalling that group would hit the runtime and every other job. The runtime therefore starts every job through a shim built into the same native binary:
+
+. The runtime verifies the job (verify-not-resolve, `PM-EXEC-2`) and starts `pm-mcp job-exec -- <verified absolute executable> <args…>` with `ProcessBuilder`, keeping all of its I/O handling (pipes, in-memory `stdin` payloads, log redirection, exit codes).
+. The shim calls `setpgid(0, 0)` via FFM, so its PID becomes the process-group ID, and then replaces itself with the target via `execve` (never `execvp`: no `PATH` search, `PM-EXEC-1`). The job's PID recorded by the runtime is therefore both the job PID and its process-group ID.
+. Cancellation and timeouts signal exactly that group (`kill(-pid, …)`). Warm build daemons that detach themselves into their own session (Gradle daemon, `mvnd`) are intentionally not affected (`PM-EXEC-4`).
+. `job-exec` is an internal verb: it accepts only an absolute executable path and an argument vector, performs no verification of its own, and is not part of the operator CLI.
+
+*Alternative for later implementations*: Start jobs directly via FFM `posix_spawn` with `POSIX_SPAWN_SETPGROUP` (the mechanism already used for the detached runtime start, link:runtime-model.adoc[Runtime & Interaction Model Specification]). This removes the extra `execve` hop but replaces `ProcessBuilder` completely: pipes, `stdin` streaming, output capture, and exit-status reaping (`waitpid`) must then be implemented on FFM as well. The job contract (process group = job PID, outcome classification) is identical, so the runtime can switch implementations without changing any other specification.
+
 [source,java]
 ----
-ProcessBuilder pb = new ProcessBuilder(verifiedArgv);
+List<String> argv = new ArrayList<>(List.of(pmMcpBinary, "job-exec", "--"));
+argv.addAll(verifiedArgv); // verifiedArgv.get(0) is the verified absolute executable path
+ProcessBuilder pb = new ProcessBuilder(argv);
 pb.directory(verifiedWorkingDir.toFile());
 // Environment sanitization
 pb.environment().clear();
@@ -124,10 +137,11 @@ When a workflow primitive passes multi-line text to an enrolled `git` or `ci` to
 
 When a job exceeds its configured timeout (`PM-EXEC-4`) or when the user/client calls `cancel`:
 
-1. *SIGTERM Escalation*: `pm-mcp` sends `SIGTERM` to the entire process group (using Java `ProcessHandle.descendants()` and native OS `kill(-pgid, SIGTERM)` via Java FFM, `PM-TECH-4`).
-2. *Grace Period*: `pm-mcp` waits up to 5,000 milliseconds for all child processes in the group to exit cleanly.
-3. *SIGKILL Cleanup*: If any process remains alive after the grace period, `pm-mcp` issues `kill(-pgid, SIGKILL)` to immediately terminate the remaining process group.
+1. *SIGTERM Escalation*: `pm-mcp` sends `SIGTERM` to the job's process group (`kill(-pid, SIGTERM)` via Java FFM, `PM-TECH-4`), whose ID equals the job PID (see <<Process-Group Creation via the `job-exec` Shim>>).
+2. *Grace Period*: `pm-mcp` waits up to 5,000 milliseconds for all processes in the group to exit cleanly.
+3. *SIGKILL Cleanup*: If any process remains alive after the grace period, `pm-mcp` issues `kill(-pid, SIGKILL)` to immediately terminate the remaining process group.
 4. *Closed-Enum Outcome Assignment*: Cancelled requests return `cancelled`; wall-clock timeout expirations return `timed_out`; jobs interrupted by a runtime crash or drain are recorded as `killed` (on drain, or by crash recovery at the next runtime start); relay termination never affects a job.
+5. *Live Orphans after a Runtime Crash*: Each job record stores the job PID and the process start instant. At the next runtime start, a record left `running` whose process group still exists (PID and start instant match, ruling out PID reuse) is terminated with steps 1–3 and recorded as `killed`; it is never adopted or re-executed (link:runtime-model.adoc[Runtime & Interaction Model Specification], Startup Sequence).
 
 === Bounded Long-Poll & Progress-Reset Waiting Primitives (`PM-WF-8`, `PM-IMPL-4`)
 
