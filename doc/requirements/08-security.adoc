@@ -14,7 +14,7 @@ The security architecture of `PM-MCP` enforces a strict dual-boundary security m
 * The system must process untrusted external text through a restricted extraction parser whose output is strictly validated against a closed JSON schema prior to incorporation into plan stores.
 * The system must record the repository state of the main checkout and active worktrees at task start, and verify realized changes at task submit and before commit; any change detected outside the assigned worktree must transition the plan into a `*.footprint-violation` state with an explanatory finding and restrict offered links to `fix` and `escalate`.
 
-See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification], link:specification/job-runtime.adoc[Job Runtime & Execution Specification], and link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification] for implementation details.
 
 [#PM-SEC-2]
 === PM-SEC-2: Workspace Confinement & Path Traversal Prevention
@@ -24,7 +24,7 @@ To prevent unauthorized file modifications or cross-project data leakage, all PM
 * The system must resolve the canonical repository root at session entry (`pm-mcp enter`) and persist it in the scope's entry record (`mcp/entry.json`).
 * The system must cross-check client-declared MCP roots with the process working directory at entry, report any discrepancy in the audit log, and apply the narrower root set.
 * The system must canonicalize all paths (resolving all symbolic links) for every filesystem, git, and build operation, asserting that the target path resides within the enrolled workspace root or a live linked git worktree whose git common directory resolves to that root.
-* The system must reject any path traversal attempt (including directory traversal sequences `..`, absolute paths outside the workspace, or symlinks pointing outside the root) with an explicit `path_traversal_rejected` error outcome and an HTTP 403 status where applicable.
+* The system must reject any path traversal attempt (including directory traversal sequences `..`, absolute paths outside the workspace, or symlinks pointing outside the root) with an explicit `path_traversal_rejected` error outcome.
 * The system must forbid AI models from specifying raw filesystem paths for state manipulation; all target scopes (`plan_id`, `epic_id`) must be resolved server-side from persisted state.
 * The system must require explicit operator approval for cross-project access (such as multi-repo epic landing or dependency verification); such access must be requested via an `escalate` link, approved exclusively by the operator via elicitation or operator CLI, limited to enrolled projects, scoped to a specific access level (read or read-write) and execution lifetime, and recorded in the audit log.
 
@@ -39,7 +39,7 @@ Privileged operations that alter machine configuration, security posture, or pro
 * The system must reject any attempt to execute operator-only actions via `pm_do` regardless of supplied arguments.
 * The system must provide exactly two isolated channels for operator decisions, neither of which routes through the AI model:
 ** MCP Elicitation: Direct interactive user prompts supported by compliant host runtimes that return answers straight to PM-MCP without model interception.
-** Operator CLI (`pm-mcp operator <action>`): An interactive command-line interface communicating over the loopback endpoint using the privileged operator token and requiring terminal confirmation (TTY).
+** Operator CLI (`pm-mcp operator <action>`): An interactive command-line interface operating directly against the local state and credential stores under `FileChannel.lock()`, verifying the privileged operator credential and requiring terminal confirmation (`isatty(STDIN_FILENO)`).
 * The system must transition a plan or epic into a `*.blocked` state whenever an operator decision is required, displaying the pending request and matching CLI command, and offering only a `wait` link until resolved.
 * The system must protect the operator token using the OS credential store (macOS Keychain access control list restricted to `pm-mcp`); when operating on platforms lacking application-level access control (Linux Secret Service or file store), the system must require a salted PBKDF2 operator passphrase entered interactively without terminal echo.
 * The system must enforce exponential rate-limiting on operator passphrase verification failures and log all privileged authentication attempts to the audit log.
@@ -47,17 +47,14 @@ Privileged operations that alter machine configuration, security posture, or pro
 See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/mcp-tools.adoc[MCP Tools & Resources Specification] for implementation details.
 
 [#PM-SEC-4]
-=== PM-SEC-4: Loopback Endpoint Hardening & Cookie Authentication
+=== PM-SEC-4: STDIO Transport Isolation, Zero Network Exposure & Stream Hygiene
 
-The local daemon HTTP endpoints must be fortified against DNS rebinding, cross-origin requests, and unauthorized local process access.
+By operating exclusively over the MCP `stdio` transport (`io.quarkiverse.mcp:quarkus-mcp-server-stdio`), `pm-mcp` eliminates network-borne attack vectors (DNS rebinding, cross-origin browser requests, unauthorized local TCP port access, and SSH port-forwarding leaks) and enforces strict OS-level process and stream isolation.
 
-* The system must bind the daemon HTTP listener exclusively to `127.0.0.1` (`quarkus.http.host=127.0.0.1`), refusing external interface binding in all deployment profiles.
-* The system must enable DNS rebinding protection and enforce request header validation via a dedicated route filter that accepts only `Host` headers matching `127.0.0.1:<port>` or `localhost:<port>`, immediately rejecting foreign or missing Host headers with HTTP 403 Forbidden.
-* The system must validate the `Origin` header on every incoming HTTP request, rejecting any request carrying an untrusted or non-loopback origin with HTTP 403 Forbidden.
-* The system must generate a cryptographically secure random 256-bit ephemeral cookie at every daemon startup and write it to `~/.plan-marshall/mcp/run/cookie` with POSIX file mode `0600` (directory mode `0700`); the daemon must refuse to start if file permissions are insecure or if ownership does not match the active user.
-* The system must authenticate all requests to `/mcp/*` and `/clients/*` by verifying the `Authorization: Bearer <cookie>` header using a constant-time comparison mechanism.
-* The system must enforce that the client bundle installation endpoint (`/clients`) adheres to the identical loopback binding, Host/Origin validation, and bearer cookie authentication as the MCP tool endpoint.
-* The system must treat MCP sessions as stateless with respect to authentication, verifying the bearer cookie on every individual HTTP request.
+* The system must open zero inbound TCP, HTTP, SSE, or WebSocket listeners in any execution mode (`quarkus-mcp-server-stdio` only).
+* The system must enforce strict `stdout` stream hygiene: `stdout` is reserved exclusively for newline-delimited JSON-RPC 2.0 MCP frames (`quarkus.mcp.server.stdio.null-system-out=true`), while all server logs, Quarkus startup banners, and diagnostic outputs are routed strictly to `stderr` and `~/.plan-marshall/mcp/logs/daemon.log`.
+* The system must redirect `stdout` and `stderr` of all spawned child subprocesses (`build`, `git`, `ci`, `script`, and warm LSP servers) to dedicated capture pipes or log files, never allowing child processes to inherit or write to the MCP server's `stdout` descriptor.
+* The system must enforce POSIX directory permissions of `0700` on `~/.plan-marshall/mcp/` and `0600` on all state, lock, enrolment, and audit files, refusing startup if directory or file ownership does not match the active OS user UID.
 
 See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
 
@@ -67,7 +64,7 @@ See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] f
 Subprocesses spawned by PM-MCP for builds, git operations, CI queries, and legacy scripts must be executed with sanitized environments and OS-level confinement.
 
 * The system must spawn all subprocesses directly via operating system process creation APIs without invoking intermediate system shells (`/bin/sh` or `/bin/bash`), and place each job in its own distinct process group.
-* The system must filter subprocess environments against a strict allowlist of necessary variables (`PATH`, `HOME`, toolchain paths); the daemon cookie, operator tokens, and credential secrets must never be exported to child environments.
+* The system must filter subprocess environments against a strict allowlist of necessary variables (`PATH`, `HOME`, toolchain paths); operator tokens and credential secrets must never be exported to child environments.
 * The system must pass free-text parameters (such as commit messages, PR descriptions, and outline text) via standard input (`stdin`) or temporary files, never interpolating free text into command-line arguments.
 * The system must execute all subprocesses on Linux under systemd user confinement (`systemd-run --user` or systemd user service), enforcing:
 ** `NoNewPrivileges=yes`
@@ -88,10 +85,10 @@ The system must maintain an append-only, tamper-evident audit record of all secu
 * The system must record every tool invocation, state machine transition, job submission, credential access, and operator action to an append-only JSONL audit log (`~/.plan-marshall/mcp/logs/audit.jsonl`).
 * The system must record three distinct identity layers for every audited operation:
 ** The declared client identity (`--client` parameter from entry point).
-** The detected environment signature (runtime environment variables such as `CLAUDECODE`, `AI_AGENT`, session IDs).
+** The detected environment signature (runtime environment variables such as `CLAUDECODE`, `OPENCODE_SESSION_ID`, `ANTIGRAVITY_CLI_ALIAS`, `CODEX_SANDBOX` / `CODEX_CI`, or MCP `clientInfo`).
 ** The authenticated operating system user principal running the process.
 * The system must explicitly flag any discrepancy between declared client identity and detected environment signature (`identity_mismatch=true`) in the audit log and return a warning in the state representation.
-* The system must redact all sensitive credentials, bearer cookies, passwords, and tokens before writing entries to daemon logs or the audit log.
+* The system must redact all sensitive credentials, passwords, and tokens before writing entries to diagnostic logs or the audit log.
 * The system must sanitize error responses returned to AI models, suppressing internal exception traces, stack traces, and local system paths, returning only closed-enum error codes and the unique audit record identifier for operator diagnostics.
 
 See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] for implementation details.

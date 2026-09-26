@@ -16,9 +16,17 @@ This document specifies the declarative Workflow Domain-Specific Language (DSL),
 
 _See Requirements:_
 
+* _See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation & Form Vocabulary]_
+* _See Requirement link:../Requirements.adoc#PM-WF-3[PM-WF-3: Server-Side Guard Evaluation & Link Omission]_
+* _See Requirement link:../Requirements.adoc#PM-WF-4[PM-WF-4: Closed-Outcome Primitives & Deterministic Auto-Chaining]_
 * _See Requirement link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint]_
 * _See Requirement link:../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
 * _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+* _See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+* _See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: State-Name Migration Registry]_
+* _See Requirement link:../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine Property Verification]_
+* _See Requirement link:../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario Replay Harness]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
 
@@ -27,7 +35,7 @@ _See Requirements:_
 == Module Boundary & Decoupled Core Architecture
 _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
 
-The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP transport libraries:
+The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP transport libraries. During the initial M1 scaffold, packages reside within the root `plan-marshall-mcp` Maven module and are extracted into dedicated Maven sub-modules (`pm-mcp-core`, `pm-mcp-server`, `pm-mcp-dist`) with ArchUnit boundary enforcement before M2 distribution packaging:
 
 [cols="1,2,3"]
 |===
@@ -40,9 +48,23 @@ The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP tra
 |`pm-mcp-server`
 |`de.cuioss.pm.mcp.server.*`
 |Instantiates core engine services via CDI `@Produces`, binds concrete `Primitive` implementations to the daemon's job runner and state stores, registers persisted records via `@RegisterForReflection`, and maps `pm_start`, `pm_state`, and `pm_do` calls to the engine.
+
+|`pm-mcp-dist`
+|`de.cuioss.pm.mcp.dist.*`
+|Packages the GraalVM native executable (`pm-mcp`), static `skill://pm/**` corpus resources, and platform archive artifacts (`tar.gz`, Homebrew formula, JBang catalog).
 |===
 
 == Formal EBNF Grammar for the Workflow DSL
+_See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation & Form Vocabulary]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-3[PM-WF-3: Server-Side Guard Evaluation & Link Omission]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-4[PM-WF-4: Closed-Outcome Primitives & Deterministic Auto-Chaining]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
 _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
 
 Workflow definitions (`*.pmwf` resources compiled into the binary under `classpath:/workflows/`) conform to the following ISO/IEC 14977 Extended Backus-Naur Form (EBNF) grammar. The DSL is line-oriented; comments start with `#` and run to the end of the line.
@@ -55,12 +77,12 @@ workflow_file        = workflow_header ,
                        { migrate_decl } ,
                        state_decl , { state_decl } ;
 
-workflow_header      = "workflow" , identifier , "version" , positive_int , EOL ;
+workflow_header      = "workflow" , state_id , "version" , positive_int , EOL ;
 scope_decl           = "scope" , ( "plan" | "epic" | "entity" | "subworkflow" ) , EOL ;
 start_decl           = "start" , state_id , EOL ;
 migrate_decl         = "migrate" , state_id , "->" , state_id , EOL ;
 
-state_decl           = "state" , state_id , [ "terminal" ] , EOL ,
+state_decl           = "state" , state_id , [ "terminal" , [ outcome_id ] ] , EOL ,
                        [ phase_clause ] ,
                        [ skill_clause ] ,
                        [ facts_clause ] ,
@@ -82,8 +104,10 @@ auto_clause          = "auto" , primitive_id , EOL ,
 job_clause           = ( "job" | "composite_job" ) , primitive_id , EOL ,
                        outcome_transition , { outcome_transition } ;
 
-call_clause          = "call" , identifier , EOL ,
+call_clause          = "call" , state_id , [ "(" , [ call_arg_list ] , ")" ] , EOL ,
                        outcome_transition , { outcome_transition } ;
+call_arg_list        = call_arg , { "," , call_arg } ;
+call_arg             = identifier , "=" , identifier ;
 
 link_clause          = "link" , relation , link_id_pattern ,
                        [ "[" , link_form , "]" ] ,
@@ -122,7 +146,7 @@ guard_atom           = "in_worktree"
                      | "predicate:" , primitive_id ;
 
 link_action          = ( "do" , primitive_id , EOL )
-                     | ( "dispatch" , identifier , "level" , ( "1" | "2" | "3" | "4" ) , EOL )
+                     | ( "dispatch" , identifier , ( "role" , identifier | "level" , ( "1" | "2" | "3" | "4" | "5" | "6" | "7" | "inherit" ) ) , EOL )
                      | ( "escalate" , identifier , EOL ) ;
 
 outcome_transition   = outcome_id , "->" , state_id , EOL ;
@@ -144,33 +168,26 @@ EOL                  = [ "#" , { any_char_except_nl } ] , "\n" ;
 ----
 workflow finalize version 1
 scope plan
-start finalize.commit
+start finalize.settle-commit
 migrate finalize.push_wait -> finalize.push-barrier
 
-state finalize.commit
+state finalize.settle-commit
   phase finalize
-  skill pm/finalize/commit-message
-  facts git.commit-status
-  link next commit [submit] (message: text 1..2000)
-    do git.commit
-      ok                -> finalize.push-barrier
-      nothing_to_commit -> finalize.concurrent-wait
-      hook_failed       -> finalize.commit-fix
+  call git.commit_and_push (message_mode=step_or_fallback, push_mode=post_pr_conditional)
+    committed_local      -> finalize.next-step
+    committed_and_pushed -> finalize.concurrent-wait
+    pushed_clean         -> finalize.concurrent-wait
+    clean                -> finalize.next-step
+    aborted              -> finalize.aborted
 
 state finalize.push-barrier
   phase finalize
-  skill pm/finalize/push-barrier
-  facts git.branch-status
-  link next push [noop] ()
-    guard in_worktree
-    do git.push
-      ok                -> finalize.concurrent-wait
-      already_pushed    -> finalize.concurrent-wait
-      rejected          -> finalize.sync-required
-  link escalate escalate [escalate] (reason: text 1..500)
-    escalate push_override
-      approved          -> finalize.concurrent-wait
-      denied            -> finalize.aborted
+  call git.commit_and_push (message_mode=none_assert_clean, push_mode=if_configured)
+    committed_local      -> finalize.create-pr
+    committed_and_pushed -> finalize.create-pr
+    pushed_clean         -> finalize.create-pr
+    clean                -> finalize.create-pr
+    aborted              -> finalize.aborted
 
 state finalize.concurrent-wait
   phase finalize
@@ -207,6 +224,8 @@ state finalize.aborted terminal
 ----
 
 == AST Node Model
+_See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
 _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
 
 _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
@@ -241,6 +260,7 @@ public record StateNode(
     String id,
     String phase,
     boolean terminal,
+    Optional<String> terminalOutcome,
     Optional<String> skillPath,
     Optional<String> factsPrimitiveId,
     StateBehavior behavior,
@@ -257,9 +277,22 @@ public sealed interface StateBehavior
     record InteractiveLinks(List<LinkSpec> links) implements StateBehavior {}
     record AutoStep(String primitiveId, List<OutcomeTransition> transitions) implements StateBehavior {}
     record JobStep(String primitiveId, boolean composite, List<OutcomeTransition> transitions) implements StateBehavior {}
-    record SubWorkflowCall(String subWorkflowId, List<OutcomeTransition> transitions) implements StateBehavior {}
+    record SubWorkflowCall(
+        String subWorkflowId,
+        Map<String, String> paramBindings,
+        List<OutcomeTransition> transitions
+    ) implements StateBehavior {}
     record TerminalState() implements StateBehavior {}
 }
+
+public record CallFrame(
+    String callerWorkflowId,
+    String callerStateId,
+    String callerPhase,
+    String subWorkflowId,
+    Map<String, String> boundArgs,
+    String pushedAt
+) {}
 
 public record LinkSpec(
     LinkRelation rel,
@@ -278,7 +311,7 @@ public sealed interface LinkAction
             LinkAction.EscalateDecision {
 
     record ExecutePrimitive(String primitiveId) implements LinkAction {}
-    record DispatchSubAgent(String targetEntityKind, int level) implements LinkAction {}
+    record DispatchSubAgent(String targetEntityKind, Optional<String> roleId, Optional<String> effortLevel) implements LinkAction {}
     record EscalateDecision(String decisionId) implements LinkAction {}
 }
 
@@ -312,13 +345,19 @@ public record OutcomeTransition(
 === Static AST Verification Rules (Build-Time & Daemon Startup)
 _See Requirement link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint]_
 
+_See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+_See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: State-Name Migration Registry]_
+
 `WorkflowValidator` verifies every `WorkflowDefinition` both in JUnit build tests and at daemon startup (failing closed if any rule is violated):
 
 1. *Primitive Binding & Parameter Equivalence*: Every `primitiveId` in `do`, `auto`, `job`, `facts`, and `predicate:` must resolve to a registered `Primitive<P, R>`. For every `LinkSpec`, the declared `freeParams` list must exactly match the name, type, and constraints of the `Record` components annotated as `@FreeParam` on `P`.
 2. *Exhaustive Outcome Coverage*: For every `auto`, `job`, and `link` action backed by `Primitive<P, R>`, the set of `OutcomeTransition.outcomeName` entries must form an exact 1-to-1 bijection with the enum constants of `R` (`R.getEnumConstants()`). Missing or unknown outcome names fail validation with the source file and line number.
 3. *Graph Integrity*: `startState` and every `OutcomeTransition.targetStateId` must exist in `states`. Every `StateNode` must be reachable from `startState`. Every non-terminal `StateNode` must have at least one outgoing transition path to a `terminal` state.
 4. *Single-Level Leaf Sub-Agent Constraint (`PM-WF-5`)*: Any `WorkflowDefinition` with `scope == WorkflowScope.ENTITY` (or any state reachable within an entity sub-agent scope) is strictly forbidden from containing a `LinkSpec` with `form == LinkForm.DISPATCH` or `LinkAction.DispatchSubAgent`. Sub-agents are leaves and can never dispatch nested sub-agents.
-5. *Backwards-Compatible State Migration*: Every state name present in the committed `released-states.txt` baseline must either exist in `states` or appear as `oldStateId` in a `migrate <old> -> <new>` declaration whose target exists in `states`.
+5. *Backwards-Compatible State Migration (`PM-MIG-4`)*: Every state name present in the committed `released-states.txt` baseline must either exist in `states` or appear as `oldStateId` in a `migrate <old> -> <new>` declaration whose target exists in `states`.
+6. *Sub-Workflow Outcome Bijection & Parameter Binding (`PM-WF-16`)*: Every `StateBehavior.SubWorkflowCall` (`call <subWorkflowId>`) must reference a registered `WorkflowDefinition` whose `scope == WorkflowScope.SUBWORKFLOW`. Every terminal `StateNode` in a `SUBWORKFLOW` must declare a non-empty `terminalOutcome` (`state <id> terminal <outcome_id>`), and the set of `OutcomeTransition.outcomeName` entries on each `call` site must form an exact 1-to-1 bijection with the target sub-workflow's declared `terminalOutcome` values. Every key/value in `paramBindings` must conform to the sub-workflow's declared parameter schema.
+7. *Acyclic Call-Graph DAG & Bounded Depth (`PM-WF-16`)*: Across all registered `WorkflowDefinition` instances, the static `call` graph must form a strict directed acyclic graph (DAG) with zero cycles and a maximum static call-stack depth $\le 4$.
 
 == Typed Java `Primitive<P, R>` Interface & Transition Validation
 _See Requirement link:../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
@@ -393,7 +432,8 @@ public final class GitCommitPrimitive
 
     @Override
     public PrimitiveResult<Outcome> execute(WorkflowExecutionContext ctx, Params params) {
-        // Executes git commit via the enrolled GitJobService in ctx.worktreePath()
+        // Validates Conventional Commit syntax, appends Co-Authored-By trailer,
+        // and streams UTF-8 message via stdin to `git -C <worktree> commit -F -`
         ...
     }
 }
@@ -403,13 +443,280 @@ public final class GitCommitPrimitive
 
 When `pm_do(scope_id, link, args, dispatch_id)` arrives, the workflow engine executes a single atomic transaction under the scope's exclusive `FileChannel` lock:
 
-1. *Load Authoritative State*: Read `mcp/status.json` for `scope_id` (applying any `migrate` mapping if `status.json` references a legacy state) and resolve the active `StateNode`.
+1. *Load Authoritative State*: Read `mcp/status.json` for `scope_id` (applying any `migrate` mapping if `status.json` references a legacy state) and resolve the active `StateNode` (within the top `CallFrame.subWorkflowId()` if `call_stack` is non-empty, or the root workflow otherwise).
 2. *Verify Dispatch Claim (if `dispatch_id` present)*: If `dispatch_id` is superseded or expired, reject immediately with `reason: "superseded_dispatch_id"`.
 3. *Re-Compute Active Links & Guards*: Evaluate all `LinkSpec` entries on `StateNode`, expanding entity placeholders (`triage:<finding_id>`) against current persisted stores (`findings.jsonl`, `tasks/TASK-*.json`) and evaluating each link's `GuardExpr`.
 4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set (including any attempt to invoke an omitted operator transition or an already-closed entity), return `isError: false` with `rejected.reason = "link_not_available"` and the current representation.
-5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges). If validation fails, return `isError: false` with `rejected.reason = "invalid_link_args"` and the current representation.
+5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges) and execute any attached content validator (`OutlineValidator`, `AsciiDocValidator`, `ConventionalCommitValidator`) in-process on submitted text payloads. If validation fails, return `isError: false` with `rejected.reason = "invalid_link_args"` and the current representation.
 6. *Verify Workspace Footprint*: For task `submit` and git `commit` links, verify that no files outside the plan's worktree were dirtied by host tools; on violation, transition immediately to `<phase>.footprint-violation`.
-7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions`, persist the new `state` in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` steps if the target state is an `AutoStep`).
+7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions`, persist the new `state` (and updated `call_stack` if entering or exiting a `SubWorkflowCall`) in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` and `call` steps until an interactive link state, async job state, or root terminal state is reached).
+
+== Reusable Compound Sub-Workflows & Call-Stack Execution (`PM-WF-16`)
+_See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+Workflows are composed not only of atomic `do` / `auto` / `job` primitives, but also of reusable, config-aware *compound sub-workflows* (`scope subworkflow`). A compound sub-workflow encapsulates a multi-state sub-process—combining deterministic `auto` checks, configuration lookups, conditional interactive pauses, and recovery branches—so that Phase 5 (`execute`), Phase 6 (`finalize`), `pr-doctor`, `marshall-steward`, and `plan-orchestrator` invoke the exact same state machine rather than duplicating states or collapsing interactive recovery into opaque Java code.
+
+=== Call-Stack Execution & Persistence Semantics
+
+1. *Sub-Workflow Invocation (`call`)*: When the engine transitions into a `StateNode` whose behavior is `StateBehavior.SubWorkflowCall(subWorkflowId, paramBindings, transitions)`, it pushes a `CallFrame(callerWorkflowId, callerStateId, callerPhase, subWorkflowId, paramBindings, Instant.now().toString())` onto the `call_stack` array in `mcp/status.json` and sets `status.state` to the target sub-workflow's `startState` while preserving `status.phase = callerPhase` whenever a sub-workflow state declares `phase inherit`. Preserving `callerPhase` guarantees that phase-scoped guards (`in_worktree`, `loop_count_below_max`), phase metric accounting (`metrics.json`), and terminal-title updates remain invariant regardless of which caller invoked the sub-workflow.
+2. *Interactive Pauses & Job Waits Inside a Sub-Workflow*: If execution inside the sub-workflow reaches an `AutoStep`, the engine executes it immediately in the same turn. If execution reaches an `InteractiveLinks` state (such as `git.artifact-review`, `git.compose-message`, `git.commit-fix`, or `git.sync-required`) or a `JobStep`, the engine persists `mcp/status.json` (with the active `call_stack` and sub-workflow `state`) and returns that state's TOON representation to the caller. Subsequent `pm_do` or `pm_state` calls resolve against the active sub-workflow state at the top of `call_stack`, surviving context compactions and daemon restarts identically to top-level states.
+3. *Sub-Workflow Return (`terminal <outcome_id>`)*: When a transition inside the sub-workflow lands on a `StateNode` with `terminal == true` and `terminalOutcome == Optional.of(outcomeId)`, the engine pops the top `CallFrame` from `call_stack`, looks up `outcomeId` in the caller state's `OutcomeTransition` table, transitions `status.state` to `targetStateId` in `callerWorkflowId`, and continues auto-chaining in the same atomic transaction.
+
+=== Canonical Reusable Sub-Workflow: `git.commit_and_push` (`git-commit-and-push.pmwf`)
+
+The `git.commit_and_push` sub-workflow models the complete git commit-and-push sub-process grounded in `workflow-integration-git`, `phase-5-execute` (Step 10a), and `phase-6-finalize` (Step 3 item 5f, `standards/push.md`, and post-PR re-push).
+
+==== Bound Parameter Contract
+
+[cols="1,2,3"]
+|===
+|Parameter |Allowed Values |Semantics
+
+|`message_mode`
+|`auto_deliverable` \| `step_or_fallback` \| `interactive` \| `none_assert_clean`
+|Controls commit message sourcing: `auto_deliverable` formats `feat(<module>): complete deliverable <N> - <title>` from the active deliverable; `step_or_fallback` uses a step-supplied commit message or `chore(finalize): apply <step_id> changes`; `interactive` pauses in `git.compose-message` with diff analysis facts for model submission; `none_assert_clean` expects a clean working tree (used by `finalize.push-barrier`) and routes any unexpected dirty files through `git.compose-message` before pushing.
+
+|`push_mode`
+|`never` \| `if_configured` \| `always` \| `post_pr_conditional`
+|Controls push execution after commit (or on a clean tree): `never` stops after local commit; `if_configured` reads `.plan/marshal.json -> /phase-5-execute/commit_and_push` (default `true`); `always` pushes unconditionally; `post_pr_conditional` pushes if and only if the caller step has `order > 20` (post-`create-pr`) and `commit_and_push == true`.
+|===
+
+==== Declarative DSL Definition (`classpath:/workflows/git-commit-and-push.pmwf`)
+
+[source,text]
+----
+workflow git.commit_and_push version 1
+scope subworkflow
+start git.inspect-worktree
+
+state git.inspect-worktree
+  phase inherit
+  auto git.inspect-worktree
+    dirty                   -> git.detect-artifacts
+    clean_skip_push         -> git.done-clean
+    clean_needs_push_check  -> git.evaluate-push-policy
+
+state git.detect-artifacts
+  phase inherit
+  auto git.detect-artifacts
+    clean_or_safe_deleted   -> git.resolve-message
+    uncertain_or_prohibited -> git.artifact-review
+    oracle_failed           -> git.artifact-escalate
+
+state git.artifact-review
+  phase inherit
+  skill pm/git/artifact-cleanup
+  facts git.artifact-candidates
+  link next confirm_cleanup [submit] (action: enum[delete_uncertain|keep_tracked], paths?: list<text>)
+    do git.apply-artifact-decision
+      resolved              -> git.resolve-message
+      prohibited_remaining  -> git.artifact-review
+  link abort abort [noop] ()
+    do git.abort-commit
+      aborted               -> git.done-aborted
+
+state git.artifact-escalate
+  phase inherit
+  facts git.artifact-oracle-error
+  link retry retry [noop] ()
+    do git.retry-oracle
+      ok                    -> git.detect-artifacts
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate gitignore_oracle_failure
+      approved              -> git.resolve-message
+      denied                -> git.done-aborted
+
+state git.resolve-message
+  phase inherit
+  auto git.resolve-message
+    ready                   -> git.stage-and-commit
+    needs_interactive       -> git.compose-message
+
+state git.compose-message
+  phase inherit
+  skill pm/git/commit-message
+  facts git.diff-summary
+  link next commit [submit] (message: text 1..2000)
+    do git.validate-message
+      valid                 -> git.stage-and-commit
+  link abort abort [noop] ()
+    do git.abort-commit
+      aborted               -> git.done-aborted
+
+state git.stage-and-commit
+  phase inherit
+  auto git.stage-and-commit
+    committed               -> git.evaluate-push-policy
+    nothing_to_commit       -> git.evaluate-push-policy
+    hook_failed             -> git.commit-fix
+
+state git.commit-fix
+  phase inherit
+  skill pm/git/commit-recovery
+  facts git.hook-failure
+  link retry retry [noop] ()
+    do git.retry-commit
+      ok                    -> git.evaluate-push-policy
+      hook_failed           -> git.commit-fix
+  link fix recompose [submit] (message: text 1..2000)
+    do git.validate-message
+      valid                 -> git.stage-and-commit
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate commit_hook_failure
+      approved              -> git.done-aborted
+      denied                -> git.done-aborted
+
+state git.evaluate-push-policy
+  phase inherit
+  auto git.evaluate-push-policy
+    skip_push_committed     -> git.done-committed-local
+    skip_push_clean         -> git.done-clean
+    push_required           -> git.verify-freshness
+
+state git.verify-freshness
+  phase inherit
+  auto git.pre-commit-verify-freshness
+    fresh_or_exempt         -> git.check-branch-parity
+    stale_or_undecidable    -> git.freshness-blocked
+
+state git.freshness-blocked
+  phase inherit
+  skill pm/finalize/push-barrier
+  facts git.freshness-status
+  link fix run_verification_build [noop] ()
+    do build.enqueue-verification
+      started               -> git.freshness-build-running
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate force_stale_push
+      approved              -> git.check-branch-parity
+      denied                -> git.done-aborted
+
+state git.freshness-build-running
+  phase inherit
+  job build.verify-worktree
+    succeeded               -> git.verify-freshness
+    failed                  -> git.freshness-blocked
+    refused                 -> git.freshness-blocked
+    cancelled               -> git.freshness-blocked
+    timed_out               -> git.freshness-blocked
+    killed                  -> git.freshness-blocked
+    indeterminate           -> git.freshness-blocked
+
+state git.check-branch-parity
+  phase inherit
+  auto git.branch-sync-state
+    ahead_or_unpushed       -> git.execute-push
+    synced_or_landed_skip   -> git.done-pushed-clean
+
+state git.execute-push
+  phase inherit
+  auto git.push
+    pushed_with_commit      -> git.done-committed-and-pushed
+    pushed_clean_tree       -> git.done-pushed-clean
+    rejected_non_ff         -> git.sync-required
+
+state git.sync-required
+  phase inherit
+  skill pm/git/sync-recovery
+  facts git.branch-divergence
+  link fix sync_rebase [noop] ()
+    do git.rebase-onto-upstream
+      rebased               -> git.verify-freshness
+      conflict              -> git.sync-escalate
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate force_push_with_lease
+      approved              -> git.done-committed-and-pushed
+      denied                -> git.done-aborted
+
+state git.sync-escalate
+  phase inherit
+  facts git.rebase-conflict
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate rebase_conflict_resolution
+      approved              -> git.verify-freshness
+      denied                -> git.done-aborted
+
+state git.done-committed-local terminal committed_local
+  phase inherit
+
+state git.done-committed-and-pushed terminal committed_and_pushed
+  phase inherit
+
+state git.done-pushed-clean terminal pushed_clean
+  phase inherit
+
+state git.done-clean terminal clean
+  phase inherit
+
+state git.done-aborted terminal aborted
+  phase inherit
+----
+
+==== Six-Stage Execution Contract of `git.commit_and_push`
+
+* *Stage 1 — Working-Tree Inspection (`git.inspect-worktree`)*:
+** Resolves the target checkout path from the locked scope context (`worktree_path` when `location == WORKTREE`, or `workspace_root` when `MAIN_CHECKOUT` / `epic` / `steward`).
+** Executes `git -C <tree> status --porcelain` (ignoring `.plan/local/**`).
+** If uncommitted changes exist (`staged`, `unstaged`, or `untracked`), returns `dirty -> git.detect-artifacts`.
+** If the working tree is clean: returns `clean_skip_push -> git.done-clean` when `push_mode == never`; otherwise returns `clean_needs_push_check -> git.evaluate-push-policy` so clean-tree push barriers (`finalize.push-barrier` or post-rebase pushes) proceed directly to the freshness and parity checks without creating an empty commit.
+* *Stage 2 — `.gitignore`-Aware Artifact Detection & Cleanup (`git.detect-artifacts`)*:
+** Scans the working tree against `artifact-patterns.json` (`*.tmp`, `*.bak`, `*.orig`, `*.swp`, `.DS_Store`, `Thumbs.db`, coverage/build scratch files) while querying `git -C <tree> check-ignore`.
+** Fails closed (`oracle_failed -> git.artifact-escalate`) if the `.gitignore` oracle cannot be evaluated.
+** Unconditionally excludes `.plan/**` and any nested git worktrees or submodules (`git submodule status` / `.git` file markers) from deletion.
+** Automatically deletes `safe` untracked artifact files and records `artifacts_deleted` in the audit log.
+** Transitions to `git.artifact-review` only if `uncertain` tracked files match artifact patterns (`tracked_resolved == false`) or prohibited secret files (`.env*`, `*.pem`, `*.key`, `credentials.json`) are staged/untracked.
+* *Stage 3 — In-Memory Commit Message Resolution, Validation & Trailer Injection (`git.resolve-message` / `git.compose-message`)*:
+** When `message_mode` is `auto_deliverable` or `step_or_fallback`, resolves the deterministic commit message in memory (e.g., `feat(<module>): complete deliverable <N> - <title>` or `chore(finalize): apply <step_id> changes`).
+** When `message_mode == interactive` (or `none_assert_clean` when unexpected dirty files were found), transitions to `git.compose-message`, populates `facts` via `git.diff-summary` (changed file count, module scope, priority-ordered suggested type `fix > feat > perf > refactor > docs > style > test > chore > ci`), and accepts `message: text 1..2000` directly in `pm_do` `args`.
+** Validates Conventional Commits format (`<type>[optional (<scope>)][!]: <subject>`) via `ConventionalCommitValidator` and deterministically appends the configured trailer (`commit-trailer` from `.plan/marshal.json`, defaulting to `Co-Authored-By: plan-marshall <noreply@cuioss.de>`).
+* *Stage 4 — Staging, `stdin`-Piped Commit & Change-Ledger Stamping (`git.stage-and-commit`)*:
+** Stages scoped files (`git -C <tree> add -- <paths>`) and invokes `git -C <tree> commit -F -`, streaming the validated UTF-8 commit message + trailer directly to child `stdin` in memory (`PM-EXEC-5`) with zero `.plan/temp/` files.
+** Captures `commit_sha` (`git -C <tree> rev-parse HEAD`) and git-sourced `changed_paths` (`git -C <tree> diff-tree --no-commit-id --name-only -r <commit_sha>`), appending a `kind = "change"` entry to `change-ledger.jsonl`.
+** When invoked from a Phase 6 `mutates_source: true` step: re-stamps `head_at_completion = commit_sha` on `head_dependent: true` steps in `mcp/status.json`, and for steps with `order >= 10` (`pre-push-quality-gate.order`), writes a `freshness_reconcile` record (`commit_sha`, `step_id`, `prior_build_worktree_sha` from the latest passing build row in `change-ledger.jsonl`) so the downstream push gate recognizes the finalize-internal commit without requiring a redundant full build when no source-affecting inputs changed.
+** If `git commit` exits non-zero due to a repository pre-commit hook, returns `hook_failed -> git.commit-fix`.
+* *Stage 5 — Config-Driven Push Policy & Freshness Precondition (`git.evaluate-push-policy` -> `git.verify-freshness`)*:
+** Evaluates `push_mode` together with `.plan/marshal.json -> /phase-5-execute/commit_and_push` (default `true`): `push_mode == never` skips push (`skip_push_committed -> git.done-committed-local`); `push_mode == if_configured` requires push if and only if `commit_and_push == true`; `push_mode == post_pr_conditional` requires push if and only if `commit_and_push == true` and the calling finalize step has `order > 20` (after `create-pr`), automating post-PR re-push for late source-mutating steps (`adr-propose` or triage fixes); `push_mode == always` requires push unconditionally.
+** Before any push, `git.pre-commit-verify-freshness` verifies `change-ledger.jsonl` freshness (`fresh` corroborated on both notation and scope dimensions against the current `worktree_sha`, `exempt` when `build-decision == not_necessary`, or reconciled via `freshness_reconcile`). If `stale` or `undecidable`, transitions to `git.freshness-blocked` (offering `run_verification_build` or operator `escalate`).
+* *Stage 6 — Branch Sync Parity Probe & Push Execution (`git.check-branch-parity` -> `git.execute-push`)*:
+** Runs `git.branch-sync-state` comparing local `HEAD` against `origin/<branch>`: `ahead` or `remote_absent_unverified` (initial unpushed branch) proceeds to `git.execute-push` (`git -C <tree> push` or `git -C <tree> push --set-upstream origin <branch>`); `synced` or `remote_absent_landed` (branch already merged and remote deleted) returns `synced_or_landed_skip -> git.done-pushed-clean` so a landed-and-deleted remote branch is never resurrected.
+** If `git push` is rejected as non-fast-forward (`rejected_non_ff`), transitions to `git.sync-required` (offering `sync_rebase` or operator `force_push_with_lease` escalation).
+
+==== Call-Site Reuse Matrix Across Workflows
+
+[cols="2,2,2,3"]
+|===
+|Caller Workflow & State |`message_mode` |`push_mode` |Behavior & Config Interaction
+
+|`execute.pmwf` -> `execute.chain-tail-commit`
+|`auto_deliverable`
+|`never`
+|Per-deliverable checkpoint commit at the tail of each deliverable's verification chain (`Step 10a`); cleans artifacts, commits via `stdin`, stamps `change-ledger.jsonl`, and stays local until Phase 6.
+
+|`execute.pmwf` -> `execute.remediation-commit`
+|`interactive`
+|`never`
+|Commits model fixes produced during `verification-feedback` triage in Phase 5; validates Conventional Commit message, stamps `change-ledger.jsonl`, and re-enters build verification.
+
+|`finalize.pmwf` -> `finalize.settle-commit`
+|`step_or_fallback`
+|`post_pr_conditional`
+|Phase 6 commit instrumentation after any `mutates_source: true` step (`simplify`, `security-audit`, `self-review`, `architecture-refresh`, `adr-propose`); re-stamps `head_at_completion`, records `freshness_reconcile` (`order >= 10`), and automatically re-pushes if `order > 20` and `commit_and_push == true`.
+
+|`finalize.pmwf` -> `finalize.push-barrier`
+|`none_assert_clean`
+|`if_configured`
+|Phase 6 `default:push` barrier (`order == 11`); verifies working-tree cleanliness (or commits residual changes), checks `commit_and_push` config, enforces `pre-commit-verify-freshness` and `branch-sync-state`, and pushes to `origin/<branch>`.
+
+|`pr-doctor.pmwf` -> `pr-doctor.commit-and-push`
+|`interactive`
+|`always`
+|Commits PR remediation fixes, verifies build freshness, and pushes the updated branch to re-trigger CI/review checks.
+
+|`orchestrator.pmwf` / `steward.pmwf` -> `*.commit-changes`
+|`step_or_fallback`
+|`if_configured`
+|Commits epic ledger updates or `.plan/marshal.json` steward reconfigurations on the primary checkout with full artifact cleanup and trailer injection.
+|===
 
 == Worktree-Constrained Loop-Back & Iteration Bounds
 _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
@@ -434,13 +741,14 @@ When a finalize step (CI failure, quality gate failure, or review finding triage
   }
 }
 ----
+
 * If `/phase-6-finalize/max_iterations` is omitted in `.plan/marshal.json`, the engine applies the normative default of `3` (valid configured range: `1..10`).
-* The plan's `mcp/status.json` persists `"finalize_iteration_count": <int>` (initialized to `0` when entering `finalize` for the first time).
-* `GuardExpr.LoopCountBelowMax` evaluates `status.finalizeIterationCount() < config.phase6Finalize().maxIterations()`.
+* The plan's `mcp/status.json` persists `"finalize_iteration": <int>` (initialized to `0` when entering `finalize` for the first time).
+* `GuardExpr.LoopCountBelowMax` evaluates `status.finalizeIteration() < config.phase6Finalize().maxIterations()`.
 * When `plan.allocate-remediation-tasks` executes on a valid `loop_back`:
-  1. `finalize_iteration_count` is atomically incremented by `1` in `mcp/status.json`.
-  2. Fresh task files (`TASK-NNN.json`) and a fresh dispatch envelope (`envelope-M` with a new `dispatch_id`) are allocated in the worktree — completed tasks are never mutated or reopened.
-* If a finalize failure occurs when `finalize_iteration_count >= max_iterations`, `LoopCountBelowMax` evaluates to `false`, `loop_back` is omitted, and the state transitions to `finalize.loop-limit-reached`, which offers only `escalate` (requiring operator approval via elicitation or `pm-mcp operator` to grant additional iterations or abort).
+** `finalize_iteration` is atomically incremented by `1` in `mcp/status.json`.
+** Fresh task files (`TASK-NNN.json`) and a fresh dispatch envelope (`envelope-M` with a new `dispatch_id`) are allocated in the worktree — completed tasks are never mutated or reopened.
+* If a finalize failure occurs when `finalize_iteration >= max_iterations`, `LoopCountBelowMax` evaluates to `false`, `loop_back` is omitted, and the state transitions to `finalize.loop-limit-reached`, which offers only `escalate` (requiring operator approval via elicitation or `pm-mcp operator` to grant additional iterations or abort).
 
 == Automated PlantUML, Mermaid, and ASCII Diagram Generation
 _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
@@ -449,12 +757,9 @@ Because workflow definitions are parsed into a typed `WorkflowDefinition` AST in
 
 === Supported Render Targets
 
-1. *PlantUML State Diagram (`renderPlantUml(WorkflowDefinition, Optional<String> activeState)`)*:
-   * Emits `@startuml` ... `@enduml` state diagrams grouping `StateNode` entries by `phase`, labeling transitions with `[rel] link_id / outcome`, and styling `activeState` with `#LightGreen` when rendering for a live plan.
-2. *Mermaid State Diagram (`renderMermaid(WorkflowDefinition, Optional<String> activeState)`)*:
-   * Emits `stateDiagram-v2` blocks embedded into AsciiDoc documentation under `doc/` and served via the MCP resource `pm://plan/{plan_id}/diagram`.
-3. *Deterministic ASCII Box-and-Transition Table (`renderAscii(WorkflowDefinition, Optional<String> activeState)`)*:
-   * Emits a right-border-aligned ASCII state boxes diagram and transition matrix for terminal output (`pm-mcp daemon status`, `pm-mcp-inspect`).
+1. *PlantUML State Diagram (`renderPlantUml(WorkflowDefinition, Optional<String> activeState)`)*: Emits `@startuml` ... `@enduml` state diagrams grouping `StateNode` entries by `phase`, labeling transitions with `[rel] link_id / outcome`, and styling `activeState` with `#LightGreen` when rendering for a live plan.
+2. *Mermaid State Diagram (`renderMermaid(WorkflowDefinition, Optional<String> activeState)`)*: Emits `stateDiagram-v2` blocks embedded into AsciiDoc documentation under `doc/` and served via the MCP resource `pm://plan/{plan_id}/diagram`.
+3. *Deterministic ASCII Box-and-Transition Table (`renderAscii(WorkflowDefinition, Optional<String> activeState)`)*: Emits a right-border-aligned ASCII state boxes diagram and transition matrix for terminal output (`pm-mcp daemon status`, `pm-mcp-inspect`).
 
 === Example Generated PlantUML & ASCII Output
 
@@ -490,3 +795,51 @@ finalize_ci_failed --> finalize_loop_limit_reached : loop_back:loop_back / limit
 === Build-Time Drift Gate
 
 A mandatory JUnit test (`WorkflowDiagramDriftTest`) in `pm-mcp-core` parses all `classpath:/workflows/*.pmwf` files, invokes `WorkflowDiagramGenerator`, and compares the output byte-for-byte against the committed diagram files in `doc/`. Any divergence fails the build, guaranteeing that workflow documentation can never drift from the executable state machine.
+
+== State-Machine Property Verification, Scenario Replay & State Migration
+_See Requirement link:../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine Property Verification]_
+
+_See Requirement link:../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario Replay Harness]_
+
+_See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: State-Name Migration Registry]_
+
+=== Property-Based State-Machine Verification (`PM-TEST-3`)
+
+The `pm-mcp-core` test suite executes property-based tests (using `jqwik` / `cui-test-generator`) over every compiled `WorkflowDefinition` AST:
+
+* *No Dead-End Non-Terminal States*: Every non-terminal `StateNode` has at least one guard assignment under which at least one outgoing link or auto/job transition is offered, and every reachable state has a finite path to a `terminal` state (`completed` or `aborted`).
+* *Strict Guard Enforcement & Link Omission*: Random sequences of `pm_do` calls with invalid link names, unsatisfied guards (such as `loop_back` when `in_worktree == false` or `finalize_iteration >= max_iterations`), or out-of-range parameters never mutate `mcp/status.json` and always return `rejected.reason` with `isError: false`.
+* *Single-Level Leaf Sub-Agent Invariant*: Property generators traverse all reachable states in `WorkflowScope.ENTITY` definitions and verify that zero `form == LinkForm.DISPATCH` links are ever emitted.
+* *Monotonic Bounded Loops*: Random failure injection in Q-Gate and finalize-to-execute loop-backs verifies that no path can traverse `loop_back` more than `max_iterations` times without entering `*.loop-limit-reached` / `*.qgate-exhausted`.
+
+=== Deterministic Scenario Replay Harness (`pm-mcp-scenario`, `PM-TEST-4`)
+
+End-to-end lifecycle scenarios are authored as deterministic `.pmscenario` scripts executed in-process by `ScenarioReplayRunner` against a hermetic temporary git repository without invoking any live LLM:
+
+[source,text]
+----
+scenario happy-path-single-module
+start request "Add null-safe header parser" slug "header-parser"
+assert_state refine.analyze
+assert_skill skill://pm/refine/analyze/SKILL.md
+assert_links submit:refine
+do submit:refine {"confidence_scores":{"correctness":98,"completeness":96,"consistency":100,"non_duplication":100,"ambiguity":95,"module_mapping":100},"pr_title":"feat(http): add null-safe header parser"}
+assert_state outline.detect-change-type
+...
+resolve_elicitation approve_outline {"decision":"approve"}
+complete_job job-build-0001 {"outcome":"passed","worktree_sha":"e3b0c442..."}
+assert_state completed
+----
+
+* Each scenario step supports deterministic assertions (`assert_state`, `assert_links`, `assert_skill`, `assert_rejected`) and simulated actor actions (`do`, `complete_job`, `resolve_elicitation`, `operator_cli`).
+* The mandatory CI regression suite replays scenarios covering: (1) happy-path single-module plan, (2) multi-task envelope dispatch and context-budget yield, (3) CI failure and worktree-constrained `loop_back` to `execute`, (4) review-bot finding triage (`FIX`, `SUPPRESS`, `ACCEPT`), (5) operator escalation via elicitation and CLI fallback, and (6) mid-job daemon restart recovery.
+
+=== State-Name Migration Registry & `released-states.txt` Gate (`PM-MIG-4`)
+
+To guarantee that active plans survive `pm-mcp` binary upgrades across state renames or workflow splits:
+
+* Every state identifier shipped in a public release is appended to the committed `classpath:/workflows/released-states.txt` baseline.
+* When a state is renamed or split in a `.pmwf` file, the workflow header declares `migrate <old_state_id> -> <new_state_id>`.
+* When `WorkflowEngine` loads `mcp/status.json` whose `state` matches `<old_state_id>`, it transparently rewrites `state` to `<new_state_id>` and appends a `state_migrated` event to `audit.jsonl`.
+* A build-time JUnit gate (`ReleasedStatesMigrationTest`) verifies that every entry in `released-states.txt` either exists in the current `WorkflowDefinition.states()` map or is covered by a transitive `migrate` chain terminating in a live state.
+
