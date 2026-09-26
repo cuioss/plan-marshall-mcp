@@ -140,7 +140,7 @@ _See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialo
 |The plan persists a `<phase>.awaiting_user` (or `<phase>.awaiting_answers`) state carrying a typed `questions` schema in `facts`. When answered via the model-relayed `submit` link, the transition succeeds and records `channel: "model_relayed"` in `audit.jsonl`.
 
 |*Operator-Authorizing Decisions* (Gate-Forcing / Privileged)
-|Solution outline approval (`outline.review` -> `phase-4-plan`), scope-deviation `accept` (`execute.deviation-review`), handshake or baseline drift override, bare-transition artifact-gate exemption (`--allow-bare-transition`), pre-rebase overlap override & pre-merge consent, pre-merge barrier / coverage-gap / red-CI / bot-demotion grants, and plan deletion (`delete-plan`).
+|Solution outline approval (`outline.review` -> `phase-4-plan`), scope-deviation `accept` (`execute.deviation-review`), handshake or baseline drift override, bare-transition artifact-gate exemption (`--allow-bare-transition`), pre-rebase overlap override, merge-authorization grants for every gap class of the roster (`review_barrier_gap`, `merge_action`, `red_ci_gate`, `rereview_timeout`), and plan deletion (`delete-plan`).
 |Host MCP Elicitation, or Authenticated Operator CLI (`pm-mcp operator ...`).
 |*Strict Link Omission (`PM-WF-3`)*: No model-invocable `submit` or `noop` link is ever emitted to approve or force these gates. If the host does not support MCP elicitation, the state transitions to `<phase>.blocked`, emits the exact `pm-mcp operator` command in `facts.operator_command`, and offers only a `wait` link until the operator acts.
 |===
@@ -1085,12 +1085,51 @@ Inside `default:branch-cleanup` (`order = 70`), immediately before executing the
 
 Both predicates must evaluate to `true` against the current worktree `HEAD` SHA ($H_{\text{cur}}$):
 
-1. *Predicate 1 — Zero Unhandled Review Comments*: Every finding in `findings.jsonl` originating from `automatic-review`, `ci-verify`, or `sonar-roundtrip` must have a persisted, terminal triage disposition (`FIX`, `SUPPRESS`, or `ACCEPT`) whose outbound response or dismissal has been transmitted to the provider (`response_transmitted == true`).
+1. *Predicate 1 — Zero Unhandled Review Comments*: Every finding in the findings store originating from `automatic-review`, `ci-verify`, or `sonar-roundtrip` must have a persisted, terminal triage disposition (`FIX`, `SUPPRESS`, or `ACCEPT`) whose outbound response or dismissal has been transmitted to the provider (`response_transmitted == true`). *Deliberate change vs. `plan-marshall`*: `plan-marshall` counts only pending PR-comment findings and does not require transmission; `PM-MCP` also covers CI and Sonar findings and requires the response to be transmitted.
 2. *Predicate 2 — Required-Bot Participation on Current `HEAD`*: Every review bot configured as required in the project's review-bot registry must have a verified participation record for $H_{\text{cur}}$ with `completion_state == "completed"`. An `unknown`, `pending`, `rate_limited`, `timed_out`, or `not_triggered` bot state **never** satisfies Predicate 2 and **never** automatically mints a merge grant.
+
+==== Merge-Authorization Roster & Gap Classes
+
+Every mechanism that authorizes advancing past the merge gate mirrors the merge-authorization roster of `plan-marshall` (`phase-6-finalize/standards/branch-cleanup.md`, verified at commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing). A grant authorizes exactly one *gap class*; HEAD binding alone is never authorization.
+
+[cols="2,2,1,4"]
+|===
+|Mechanism (`kind`) |Gap class |Bound via |Trigger
+
+|`barrier-ask-override`
+|`review_barrier_gap`
+|HEAD-bound grant
+|Barrier in `ask` mode ("merge anyway, record reason"), including accepting a structural coverage gap; covers every failing state of Predicate 1 or 2.
+
+|`pre-merge-consent`
+|`merge_action`
+|HEAD-bound grant
+|Operator answers the pre-merge confirmation gate with "Yes, merge". A re-rebase between consent and merge lapses the consent.
+
+|`red-ci-override`
+|`red_ci_gate`
+|HEAD-bound grant
+|Immediate-merge arm with red CI: "merge anyway, override red CI". The merge-queue arm needs no grant.
+
+|`rereview-timeout-override`
+|`rereview_timeout`
+|HEAD-bound grant
+|Re-review timeout after a rebase, either by the `re_review_on_timeout: proceed` policy or by the operator choosing "merge anyway, proceed unreviewed".
+
+|`automatic-review-force-done`
+|`find_step_completion`
+|Step `head_at_completion`
+|`automatic-review` force-completed with a recorded reason; bound by the step's own `head_dependent` anchor, no separate grant.
+
+|`final_merge_without_asking`
+|`merge_action`
+|Standing policy (not HEAD-bound)
+|Step parameter of `default:branch-cleanup` (default `true`); when set, it satisfies `merge_action` without a per-merge consent. It never satisfies any other gap class.
+|===
 
 ==== Operator Merge Authorization Record (`MergeAuthorizationRecord`)
 
-When either barrier predicate fails (or when coverage-gap or red-CI overrides are requested), the plan cannot merge unless an admissible `MergeAuthorizationRecord` exists in `mcp/status.json`.
+When the barrier fails, a gate requires consent, or an override is requested, the plan cannot merge unless an admissible `MergeAuthorizationRecord` exists in `mcp/status.json` for the active gap class (or, for `merge_action`, the `final_merge_without_asking` policy is `true`).
 
 [source,java]
 ----
@@ -1099,12 +1138,11 @@ package de.cuioss.pm.mcp.core.workflow.finalize;
 import java.time.Instant;
 
 public enum MergeGapClass {
-    UNHANDLED_COMMENTS("unhandled_comments"),
-    BOT_TIMED_OUT("bot_timed_out"),
-    BOT_RATE_LIMITED("bot_rate_limited"),
-    BOT_NOT_TRIGGERED("bot_not_triggered"),
-    RED_CI_OVERRIDE("red_ci_override"),
-    COVERAGE_GAP("coverage_gap");
+    REVIEW_BARRIER_GAP("review_barrier_gap"),
+    MERGE_ACTION("merge_action"),
+    RED_CI_GATE("red_ci_gate"),
+    REREVIEW_TIMEOUT("rereview_timeout"),
+    FIND_STEP_COMPLETION("find_step_completion");
 
     private final String wireName;
     MergeGapClass(String wireName) { this.wireName = wireName; }
@@ -1112,7 +1150,7 @@ public enum MergeGapClass {
 }
 
 public record MergeAuthorizationRecord(
-    String grantId,
+    String kind,
     String planId,
     String headSha,
     MergeGapClass gapClass,
@@ -1128,8 +1166,8 @@ public record MergeAuthorizationRecord(
 }
 ----
 
-* *Operator-Only Minting*: Grants are minted exclusively through the authenticated operator channel (MCP elicitation or `pm-mcp operator authorize-merge --plan <plan_id> --head <sha> --gap-class <class> --rationale <text>`). Free-text lines in `decision.log` are never accepted as authorization evidence.
-* *Route on `admissible`, Never on Boolean `authorized`*: The barrier checks `grant.isAdmissibleFor(currentHeadSha, activeGapClass)`. A grant minted for an earlier commit $H_1$ or for `BOT_RATE_LIMITED` is inadmissible if `HEAD` advances to $H_2$ (e.g., after rebase) or if the active failure is `UNHANDLED_COMMENTS`.
+* *Operator-Only Minting*: Grants are minted exclusively through the authenticated operator channel (MCP elicitation or `pm-mcp operator authorize-merge --plan <plan_id> --head <sha> --gap-class <class> --rationale <text>`). Free-text lines in `decision.log` are never accepted as authorization evidence. A re-grant of the same `kind` replaces the previous record.
+* *Route on `admissible`, Never on Boolean `authorized`*: The barrier checks `grant.isAdmissibleFor(currentHeadSha, activeGapClass)`. A grant minted for an earlier commit $H_1$ or for `RED_CI_GATE` is inadmissible if `HEAD` advances to $H_2$ (e.g., after rebase) or if the active gap is `REVIEW_BARRIER_GAP`.
 
 === Cross-Plan Merge Mutex, FIFO Admission Queue & Epic Plan Emission
 _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
