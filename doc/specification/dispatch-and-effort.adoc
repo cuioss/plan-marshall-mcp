@@ -435,237 +435,84 @@ _See Requirements link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelope
 
 `PM-MCP` decouples workflow dispatch states from concrete LLM model identifiers through a two-stage resolution pipeline:
 
-1. **Role Resolution**: Maps a workflow state's semantic `role` to an abstract **Effort Level** (`1`..`7` or `"inherit"`).
-2. **Ladder & Variant Resolution**: Maps the abstract Effort Level and the scope's recorded `client_id` (`mcp/entry.json`) to an installed per-client agent variant pinning the runtime-specific `model` and `effort` parameters.
+1. **Role Resolution**: Maps a dispatch's role key to an abstract **effort level** (`level-1`..`level-7` or `inherit`).
+2. **Ladder & Variant Resolution**: Maps that level and the scope's recorded `client_id` (`mcp/entry.json`) to an installed per-client agent variant pinning the runtime-specific `model` and `effort`.
 
-=== Semantic Role Registry & Lookup Hierarchy
+The role registry, the level vocabulary, the resolve chain, the ladders, and the variant naming mirror `plan-marshall` (`plan-marshall/standards/effort-roles.md`, `effort-levels.md`, `effort-variants.md`, ADR-021), verified at commit `1d4a1da37`. Re-verify against the latest `plan-marshall` version before implementing.
 
-Every `dispatch` state in the Workflow DSL declares a canonical role key. Role keys are partitioned into two top-level namespaces:
+=== Role Registry & Lookup Hierarchy
 
-* **Plan Roles (`plan.<phase>.effort.<subkey>`)**: Used by plan-scoped dispatches across phases 1 through 6.
-* **Orchestrator Roles (`orchestrator.effort.<subkey>`)**: Used by epic-scoped analysis dispatches (landing analysis, spec corpus re-grounding, workstream decomposition).
+Configured values are the strings `level-1` .. `level-7` or `inherit`; any other value is a hard error on read. There are no mandatory keys and no built-in per-role defaults: an unconfigured role resolves to `inherit`.
 
-[cols="2,2,1,3"]
+[cols="2,2,4"]
 |===
-|Canonical Role Key |Phase / Scope |Built-in Default Level |Responsibility
+|Group |Sub-keys |Where the sub-keys fire
 
-|`plan.phase-1-init.effort.reader`
-|`init`
-|`2`
-|Untrusted external issue/PR/web content extraction (`execution-context-reader`).
+|`plan.phase-2-refine.effort`
+|`default`
+|The phase's dispatches (refine body, issue-body reader ingestion, q-gate validation).
 
-|`plan.phase-2-refine.effort.clarifier`
-|`refine`
-|`3`
-|Codebase-grounded requirement gap analysis and question generation.
+|`plan.phase-3-outline.effort`
+|`default`
+|Outline dispatches, including architecture enrichment.
 
-|`plan.phase-3-outline.effort.light_outliner`
-|`outline`
-|`4`
-|Bounded localized solution outline generation (light lane).
+|`plan.phase-4-plan.effort`
+|`default`
+|Task planning dispatches.
 
-|`plan.phase-3-outline.effort.deep_explorer`
-|`outline`
-|`3`
-|Read-only module/dependency survey in deep-lane outline fan-out.
+|`plan.phase-5-execute.effort`
+|`default`, `verification-feedback`
+|`default`: task envelopes; `verification-feedback`: per-finding FIX / SUPPRESS / ACCEPT triage of build findings.
 
-|`plan.phase-3-outline.effort.deep_synthesizer`
-|`outline`
-|`5`
-|Architectural synthesis and deliverable structuring (deep lane).
+|`plan.phase-6-finalize.effort`
+|`default`, `verification-feedback`, `post-run-review`
+|`default`: finalize dispatches such as create-pr and pre-submission self-review; `verification-feedback`: Sonar, review-bot, and plugin-doctor finding triage; `post-run-review`: lessons capture and plan retrospective.
 
-|`plan.phase-4-plan.effort.task_planner`
-|`plan`
-|`4`
-|Deliverable-to-task decomposition and verification step binding.
-
-|`plan.phase-5-execute.effort.implementer`
-|`execute`
-|`4`
-|Production code implementation envelope execution.
-
-|`plan.phase-5-execute.effort.module_tester`
-|`execute`
-|`4`
-|Unit and integration test authoring envelope execution.
-
-|`plan.phase-5-execute.effort.verifier`
-|`execute`
-|`3`
-|End-of-phase verification sweep and arch-gate assessment.
-
-|`plan.phase-6-finalize.effort.self_reviewer`
-|`finalize`
-|`5`
-|Pre-submission structural self-review and security audit evaluation.
-
-|`plan.phase-6-finalize.effort.triager`
-|`finalize`
-|`4`
-|PR review comment and Sonar finding disposition triage.
-
-|`orchestrator.effort.decomposer`
-|`orchestrate`
-|`5`
-|Epic workstream decomposition and dependency graph staging.
-
-|`orchestrator.effort.landing_analyzer`
-|`orchestrate`
-|`3`
-|Completed plan landing analysis and ledger reconciliation.
-
-|`orchestrator.effort.spec_reviewer`
-|`orchestrate`
-|`4`
-|Staged specification re-grounding against repository `HEAD`.
+|`orchestrator.effort`
+|`analyze`, `decompose`, `reader` (plus `default` slot and `max` ceiling)
+|Epic landing analysis, decomposition, and untrusted-text ingestion. Resolves under the top-level `orchestrator` block, not under `plan`.
 |===
+
+Phase 1 (`init`) runs inline and has no role. A group may be a plain string (one level for every sub-key) or an object with per-sub-key values and a `default` slot.
 
 ==== Deterministic Role Lookup Algorithm
 
-When resolving the target level for a role key, the engine evaluates the project configuration (`.plan/marshal.json`) using the following precedence chain:
+1. **Plan roles**: `plan.<phase>.effort.<subkey>` -> `plan.<phase>.effort.default` -> `plan.<phase>.effort` (string) -> `plan.effort` -> `inherit`.
+2. **Orchestrator roles**: `orchestrator.effort.<surface>` -> `orchestrator.effort.default` (or the plain string) -> `plan.effort` -> `inherit`, then clamped to `orchestrator.effort.max` on the ordinal ladder (`min(resolved, max)`; an unset `max` is a no-op). Orchestrator dispatches always name their surface so the clamp cannot be bypassed.
+3. **Unknown sub-key**: A warning (`WARN_UNKNOWN_EFFORT_ROLE`) is logged and the lookup continues at the `default` slot; an unknown key never blocks a dispatch.
 
-1. **For Plan Roles (`plan.<phase>.effort.<subkey>`)**: $\text{resolve}(phase, subkey) = \text{config}[\texttt{plan.}\langle phase\rangle\texttt{.effort.}\langle subkey\rangle] \;\text{COALESCE}\; \text{config}[\texttt{plan.}\langle phase\rangle\texttt{.effort.default}] \;\text{COALESCE}\; \text{config}[\texttt{plan.effort.default}] \;\text{COALESCE}\; \text{builtInDefault}(phase, subkey) \;\text{COALESCE}\; \texttt{"inherit"}$.
-2. **For Orchestrator Roles (`orchestrator.effort.<subkey>`) with `max` Clamp**: $\text{raw}(subkey) = \text{config}[\texttt{orchestrator.effort.}\langle subkey\rangle] \;\text{COALESCE}\; \text{config}[\texttt{orchestrator.effort.default}] \;\text{COALESCE}\; \text{builtInDefault}(\texttt{"orchestrator"}, subkey) \;\text{COALESCE}\; \texttt{"inherit"}$. If $\text{config}[\texttt{orchestrator.effort.max}]$ is configured as an integer $M \in [1..7]$ and $\text{raw}(subkey)$ resolves to an integer level $L$, the effective level is clamped to $\min(L, M)$. Orchestrator dispatches must always name their `orchestrator.effort.<subkey>` role explicitly so the `max` clamp can never be bypassed.
-3. **Unknown Role Key Fallback**: If a workflow or override references an unrecognized `<subkey>`, the resolver logs a structured configuration warning (`WARN_UNKNOWN_EFFORT_ROLE`) and falls back to `plan.<phase>.effort.default` -> `plan.<phase>.effort` (string) -> `plan.effort` -> `"inherit"`. An unknown role key **never** blocks a dispatch.
+=== Effort Ladders (`.plan/local/effort-ladder.json`)
 
-=== The 7-Level Effort Ladder & Alias Gating (`effort-ladder.json`)
+The ladder maps each level to a concrete `model` and `effort` per client runtime. `.plan/marshal.json` carries only the target-neutral levels; model pins are never stored in git-tracked configuration (ADR-021).
 
-The effort ladder maps abstract levels `1` through `7` (plus `"inherit"`) to concrete model identifiers and reasoning/thinking effort levels per client runtime (`claude`, `opencode`, `antigravity`, `codex`).
+* **Machine-local ladder**: The git-ignored file `.plan/local/effort-ladder.json` holds `{"targets": {"<client_id>": {"level-N": {"model": <string|null>, "effort": <string|null>}}}}`, the format `plan-marshall` uses. `model: null` means unpinned (the dispatch inherits the session model).
+* **Compiled defaults**: When the file or a target entry is absent, the ladder compiled into the client profile (link:client-profiles.adoc[Client Profiles Specification]) applies and the representation carries a warning; the project setup workflow seeds the file from the compiled defaults.
+* **Narrow but never escalate (ADR-021)**: A ladder entry serves only its own level and never provisions a model beyond the capability of the resolved rung. ADR-021 (status *Proposed* in `plan-marshall`) also prescribes an entry-kind discriminator (`local` / `provider`) that `plan-marshall`'s current file format does not yet carry; verify its status before implementing the ladder reader.
+* **Capability gating**: A variant for a `(model, effort)` pair is installed only when the model alias supports that effort (for Claude, `xhigh` and `max` depend on the alias). A level whose variant is not installed dispatches on the canonical `inherit` variant. The resolver never names a variant that is not installed.
 
-* **Default Ladder**: Compiled into each client profile (`classpath:/profiles/<client_id>.json`).
-* **Machine-Local Override**: Operators may customize model pins or enable frontier alias tiers in `.plan/local/effort-ladder.json` or `~/.plan-marshall/mcp/effort-ladder.json`.
-* **Alias Gating of Levels 6 and 7**: Levels `1` through `5` and `"inherit"` are always enabled by default. Levels `6` and `7` represent high-cost frontier reasoning tiers (`opus-high`, `opus-max` / ultra extended thinking) and are **alias-gated**: they are only active when `alias_gates.level_6_enabled` or `alias_gates.level_7_enabled` is `true` in the active ladder configuration and the corresponding variant file is installed. If a role resolves to level `6` or `7` while its alias gate is disabled, the resolver clamps the level down to `5` (or the highest installed level $\le 5$).
-* **Installed Variant Invariant**: The resolver enforces the strict invariant: *Never name an agent variant in a `dispatch` link that was not installed in the client bundle*.
-
-[cols="1,2,2,2,2,3"]
+[cols="1,2,2,2,2"]
 |===
-|Level |Tier Classification |Claude Code Default (`model` / `effort`) |Antigravity / OpenCode Default |Codex Default (`model` / `effort`) |Typical Workload
+|Level |Claude Code (`model` / `effort`) |Antigravity (`model` / `effort`) |OpenCode |Codex (*provisional*)
 
-|`1`
-|Mechanical / Fast-Low
-|`haiku` / `low`
-|`flash_lite` / `low`
-|`gpt-5.4-codex-mini` / `low`
-|Deterministic formatting, simple marker lookups.
-
-|`2`
-|Fast-Standard
-|`haiku` / `medium`
-|`flash` / `medium`
-|`gpt-5.4-codex-mini` / `medium`
-|Reader extraction (`execution-context-reader`), lightweight inventory scans.
-
-|`3`
-|Standard-Low
-|`sonnet` / `low`
-|`pro` / `low`
-|`gpt-5.4-codex` / `low`
-|Verification sweeps, landing analysis, bounded refinement checks.
-
-|`4`
-|Standard-Medium
-|`sonnet` / `medium`
-|`pro` / `medium`
-|`gpt-5.4-codex` / `medium`
-|Default implementation, module testing, task planning, PR finding triage.
-
-|`5`
-|Standard-High
-|`sonnet` / `high`
-|`pro` / `high`
-|`gpt-5.4-codex` / `high`
-|Deep-lane architectural synthesis, pre-submission structural self-review, security audits.
-
-|`6`
-|Frontier-High *(Alias-Gated)*
-|`opus` / `high`
-|`pro` / `high` (or frontier alias)
-|`gpt-5.4-pro` / `high`
-|Complex multi-module refactoring and cross-cutting concurrency design.
-
-|`7`
-|Frontier-Max *(Alias-Gated)*
-|`opus` / `max`
-|`pro` / `max` (or frontier alias)
-|`gpt-5.4-pro` / `max`
-|Hardest architectural deadlocks and formal protocol verification.
-
-|`inherit`
-|Session-Inherited
-|*(omitted — inherits parent model)*
-|`inherit`
-|`inherit`
-|Fallback when operator prefers uniform session-wide model selection.
+|`level-1` |`haiku` / _(none; Haiku takes no effort)_ |`flash` / `low` |unpinned |`gpt-5.4-codex-mini` / `low`
+|`level-2` |`sonnet` / `medium` |`flash` / `low` |unpinned |`gpt-5.4-codex-mini` / `medium`
+|`level-3` |`sonnet` / `high` |`flash` / `medium` |unpinned |`gpt-5.4-codex` / `low`
+|`level-4` |`opus` / `medium` |`flash` / `medium` |unpinned |`gpt-5.4-codex` / `medium`
+|`level-5` |`opus` / `high` |`flash` / `high` |unpinned |`gpt-5.4-codex` / `high`
+|`level-6` |`opus` / `xhigh` |`pro` / `low` |unpinned |`gpt-5.4-pro` / `high`
+|`level-7` |`fable` / `max` |`pro` / `high` |unpinned |`gpt-5.4-pro` / `max`
+|`inherit` |session model |session model |session model |session model
 |===
 
-==== Normative `effort-ladder.json` Schema
-
-[source,json]
-----
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/effort-ladder-v1.json",
-  "title": "EffortLadderConfig",
-  "type": "object",
-  "required": ["format_version", "client_id", "alias_gates", "levels"],
-  "additionalProperties": false,
-  "properties": {
-    "format_version": {
-      "type": "integer",
-      "const": 1
-    },
-    "client_id": {
-      "type": "string",
-      "enum": ["claude", "opencode", "antigravity", "codex", "neutral"]
-    },
-    "alias_gates": {
-      "type": "object",
-      "required": ["level_6_enabled", "level_7_enabled"],
-      "additionalProperties": false,
-      "properties": {
-        "level_6_enabled": { "type": "boolean", "default": false },
-        "level_7_enabled": { "type": "boolean", "default": false }
-      }
-    },
-    "levels": {
-      "type": "object",
-      "required": ["1", "2", "3", "4", "5", "6", "7", "inherit"],
-      "additionalProperties": false,
-      "patternProperties": {
-        "^([1-7]|inherit)$": {
-          "type": "object",
-          "required": ["variant_suffix", "model", "effort", "installed"],
-          "additionalProperties": false,
-          "properties": {
-            "variant_suffix": {
-              "type": "string",
-              "enum": ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "inherit"]
-            },
-            "model": {
-              "type": ["string", "null"],
-              "description": "Concrete model identifier or null for 'inherit'."
-            },
-            "effort": {
-              "type": ["string", "null"],
-              "enum": ["low", "medium", "high", "xhigh", "max", null]
-            },
-            "installed": {
-              "type": "boolean"
-            }
-          }
-        }
-      }
-    }
-  }
-}
-----
+The Claude, Antigravity, and OpenCode columns are `plan-marshall`'s defaults. `plan-marshall` has no Codex target, so the Codex column is provisional until verified in Milestone 1.
 
 === Per-Client Variant Installation (`execution-context`)
 
-Because agent hosts such as Claude Code and OpenCode load sub-agent definitions from static files at session startup and bind model/effort settings plus allowed tool lists in agent frontmatter, `pm-mcp client install <client>` generates and installs the per-level variant files into the host's agent directory:
+Because agent hosts such as Claude Code and OpenCode load sub-agent definitions from static files at session startup and bind model/effort settings plus allowed tool lists in agent frontmatter, `pm-mcp client install <client>` renders and installs the per-level variant files into the host's agent directory:
 
-* **Worker Family Variants**: `execution-context-l1` through `execution-context-l7` (for enabled levels) and `execution-context-inherit`.
-* **Reader Family Variants**: `execution-context-reader-l2` and `execution-context-reader-inherit`.
+* **Worker Family Variants**: `execution-context-level-1` through `execution-context-level-7` (for installed levels) and `execution-context` (the `inherit` variant).
+* **Reader Family Variants**: `execution-context-reader-level-1` through `execution-context-reader-level-7` and `execution-context-reader` (`inherit`), so a reader role resolves at any level like every other role.
+* **Rendered at Install Time**: Variant files are rendered from the templates in the embedded bundle and the effective ladder (`.plan/local/effort-ladder.json` or the compiled defaults). The bundle manifest marks them `rendered`; the installer verifies the template digest and records the rendered digest in `install-records.json`. A ladder change takes effect after `pm-mcp client update` and a host restart.
 * **Mandatory MCP Tool Inclusion**: Every installed `execution-context` worker variant **must** include the `PM-MCP` tool surface (`mcp__plan-marshall__pm_state`, `mcp__plan-marshall__pm_do`, `mcp__plan-marshall__pm_build`, `mcp__plan-marshall__pm_lsp`, `mcp__plan-marshall__pm_skill` or host-equivalent wildcard `mcp__plan-marshall__*`) alongside host file/shell tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`). Without these MCP tool permissions, a sub-agent cannot execute `start: pm_state(...)` or submit its work via `pm_do`.
 * **Concise Universal Worker Body**: The prompt body of every `execution-context-*` variant is reduced to a deterministic 5-step execution loop:
 ** Load `skill://pm/core` and every URI listed in `skills[]`.
