@@ -32,12 +32,14 @@ _See Requirements:_
 == Four-Axis Domain Architecture (Axes A–D, ADR-004 / ADR-013)
 _See Requirement link:../Requirements.adoc#PM-EXT-1[PM-EXT-1: Four-Axis Domain Descriptors (Axes A–D)]_
 
-To comply with the GraalVM native-image closed-world constraint (`PM-TECH-3`), `PM-MCP` eliminates runtime `importlib` plugin loading. Built-in domains (`java`, `java-cui`, `javascript`, `javascript-cui`, `python`, `oci-containers`, `documentation`, `requirements`, `plan-marshall-plugin-dev`, `general-dev`) and organization data packs are represented by declarative JSON descriptors (`classpath:/domains/<domain_id>.json`) bound to four orthogonal, sealed Java interfaces corresponding to Axes A through D (ADR-004, ADR-013).
+To comply with the GraalVM native-image closed-world constraint (`PM-TECH-3`), `PM-MCP` eliminates runtime `importlib` plugin loading. Built-in domains (`java`, `java-cui`, `javascript`, `javascript-cui`, `python`, `oci-containers`, `documentation`, `requirements`, `plan-marshall-plugin-dev`, `general-dev`) and organization data packs are represented by declarative JSON descriptors (`classpath:/domains/<domain_id>.json`) bound to four orthogonal, sealed Java interfaces corresponding to Axes A through D (ADR-004, ADR-013). Axis B is the exception: the file-to-build contract is owned by build-system extensions, not by language or content domains (ADR-004), so it is declared by build-system descriptors (`classpath:/build-systems/<build_system_id>.json` for `maven`, `gradle`, `npm`, and `pyproject`), each naming the domain key its routes are filed under in `build.map`.
+
+The axis split mirrors `plan-marshall` (`script-shared/scripts/extension/extension_base.py`: `ExtensionBase` owns Axis A — `get_skill_domains`, `applies_to_module`, `config_defaults`, and the `provides_*` hooks; `BuildExtensionBase` owns Axis B — `classify_globs`, `classify_paths`, `classify_path_specificity`, `classify_build_class`; `DerivationResolverBase` and `PathAttributionBase` own Axes C and D; ADR-004, ADR-013), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
 
 === Core Architectural Invariants
 
-1. *Fail-Closed Descriptor Loading (ADR-009)*: Unlike the legacy catch-all that silently ignored broken `extension.py` modules, `PM-MCP` validates every compiled and project-local descriptor against its closed JSON Schema at startup. Any schema violation or unresolvable skill/resolver reference causes an immediate, explicit diagnostic failure rather than silent degradation.
-2. *Null-on-Absent Never Fabricates a Positive (ADR-010)*: When a domain is inactive or does not declare an optional capability (such as an architecture fitness gate or domain verb like `search-markers` or `parse-rewrite-log`), that capability is omitted from representations (`null` / absent). Conversely, if an active domain promises a mandatory gate that cannot execute, the engine halts with a diagnosable refusal (`refused`) and **never** records a synthetic pass.
+1. *Fail-Closed Descriptor Loading (ADR-017)*: A validator derives its contract from the target's own declaration and fails closed when it cannot. Unlike the legacy catch-all that silently ignored broken `extension.py` modules, `PM-MCP` validates every compiled and project-local descriptor against its closed JSON Schema at startup. Any schema violation or unresolvable skill/resolver reference causes an immediate, explicit diagnostic failure rather than silent degradation.
+2. *Null-on-Absent Never Fabricates a Positive (ADR-010)*: When a domain is inactive or does not declare an optional capability (such as an architecture fitness gate or a domain verb like `marker-detect` or `rewrite-log-parse`), that capability is omitted from representations (`null` / absent). Conversely, if an active domain promises a mandatory gate that cannot execute, the engine halts with a diagnosable refusal (`refused`) and **never** records a synthetic pass.
 3. *Security Profile Resolution Constraint*: The `security` profile in `skills_by_profile` resolves focused security vocabulary skills (`skill://pm/domain/<domain>/security`) for implementation, review, and audit states; it **never** generates standalone implementation tasks of its own.
 
 === Sealed Java Interfaces for Axes A–D
@@ -53,7 +55,8 @@ import java.util.Set;
 
 /**
  * Axis A: Skill loading, domain detection globs, profile-to-skill mapping,
- * triage vocabulary, and architecture gate declarations (ADR-004).
+ * module applicability, write-once config defaults, triage vocabulary,
+ * and architecture gate declarations (ADR-004).
  */
 public sealed interface SkillLoadingAxis permits DeclarativeDomainAxisA {
 
@@ -68,6 +71,14 @@ public sealed interface SkillLoadingAxis permits DeclarativeDomainAxisA {
     /** Maps execution profile (core, implementation, module_testing, integration_testing, quality, documentation, security; `core` is merged into every other profile) to skill:// URIs. */
     Map<String, List<String>> skillsByProfile();
 
+    /**
+     * Evaluates the domain's declarative applicability rules (applies_to_module) against a
+     * discovered module's facts: decides whether the domain applies to the module, which
+     * profiles activate, and which optional skills are promoted. Also gates whether the
+     * routes filed under this domain are seeded into build.map (ADR-004).
+     */
+    ApplicabilityMatch evaluateApplicability(DiscoveredModuleFacts moduleFacts);
+
     /** Optional domain-specific triage vocabulary skill (e.g. skill://pm/triage/java); falls back to skill://pm/triage/generic. */
     Optional<String> triageSkillUri();
 
@@ -77,20 +88,42 @@ public sealed interface SkillLoadingAxis permits DeclarativeDomainAxisA {
     /** Optional architectural fitness function gate (ArchUnit, import-linter, dependency-cruiser). */
     Optional<ArchGateDeclaration> archGateDeclaration();
 
-    /** Optional compiled-in domain verbs (e.g. search-markers, parse-rewrite-log). */
+    /** Optional compiled-in domain verbs (marker-detect, invoked as search-markers; rewrite-log-parse, invoked as parse-rewrite-log). */
     Set<String> domainVerbs();
 }
 
 /**
- * Axis B: Module applicability evaluation, file-to-build classification,
- * and canonical build command templates (ADR-004).
+ * Axis B: File-to-build classification, owned by build-system extensions
+ * (maven, gradle, npm, pyproject), never by language/content domains (ADR-004).
+ * Classifies changed paths into (role, build_class) build-map routes that
+ * resolve to canonical build commands; it decides no module applicability.
  */
-public sealed interface BuildRoutingAxis permits DeclarativeDomainAxisB {
+public sealed interface BuildRoutingAxis permits DeclarativeBuildSystemAxisB {
 
     String buildSystemId();
 
-    /** Evaluates declarative signal predicates against a discovered module's facts. */
-    ApplicabilityMatch evaluateApplicability(DiscoveredModuleFacts moduleFacts);
+    /** Domain key under which this build system's routes are filed in build.map. */
+    String servedDomainKey();
+
+    /**
+     * Explicit (glob, role) build-map routes (classify_globs); role is production, test,
+     * or config. Globs are single-* fnmatch patterns or bare basenames, never recursive **.
+     */
+    List<BuildMapRoute> classifyGlobs();
+
+    /**
+     * Build class of a claimed (path, role) pair (classify_build_class): production -> compile,
+     * test -> module-tests, config -> verify, any other role -> none, unless the build system
+     * overrides the default for a specific path.
+     */
+    BuildClass classifyBuildClass(String path, BuildMapRole role);
+
+    /**
+     * Classifies changed paths into (role, build_class) routes of this build system, with the
+     * non-wildcard segment count of the matching glob as longest-glob-wins specificity
+     * (classify_paths, classify_path_specificity). Paths matching no route are omitted.
+     */
+    List<ClassifiedPathRoute> classifyPaths(List<String> changedPaths);
 
     /** Maps canonical verbs (clean..package, module-tests, quality-gate, verify) to argument templates. */
     Map<CanonicalBuildVerb, ArgumentTemplate> canonicalCommandTemplates();
@@ -105,10 +138,10 @@ public sealed interface BuildRoutingAxis permits DeclarativeDomainAxisB {
 public sealed interface EdgeDerivationAxis
         permits MavenEdgeResolver, GradleEdgeResolver, NpmEdgeResolver,
                 PyprojectEdgeResolver, PythonImportEdgeResolver,
-                MarkdownCrossRefResolver, LspSymbolEdgeResolver,
-                ProjectScriptEdgeResolver {
+                MarkdownCrossRefResolver, DocumentationCrossRefResolver,
+                LspSymbolEdgeResolver, ProjectScriptEdgeResolver {
 
-    /** Stable resolver ID (e.g. "maven-pom", "gradle-deps", "npm-workspaces", "pyproject", "python-ast", "markdown-xref", "lsp"). */
+    /** Stable, unique resolver ID ("maven", "gradle", "npm", "pyproject", "python", "markdown", "documentation", "lsp"). */
     String resolverId();
 
     /** Derives directed inter-module dependency edges; never activated by file pattern, only by explicit resolverId. */
@@ -120,16 +153,27 @@ public sealed interface EdgeDerivationAxis
  */
 public sealed interface PathOwnershipAxis permits DeclarativeDomainAxisD {
 
-    String domainId();
+    /** Stable attributor ID stamped onto every claim's producers and onto its AttributorReport. */
+    String attributorId();
 
-    /** Returns constant (pathPrefix, targetModuleId) ownership tuples. */
-    List<PathOwnershipClaim> claimPaths();
+    /**
+     * Returns constant (pathPrefix, targetModuleId) ownership claims plus the attributor's own
+     * notes on claims it suppressed; stateless, no filesystem access.
+     *
+     * @throws AttributorException when the attributor cannot produce its claims; the merge
+     *         reports it and continues with the sibling attributors
+     */
+    PathClaimSet claimPaths() throws AttributorException;
 }
 ----
 
+The Axis C resolver IDs mirror `plan-marshall` (`derivation_resolver_id()` of `build-maven`, `build-npm`, `build-pyproject`, `pm-dev-python`, `pm-plugin-development`, `pm-documents`, and `plan-marshall-plugin`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. `pyproject` (declared-dependency join) and `python` (import join) stay distinct IDs so an edge's provenance tells the two derivations apart; `markdown` and `documentation` read overlapping file types over different module corpora, and an edge both find carries both IDs. *Deliberate addition vs. `plan-marshall`*: the `gradle` resolver (`GradleEdgeResolver`) has no `plan-marshall` counterpart (`build-gradle` ships no derivation resolver).
+
+*Machine-local resolver enablement*: Which discovered resolvers run is a machine-local binding, because a resolver's availability and cost depend on locally installed tooling (the `lsp` resolver needs an enrolled language server). The binding `derivation_resolvers.<resolver_id>.enabled` lives per project in `~/.plan-marshall/mcp/machine-config.json` (Tier 2, written via `pm-mcp operator config`), mirroring `plan-marshall`'s `derivation_resolvers` section of `.plan/local/run-configuration.json`. An absent section, absent entry, or malformed entry means *enabled*; only an explicit `false` disables a resolver. A disabled resolver is still discovered and reported (status `NOT_DISPATCHED`, reason `DISABLED`, zero edges), never pruned from the report, and is not counted as having run.
+
 === Declarative Domain Descriptor Schema (`<domain_id>.json`)
 
-All constant domain metadata—including Axis-B `applies_to_module` signal predicates (`build_system`, `dependency_contains`, `path_matches`, `file_exists`, `packaging_equals`, and `promote_optional_to_default`)—is expressed in the domain descriptor JSON Schema:
+All constant domain metadata—including the Axis-A `applies_to_module` applicability predicates (`build_system`, `dependency_contains`, `path_matches`, `file_exists`, `packaging_equals`, and `promote_optional_to_default`)—is expressed in the domain descriptor JSON Schema:
 
 [source,json]
 ----
@@ -196,7 +240,7 @@ All constant domain metadata—including Axis-B `applies_to_module` signal predi
     },
     "applicability_rules": {
       "type": "array",
-      "description": "Axis-B signal rules evaluated against each discovered module.",
+      "description": "Axis-A applicability rules (applies_to_module) evaluated against each discovered module; they decide profile activation and gate which build.map routes filed under this domain are seeded.",
       "items": {
         "type": "object",
         "required": ["rule_id", "when", "activate_profiles"],
@@ -207,7 +251,7 @@ All constant domain metadata—including Axis-B `applies_to_module` signal predi
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "build_system": { "type": "string", "enum": ["maven", "gradle", "npm", "pyproject", "none"] },
+              "build_system": { "type": "string", "enum": ["maven", "gradle", "npm", "pyproject", "documentation", "marshall-plugin", "none"] },
               "packaging_not_equals": { "type": "string" },
               "dependency_contains_any": { "type": "array", "items": { "type": "string" } },
               "path_matches_any": { "type": "array", "items": { "type": "string" } },
@@ -229,7 +273,7 @@ All constant domain metadata—including Axis-B `applies_to_module` signal predi
       "type": "array",
       "items": {
         "type": "string",
-        "enum": ["maven-pom", "gradle-deps", "npm-workspaces", "pyproject", "python-ast", "markdown-xref", "lsp"]
+        "enum": ["maven", "gradle", "npm", "pyproject", "python", "markdown", "documentation", "lsp"]
       }
     },
     "claim_paths": {
@@ -246,30 +290,34 @@ All constant domain metadata—including Axis-B `applies_to_module` signal predi
     },
     "domain_verbs": {
       "type": "array",
-      "items": { "type": "string", "enum": ["search-markers", "parse-rewrite-log"] }
+      "description": "Domain verb IDs: marker-detect (invoked via search-markers), rewrite-log-parse (invoked via parse-rewrite-log).",
+      "items": { "type": "string", "enum": ["marker-detect", "rewrite-log-parse"] }
     }
   }
 }
 ----
 
+The `when.build_system` values are the module `build_systems` facts that `plan-marshall`'s discovery emits (`maven`, `gradle`, `npm`, `documentation` from `pm-documents`, `marshall-plugin` from `pm-plugin-development`), and the domain verb IDs are those `pm-dev-java-cui` declares in `provides_domain_verb()` (`marker-detect` → `search-markers`, `rewrite-log-parse` → `parse-rewrite-log`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. `PM-MCP` names the Python build system `pyproject` throughout, where `plan-marshall`'s discovery records `python`.
+
 == Provenance-Preserving Merge Algorithms (ADR-014)
 _See Requirement link:../Requirements.adoc#PM-EXT-2[PM-EXT-2: Provenance-Preserving Edge Derivation & Path Attribution Merges]_
 
-When multiple domains and resolvers are active in a repository, `PM-MCP` merges their module dependency edges (Axis C) and path-prefix ownership claims (Axis D) using deterministic, order-independent algorithms ported from `_derivation_merge.py` and `_path_attribution_merge.py` (ADR-014).
+When multiple domains and resolvers are active in a repository, `PM-MCP` merges their module dependency edges (Axis C) and path-prefix ownership claims (Axis D) using deterministic, order-independent algorithms ported from `_derivation_merge.py` and `_path_attribution_merge.py` (ADR-014; `extension-api/scripts/`, verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing). Neither merge ever throws or aborts on a producer's output: a producer that fails is reported and its siblings still contribute, and every candidate the merge drops is recorded as a note prefixed `merge: ` on the producer's own report, so a dropped candidate is never silent and is always distinguishable from the producer's own notes.
 
 === Edge Derivation Merge (`DerivationMerge`)
 
 The edge derivation merge combines directed inter-module edges $(u \to v)$ from all explicitly activated Axis-C resolvers while preserving full producer provenance and distinguishing "zero edges found" from "resolver did not run":
 
-1. *Activation by Explicit Resolver ID*: Resolvers are invoked strictly by their configured `resolverId` (never implicitly by file extension).
-2. *Idempotent Union with Provenance*: Multiple resolvers discovering the same directed edge $(u, v)$ are merged into a single `MergedDependencyEdge` record whose `resolverIds` set is the sorted union of all contributing resolver IDs. Self-edges $(u, u)$ and edges referencing undiscovered modules are filtered out and recorded in diagnostics.
-3. *Explicit Non-Run Reporting for LSP & External Resolvers*: An `LspSymbolEdgeResolver` (or `ProjectScriptEdgeResolver`) that could not execute **never returns an empty edge list masquerading as a clean scan**. Instead, it returns a `ResolverExecutionResult` with `status != RAN` and an explicit `NonRunReason` (`ABSENT`, `FAILED_TO_START`, `TIMEOUT`, `UNSUPPORTED`).
+1. *Activation by Explicit Resolver ID*: Resolvers are invoked strictly by their `resolverId` (never implicitly by file extension). A resolver disabled by the machine-local `derivation_resolvers` binding is not invoked; the caller folds in a `ResolverExecutionResult` with status `NOT_DISPATCHED` and reason `DISABLED`, which is reported with zero edges and excluded from the count of resolvers that ran.
+2. *Idempotent Union with Provenance*: Multiple resolvers discovering the same directed edge $(u, v)$ are merged into a single `MergedDependencyEdge` record whose `resolverIds` set is the sorted union of all contributing resolver IDs. A resolver's `contributedEdgeCount` counts its distinct accepted pairs.
+3. *Reported Drops*: Self-edges $(u, u)$ and edges naming a module outside the discovered module set are dropped, each with a `merge: ` note on the producing resolver's report.
+4. *Explicit Non-Run Reporting for LSP & External Resolvers*: An `LspSymbolEdgeResolver` (or `ProjectScriptEdgeResolver`) that could not execute **never returns an empty edge list masquerading as a clean scan**. Instead, it returns a `ResolverExecutionResult` with status `NOT_RUN` and an explicit `NonRunReason` (`ABSENT`, `FAILED_TO_START`, `TIMEOUT`, `UNSUPPORTED`).
 
 [source,java]
 ----
 package de.cuioss.pm.mcp.core.architecture;
 
-import java.util.Comparator;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -279,9 +327,11 @@ import java.util.TreeSet;
 
 public final class DerivationMerge {
 
-    public enum ResolverStatus { RAN, NOT_RUN }
+    private static final String MERGE_NOTE = "merge: ";
 
-    public enum NonRunReason { NONE, ABSENT, FAILED_TO_START, TIMEOUT, UNSUPPORTED }
+    public enum ResolverStatus { RAN, NOT_RUN, NOT_DISPATCHED }
+
+    public enum NonRunReason { NONE, ABSENT, FAILED_TO_START, TIMEOUT, UNSUPPORTED, DISABLED }
 
     public record RawEdge(String fromModule, String toModule, String detail) {}
 
@@ -290,7 +340,8 @@ public final class DerivationMerge {
             ResolverStatus status,
             NonRunReason nonRunReason,
             String diagnosticMessage,
-            List<RawEdge> edges
+            List<RawEdge> edges,
+            List<String> notes          // the resolver's own suppression notes
     ) {}
 
     public record MergedDependencyEdge(
@@ -305,13 +356,14 @@ public final class DerivationMerge {
             ResolverStatus status,
             NonRunReason nonRunReason,
             String diagnosticMessage,
-            int contributedEdgeCount
+            int contributedEdgeCount,   // distinct accepted (from, to) pairs
+            List<String> notes          // resolver notes followed by "merge: " drop notes
     ) {}
 
     public record DerivationMergeResult(
             List<MergedDependencyEdge> edges,
             List<ResolverStatusReport> resolverReports,
-            List<String> droppedUnknownModuleEdges
+            int dispatchedResolverCount // excludes NOT_DISPATCHED reports
     ) {}
 
     public DerivationMergeResult merge(
@@ -328,37 +380,47 @@ public final class DerivationMerge {
 
         Map<EdgeKey, TreeSet<String>> provenance = new TreeMap<>();
         Map<EdgeKey, Map<String, TreeSet<String>>> details = new TreeMap<>();
-        TreeSet<String> dropped = new TreeSet<>();
         Map<String, ResolverStatusReport> reports = new TreeMap<>();
 
         for (ResolverExecutionResult res : results) {
+            List<String> notes = new ArrayList<>(res.notes());
             if (res.status() != ResolverStatus.RAN) {
                 reports.put(res.resolverId(), new ResolverStatusReport(
                         res.resolverId(), res.status(), res.nonRunReason(),
-                        res.diagnosticMessage(), 0));
+                        res.diagnosticMessage(), 0, List.copyOf(notes)));
                 continue;
             }
-            int acceptedCount = 0;
+            Set<EdgeKey> contributed = new TreeSet<>();
             for (RawEdge edge : res.edges()) {
                 if (edge.fromModule().equals(edge.toModule())) {
-                    continue; // ignore self-dependency
+                    notes.add(MERGE_NOTE + "dropped self-edge (" + edge.fromModule() + " -> "
+                            + edge.toModule() + ") - a module does not depend on itself");
+                    continue;
                 }
-                if (!knownModules.contains(edge.fromModule()) || !knownModules.contains(edge.toModule())) {
-                    dropped.add(res.resolverId() + ":" + edge.fromModule() + "->" + edge.toModule());
+                List<String> unknown = new ArrayList<>();
+                if (!knownModules.contains(edge.fromModule())) {
+                    unknown.add(edge.fromModule());
+                }
+                if (!knownModules.contains(edge.toModule())) {
+                    unknown.add(edge.toModule());
+                }
+                if (!unknown.isEmpty()) {
+                    notes.add(MERGE_NOTE + "dropped edge (" + edge.fromModule() + " -> " + edge.toModule()
+                            + ") - unknown module endpoint(s): " + String.join(", ", unknown));
                     continue;
                 }
                 EdgeKey key = new EdgeKey(edge.fromModule(), edge.toModule());
+                contributed.add(key);
                 provenance.computeIfAbsent(key, k -> new TreeSet<>()).add(res.resolverId());
                 if (edge.detail() != null && !edge.detail().isBlank()) {
                     details.computeIfAbsent(key, k -> new TreeMap<>())
                             .computeIfAbsent(res.resolverId(), r -> new TreeSet<>())
                             .add(edge.detail());
                 }
-                acceptedCount++;
             }
             reports.put(res.resolverId(), new ResolverStatusReport(
                     res.resolverId(), ResolverStatus.RAN, NonRunReason.NONE,
-                    res.diagnosticMessage(), acceptedCount));
+                    res.diagnosticMessage(), contributed.size(), List.copyOf(notes)));
         }
 
         List<MergedDependencyEdge> mergedEdges = provenance.entrySet().stream()
@@ -372,30 +434,40 @@ public final class DerivationMerge {
                 })
                 .toList();
 
-        return new DerivationMergeResult(
-                mergedEdges,
-                List.copyOf(reports.values()),
-                List.copyOf(dropped)
-        );
+        int dispatched = (int) reports.values().stream()
+                .filter(r -> r.status() != ResolverStatus.NOT_DISPATCHED)
+                .count();
+
+        return new DerivationMergeResult(mergedEdges, List.copyOf(reports.values()), dispatched);
     }
 }
 ----
 
 === Path Attribution Merge & Collision Rejection (`PathAttributionMerge`)
 
-The path attribution merge combines Axis-D `claim_paths` tuples across active domains and resolves repository-relative file paths to their owning module via longest-prefix matching:
+The path attribution merge combines Axis-D `claim_paths` claims across active attributors and resolves repository-relative file paths to their owning module via longest-prefix matching:
 
-1. *Single Shared Path Normalizer (`normalizeRelPath`)*: Both claim registration and file lookup pass through the exact same normalizer, which converts backslashes to `/`, strips leading `./` and `/`, collapses redundant slashes, rejects `..` traversal segments, and removes trailing slashes.
-2. *Absent-Module Pruning*: Any path claim whose `target_module` does not exist in the discovered module set (or registered synthetic domain modules such as `.plan`) is pruned prior to collision detection.
-3. *Collision Without Winner Invariant*: If two distinct domains claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` is removed from the active lookup table and recorded as a `PathClaimCollision` diagnostic. Identical claims `(same prefix, same target_module)` merge idempotently with combined domain provenance.
-4. *Segment-Boundary Longest-Prefix Lookup*: A normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`. Among all matching non-collided claims, the claim with the greatest character/segment length wins.
+1. *Single Shared Spelling Normalizer (`normalizeSpelling`)*: Claim registration and file lookup pass through the exact same normalizer. Normalization is spelling-only: it trims surrounding whitespace, folds backslashes to `/`, strips leading `./` runs, and strips trailing slashes. It resolves no symlink, touches no filesystem, does not collapse `..` segments, does not strip a leading `/`, and does not collapse `//`; whether a path is admissible is a policy decision of each side, not a spelling decision.
+2. *Claim Validity Filters (Drop and Report, Never Throw)*: A claim survives only if it is well-formed (non-null prefix and module), its normalized prefix bounds a subtree inside the repository, and its `target_module` is a known module (a discovered module or a registered synthetic domain module such as the one owning `.plan`). A blank or root-level prefix (`""`, `.`, `..`, or a bare `/`) and a prefix whose first normalized segment is `..` are dropped; a merely dot-relative prefix (`./doc`) is normalized to `doc`, not dropped. Every dropped claim appends a `merge: ` note naming the claim and the reason to the claiming attributor's report.
+3. *Failing Attributor Isolation*: An attributor whose `claimPaths()` throws `AttributorException` is reported with status `ERROR`, `claimCount` `0`, and a note carrying the failure; it contributes no claims, and its siblings still contribute. A failing attributor never aborts the merge.
+4. *Collision Without Winner Invariant*: If two attributors claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` yields no claim, is recorded as a `PathClaimCollision` diagnostic, and every contending attributor receives a `merge: ` note naming all contending modules. Identical claims `(same prefix, same target_module)` merge idempotently into one claim carrying the sorted union of producer IDs. Differently-scoped prefixes (`.plan` and `.plan/local`) are not a collision.
+5. *Per-Attributor Report*: Every attributor yields exactly one `AttributorReport(attributorId, status, claimCount, notes)`, where `claimCount` counts the surviving (non-collided) claims it produced. Zero attributors is a first-class outcome (empty claims, empty reports, never an exception); the report count distinguishes "no attributor ran" from "attributors ran and none claimed the path".
+6. *Segment-Boundary Longest-Prefix Lookup*: A spelling-normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`, so `.plans/x` never resolves through a `.plan` claim. Among all matching claims, the longest prefix wins; this is resolution order, not a collision tie-break.
 
 [source,java]
 ----
 package de.cuioss.pm.mcp.core.architecture;
 
+import de.cuioss.pm.mcp.core.domain.AttributorException;
+import de.cuioss.pm.mcp.core.domain.PathClaimSet;
+import de.cuioss.pm.mcp.core.domain.PathOwnershipAxis;
+import de.cuioss.pm.mcp.core.domain.PathOwnershipClaim;
+
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -405,22 +477,25 @@ import java.util.TreeSet;
 
 public final class PathAttributionMerge {
 
-    public record RawPathClaim(String domainId, String rawPrefix, String targetModule) {}
+    private static final String MERGE_NOTE = "merge: ";
 
-    public record ActivePathClaim(String normalizedPrefix, String targetModule, List<String> claimingDomains) {}
+    private static final Set<String> ROOT_LEVEL_PREFIXES = Set.of("", ".", "..");
 
-    public record PathClaimCollision(String normalizedPrefix, Map<String, List<String>> domainsByTargetModule) {}
+    public enum AttributorStatus { OK, ERROR }
+
+    public record ActivePathClaim(String normalizedPrefix, String targetModule, List<String> producers) {}
+
+    public record PathClaimCollision(String normalizedPrefix, Map<String, List<String>> producersByTargetModule) {}
+
+    public record AttributorReport(String attributorId, AttributorStatus status, int claimCount, List<String> notes) {}
 
     public record AttributionTable(
             List<ActivePathClaim> claimsByDescendingLength,
             List<PathClaimCollision> collisions,
-            List<String> prunedAbsentModuleClaims
+            List<AttributorReport> attributorReports
     ) {
         public Optional<ActivePathClaim> attributePath(String rawFilePath) {
-            String norm = normalizeRelPath(rawFilePath);
-            if (norm.isEmpty()) {
-                return Optional.empty();
-            }
+            String norm = normalizeSpelling(rawFilePath);
             for (ActivePathClaim claim : claimsByDescendingLength) {
                 String prefix = claim.normalizedPrefix();
                 if (norm.equals(prefix) || norm.startsWith(prefix + "/")) {
@@ -431,70 +506,118 @@ public final class PathAttributionMerge {
         }
     }
 
-    public static String normalizeRelPath(String raw) {
-        if (raw == null) {
-            throw new IllegalArgumentException("Path must not be null");
-        }
-        String p = raw.replace('\\', '/').trim();
+    /** Spelling-only normalizer shared by the claim side and the lookup side. */
+    public static String normalizeSpelling(String raw) {
+        String p = raw.strip().replace('\\', '/');
         while (p.startsWith("./")) {
             p = p.substring(2);
         }
-        while (p.startsWith("/")) {
-            p = p.substring(1);
+        int end = p.length();
+        while (end > 0 && p.charAt(end - 1) == '/') {
+            end--;
         }
-        p = p.replaceAll("/+", "/");
-        if (p.endsWith("/")) {
-            p = p.substring(0, p.length() - 1);
-        }
-        for (String seg : p.split("/")) {
-            if ("..".equals(seg)) {
-                throw new IllegalArgumentException("Relative path traversal '..' is forbidden: " + raw);
-            }
-        }
-        return p;
+        return p.substring(0, end);
     }
 
-    public AttributionTable buildTable(Set<String> validModules, List<RawPathClaim> rawClaims) {
-        Map<String, Map<String, TreeSet<String>>> byPrefixAndTarget = new TreeMap<>();
-        List<String> pruned = new ArrayList<>();
-
-        for (RawPathClaim rc : rawClaims) {
-            String prefix = normalizeRelPath(rc.rawPrefix());
-            if (prefix.isEmpty()) {
-                continue;
-            }
-            if (!validModules.contains(rc.targetModule())) {
-                pruned.add(rc.domainId() + ":" + prefix + "->" + rc.targetModule());
-                continue;
-            }
-            byPrefixAndTarget
-                    .computeIfAbsent(prefix, k -> new TreeMap<>())
-                    .computeIfAbsent(rc.targetModule(), k -> new TreeSet<>())
-                    .add(rc.domainId());
+    /** Identity key of a claimed prefix; empty when the prefix bounds no subtree inside the repository. */
+    static Optional<String> normalizePrefix(String raw) {
+        String p = normalizeSpelling(raw);
+        if (ROOT_LEVEL_PREFIXES.contains(p) || "..".equals(p.split("/", 2)[0])) {
+            return Optional.empty();
         }
+        return Optional.of(p);
+    }
+
+    public AttributionTable buildTable(Set<String> knownModules, List<PathOwnershipAxis> attributors) {
+        record ClaimKey(String prefix, String module) implements Comparable<ClaimKey> {
+            @Override
+            public int compareTo(ClaimKey o) {
+                int c = this.prefix.compareTo(o.prefix);
+                return c != 0 ? c : this.module.compareTo(o.module);
+            }
+        }
+
+        Map<ClaimKey, TreeSet<String>> producers = new TreeMap<>();
+        Map<String, AttributorStatus> statusById = new LinkedHashMap<>();
+        Map<String, List<String>> notesById = new HashMap<>();
+
+        for (PathOwnershipAxis attributor : attributors) {
+            String id = attributor.attributorId();
+            PathClaimSet declared;
+            try {
+                declared = attributor.claimPaths();
+            } catch (AttributorException e) {
+                statusById.put(id, AttributorStatus.ERROR);
+                notesById.put(id, new ArrayList<>(List.of("claimPaths() failed: " + e.getMessage())));
+                continue;
+            }
+            statusById.put(id, AttributorStatus.OK);
+            List<String> notes = new ArrayList<>(declared.notes());
+            for (PathOwnershipClaim claim : declared.claims()) {
+                if (claim == null || claim.pathPrefix() == null || claim.targetModule() == null) {
+                    notes.add(MERGE_NOTE + "dropped malformed claim " + claim
+                            + " - not a (path_prefix, module_name) pair");
+                    continue;
+                }
+                Optional<String> prefix = normalizePrefix(claim.pathPrefix());
+                if (prefix.isEmpty()) {
+                    notes.add(MERGE_NOTE + "dropped claim ('" + claim.pathPrefix() + "' -> " + claim.targetModule()
+                            + ") - blank, root-level, or repo-escaping prefix does not bound a subtree"
+                            + " inside the repository");
+                    continue;
+                }
+                if (!knownModules.contains(claim.targetModule())) {
+                    notes.add(MERGE_NOTE + "dropped claim (" + prefix.get() + " -> " + claim.targetModule()
+                            + ") - unknown module name");
+                    continue;
+                }
+                producers.computeIfAbsent(new ClaimKey(prefix.get(), claim.targetModule()), k -> new TreeSet<>())
+                        .add(id);
+            }
+            notesById.put(id, notes);
+        }
+
+        Map<String, TreeMap<String, TreeSet<String>>> byPrefix = new TreeMap<>();
+        producers.forEach((key, ids) ->
+                byPrefix.computeIfAbsent(key.prefix(), p -> new TreeMap<>()).put(key.module(), ids));
 
         List<ActivePathClaim> active = new ArrayList<>();
         List<PathClaimCollision> collisions = new ArrayList<>();
+        Map<String, Integer> claimCountById = new HashMap<>();
 
-        for (var entry : byPrefixAndTarget.entrySet()) {
-            String prefix = entry.getKey();
-            Map<String, TreeSet<String>> targets = entry.getValue();
+        byPrefix.forEach((prefix, targets) -> {
             if (targets.size() == 1) {
-                var single = targets.entrySet().iterator().next();
+                var single = targets.firstEntry();
                 active.add(new ActivePathClaim(prefix, single.getKey(), List.copyOf(single.getValue())));
+                single.getValue().forEach(id -> claimCountById.merge(id, 1, Integer::sum));
             } else {
-                // Collision: never pick a winner; exclude from active claims and report
-                Map<String, List<String>> reportMap = new TreeMap<>();
-                targets.forEach((mod, doms) -> reportMap.put(mod, List.copyOf(doms)));
-                collisions.add(new PathClaimCollision(prefix, Map.copyOf(reportMap)));
+                // Collision: never pick a winner; no claim, a diagnostic, and a note to every contender
+                TreeMap<String, List<String>> reportMap = new TreeMap<>();
+                targets.forEach((mod, ids) -> reportMap.put(mod, List.copyOf(ids)));
+                collisions.add(new PathClaimCollision(prefix, Collections.unmodifiableSortedMap(reportMap)));
+                String note = MERGE_NOTE + "suppressed claim on prefix '" + prefix
+                        + "' - contested by more than one module (" + String.join(", ", targets.keySet()) + ")";
+                targets.values().stream()
+                        .flatMap(Set::stream)
+                        .distinct()
+                        .sorted()
+                        .forEach(id -> notesById.computeIfAbsent(id, k -> new ArrayList<>()).add(note));
             }
-        }
+        });
 
         active.sort(Comparator.comparingInt((ActivePathClaim c) -> c.normalizedPrefix().length())
                 .reversed()
                 .thenComparing(ActivePathClaim::normalizedPrefix));
 
-        return new AttributionTable(List.copyOf(active), List.copyOf(collisions), List.copyOf(pruned));
+        List<AttributorReport> reports = statusById.entrySet().stream()
+                .map(e -> new AttributorReport(
+                        e.getKey(),
+                        e.getValue(),
+                        claimCountById.getOrDefault(e.getKey(), 0),
+                        List.copyOf(notesById.getOrDefault(e.getKey(), List.of()))))
+                .toList();
+
+        return new AttributionTable(List.copyOf(active), List.copyOf(collisions), reports);
     }
 }
 ----
@@ -535,10 +658,13 @@ Module discovery combines compiled-in descriptor parsers with optional enrolled 
 
 === Build Map & Deterministic `derive-verification` (ADR-004)
 
-The project's `.plan/marshal.json` contains a write-once `build_map` table that maps changed repository file paths to a classification (`role` and `build_class`) and determines the exact set of canonical verification commands required during Phase 5 (`execute`) and Phase 6 (`finalize`).
+The file-to-build contract lives at `build.map` in `.plan/marshal.json` (peer of `build.queue`): a domain-keyed inventory `{"<domain>": [{"glob", "role", "build_class"}]}` with roles `production`, `test`, and `config` and the closed build classes `compile`, `module-tests`, `verify`, and `none`. Phase 4 (`plan`) calls `derive-verification` with each task's changed-artifact list and stamps the returned canonical command set into the task's `verification.commands`; Phase 5 (`execute`) runs the stamped commands. The seeding, editing, and reseeding rules mirror `plan-marshall` (`manage-config/scripts/_cmd_build_map.py`, `manage-config/standards/data-model.md` § build.map, `marshall-steward/references/build-map-setup.md`, `phase-4-plan/SKILL.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
 
-* **Separate Glob Dialect**: Build-map routes use the **`fnmatch` glob dialect**, which is kept strictly separate from the Axis-A `provides_file_globs` domain-detection dialect.
-* **Fail-Closed Read Invariant**: `derive-verification` reads `build_map` fail-closed. If `build_map` is absent, malformed, or maps a route to an unknown module, the engine refuses verification derivation with an explicit diagnostic (`build_map_invalid` or `build_map_unseeded`) rather than returning an empty verification set.
+* **Seeding from Axis B**: The seed collects every build-system descriptor's `classifyGlobs()` routes under its served domain key, keeps a domain's routes only when that domain's Axis-A applicability matches at least one discovered module, prunes routes that match no git-tracked file, and stamps each route with `classifyBuildClass()`. Because applicability needs discovered modules, seeding happens only in `setup.seed-build-map` after `setup.discover-modules`; `config.reconcile` default seeding never creates `build.map`.
+* **Write-Once Seed, Direct Edits**: A seed never overwrites an existing `build.map` block. Corrections are made directly to the seeded entries — through the `customize_routes` link of `setup.seed-build-map`, or by a committed edit of `.plan/marshal.json` — and there is no separate override layer. `customize_routes` therefore edits the seeded block itself and is not an exception to write-once: write-once constrains the seeder, not the user.
+* **Explicit Reseed Only**: The seeded block is re-derived only through `setup.reseed-build-map`, which the setup workflow enters on every reconcile run when a `build.map` block exists. The state compares the persisted block with the live derivation (per domain, added and removed globs). When they agree it passes silently; on drift it offers `reseed_build_map` (replace the whole block with the live derivation, discarding hand edits) and `keep_build_map` (preserve the persisted block). The state always waits for this answer, even when other setup decisions are pre-answered, so a hand edit is never discarded without consent (`plan-marshall`: `build-map drift`, `build-map seed --force`, upgrade nested gate `build-map-reseed`).
+* **Separate Glob Dialect**: Build-map routes use the **`fnmatch` glob dialect**, which is kept strictly separate from the Axis-A `provides_file_globs` domain-detection dialect. A path-bearing route matches the whole repository-relative path (a single `*` spans `/`; routes never use `**`), and a bare-basename route (no `/`, e.g. `pom.xml`) matches that file name at any depth.
+* **Fail-Closed Read Invariant**: `derive-verification` reads `build.map` fail-closed. If `build.map` is absent, malformed, or holds an entry with an unknown `role` or `build_class`, the engine refuses verification derivation with an explicit diagnostic (`build_map_invalid` or `build_map_unseeded`) rather than returning an empty verification set. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `build-map read` also fails closed, but its deriver and build-decision readers degrade an absent `build.map` to an empty map instead of refusing.
 * **Canonical Command Resolution Rules**:
   - Production paths (`role == "production"`, `build_class == "compile"`) resolve `compile` on the owning module.
   - Test paths (`build_class == "module-tests"`) resolve `test-compile` + `module-tests` on the owning module (Maven Failsafe `*IT`/`IT*`/`*ITCase` test paths route to `verify`).
@@ -561,7 +687,7 @@ Instead of invoking Python CLI scripts via Bash to inspect repository structure,
 |Complete discovered facts, active profiles, resolved `skill://` URIs, key packages, and persisted semantic enrichment for `<module_id>`.
 
 |`pm://architecture/files?path={rel_path}`
-|Owning module (`which-module`) resolved via module roots and Axis-D `PathAttributionMerge`, plus matching `build_map` route.
+|Owning module (`which-module`) resolved via module roots and Axis-D `PathAttributionMerge`, plus matching `build.map` route.
 
 |`pm://architecture/graph`
 |Merged Axis-C dependency graph (`MergedDependencyEdge[]` with `resolverIds` provenance) and topological layers.
@@ -578,32 +704,253 @@ Instead of invoking Python CLI scripts via Bash to inspect repository structure,
 
 === Architecture Enrichment Judgment Links & Project Setup State Machine
 
-Only semantic module enrichment (`responsibility`, `purpose`, and `key_packages` with architectural reasoning) requires model judgment. `PM-MCP` replaces the legacy multi-step (Steps 1–16) `marshall-steward` wizard with a dedicated **`project-setup`** state machine (`classpath:/workflows/project-setup.pmwf`):
+Only semantic module enrichment (`responsibility`, `purpose`, and `key_packages` with their reasoning) requires model judgment. `PM-MCP` replaces the legacy `marshall-steward` first-run wizard (Steps 1–16) and its `upgrade` verb with one dedicated **`project-setup`** state machine (`classpath:/workflows/project-setup.pmwf`). On first entry (no `.plan/marshal.json`) the workflow starts at `setup.prepare-workspace`; on every later entry it runs the reconcile path starting at `setup.reconcile-config`.
 
 [source,text]
 ----
-setup.detect-domains (auto: scans provides_file_globs & descriptors)
+First run                                           Reconcile run (configured project)
+
+setup.prepare-workspace                             setup.reconcile-config
+  (auto: .gitignore entries; config.reconcile         (auto: config.reconcile, five-phase
+   creates .plan/marshal.json)                         ConfigReconciler pipeline)
+         │                                                   │
+         ▼                                                   ▼
+setup.effort-ladder                                 setup.discover-modules
+  (auto: validates .plan/local/effort-ladder.json)    (job: rediscovery; descriptor regression
+         │                                             via pm://architecture/drift)
+         ▼                                                   │
+setup.project-settings                                       ▼
+  (link: configure_project — base branch,           setup.reseed-build-map
+   interaction mode, phase settings, review gates)    (auto when in sync; on drift link:
+         │                                             reseed_build_map / keep_build_map)
+         ▼                                                   │
+setup.detect-domains                                         ▼
+  (auto: scans provides_file_globs & descriptors,   setup.commit-changes
+   seeds config_defaults write-once)                  (sub-workflow: git.commit_and_push;
+         │                                             links: land / leave)
+         ▼                                                   │
+setup.discover-modules                                       ▼
+  (job: runs descriptor parsers & enrolled          setup.completed (terminal)
+   discovery templates)
          │
          ▼
-setup.discover-modules (job: runs descriptor parsers & enrolled discovery templates)
+setup.seed-build-map
+  (link: confirm_build_map / customize_routes)
          │
          ▼
-setup.seed-build-map (link: confirm_build_map / customize_routes)
+setup.select-providers
+  (link: configure_providers — VCS=1, CI<=1, Sonar/other)
          │
          ▼
-setup.select-providers (link: configure_providers — VCS=1, CI<=1, Sonar/other)
+setup.configure-finalize
+  (link: configure_finalize — verification steps, finalize steps;
+   every lane:ask element must be answered)
          │
          ▼
-setup.awaiting-enrolment (escalate: operator runs `pm-mcp operator enrol` & `pm-mcp operator credentials`)
+setup.merge-queue
+  (link: enable_merge_queue / skip_merge_queue; skipped when not eligible)
          │
          ▼
-setup.enrich-architecture (parallel dispatch: enrich:<module_id> per unenriched module)
+setup.awaiting-enrolment
+  (escalate: operator runs `pm-mcp operator enrol` & `pm-mcp operator credentials`)
+         │
+         ▼
+setup.enrich-architecture
+  (parallel dispatch: enrich:<module_id> per unenriched module)
          │  [Guard: every_module_enriched]
+         ▼
+setup.commit-changes
+  (sub-workflow: git.commit_and_push; links: land / leave)
+         │
          ▼
 setup.completed (terminal)
 ----
 
-In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `dispatch:enrich-<module_id>` links (or direct `enrich:<module_id>` submission links for single-module repositories) with free parameters `responsibility:text[10..240]`, `purpose:text[20..600]`, and `key_packages:list<text>`. The state cannot transition to `setup.completed` until the **`every_module_enriched`** guard evaluates to `true`.
+In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `dispatch:enrich-<module_id>` links (or direct `enrich:<module_id>` submission links for single-module repositories). The submission parameters mirror `plan-marshall`'s `architecture enrich module` and `architecture enrich package` commands (`manage-architecture/scripts/architecture.py`, purpose values from `manage-architecture/standards/architecture-persistence.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing:
+
+[cols="2,1,5"]
+|===
+|Parameter |Required |Content
+
+|`responsibility`
+|Yes
+|Module description, 1–3 sentences.
+
+|`responsibility_reasoning`
+|No
+|Sources the responsibility was derived from (for example the README overview or a central type).
+
+|`purpose`
+|No
+|Module classification, closed enum `library` \| `extension` \| `deployment` \| `runtime` \| `parent` \| `bom` \| `integration-tests` \| `benchmark`.
+
+|`purpose_reasoning`
+|No
+|Signal the purpose was derived from (for example `packaging=jar`, no runtime dependencies).
+
+|`reasoning`
+|No
+|Shared rationale, applied to `responsibility_reasoning` and `purpose_reasoning` where the specific field is not supplied.
+
+|`key_packages`
+|No
+|List of `{package, description, components}`: `package` is a repository-relative path that must resolve to an existing location (the path is the identity key), `description` is 1–2 sentences and required, and `components` optionally names the package's key types.
+|===
+
+The reasoning fields carry the enrichment rationale required by `PM-EXT-3` and are persisted next to the values they justify. *Deliberate hardening vs. `plan-marshall`*: `purpose` is validated against the closed enum; `plan-marshall` documents the same eight values but its CLI accepts any string. The state cannot transition to `setup.commit-changes` until the **`every_module_enriched`** guard evaluates to `true` (every discovered module has a `responsibility`).
+
+==== Steward Wizard Step Mapping
+
+Every step of the `plan-marshall` first-run wizard and every stage sub-step and gate of its `upgrade` verb maps to exactly one disposition: a `project-setup` state, or *retired* with the reason. No wizard step or upgrade gate survives outside the `project-setup` workflow. The wizard steps mirror `marshall-steward/references/wizard-flow.md` and the upgrade stages and gates mirror `marshall-steward/scripts/upgrade.py` and `references/upgrade-flow.md`, verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+
+[cols="2,3,4"]
+|===
+|`plan-marshall` step or gate |Legacy action |`PM-MCP` disposition
+
+3+|*First-run wizard (`wizard-flow.md`)*
+
+|Step 1: Gitignore Setup
+|Writes the `.plan/` entries with tracked-file exceptions into `.gitignore` (`gitignore_setup.py`).
+|`setup.prepare-workspace`.
+
+|Step 2: Update Project Documentation
+|Appends executor and temp-file conventions to the project's agent documentation (`determine_mode fix-docs`).
+|*Retired*: there is no executor or script-call convention to document; agent-facing guidance ships with the client bundle (`pm-mcp client install`) and the `skill://` resources.
+
+|Step 3: Ensure Executor Permission
+|Consults, then widens the host allow-list for `execute-script.py`.
+|*Retired*: there is no executor. Host permissions for the MCP server are written by `pm-mcp client install`.
+
+|Step 4: Generate Executor
+|Generates `.plan/execute-script.py`.
+|*Retired*: there is no executor; the runtime executes every primitive in-process or as a job.
+
+|Step 5: Initialize Marshal.json
+|Creates `.plan/marshal.json` with defaults (`manage-config init`).
+|`setup.prepare-workspace` (`config.reconcile` creates the file from compiled defaults).
+
+|Step 5b: Effort Ladder & Pin Setup
+|Seeds and validates the machine-local effort ladder and materializes model pins (`effort_pins`).
+|`setup.effort-ladder` validates `.plan/local/effort-ladder.json` and fails closed on a malformed ladder; model pins are applied when `pm-mcp client install` / `update` renders the agent variants.
+
+|Step 6: Project Default Base Branch
+|Seeds `project.default_base_branch` from `origin/HEAD` (fallback `main`).
+|`setup.project-settings`.
+
+|Step 6b: Interaction Mode
+|Persists `interaction_mode` (`basic` \| `advanced` \| `expert`).
+|`setup.project-settings`.
+
+|Step 7: Discover and Activate Providers
+|Detects and activates VCS, CI, and other providers.
+|`setup.select-providers`.
+
+|Step 8: Project Architecture
+|Applies extension `config_defaults`, discovers modules, runs the LLM architectural analysis.
+|`setup.detect-domains` (`config_defaults`), `setup.discover-modules` (discovery), `setup.enrich-architecture` (analysis).
+
+|Step 8b: Seed the Build Map
+|Seeds `build.map` after architecture discovery (write-once).
+|`setup.seed-build-map`.
+
+|Step 9: Configure Skill Domains
+|Activates the applicable skill domains and profiles from the architecture analysis.
+|`setup.detect-domains` (domain activation) together with the per-module Axis-A applicability evaluated in `setup.discover-modules`.
+
+|Step 10: Plan Phase Settings
+|Sets `branch_strategy`, `compatibility`, `commit_and_push`.
+|`setup.project-settings`.
+
+|Step 11: Quality Pipeline Configuration
+|Selects `verification_steps` and finalize steps.
+|`setup.configure-finalize`.
+
+|Step 11b: Resolve Adversarial Infra Elements (`lane: ask`)
+|Mandatory, non-skippable answer for every `lane: ask` finalize element.
+|`setup.configure-finalize`: the state does not advance while a `lane: ask` element is unanswered.
+
+|Step 12: Review Gates
+|Sets the `*_without_asking` transition flags.
+|`setup.project-settings`.
+
+|Step 13: Detect CI Provider and Configure Credentials
+|Detects the CI provider, verifies its CLI, optionally configures credentials.
+|`setup.select-providers` (CI detection) and `setup.awaiting-enrolment` (host tools via `pm-mcp operator enrol`, secrets via `pm-mcp operator credentials`).
+
+|Step 13.5: Merge-Queue Provisioning
+|Probes the platform merge queue and persists the `use_merge_queue` opt-in.
+|`setup.merge-queue`.
+
+|Step 14: Permission Setup
+|Grants standing host permissions for routine commands.
+|*Retired*: replaced by `pm-mcp client install`; the MCP tool surface needs no per-command approvals.
+
+|Step 14b: OpenCode Enforcement Apply
+|Copies the permission block into `opencode.json` and places the guard plugin.
+|*Retired*: script-call enforcement is moot without an executor; the OpenCode host configuration is written by `pm-mcp client install opencode`.
+
+|Step 15: Summary
+|Prints the wizard summary.
+|`setup.completed` (the terminal representation's facts).
+
+|Step 16: Step-Ordering + End-of-Run Landing Cycle
+|Runs `sync-defaults` and `steps-sort`, then lands the steward-created artifacts.
+|Ordering: `config.reconcile` phases 2–3 inside `setup.prepare-workspace` and `setup.reconcile-config`. Landing: `setup.commit-changes`.
+
+3+|*`upgrade` verb (`upgrade.py`, `upgrade-flow.md`)*
+
+|Stage top-level gates (suppressed by `--integrate true`)
+|Prompts before each of the four stages.
+|*Retired*: each reconcile-path state is its own gate; there is no stage grouping to confirm.
+
+|Stage 1 `regenerate-target-tree` (meta project)
+|Regenerates the generated target tree.
+|*Retired*: no generated target tree; client bundles are compiled into the binary.
+
+|Stage 1 `regenerate-executor`
+|Regenerates `.plan/execute-script.py`.
+|*Retired*: there is no executor.
+
+|Stage 1 `cache-freshness-check` (consumer project)
+|Verifies the plugin cache is fresh.
+|*Retired*: there is no plugin cache; bundle and binary parity is reported by `pm-mcp client status` and repaired by `pm-mcp client update`.
+
+|Stage 1 `cache-retention-sweep` and nested gate `cache-retention-prune`
+|Sweeps and, on confirmation, prunes stale plugin-cache versions.
+|*Retired*: there is no plugin cache.
+
+|Stage 2 `reconcile-marshal-json`
+|Reconciles `marshal.json` (`sync-defaults`, `steps-sort`, key normalization).
+|`setup.reconcile-config`.
+
+|Stage 2 `migrate-bot-lists`
+|Maps the retired `enabled_bots` knob onto `required_bots` / `optional_bots`.
+|`setup.reconcile-config` (migration command `M004_split_enabled_bots_to_participation_lists`).
+
+|Stage 2 `validate-bot-lists`
+|Reports bot tokens that match no registered reviewer.
+|`setup.reconcile-config` (`ConfigReconciler` phase 4, registry validation).
+
+|Stage 2 `migrate-architecture-descriptors`
+|Rewrites architecture descriptors (`discover --force --apply migration`) and checks for regression (`descriptor-regression-check`).
+|`setup.discover-modules` on the reconcile path (rediscovery plus the `pm://architecture/drift` regression report).
+
+|Stage 2 nested gate `build-map-reseed`
+|Compares `build.map` with the live derivation and, on confirmation, re-seeds (`build-map seed --force`).
+|`setup.reseed-build-map`.
+
+|Stage 3 `executor-preflight`
+|Checks the regenerated executor.
+|*Retired*: there is no executor.
+
+|Stage 3 `content-drift-report` (meta project)
+|Reports drift between sources and the generated target tree.
+|*Retired*: no generated target tree.
+
+|Stage 4 `run-landing-cycle` and nested gates `land-leave`, `branch-reuse`
+|Lands the reconciled artifacts, asking whether to land or leave them and whether to reuse an existing branch.
+|`setup.commit-changes` (`land` / `leave` links; branch handling by `git.commit_and_push`).
+|===
 
 == Declarative Recipe Engine & Tier-1 Init Routing
 _See Requirement link:../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
@@ -855,7 +1202,7 @@ To support repository-specific automation (`finalize-step-*` skills that ship ex
 == Three-Way Configuration Split (`marshal.json`, Enrolment, Server State)
 _See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
 
-In the legacy architecture, `.plan/marshal.json` and `.plan/run-configuration.json` mixed declarative project settings, frozen extension hook snapshots (`skill_domains`), overridable shell commands (`verify_command`), language-server argument vectors, and learned runtime timeouts inside workspace files that the model's file/shell tools could modify.
+In the legacy architecture, `.plan/marshal.json` and `.plan/local/run-configuration.json` mixed declarative project settings, frozen extension hook snapshots (`skill_domains`), overridable shell commands (`verify_command`), language-server argument vectors, and learned runtime timeouts inside workspace files that the model's file/shell tools could modify.
 
 `PM-MCP` enforces a fundamental security invariant: **Nothing that decides what binary or argument vector executes on the host may be read from a file the model can write.** Configuration and operational state are partitioned across three strictly separated stores.
 
@@ -869,22 +1216,21 @@ In the legacy architecture, `.plan/marshal.json` and `.plan/run-configuration.js
 `.plan/marshal.json`
 |Yes (committed to repository)
 |Daemon via validated setup/config hypermedia links; Domain `config_defaults` seeded write-once.
-|Project metadata (`project.default_base_branch`), workflow posture & `*_without_asking` knobs, loop-back caps, effort role overrides (`plan.*.effort.*`, `orchestrator.effort.*`), active skill domains (`skill_domains`), `build_map` routes, non-secret provider selection and base URLs/origins (VCS=1, CI<=1, Sonar/other), `{tool}.acceptable_warnings`, coverage thresholds, and architecture module enrichment metadata.
+|Project metadata (`project.default_base_branch`), workflow posture & `*_without_asking` knobs, loop-back caps, effort role overrides (`plan.*.effort.*`, `orchestrator.effort.*`), active skill domains (`skill_domains`), `build.map` routes, non-secret provider selection and base URLs/origins (VCS=1, CI<=1, Sonar/other), `{tool}.acceptable_warnings`, and coverage thresholds. Architecture module enrichment is stored separately in `.plan/project-architecture/<module>/enriched.json`, as in `plan-marshall`.
 
 |*Tier 2: Operator Enrolment & Machine Config* +
 `~/.plan-marshall/mcp/enrolments.json` +
 `~/.plan-marshall/mcp/machine-config.json`
 |No (machine-local, outside workspace)
 |Human operator exclusively via `pm-mcp operator enrol` / `pm-mcp operator config` CLI (`0600` permissions; unreachable from any MCP tool or plan link).
-|Enrolled project root paths, pinned build wrappers (`./mvnw`, `./gradlew`, `./pw`) and SHA-256 digests, enrolled host tools (`npm`, `git`, `gh`, `glab`, `python3`, language server binaries) with absolute paths and SHA-256 digests, canonical & discovery argument template allowlists, `project_script` digests and schemas, CLI provider `verify_command` overrides, and the machine-global build slot cap.
+|Enrolled project root paths, pinned build wrappers (`./mvnw`, `./gradlew`, `./pw`) and SHA-256 digests, enrolled host tools (`npm`, `git`, `gh`, `glab`, `python3`, language server binaries) with absolute paths and SHA-256 digests, canonical & discovery argument template allowlists, `project_script` digests and schemas, CLI provider `verify_command` overrides, machine-local Axis-C resolver enablement (`derivation_resolvers`), and the machine-global build slot cap.
 
 |*Tier 3: Server-Managed State* +
 `~/.plan-marshall/mcp/state/` +
-`.plan/local/mcp-state/` +
 `.plan/local/plans/<id>/mcp/`
 |No (git-ignored daemon runtime state)
 |Daemon exclusively (internal state stores and journals).
-|Adaptive build timeouts (`~/.plan-marshall/mcp/state/build-timings.json` and `.plan/local/mcp-state/timeouts.json`), historical CI durations, commit-keyed module discovery cache (`discovery-cache.json`), verification timestamps, active/completed job records and logs, crash-replay journals, and interaction audit logs.
+|Adaptive build timeouts (`~/.plan-marshall/mcp/state/build-timings.json`, keyed by project and canonical command), historical CI durations, commit-keyed module discovery cache (`discovery-cache.json`), verification timestamps, active/completed job records and logs, crash-replay journals, and interaction audit logs.
 |===
 
 === Tier 1: Git-Tracked Project Configuration (`.plan/marshal.json`)
@@ -918,9 +1264,10 @@ To prevent argument injection without requiring the operator to re-enrol the pro
 
 The daemon maintains learned operational metrics and job journals in Tier 3 server state:
 
-1. *Adaptive Timeout Learning (`build-timings.json` / `timeouts.json`)*: Keyed by the canonical normalized argument vector `(build_system, canonical_verb, module_id, sorted_profiles)`. Given observed run durations, the server maintains a max-biased baseline $T_{\text{learned}} = \lfloor 0.8 \times \max(T_{\text{learned}}, d) + 0.2 \times \min(T_{\text{learned}}, d) \rfloor$ and sets the execution timeout to $T_{\text{limit}} = \max\left(T_{\text{engine\_floor}},\; \lfloor 1.25 \times T_{\text{learned}} \rfloor\right)$. Per-engine minimum floors (Maven/Gradle/npm: `300s`, pyproject: `330s`) are never violated, even if an explicit bound is configured, every completed run (any exit code) feeds $T_{\text{learned}}$, a `timed_out` run feeds $\min(2 \times \text{timeout}, 1800\,s)$, and durations from `killed` or `cancelled` runs are **never** incorporated.
-2. *Gate Honesty & Examined Population Tracking*: Before a green build or quality gate clears open findings in `findings.jsonl`, the server's compiled log and report parsers verify that for Maven and Gradle the build log explicitly contains the engine's terminal success marker (e.g., `BUILD SUCCESS` / `BUILD SUCCESSFUL`) in addition to exit code `0`, and that the tool examined a non-empty file/test population capable of reaching the finding's file and category (e.g., `mypy` gates run with `--no-incremental` / cache disabled so untouched files with broken cross-module types are not skipped).
-3. *Crash Replay & Atomic Fate Recording*: Every spawned job is recorded in the daemon's write-ahead job journal prior to `ProcessBuilder.start()`. Request status (`running`) is never treated as terminal fate; terminal fate (`succeeded`, `failed`, `timed_out`, `cancelled`, `killed`, `indeterminate`) is written atomically at process termination. If the daemon restarts while a job record is still `running`, journal replay marks the orphaned job `killed` ("do not retry blindly") and attaches no synthetic error findings.
+1. *Adaptive Timeout Learning (`build-timings.json`)*: One machine-level store, `~/.plan-marshall/mcp/state/build-timings.json`, keyed by project (the enrolled project root) and canonical command (the normalized canonical argument vector `(build_system, canonical_verb, module_id, sorted_profiles)`); no project-local timeout store exists. Given observed run durations, the server maintains a max-biased baseline $T_{\text{learned}} = \lfloor 0.8 \times \max(T_{\text{learned}}, d) + 0.2 \times \min(T_{\text{learned}}, d) \rfloor$ and sets the execution timeout to $T_{\text{limit}} = \max\left(T_{\text{engine\_floor}},\; \lfloor 1.25 \times T_{\text{learned}} \rfloor\right)$. Per-engine minimum floors (Maven/Gradle/npm: `300s`, pyproject: `330s`) are never violated, even if an explicit bound is configured, every completed run (any exit code) feeds $T_{\text{learned}}$, a `timed_out` run feeds $\min(2 \times \text{timeout}, 1800\,s)$, and durations from `killed` or `cancelled` runs are **never** incorporated.
+2. *One-Time Import of Learned Timeouts*: At machine cutover (`PM-MIG-2`), and when a project is first enrolled after cutover, the runtime imports that project's learned values once from `.plan/local/run-configuration.json` (`commands["<tool>:<key>"].timeout_seconds`, in seconds, e.g. `commands["maven:verify"]`) as the initial $T_{\text{learned}}$ of the canonical command the key maps to. Existing `build-timings.json` entries are never overwritten, keys that map to no canonical command are skipped and listed in the cutover receipt, and the legacy file is left unchanged. As a store conversion under `PM-MIG-3`, the import has a reverse converter that writes the learned values back to their originating keys on rollback (`PM-MIG-5`). The legacy source mirrors `plan-marshall` (`manage-run-config/scripts/run_config.py`, `script-shared/scripts/build/_build_execute.py`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+3. *Gate Honesty & Examined Population Tracking*: Before a green build or quality gate clears open findings in `findings.jsonl`, the server's compiled log and report parsers verify that for Maven and Gradle the build log explicitly contains the engine's terminal success marker (e.g., `BUILD SUCCESS` / `BUILD SUCCESSFUL`) in addition to exit code `0`, and that the tool examined a non-empty file/test population capable of reaching the finding's file and category (e.g., `mypy` gates run with `--no-incremental` / cache disabled so untouched files with broken cross-module types are not skipped).
+4. *Crash Replay & Atomic Fate Recording*: Every spawned job is recorded in the daemon's write-ahead job journal prior to `ProcessBuilder.start()`. Request status (`running`) is never treated as terminal fate; terminal fate (`succeeded`, `failed`, `timed_out`, `cancelled`, `killed`, `indeterminate`) is written atomically at process termination. If the daemon restarts while a job record is still `running`, journal replay marks the orphaned job `killed` ("do not retry blindly") and attaches no synthetic error findings.
 
 == Systematized `marshal.json` Upgrades: Command-Pattern Migration Chain & Zero-CoT Reconciliation (`PM-EXT-7`)
 _See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
