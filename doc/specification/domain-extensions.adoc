@@ -623,43 +623,27 @@ Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local 
   "type": "object",
   "required": [
     "format_version",
-    "recipe_id",
+    "recipe_key",
     "display_name",
-    "required_domains",
-    "matching",
+    "description",
+    "scope",
+    "default_change_type",
     "target_harvester",
     "deliverable_template"
   ],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "recipe_id": { "type": "string", "pattern": "^recipe-[a-z0-9-]+$" },
+    "recipe_key": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Registry key as in plan-marshall (e.g. code-review)." },
     "display_name": { "type": "string", "minLength": 3, "maxLength": 100 },
-    "required_domains": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Domains that must be active in .plan/marshal.json for this recipe to be eligible."
-    },
+    "description": { "type": "string", "description": "Scored by keyword overlap together with display_name." },
+    "domain": { "type": "string", "description": "Optional domain; matches the plan's domain for the domain score." },
+    "scope": { "type": "string", "enum": ["module", "codebase_wide"] },
+    "default_change_type": { "type": "string" },
+    "lane": { "type": "object", "description": "Optional execution-profile seed (posture and per-step overrides), lowest precedence." },
     "skill_uri": {
       "type": "string",
       "pattern": "^skill://pm/recipe/[a-z0-9-]+$"
-    },
-    "matching": {
-      "type": "object",
-      "required": ["keywords", "aspect_tags", "min_score"],
-      "additionalProperties": false,
-      "properties": {
-        "keywords": {
-          "type": "object",
-          "additionalProperties": { "type": "number", "minimum": 0.1, "maximum": 10.0 },
-          "description": "Weighted keyword/phrase triggers for Tier-1 init scoring."
-        },
-        "aspect_tags": {
-          "type": "array",
-          "items": { "type": "string", "enum": ["audit", "review", "refactor", "hygiene", "documentation", "logging", "diagrams", "lessons"] }
-        },
-        "min_score": { "type": "number", "minimum": 1.0 }
-      }
     },
     "parameters": {
       "type": "array",
@@ -722,10 +706,13 @@ Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local 
 
 === Tier-1 Init Routing & Deterministic Deliverable Generation
 
-1. *Domain Exclusion Rule*: Any recipe whose `required_domains` set is not a subset of the project's active domains in `.plan/marshal.json` is excluded prior to scoring.
-2. *Explicit Choice Beats Heuristic Match*: If the operator starts a plan with an explicit `--recipe <recipe_id>` parameter, Tier-1 keyword scoring is bypassed and the plan routes directly to `init.recipe-selected`.
-3. *Tier-1 Deterministic Keyword & Aspect Scoring*: During `phase-1-init` (ahead of light/deep planning-lane routing), the server tokenizes `request.md`, classifies request aspects, and scores all domain-eligible recipes. If one or more recipes meet or exceed `matching.min_score`, the engine transitions to `init.recipe-candidate` offering `use_recipe:<recipe_id>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for secondary matches) and `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
-4. *Server-Side Target Harvesting & Deliverable Generation*: When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`) and verifying coverage at completion.
+The scoring and routing rules mirror `plan-marshall` (`script-shared/scripts/recipe_scoring.py`, `phase-1-init/SKILL.md`, verified at commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing).
+
+1. *Explicit Choice Beats Heuristic Match*: A plan started from a recipe (`pm_start` with `recipe_id`, i.e. source `recipe`) bypasses scoring and routes directly to `init.recipe-selected`.
+2. *Registry-Wide Deterministic Scoring*: For every other source, during `phase-1-init` (ahead of light/deep planning-lane routing), the server scores **every** registered recipe (no domain pre-filter): $\text{confidence} = 0.6 \cdot \text{keyword} + 0.25 \cdot \text{domain} + 0.15 \cdot \text{scope}$, rounded to three decimals, where `keyword` is the share of the recipe's `display_name` + `description` tokens (stop-words removed) found in the request, `domain` is `1` when the recipe's `domain` equals the plan's domain, and `scope` is `1` when the plan's scope estimate matches the recipe's `scope` (`module` for surgical/narrow plans, `codebase_wide` for broad ones). For the surgical-fix recipe only, a pre-diagnosed-change shape score of the request may raise the confidence (`max`). Recipes below `0.35` are dropped.
+3. *Auto-Route or Ask*: When `plan.phase-1-init.auto_route_recipe` is `true` (default) and the top confidence is at least `plan.phase-1-init.auto_route_recipe_threshold` (default `0.6`), the engine selects that recipe without asking. Otherwise, if candidates remain, it enters `init.recipe-candidate` (an `*.awaiting_user` state) offering `use_recipe:<recipe_key>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for the others) and `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
+4. [[recipe-plan-id]]*Recipe Plan ID*: A recipe plan's `plan_id` is `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC), so every run gets a fresh branch name. *Deliberate change vs. `plan-marshall`*: `plan-marshall` uses hour precision (`{yyyy-mm-dd-hh}`), which collides when the same recipe runs twice within an hour.
+5. *Server-Side Target Harvesting & Deliverable Generation*: When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`) and verifying coverage at completion.
 
 === Pre-Submission Self-Review Surfacer Contract (`ext-self-review-*`)
 
