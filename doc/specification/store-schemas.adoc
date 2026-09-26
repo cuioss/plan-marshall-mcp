@@ -870,12 +870,12 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 |===
 |Disposition |Target Surface in `PM-MCP` |Verification Strategy
 
-|*Ported (1:1 Data Layer)*
+|*Ported (Data Layer, Redesigned Store Format)*
 |Canonical store read/write invariants of `manage-status.py`, `manage-tasks.py`, `manage-findings.py`, `manage-references.py`, `manage-change-ledger.py`, `manage-execution-manifest.py`, and `manage-lessons.py`
-|100% differential equivalence testing (`PM-TEST-2`) over shared JSON/JSONL fixture corpuses before cutover. Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion).
+|100% differential equivalence testing (`PM-TEST-2`) over shared fixture corpuses before cutover, comparing the Java result with the Python result mapped through the store's legacy -> target converter (<<Legacy Store Formats & One-Time Conversion>>). Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion).
 
 |*Redesigned (Hypermedia & Native Services)*
-|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by OS `FileChannel.lock()` + `ProcessHandle.of(pid)`), `manage_personas.py`, `manage-providers/credentials.py`, `workflow-integration-{git,github,gitlab,sonar}`
+|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `workflow-integration-{git,github,gitlab,sonar}`
 |Workflow DSL AST verification (`PM-TEST-3`), `ConfigMigrationChainTest` version/idempotency verification, scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
 
 |*Retired (Obsolete Infrastructure)*
@@ -883,10 +883,45 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 |Retired at stage exit gates (`PM-MIG-4`) once zero active plans reference the legacy surface.
 |===
 
+=== Legacy Store Formats & One-Time Conversion (`PM-MIG-3`, `PM-MIG-5`)
+
+The schemas in this document are the target formats. Legacy `plan-marshall` stores differ; each store switches exactly once, in the stage that ports it, through a legacy -> target converter, and every legacy script touching that store is ported or retired in the same stage. Each converter has a reverse converter used by `pm-mcp operator rollback`.
+
+IMPORTANT: The legacy formats below were verified against `plan-marshall` commit `1d4a1da37`. `plan-marshall` keeps evolving: before implementing a converter, re-verify the legacy format of that store against the latest `plan-marshall` version and update this table.
+
+[cols="1,3,2"]
+|===
+|Store |Legacy format (verified snapshot) |Conversion notes
+
+|Plan status
+|`.plan/local/plans/<id>/status.json` with `title`, `short_description`, `current_phase`, `phases[{name,status}]`, `created`, `updated`, `metadata` (`manage-status/scripts/_cmd_lifecycle.py`); merge authorizations in `metadata.merge_authorizations`, keyed by kind, `{head, gap_class, granted_over, reason, granted_at}`, re-grant overwrites (`_cmd_merge_authorization.py`)
+|Split into the target plan record and `mcp/status.json`; map phase names and statuses; map keyed merge authorizations to the target array.
+
+|Tasks
+|`tasks/TASK-NNN.json` with `number`, `deliverable` (int), `domain`, `origin`, `description`, `depends_on`, `verification{commands,criteria,manual}`; task status `pending\|in_progress\|done\|blocked\|infeasible\|failed`, step status `done\|skipped\|failed` (`manage-tasks/scripts/_tasks_core.py`)
+|Map field names and status enums; keep task numbers.
+
+|Findings
+|`artifacts/findings/{type}.jsonl` (one file per type), `artifacts/findings/qgate-{phase}.jsonl`, `artifacts/findings/assessments.jsonl`; 6-character `hash_id`; severity `error\|warning\|info`; resolution `pending\|fixed\|suppressed\|accepted\|taken_into_account\|rejected` (`manage-findings/scripts/_findings_core.py`)
+|Merge per-type files into the target store; keep `hash_id` as a legacy alias; map resolutions to target dispositions.
+
+|References
+|`references.json` with `affected_files`, `read_intent_files`, `realized_footprint`; the structured-derived set is recomputed, never stored (`manage-references/scripts/_references_crud.py`)
+|Map key names; do not persist the derived set unless the target schema requires it.
+
+|Change ledger
+|Repository-level `.plan/work/change-ledger.jsonl` (not plan-scoped, `NO_PLAN` rows) with `timestamp_iso`, `duration_seconds`, status `success\|error\|timeout\|killed\|unknown` (`manage-change-ledger/scripts/_ledger_core.py`)
+|Split by plan into per-plan ledgers; keep plan-less rows in a repository-level ledger; map status to the job outcome enum.
+
+|Plan ID grammar
+|`^[a-z][a-z0-9-]*$` (`tools-input-validation/scripts/input_validation.py`)
+|Legacy IDs are a subset of the target grammar; the reverse converter refuses plans whose IDs fall outside the legacy grammar.
+|===
+
 === Differential Equivalence Harness & Executor Shadow Routing (`PM-TEST-2`, `PM-MIG-1`)
 
-* *Shared Corpus Differential Runner (`PM-TEST-2`)*: In JUnit 5 (`pm-mcp-core`), parameterized differential tests execute each `Ported` Java store primitive and its reference Python counterpart against identical initial `.plan/` directory trees. The harness canonicalizes JSON/JSONL outputs (normalizing generated UUIDs and ISO-8601 timestamps) and asserts zero structural diff across both returned payloads and on-disk files for all canonical store read/write invariants.
-* *Executor Shadow Routing (`PM-MIG-1`)*: During Migration Stages 1 and 2, `execute-script.py` supports shadow-routing `Ported` read/write operations through the local `PM-MCP` daemon while comparing results against the Python baseline, logging any divergence to `audit.jsonl` and triggering automatic fallback (`PM-MIG-5`) if a discrepancy occurs.
+* *Shared Corpus Differential Runner (`PM-TEST-2`)*: In JUnit 5 (`pm-mcp-core`), parameterized differential tests execute each `Ported` Java store primitive and its reference Python counterpart against identical initial `.plan/` directory trees. The harness maps the Python result through the store's legacy -> target converter, canonicalizes JSON/JSONL outputs (normalizing generated UUIDs and ISO-8601 timestamps), and asserts zero structural diff across both returned payloads and resulting stores for all canonical store read/write invariants.
+* *Executor Shadow Routing (`PM-MIG-1`)*: During Migration Stages 1 and 2, the runtime's executor adapter supports shadow-routing `Ported` read/write operations to the Java primitive while comparing results against the Python baseline (mapped through the converter), logging any divergence to `audit.jsonl` and triggering automatic fallback (`PM-MIG-5`) if a discrepancy occurs.
 
 
 
