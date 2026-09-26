@@ -77,6 +77,8 @@ where:
 |Solo envelope only (`max_tasks = 1`); triggers a plan-phase warning advising deliverable decomposition if $N_{\text{files}}(t) > 6$.
 |===
 
+NOTE: The coefficients ($B_{\text{profile}}$, `900` / `600` / `750`, `10,000`) are uncalibrated packing heuristics carried from `plan-marshall`, not measured costs. They price a byte when it enters a context and ignore how long it stays resident. Before Migration Stage 4 they must be re-derived from a measured `metrics.json` population (link:store-schemas.adoc#metrics-store[Store Schemas Specification, Metrics Store]); until then every figure derived from them (`predicted_cost_tokens`, the Phase 4 budget projection) is labelled `uncalibrated`. Isolating work in a separate envelope is justified only when re-creating the envelope's starting context (created bytes bill 1.25) costs less than the residency it removes (read bytes bill 0.1 per remaining turn); this condition is evaluated per split, never assumed. The server supplies both inputs: `record-metrics` publishes per envelope the `predicted_cost_tokens` beside the measured token components, and per envelope split (`yield:envelope-M`) the re-creation and residency terms, or `not_derivable` when a component is unmeasured.
+
 === Deterministic Envelope Packing Algorithm (`EnvelopePacker`)
 
 Given the ordered sequence of tasks $T = [t_1, t_2, \dots, t_n]$ produced during Phase 4 (`plan`), `EnvelopePacker` runs automatically in-process upon `plan.describe-tasks` submission to partition $T$ into an ordered list of `TaskEnvelope` records while preserving topological dependency order:
@@ -273,7 +275,7 @@ Every time the workflow engine renders a representation offering a `dispatch:<en
 
 |`RETURNED`
 |Parent session invokes `pm_do` on `returned:<dispatch_id>` after the sub-agent finishes.
-|Records `returned_at`, `reported_status`, `display_detail`, and `token_usage` (`measured` integer or `"unmeasured"`). Cross-checks entity state before advancing the parent workflow.
+|Records `returned_at`, `reported_status`, `display_detail`, `token_usage` and each reported token component and `tool_uses` (`measured` integer or `"unmeasured"`), and the server-measured `duration_ms`. Cross-checks entity state before advancing the parent workflow.
 
 |`SUPERSEDED`
 |Parent session invokes `redispatch:<entity>` on an `UNCLAIMED` or aborted dispatch, or a loop-back iteration creates a new envelope.
@@ -288,8 +290,10 @@ In the parent representation, every active `dispatch:<entity>` link is accompani
 ----
 links[2]{rel,link,form,free}:
   dispatch,dispatch:envelope-1,dispatch,-
-  submit,returned:dsp-auth-refactor-0001-4b9c10,submit,"status:enum[success|error|loop_back|blocked|harness_cancellation],display_detail:text[1..80],token_usage:int[1..10000000]?"
+  submit,returned:dsp-auth-refactor-0001-4b9c10,submit,"status:enum[success|error|loop_back|blocked|harness_cancellation],display_detail:text[1..80],token_usage:int[1..10000000]?,input_tokens:int[0..10000000]?,output_tokens:int[0..10000000]?,cache_read_input_tokens:int[0..10000000]?,cache_creation_input_tokens:int[0..10000000]?,tool_uses:int[0..100000]?"
 ----
+
+The link above is rendered for a client profile declaring `dispatch.token_usage_components: all` (link:client-profiles.adoc[Client Profiles Specification]). The server renders only the usage parameters the active profile can report: `total_only` omits the four component parameters, `none` omits every token parameter, and `tool_uses` is rendered only where the profile declares `dispatch.reports_tool_uses: true`. A parameter that is not rendered is recorded as `unmeasured` with the reason `not_reported_by_client`, never as `0`. `duration_ms` is never a link parameter: the server measures it (Post-Return Integrity Invariants, item 6).
 
 When the sub-agent finishes (or fails/cancels in the host harness), the parent session invokes `pm_do` on `returned:<dispatch_id>` with the following JSON Schema for `args`:
 
@@ -326,20 +330,53 @@ When the sub-agent finishes (or fails/cancels in the host harness), the parent s
       "minimum": 1,
       "maximum": 10000000,
       "description": "Total tokens consumed by the sub-agent if reported by the host; omit or pass null when unmeasured."
+    },
+    "input_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Uncached input tokens reported by the host; a measured 0 is legal; omit or pass null when unmeasured."
+    },
+    "output_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Output tokens reported by the host; omit or pass null when unmeasured."
+    },
+    "cache_read_input_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Input tokens read from the prompt cache; omit or pass null when unmeasured."
+    },
+    "cache_creation_input_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Input tokens written to the prompt cache; omit or pass null when unmeasured."
+    },
+    "tool_uses": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 100000,
+      "description": "Number of tool calls the sub-agent made, if reported by the host; omit or pass null when unmeasured."
     }
   }
 }
 ----
 
+The four component names mirror the per-dispatch usage columns of `plan-marshall` (`manage-metrics`: `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, each optional and never defaulted to `0`); re-verify them against the latest `plan-marshall` version before implementing. The total keeps its lower bound of `1`, because a sub-agent that ran always consumed tokens; a measured `0` is legal only for a component (for example `cache_creation_input_tokens: 0`).
+
 === Post-Return Integrity Invariants
 
-The workflow engine enforces five non-negotiable post-return invariants when processing `returned:<dispatch_id>`:
+The workflow engine enforces six non-negotiable post-return invariants when processing `returned:<dispatch_id>`:
 
 1. *Unmeasured Token Usage Never Fabricates Zero*: If `token_usage` is omitted or `null` in `returned:<dispatch_id>`, the server persists `"token_usage": "unmeasured"` in the dispatch ledger and phase metrics store (`metrics.json`). It **must never** record `0`, because a zero token count corrupts cost aggregations and masks missing host telemetry. A step that runs inline by design (for example when the neutral profile converts a dispatch into an inline step, `PM-CLIENT-4`) records `"token_usage": "inline"`; `unmeasured` and `inline` are declared before any scoring and never collapse into each other or into `0`. Every token total aggregated from the dispatch ledger is published as a population-stamped aggregate (`rows`, `rows_unmeasured`, `population_count`, with the population `dispatched`; link:store-schemas.adoc#metrics-store[Store Schemas Specification, Metrics Store]); when `rows_unmeasured > 0` the total is marked `total_is_floor: true` and never wins a reconciliation against another source.
 2. *Submit-Before-Return Verification (No Synthesized Submissions)*: When `returned:<dispatch_id>` is called with `status: "success"`, the server inspects the persisted state of the target `entity`. If the entity reached its required terminal submission state (e.g., `envelope.completed`, or the expected outline/triage artifact was submitted via `pm_do`), the return succeeds and advances the parent workflow. If the entity has **not** recorded its required `submit` transition (for example, the sub-agent edited files or answered in prose and returned `"success"` without calling `pm_do(link="submit:...")`), the server **never synthesizes a missing submission**. Instead, it marks the dispatch record `INCOMPLETE_SUBMISSION`, logs an attribution defect in the audit log, and transitions the parent state to `<phase>.dispatch-incomplete` offering `resume:<entity>` (to complete or re-dispatch after inspecting disk state) and `escalate`.
 3. *No Blind Retry on Unconfirmed Dispatches*: When a dispatch fails to return (`harness_cancellation`, empty return, or host crash) or remains `UNCLAIMED` / `CLAIMED` without completion, the server never retries the sub-agent blindly. It inspects the worktree (`worktree_sha`) and entity store on disk first, exposes the observed partial progress (e.g., tasks $t_1$ completed, $t_2$ pending in `envelope-1`) in `facts`, and issues a fresh `dispatch_id` only for the remaining uncompleted tasks in the envelope.
 4. *Citations-Only Return for Read-Only Workers*: Read-only worker dispatches (such as deep-lane codebase exploration or verification sweeps) persist their detailed findings and component assessments via entity-scoped `submit` links during execution and return a short `display_detail`, keeping raw findings out of the parent session's context window. The server computes the aggregate counts from the records the entity submitted and renders them as `facts` of the parent representation; `display_detail` is display text only and is never read as evidence of a count.
 5. *Dispatch Reconciliation*: The `[DISPATCH]` audit record written on render and the `returned:<dispatch_id>` entry of the dispatch ledger are two records of one dispatch. Every `[DISPATCH]` record ends in exactly one terminal disposition: `RETURNED`, `SUPERSEDED`, or `UNCONFIRMED` (still `UNCLAIMED` or `CLAIMED` when its phase closes). `record-metrics` publishes, per divergence class (`row_absent_from_return_ledger`, `row_absent_from_dispatch_audit`, `boundary_never_closed`, `phase_re_entered`), the row count and the token mass the divergence hides.
+6. *Per-Column Usage Persistence & Server-Measured Duration*: The total, each token component, and `tool_uses` are persisted independently, each as a measured integer or `"unmeasured"`; a column is never derived from another (the total is never split, the components are never summed into a missing total) and never defaulted to `0`. `duration_ms` is measured by the server from the dispatch's `claimed_at` to its `returned_at` (from its render to `returned_at` for a dispatch that was never claimed, recorded with `duration_basis: rendered` instead of `claimed`); a dispatch that never returns keeps `duration_ms: "unmeasured"`. When every usage column of every dispatch in a phase is `"unmeasured"`, `record-metrics` reports `instrument_dark: true` for that phase instead of a total.
 
 [#spend-accounting-budget-anchors]
 == Spend Accounting & Budget Anchors
@@ -364,6 +401,33 @@ Measured spend is compared against a fixed anchor table keyed by the plan's `sco
 All other pairs (every pair with `scope_estimate` `none`, and every pair with `ChangeType` `enhancement`, `verification`, or `analysis`) are `fallback` pairs. A fallback pair has no absolute anchor and is checked against normalized ceilings instead: tokens per changed file above 50,000, worked seconds per task above 900 (unanchored), a single phase's share of the plan's tokens above 0.50, or tokens per deliverable above 500,000. The canonical reference plan for the table is a surgical bug fix of 958,064 tokens over 2 files.
 
 The values mirror `plan-marshall`'s budget anchors; re-verify them against the latest `plan-marshall` version before implementing.
+
+The server applies the anchors at three points, and nowhere else:
+
+* *Planning-Time Projection (advisory)*: At `plan.describe-tasks` the Phase 4 budget projection yields the non-blocking `split_advice` fact (link:phase-workflows.adoc[Phase Workflows Specification], Deterministic Task Derivation). It never enters an `*.awaiting_user` or blocked state.
+* *Pre-Merge Finalize Spend Check*: Before the pre-merge barrier, `default:branch-cleanup` compares the plan's cumulative finalize spend (the tokens of every Phase 6 dispatch and of the measured main session in Phase 6, one population per figure) with the error column of the plan's pair; for a fallback pair it compares the finalize phase's share of the plan's tokens with the `0.50` ceiling. Above it, the plan enters `finalize.spend-escalate`, where the operator acknowledges the overrun before the merge proceeds; an acknowledgement covers the spend recorded up to its instant, so further finalize spend is checked again. The ratio (`finalize_spend_ratio`: value, compared column, unit, population) is a landing fact in every case. An unmeasured finalize spend yields `finalize_spend_ratio: not_derivable` and no escalation; it is never read as within budget.
+* *Post-Run Comparison*: `record-metrics` and the post-run quality report render measured spend against the pair's anchor.
+
+*Spend Classes*: Every dispatch is classified by what it produced, from the entity and findings records the server holds, never from its termination `status`:
+
+[cols="1,4"]
+|===
+|Class |Condition
+
+|`submitted`
+|The dispatched entity recorded its required `submit` transition.
+
+|`findings_only`
+|No required `submit` was recorded, but the dispatch filed at least one finding (`FindingRecord.dispatch_id`).
+
+|`no_product`
+|The dispatch returned or was superseded without a submit and without a filed finding.
+
+|`unmeasured`
+|The dispatch's token usage is unmeasured, whatever it produced (its product is still shown in the cross-tabulation); it is counted by rows, never summed as `0`.
+|===
+
+Every dispatch belongs to exactly one class; the class token sums add up to the measured total with an asserted residual of `0`, and `unmeasured` rows are reported as a row count beside the sums. The termination `status` (`success`, `error`, `loop_back`, `blocked`, `harness_cancellation`) is a separate dimension, rendered as a cross-tabulation with the classes, so an `error` return that filed real findings is `findings_only`, never waste.
 
 == Sub-Agent Question Batching & Non-Blocking Escalation
 _See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_

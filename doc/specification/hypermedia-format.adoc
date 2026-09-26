@@ -26,6 +26,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-SKILL-4[PM-SKILL-4: Dynamic State Context Injection via Representations]_
 * _See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_start, pm_state, pm_do)]_
 * _See Requirement link:../Requirements.adoc#PM-TOOL-4[PM-TOOL-4: Domain Failures as Valid Workflow States]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-2[PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-3[PM-IMPL-3: Deterministic Native TOON Encoder]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
@@ -197,7 +198,7 @@ phase: execute
 summary: envelope-2 ready for dispatch (3 tasks)
 links[2]{rel,link,form,free}:
   dispatch,"dispatch:envelope-2",dispatch,""
-  submit,"returned:dsp-plan-2026-042-0001-a9f3c2",submit,"status:enum[success|error|loop_back|blocked|harness_cancellation],display_detail:text[1..80],token_usage:int[1..10000000]?"
+  submit,"returned:dsp-plan-2026-042-0001-a9f3c2",submit,"status:enum[success|error|loop_back|blocked|harness_cancellation],display_detail:text[1..80],token_usage:int[1..10000000]?,input_tokens:int[0..10000000]?,output_tokens:int[0..10000000]?,cache_read_input_tokens:int[0..10000000]?,cache_creation_input_tokens:int[0..10000000]?,tool_uses:int[0..100000]?"
 dispatch:
   link: "dispatch:envelope-2"
   host_tool: Agent
@@ -205,6 +206,16 @@ dispatch:
     subagent_type: "plan-marshall:execution-context-level-4"
   prompt: "name: envelope-2\ndispatch_id: dsp-plan-2026-042-0001-a9f3c2\nplan_id: plan-2026-042\nentity: envelope-2\nskills: skill://pm/execute/task/SKILL.md, skill://pm/domain/java/core/SKILL.md\nWORKTREE: .plan/local/worktrees/plan-2026-042\nstart: pm_state(plan_id=\"plan-2026-042\", entity=\"envelope-2\", dispatch_id=\"dsp-plan-2026-042-0001-a9f3c2\")"
 ----
+
+The `returned:` row shows the usage parameters of a profile declaring `dispatch.token_usage_components: all` and `dispatch.reports_tool_uses: true`; the server renders only the parameters the active profile can report, and it measures `duration_ms` itself (link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Normative Schema for `returned:<dispatch_id>`). The total `token_usage` never accepts `0`; a component may be a measured `0`.
+
+[#self-report-link]
+=== Self-Report Link (`report_bypass`)
+_See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+
+Every plan-scope and entity-scope representation offers the link `report_bypass` (rel `submit`, form `submit`, free `action:text[1..500],reason:text[1..1000]`), with which the model reports an action it took outside the offered links: a bypass of a sanctioned path, a direct read or write of `.plan/`, or a host tool call that replaced a missing link. Following it writes an audit record (`category: transition`, `event: self_report`) and files a `self_report` finding (link:store-schemas.adoc[Store Schemas Specification], Findings Ledger Record), then returns the unchanged current representation; it never changes the scope's state and is never refused for its content beyond the parameter bounds. The link is always offered because a bypass cannot be anticipated by state.
+
+The server can observe writes to digest-protected stores and changes to the worktree footprint, but not host-side reads of `.plan/` or host actions that leave no store or footprint change. Those remain an accepted residual risk (`PM-SEC-1`): they are visible only when self-reported.
 
 == Closed Link Relation & Identifier Grammar
 _See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
@@ -307,7 +318,7 @@ int           = "0" | nonzero_digit , { digit } ;
 
 The character classes `alpha`, `lowercase_alpha`, `digit`, and `nonzero_digit` are those of the link identifier grammar above. `param_type` mirrors the DSL `type_spec` (link:workflow-dsl.adoc[Workflow DSL Specification]): lists use the single syntax `list<…>` (for example `paths:list<text>?`), enum values may contain upper case (`enum[FIX|SUPPRESS|ACCEPT]`), and there is no object type.
 
-NOTE: Boolean parameters are prohibited in workflow transitions to preserve explicit closed-enum intent (e.g., `decision:enum[approve|reject]` rather than `approved:bool`). A trailing `?` marks an optional parameter (such as `token_usage:int[1..10000000]?`).
+NOTE: Boolean parameters are prohibited in workflow transitions to preserve explicit closed-enum intent (e.g., `decision:enum[approve|reject]` rather than `approved:bool`). A trailing `?` marks an optional parameter (such as `token_usage:int[1..10000000]?` or the component `cache_creation_input_tokens:int[0..10000000]?`).
 
 === Direct In-Band Multi-Line Text Payloads (`PM-WF-2`, `PM-WF-6`)
 
@@ -359,14 +370,16 @@ Both links are the implicit links of the `composite_job` state (link:workflow-ds
 ** The three "nobody reviewed" shapes stay distinct: `not_triggered` (never triggered), `rereview_silent_failure` (a re-review failed silently), and `run_stuck` (the bot's run never left the queue).
 ** An exhausted poll yields `unproven`, never `absent`. `unreadable` (the read failed) and `silent` (the read succeeded and nothing was published) are opposite claims and are never merged.
 ** `declined` requires review evidence naming a commit that is not the merge candidate; evidence that names no commit resolves `unproven`. A fetch that returns zero comments resolves to exactly one of: no review covering `HEAD` (`absent` or `unproven`), reviewed clean (`participated_but_empty`), or fetch unreachable (`unreadable`).
-* `bot_status` is the aggregate over the required bots only (optional bots are reported in `facts.bots` but never gate): `pending` | `running` | `completed` | `not_configured` | `refused_awaitable` | `refused_hard` | `refused_structural` | `no_unreviewed_commit` | `unproven` | `cancelled`.
-** `completed`: every required bot is `participated` or `participated_but_empty`.
+* `bot_status` is the aggregate over the required bots only (optional bots are reported in `facts.bots` but never gate): `pending` | `running` | `completed` | `not_configured` | `unestablished` | `refused_awaitable` | `refused_hard` | `refused_structural` | `no_unreviewed_commit` | `unproven` | `cancelled`.
+** `completed`: every required bot is `participated` or `participated_but_empty` for the current `HEAD`.
+** `not_configured`: the required set is empty and the operator answered it so (roster aggregate `vacuous`); the merge is recorded with `review_state: vacuous`.
+** `unestablished`: the required set is empty because the roster question was never put or the roster was migrated (roster aggregate `unestablished`); it never passes as reviewed and needs a `review_barrier_gap` grant.
 ** `refused_awaitable`: a required bot refused with mode `rate` and the registry classifies its rate limit as an awaitable window.
 ** `refused_hard`: a required bot refused with mode `weekly_quota` or `unknown`, or with mode `rate` under a hard or unknown rate-limit class (spend cap, quota exhaustion); waiting cannot recover it.
 ** `refused_structural`: a required bot refused with mode `size` (the diff exceeds the bot's structural cap).
 ** `no_unreviewed_commit`: a required bot refused with mode `no_unreviewed_commit`.
 ** `unproven`: the poll budget, derived from the bot's registered interval, is exhausted while a required bot is in any other non-participating state.
-** When required bots differ, the first matching value in the order `cancelled`, `refused_structural`, `refused_hard`, `running`, `pending`, `unproven`, `no_unreviewed_commit`, `refused_awaitable`, `completed` is the aggregate.
+** `not_configured` and `unestablished` arise only for an empty required set. When required bots differ, the first matching value in the order `cancelled`, `refused_structural`, `refused_hard`, `running`, `pending`, `unproven`, `no_unreviewed_commit`, `refused_awaitable`, `completed` is the aggregate.
 
 === Deterministic Evaluation & Immediate Short-Circuit Matrix
 
@@ -401,16 +414,22 @@ When the model follows `wait:finalize.concurrent-wait`, the daemon monitors both
 |The review-bot run was cancelled externally, or the model followed the implicit `cancel:finalize.concurrent-wait` link; all constituent jobs are cancelled and `finalize.wait-cancelled` offers `retry` and `escalate`.
 
 |`passed`
-|`completed` (0 open findings) / `not_configured`
+|`completed` (every required bot participated at `HEAD`, 0 open findings) / `not_configured` (answered empty required set)
 |`all_green`
 |`finalize.merge-gate`
-|Both concurrent gates succeeded cleanly (or no review bot is configured); advances directly to the pre-merge barrier.
+|Both concurrent gates succeeded cleanly, or the operator answered that no review bot is required (recorded as `review_state: vacuous`); advances directly to the pre-merge barrier.
+
+|`passed`
+|`unestablished`
+|`roster_unestablished`
+|`finalize.review-escalate`
+|CI passed, but the required roster was never established. No bot can be re-triggered, so `escalate` (a `review_barrier_gap` grant, recorded as `review_state: unreviewed_by_grant`) is the only way on; the representation renders "question never put".
 
 |`passed`
 |`completed` ($\ge 1$ open findings)
 |`findings_open`
 |`finalize.triage`
-|Bot review findings were ingested into `findings.jsonl`; transitions to `finalize.triage` offering `triage:<finding_id>` links.
+|Bot review findings were ingested into `findings.jsonl`; transitions to `finalize.triage` offering `triage:<finding_id>` links and carrying every open finding's essentials in `facts.findings` (link:phase-workflows.adoc[Phase Workflows Specification], Unified Triage Hook), so triage needs no further read per finding.
 
 |`passed`
 |`refused_awaitable`

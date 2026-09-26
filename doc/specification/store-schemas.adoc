@@ -278,6 +278,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
           "task_id": { "type": "string" },
           "deviated_files": { "type": "array", "items": { "type": "string" } },
           "justification": { "type": "string" },
+          "covered_findings": { "type": "array", "items": { "type": "string", "pattern": "^F-[0-9]+$" }, "description": "Findings open when the deviation was accepted; a finding filed later is never dispositioned by this acceptance." },
           "accepted_at": { "type": "string", "format": "date-time" }
         }
       }
@@ -309,6 +310,9 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
           "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
           "gap_class": { "type": "string", "enum": ["review_barrier_gap", "merge_action", "red_ci_gate", "rereview_timeout", "find_step_completion"] },
           "rationale": { "type": "string" },
+          "operator_channel": { "type": "string", "enum": ["elicitation", "operator_cli", "standing_policy"], "description": "standing_policy only for the server-minted rereview_timeout grant of re_review_on_timeout: proceed." },
+          "covered_findings": { "type": "array", "items": { "type": "string", "pattern": "^F-[0-9]+$" }, "description": "Findings unhandled when the grant was minted; the grant is inadmissible once an unhandled finding outside this set exists." },
+          "superseded_at": { "type": ["string", "null"], "format": "date-time" },
           "authorized_at": { "type": "string", "format": "date-time" }
         }
       }
@@ -422,7 +426,14 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
     "finding_id": { "type": "string", "pattern": "^F-[0-9]+$" },
     "source": {
       "type": "string",
-      "enum": ["sonar", "github_pr", "gitlab_mr", "self_review", "arch_gate", "compiler", "qgate", "security_audit", "code_review"]
+      "enum": ["sonar", "github_pr", "gitlab_mr", "self_review", "arch_gate", "compiler", "qgate", "security_audit", "code_review", "self_report"]
+    },
+    "phase": { "type": ["string", "null"], "enum": ["2-refine", "3-outline", "4-plan", "5-execute", "6-finalize", null], "description": "Phase the finding was filed against; required for qgate findings. A write addressed to a phase the plan has left is refused with phase_closed." },
+    "dispatch_id": { "type": ["string", "null"], "description": "Claimed dispatch whose entity call filed the finding; null for findings the server files itself. Feeds the spend class findings_only." },
+    "requirement_refs": {
+      "type": ["array", "null"],
+      "items": { "type": "string", "minLength": 1, "maxLength": 120 },
+      "description": "Requirement ids (PM-<AREA>-<N>) or specification anchors the finding bears on; set by triage and validated by the server against the registry of the binary."
     },
     "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
     "blocking": { "type": "boolean", "description": "Set at write time from the producer's declared class for this finding type; later changed only by triage or operator decision." },
@@ -499,6 +510,7 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
 
 * *Immutable Severity, Mutable Blocking*: `severity` is set at creation and never changed. `blocking` is written from the producer's declared class for the finding type (each producer declares it per finding type in its descriptor, validated at write) and may later change only through triage or an operator decision.
 * *What Is Not a Finding*: Refusals, rate-limit or budget notices, the server's own posted comments and triggers, and participation-only artifacts (summary cards, trigger acknowledgements) are never filed as findings; they update the review participation record only (<<review-participation>>).
+* *Self-Reports*: A `self_report` finding is filed by the server, never by a step, when the model follows `report_bypass` (link:hypermedia-format.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]); it carries the reported action as `summary`, the reason as `body`, `severity: major`, and `blocking: false`, and its paired audit record shares its timestamp. It names a sanctioned path that was missing or bypassed so the gap is fixed, and it is triaged like any other finding.
 * *Structured Reviewer Identity*: `author` and `bot_kind` come from the provider's structured author field, never from comment text. A comment whose structured author and self-declared bot identity disagree is itself filed as a finding with the provider's `source`. A comment's identity is `(bot_kind, provider_ref.comment_id)` plus `edit_marker`; an edited comment is new information.
 * *Server-Written Resolution*: The model submits only `disposition` (`FIX`, `SUPPRESS`, `ACCEPT`); the triage link grammar has no resolution parameter. The server writes `resolution` from recorded evidence, so a refuted claim, a valid finding that was dismissed, and a finding that is not this plan's concern stay distinguishable:
 +
@@ -614,6 +626,7 @@ The plan's `review-participation.jsonl` holds one record per `(pr_number, round,
 ----
 
 * *Covered Commit from Evidence Only*: `covered_commit_sha` is taken only from provider evidence (the review's commit id, or the registry's `reviewed_sha_pattern` in the body) and `sha_source` keeps structured and body-derived values distinct. It is `null` when no evidence names a commit; a refusal never sets it. `head_at_observation` is stored separately and is never copied into it.
+* *Currency Inputs*: The barrier's review currency test (link:phase-workflows.adoc#_two_fail_closed_barrier_predicates[Phase Workflows Specification, Predicate 2]) reads `covered_commit_sha` and `evidence.created_at` of each record against `HEAD` and the branch's last push; it is evaluated per record for every required bot, never skipped for a bot by a registry field.
 * *Per Round*: A looped-back pull request has no single reviewed tree. Participation is recorded per `round`; no single reviewed SHA is synthesised for a multi-round pull request.
 * *Refusal Capture*: A refusal is recorded with its `body` and `observed_at` when first seen; a later absence of the notice is not a refutation.
 * *No Backfill*: Missing records for already-merged pull requests are never synthesised. A post-merge reader treats an absent, unreadable, malformed, or stale record as `indeterminate` (never clean) and names the case.
@@ -654,7 +667,7 @@ One record per `bot_kind` is compiled into the binary; a project may add records
       },
       "description": "Anchored (start-of-block or structural) patterns, each with the sample size it was validated on."
     },
-    "participation_requires_update": { "type": "boolean", "description": "Currency-exempt bots derive from this field only." },
+    "participation_requires_update": { "type": "boolean", "description": "Mirrored from plan-marshall; exempts no bot from the review currency test, which PM-MCP applies unconditionally." },
     "reviewed_sha_carrier": { "type": "string", "enum": ["structured", "body_pattern", "none"] },
     "reviewed_sha_pattern": { "type": ["string", "null"] },
     "completion_check_name": { "type": ["string", "null"] },
@@ -662,6 +675,8 @@ One record per `bot_kind` is compiled into the binary; a project may add records
     "refusal_size_patterns": { "type": "array", "items": { "type": "string" } },
     "refusal_wrapper_markers": { "type": "array", "items": { "type": "string" } },
     "rate_limit_eta_patterns": { "type": "array", "items": { "type": "string" } },
+    "no_new_commits_patterns": { "type": "array", "items": { "type": "string" }, "description": "Anchored patterns of the bot's 'Review skipped: No new commits' notice." },
+    "no_new_commits_class": { "type": ["string", "null"], "enum": ["refused", "declined", null], "description": "Classification of that notice for a bot without trigger_verbs.full; a bot with a full verb always resolves refused with mode no_unreviewed_commit." },
     "rate_limit_class": { "type": "string", "enum": ["awaitable_window", "hard_quota", "unknown"] },
     "rate_interval_seconds": { "type": ["integer", "null"], "minimum": 1 },
     "attempt_ceiling": { "type": "integer", "minimum": 1, "default": 10 },
@@ -711,7 +726,7 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "entry_id": { "type": "string", "format": "uuid" },
-    "kind": { "type": "string", "enum": ["build", "change", "job"] },
+    "kind": { "type": "string", "enum": ["build", "change", "job", "task_diff"] },
     "worktree_sha": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "gate_kind": { "type": ["string", "null"], "enum": ["compile", "test", "quality_gate", "arch_gate", null] },
     "outcome": {
@@ -734,22 +749,27 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
       "description": "For kind == 'build': the pm_build expect parameter. A failed run with expect == 'red' is expected_red (no finding); a succeeded run with expect == 'red' is expected_red_went_green; an expect == 'red' row never satisfies a freshness gate (mcp-tools.adoc, pm_build)."
     },
     "deliverable_id": { "type": ["string", "null"] },
-    "task_id": { "type": ["string", "null"] },
+    "task_id": { "type": ["string", "null"], "description": "Required for kind == 'task_diff'; written only by the submit:TASK-NNN verification." },
     "recorded_at": { "type": "string", "format": "date-time" }
   }
 }
 ----
+
+* *Per-Task Attribution*: `kind: "task_diff"` rows are appended by the server when `submit:TASK-NNN` passes independent verification (link:phase-workflows.adoc[Phase Workflows Specification], Task Envelope Execution): `task_id`, `changed_paths` since the previous task's snapshot (present, possibly empty), and `commit_sha: null`. They are the only producer of `task_id` in this ledger.
+* *Attribution State*: Every per-task consumer first reads `change_attribution`, which the server derives: `measured` when every completed task has a `task_diff` row, otherwise `unavailable` (for example a converted legacy plan). Under `unavailable` the dependent per-task keys are absent, never empty or zero.
 
 [#metrics-store]
 == Metrics Store (`metrics.json`)
 
 The plan's `metrics.json` holds the dispatch and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Post-Return Integrity Invariants). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
 
-* *Rows*: One row per dispatch (`dispatch_id`, `phase`, `step_id` or null, `status`, `cause_class`, `population`, and the usage columns of the `returned:<dispatch_id>` link, each a measured integer, `"unmeasured"`, or, for a step that runs inline by design, `"inline"`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:job-runtime.adoc[Job Runtime Specification], Wait Attribution), and one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `step_firings` as a map from step id to firing count).
-* *Aggregates*: Every sum (per phase, per cause class, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total.
+* *Rows*: One row per dispatch (`dispatch_id`, `phase`, `step_id` or null, `envelope_id` or null with its `predicted_cost_tokens`, `status`, `cause_class`, `spend_class`, `population`, the usage columns of the `returned:<dispatch_id>` link (`token_usage`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`), each a measured integer, `"unmeasured"` (with `not_reported_by_client` where the client profile cannot report it), or, for a step that runs inline by design, `"inline"`, and the server-measured `duration_ms` with its `duration_basis`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:job-runtime.adoc[Job Runtime Specification], Wait Attribution), one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `boundary` (`closed`, `re_entered`, or `provisional` with `measured_until` and `excluded_steps`), `step_firings` as a map from step id to firing count), and one row per served document read (Served-Content Ledger below).
+* *Served-Content Ledger*: Every `pm_skill`, `pm_skill_file`, and skill `resources/read` served in a plan or epic scope appends `{uri, section?, bytes, plan_id, phase, dispatch_id?, served_at}`; `bytes` is the rendered size served, `0` for an empty section. `dispatch_id` is set when the read carries it (the server renders it into the load directives of a dispatch prompt) and is otherwise null. A read without a scope is attributed to no plan. `record-metrics` publishes from these rows the per-document consumption (reads per URI and section, bytes, repeat reads within one dispatch). It measures only what the server serves; host `Read`/`Grep` of files is not observable.
+* *Aggregates*: Every sum (per phase, per cause class, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total; Phase 6, which `record-metrics` measures from inside, is recorded `boundary: provisional` with `measured_until` and its `excluded_steps`.
 * *Populations*: Every token figure carries a `population` stamp (`dispatched` or `main_context`); an absent stamp reads `dispatched`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
 * *Re-Entry*: Re-entry is derived from observables (rows timestamped after the phase's recorded `end_time`), never from a close counter. A re-entered phase is labelled `re_entered` and accumulates across closes.
 * *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`) is a total function over the dispatch `status` enum plus `INCOMPLETE_SUBMISSION`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
+* *Spend Classes*: `spend_class` (`submitted`, `findings_only`, `no_product`, `unmeasured`) is derived by the server from what the dispatch produced (link:dispatch-and-effort.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification, Spend Classes]); it is a separate dimension from `status` and `cause_class`, and waste is read only from `no_product`.
 * *Stall Rate*: A termination with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
 * *Ledger Divergence*: Where two ledgers can diverge (dispatch rows vs audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
 * *One Writer per Name*: Every metric name has exactly one writer. A second producer over another population uses a different name.
@@ -758,7 +778,7 @@ The plan's `metrics.json` holds the dispatch and phase measurements that `defaul
 [#quality-report]
 == Quality Report Record (`quality-report.json`)
 
-The plan's `quality-report.json` is written once per firing of `plan-marshall:plan-retrospective` (`995`) by the server's report engine (link:phase-workflows.adoc#post-run-quality-report[Phase Workflows Specification, Post-Run Quality Report]). It is derived only from persisted plan stores; no model-authored text enters it. A re-fire replaces it atomically, and the store is covered by the digest sidecar (<<store-digest-verification>>).
+The plan's `quality-report.json` is written once per firing of `plan-marshall:plan-retrospective` (`995`) by the server's report engine (link:phase-workflows.adoc#post-run-quality-report[Phase Workflows Specification, Post-Run Quality Report]). It is derived only from persisted plan stores and from the metrics snapshot composed from them at the report's call (labelled `measured_until`); no model-authored text enters it. A re-fire replaces it atomically, and the store is covered by the digest sidecar (<<store-digest-verification>>).
 
 [source,json]
 ----
@@ -818,6 +838,19 @@ The plan's `quality-report.json` is written once per firing of `plan-marshall:pl
     },
     "review_retrospective": { "type": ["object", "null"], "description": "Null when the plan has no pull request (with the reason in instruments)." },
     "footprint": { "type": "object", "description": "Three-way reconciliation results and the assessment comparison state." },
+    "spend": {
+      "type": ["object", "null"],
+      "description": "Spend read from the metrics snapshot; null in corpus mode for plans whose metrics are unreadable (counted as floor).",
+      "required": ["measured_until", "excluded_steps"],
+      "properties": {
+        "measured_until": { "type": "string", "format": "date-time", "description": "Instant of the snapshot (plan mode) or the latest snapshot instant folded (corpus mode)." },
+        "excluded_steps": { "type": "array", "items": { "type": "string" }, "description": "Steps outside the window: the report's own step and every later manifest step." },
+        "per_phase": { "type": "object", "description": "Per phase: tokens and priced_units as $defs/count, with population stamp and boundary (closed, re_entered, provisional)." },
+        "per_spend_class": { "type": "object", "description": "Per spend class (submitted, findings_only, no_product, unmeasured) and termination status: one $defs/count." },
+        "per_step": { "type": "object", "description": "Per finding-filing step and firing cause: one $defs/count." },
+        "finalize_spend_ratio": { "type": "object", "description": "Numerator (cumulative finalize spend) and denominator (the compared anchor column or fallback ceiling) as $defs/count, with the column and unit named." }
+      }
+    },
     "instruments": {
       "type": "array",
       "items": {
@@ -1404,6 +1437,8 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
   }
 }
 ----
+
+*Exemption and self-report records*: An operator exemption from a gate is an `operator` record whose `details.exemption_class` holds `{gate_id, reason_class}` (`gate_false_positive`, `gate_not_applicable`, `tooling_unavailable`, `deliberate_deferral`, or `unknown`); the recurrence count across plans (link:phase-workflows.adoc[Phase Workflows Specification], Artifact Gate) is derived from these records. A model self-report (`report_bypass`) is a `transition` record with `event: self_report` and `details{action, reason, finding_id}`.
 
 *Hash chain (`PM-SEC-6`)*: The canonical line of a record is its exact UTF-8 byte sequence in `audit.jsonl`, excluding the terminating newline. A writer appends only under the log's `FileChannel.lock()`, after reading the current last line to compute `prev_hash`. The runtime verifies the chain at startup; a mismatch or unparsable line is reported to the operator and recorded as an `audit_chain_broken` record (`category: security`, `details.first_broken_line`), and the log is never rewritten or repaired.
 

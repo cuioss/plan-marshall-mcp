@@ -278,6 +278,7 @@ state finalize.concurrent-wait
     bot_refused_structural   -> finalize.review-structural
     bot_no_unreviewed_commit -> finalize.review-full-trigger
     bot_unproven             -> finalize.review-escalate
+    roster_unestablished     -> finalize.review-escalate
     cancelled                -> finalize.wait-cancelled
 
 state finalize.review-window-wait
@@ -310,6 +311,33 @@ state finalize.review-escalate
     escalate review_barrier_gap
       approved          -> finalize.merge-gate
       denied            -> finalize.aborted
+
+state finalize.review-full-trigger
+  phase finalize
+  auto review.post-full-trigger
+    triggered           -> finalize.review-cap-check
+    already_triggered   -> finalize.review-escalate
+    window_closed       -> finalize.review-window-wait
+
+state finalize.spend-escalate
+  phase finalize
+  facts finalize.spend-ratio
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate finalize_spend_overrun
+      approved          -> finalize.merge-gate
+      denied            -> finalize.aborted
+
+state finalize.emit-landing-failed
+  phase finalize
+  facts finalize.landing-status
+  link retry retry [noop] ()
+    do finalize.retry-emit-landing
+      verified          -> finalize.next-step
+      failed            -> finalize.emit-landing-failed
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate landing_delivery_failure
+      approved          -> finalize.next-step
+      denied            -> finalize.emit-landing-failed
 
 state finalize.ci-failed
   phase finalize
@@ -355,6 +383,10 @@ state finalize.aborted terminal
 * *Hard CI failure (`PM-WF-9`)*: `finalize.ci-failed` offers both remediation paths. `fix_in_branch` (rel `fix`) is followed after the model has applied the fix in the worktree; `finalize.record-in-branch-fix` records `fix_summary` and routes through `finalize.settle-commit` (`call git.commit_and_push` with `push_mode=post_pr_conditional`), whose `committed_and_pushed` outcome re-enters `finalize.concurrent-wait` (through `finalize.review-cap-check`) so CI and review bots re-evaluate the new `HEAD`. A clean worktree yields `no_changes` and leaves the plan in `finalize.ci-failed`. `loop_back` returns to `execute` for cross-task remediation (<<loop-back-bounds>>).
 * *Pre-wait cap gate*: Before `finalize.concurrent-wait` is entered, `finalize.review-cap-check` measures the diff (changed files, diff characters) against the structural caps each required review bot declares in the review-bot registry (link:phase-workflows.adoc[Phase Workflows Specification]). An exceeded cap records the bot as `refused` with mode `size` pre-emptively, names the cap and the measurement in `facts`, and routes to `finalize.review-structural` instead of waiting; under every cap the flow is unchanged.
 * *Review-bot refusal modes*: The composite outcomes of `finalize.watch-ci-and-bots` separate the refusal modes, because a single rate-limit outcome cannot express them. `bot_refused_awaitable` (a rate window that reopens) enters `finalize.review-window-wait`, a job that waits for the registered window (the registered interval times the attempt ceiling; a published ETA is a floor that is re-checked, never skipped) and then re-triggers the unproven bots automatically. `bot_refused_hard` (weekly or hard quota) and `bot_unproven` (no review evidence for the current `HEAD` after the wait) enter `finalize.review-escalate`. `bot_refused_structural` (size) enters `finalize.review-structural`, which offers split, accept, and disable-for-this-PR but never a wait; when a path partition (for example test sources versus the rest) brings each part under the cap, it proposes that concrete split. `bot_no_unreviewed_commit` enters `finalize.review-full-trigger`, which posts the registry's full-review trigger verb.
+* *Full-review trigger*: `finalize.review-full-trigger` posts the registry's `full` trigger verb for the bots that reported no unreviewed commit, once per bot and `HEAD`; a repeated notice after that trigger yields `already_triggered` and escalates, and a closed rate window routes to `finalize.review-window-wait` (link:phase-workflows.adoc#automatic-review[Phase Workflows Specification], Refusals & Rate Windows).
+* *Unestablished roster*: `roster_unestablished` (the required set is empty because the roster question was never put) enters `finalize.review-escalate`; with no bot to re-trigger, its only way on is the `review_barrier_gap` escalation.
+* *Finalize spend overrun*: Before the pre-merge barrier, `finalize.merge-gate` compares the cumulative finalize spend with the error column of the plan's budget anchor (link:dispatch-and-effort.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification]); an overrun enters `finalize.spend-escalate`, whose approved escalation records the acknowledgement and returns to `finalize.merge-gate`.
+* *Landing delivery failure*: An I/O failure of the `emit-landing` append enters `finalize.emit-landing-failed`. `retry` re-appends and re-verifies the envelope; the approved escalation continues the pipeline with `landing_delivery: pending`, keeping the envelope in the plan directory for the epic's shipped-without-landing reconciliation. Neither link refuses or strands the merged plan (link:phase-workflows.adoc[Phase Workflows Specification], validator rule 7); a denied escalation leaves the plan in the state, never aborts it.
 * *Window-gated re-trigger*: `finalize.review-escalate` offers `retry:<bot_kind>` only while the predicate `review.window-open` holds, so a trigger is never posted inside a closed rate window (a trigger in a closed window extends it; closing and reopening the PR does not reset it). The `<bot_kind>` placeholder expands over the bots of the required set that have no review evidence for the current `HEAD`, selected after the round's own comment fetch and never by comment recency; a required bot that never published is selectable. A closed window at execution time routes to `finalize.review-window-wait`.
 * *Implicit job links*: `finalize.concurrent-wait` is a `composite_job` state and therefore offers `wait:finalize.concurrent-wait` and `cancel:finalize.concurrent-wait` without declaring them (<<implicit-job-links>>). Following `cancel` yields the composite outcome `cancelled`, handled by `finalize.wait-cancelled`.
 * *Cross-file targets*: `execute.dispatch-ready` is declared in `execute.pmwf`; the target is valid because all phase files form one definition unit (<<workflow-definition-units>>).
@@ -1123,7 +1155,7 @@ A question-driven scenario runs with three separate roles: the executor (model u
 
 Every run report carries `client_id`, model identifier, binary version, client profile digest, bound skill digests, population, per-verdict counts, margin, tolerance band, `attribution`, `sample: true` for single runs, and token consumption per client and model (`unmeasured` when the host reports none, never `0`). Results are grouped by `enforcement_class`. Every report states an absolute reference as well as the delta to the previous baseline, never the delta alone. A client profile without a report of its own is reported as behaviourally untested; structural results (rendering, digests, registration, resolution) never stand in for it.
 
-The store that holds verdict records and baselines (versioned repository artifacts or a runtime store) is not fixed yet; the record content above is independent of that choice.
+*Verdict and Baseline Store*: Verdict records and baselines are versioned test artifacts in the PM-MCP repository, one file per client and model (`src/test/behaviour/baselines/<client_id>/<model>.json` in the module that hosts the harness), never a runtime store: the runtime neither writes nor reads them. Each file carries `format_version`, the scenario population, per-verdict counts, margin, tolerance band, the bound skill and client profile digests, and its pin (binary version and model identifier). The harness writes a new baseline only into the working tree; it enters the repository through a reviewed pull request and is thereby bound to a release. The delta of a report is computed against the baseline committed for the same client and model; a missing baseline makes the report absolute-only and names the client and model as behaviourally untested. A conformance verdict is never written to `findings.jsonl`, which is plan-scoped and has no verdict or population fields.
 
 ==== Cost Ceilings & Sizing
 

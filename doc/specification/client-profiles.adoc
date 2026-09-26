@@ -33,6 +33,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit]_
 * _See Requirement link:../Requirements.adoc#PM-CLIENT-4[PM-CLIENT-4: Neutral Fallback Profile for Unknown Clients]_
 * _See Requirement link:../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-6[PM-CLIENT-6: Post-Compaction Scope Pointer]_
 
 == Status: PLANNED
 
@@ -162,9 +163,18 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
         "params_template": {
           "type": "object",
           "description": "Key-value template for host_tool parameters using {{agent_variant}} and {{model}} placeholders."
+        },
+        "token_usage_components": {
+          "type": "string",
+          "enum": ["all", "total_only", "none"],
+          "description": "Which sub-agent token figures the host can report on returned:<dispatch_id>: the total and the four components, the total only, or none. Declared once per target, never per row."
+        },
+        "reports_tool_uses": {
+          "type": "boolean",
+          "description": "Whether the host reports the sub-agent's tool-call count (tool_uses) on returned:<dispatch_id>."
         }
       },
-      "required": ["supported", "host_tool", "agent_variants", "params_template"],
+      "required": ["supported", "host_tool", "agent_variants", "params_template", "token_usage_components", "reports_tool_uses"],
       "additionalProperties": false
     },
     "commands": {
@@ -269,6 +279,8 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
 }
 ----
 
+`dispatch.token_usage_components` and `dispatch.reports_tool_uses` are the profile's usage-reporting capability. The server renders on the `returned:<dispatch_id>` link only the usage parameters the profile declares (link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Normative Schema for `returned:<dispatch_id>`); a figure the host cannot report is recorded `unmeasured` with reason `not_reported_by_client`, and the model is never asked for a figure its host does not expose. The values are verified per host in Milestone 1 like the other _(provisional)_ host facts.
+
 `connection.durable_cwd` records whether the host keeps its shell working directory across tool calls. When it is `false`, rendered dispatch prompts and vocabulary skills carry the directive to address files in the plan's worktree by absolute path, because a working directory set by an earlier call cannot be relied on.
 
 === Profile Override Hierarchy
@@ -364,7 +376,7 @@ Vocabulary skill templates (`SKILL.md`), hypermedia `dispatch` blocks, and opera
 |`default`
 |===
 
-The `{{model:*}}` resolutions are a snapshot with the same provenance as the <<host-integration-table,Host Integration Table>> (`plan-marshall/standards/effort-levels.md` at `1d4a1da37`; provisional values verified in Milestone 1) and are re-confirmed whenever the host integration facts of a profile are re-verified.
+The `{{model:*}}` resolutions are a snapshot with the same provenance as the <<host-integration-table,Host Integration Table>> (`plan-marshall/standards/effort-levels.md` at `1d4a1da37`; provisional values verified in Milestone 1) and are re-confirmed whenever the host integration facts of a profile are re-verified and whenever the <<calibration-decision>> is revisited.
 
 === Rendering Invariants
 
@@ -373,6 +385,11 @@ The `{{model:*}}` resolutions are a snapshot with the same provenance as the <<h
 3. *Dispatch Suppression When Unsupported (`PM-WF-5`, `PM-CLIENT-4`)*: When `profile.dispatch.supported == false` (such as on the `neutral` profile or a host whose sub-agents lack MCP access), the workflow engine automatically suppresses `form: dispatch` links and instead serves the entity's task links directly in the main plan scope.
 4. *Vocabulary-Only Translation*: `ClientProfileRenderer` varies only the placeholder dimensions of `PM-CLIENT-2` (host tool names, skill load directives, command names, tool idioms, model and effort, dispatch). It never varies emphasis, scaffolding, structure, or format: rendered variants of one template are byte-identical outside resolved placeholders.
 5. *Profile Completeness*: Every canonical placeholder, and every rendering dimension added later, has a resolution in every built-in profile including `neutral`. A build-time test renders every template for every built-in profile and fails on any unresolved or missing form.
+
+[#calibration-decision]
+=== Calibration Decision
+
+Model-facing content is calibrated once, for the weakest model reachable through the built-in effort ladders of all profiles, and rendered vocabulary-only (Rendering Invariant 4). This is a recorded decision, not a default: a byte-identical export is not neutral, and its cost is that stronger models receive more scaffolding than they need (a larger resident surface, `PM-TOOL-5`). The decision is revisited when the behavioural conformance harness (link:workflow-dsl.adoc#behavioural-conformance-harness[Workflow DSL Specification], `PM-TEST-6`) produces a per-client behavioural signal, and before the `codex` profile leaves provisional status. Any calibration axis added later is keyed by the resolved model of the effort ladder, never by the `client_id`, because one client hosts several models (the `opencode` ladder is unpinned and inherits the session model). Such an axis multiplies the rendered digests (`PM-SKILL-2`) and requires per-model content and a `PM-TEST-6` verdict for every model it distinguishes before it ships.
 
 [#host-resident-surface-inventory]
 === Host-Resident Surface Inventory
@@ -407,9 +424,9 @@ Client identity is advisory routing and rendering metadata, never a security cre
 
 This table is the single source for host-specific values. Requirements, other specifications, and the roadmap reference it instead of repeating values. Values without a marker are backed by `plan-marshall` (`script-shared/scripts/marketplace_paths.py`, `platform-runtime/scripts/{opencode,antigravity}_runtime.py`, `plan-marshall/standards/effort-levels.md`, verified at commit `1d4a1da37`) or by the host's established MCP configuration format. Values marked _(provisional)_ have no `plan-marshall` evidence and are verified against current host documentation in Milestone 1 before implementation.
 
-[cols="1,2,2,2,2,2,2"]
+[cols="1,2,2,2,2,2,2,2"]
 |===
-|Profile |Detection signals |Session ID variable |MCP `clientInfo.name` |MCP config, user scope |MCP config, project scope (owned key) |Agent / command / skill directories
+|Profile |Detection signals |Session ID variable |MCP `clientInfo.name` |MCP config, user scope |MCP config, project scope (owned key) |Agent / command / skill directories |Session lifecycle hook events
 
 |`claude`
 |`CLAUDE_CODE_SESSION_ID` present; secondary: `CLAUDECODE=1`
@@ -418,6 +435,7 @@ This table is the single source for host-specific values. Requirements, other sp
 |`~/.claude.json`
 |`.mcp.json` (`mcpServers.plan-marshall`, `{"type": "stdio", "command": "pm-mcp", "args": ["serve"]}`)
 |`~/.claude/{agents,commands}` / `.claude/{agents,commands}`
+|`SessionStart` (a matcher-less entry fires for `startup`, `resume`, `clear`, and `compact`)
 
 |`opencode`
 |`OPENCODE` or `OPENCODE_PID` present
@@ -426,6 +444,7 @@ This table is the single source for host-specific values. Requirements, other sp
 |`~/.config/opencode/opencode.json` (or `$OPENCODE_CONFIG_DIR/opencode.json`)
 |`opencode.json` or `.opencode/opencode.json`, an existing file preferred (`mcp.plan-marshall`, `{"type": "local", "command": ["pm-mcp", "serve"], "enabled": true}`)
 |`~/.config/opencode/agent/` / `.opencode/agent/` _(provisional)_
+|_(provisional)_
 
 |`antigravity`
 |`ANTIGRAVITY_AGENT` present
@@ -434,6 +453,7 @@ This table is the single source for host-specific values. Requirements, other sp
 |MCP server configuration location _(provisional)_; `plan-marshall` configures no MCP server for Antigravity, its settings live under `~/.gemini/config/` (`config.json`, `projects/<uuid>.json`)
 |_(provisional)_
 |Skills: `~/.gemini/config/plugins/plan-marshall/skills` / `.agents/skills`
+|_(provisional)_
 
 |`codex`
 |`CODEX_SANDBOX`, `CODEX_CI`, or `CODEX_THREAD_ID` present _(provisional)_
@@ -441,6 +461,7 @@ This table is the single source for host-specific values. Requirements, other sp
 |`codex` _(provisional)_
 |`~/.codex/config.toml` _(provisional)_
 |`.codex/config.toml` (`mcp_servers.plan-marshall`, `command = "pm-mcp"`, `args = ["serve"]`) _(provisional)_
+|_(provisional)_
 |_(provisional)_
 
 |`neutral`
@@ -450,6 +471,7 @@ This table is the single source for host-specific values. Requirements, other sp
 |—
 |—
 |—
+|None
 |===
 
 *Detection precedence*: Primary signals are evaluated in the fixed order `antigravity` -> `opencode` -> `claude` (the order `plan-marshall` uses, so a host launched from inside another host is attributed to the innermost known agent consistently), then `codex` _(provisional)_; the first match wins. Secondary signals (`CLAUDECODE`, `AI_AGENT`) are consulted only when no primary signal matches. At tool-call time the relay's environment signature and the connection's MCP `clientInfo.name` are evaluated per host connection (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification]).
@@ -482,6 +504,18 @@ This table is the single source for host-specific values. Requirements, other sp
 |`neutral`
 |`mcp/entry.json` records `"client_id": "neutral"`. Every representation includes `profile_warning: neutral_fallback`; all host-specific `dispatch` links are replaced with inline `submit` task links, and skill loading uses `pm_skill`.
 |===
+
+[#session-lifecycle-hook]
+== Session Lifecycle Hook & Scope Pointer
+_See Requirement link:../Requirements.adoc#PM-CLIENT-6[PM-CLIENT-6: Post-Compaction Scope Pointer]_
+
+After `/clear` or compaction the model has lost the `plan_id` it needs for `pm_state(plan_id)` (`PM-MIG-4`). The client bundle therefore carries a session-start hook (`bundle-manifest.json` artifact kind `hook`) on every profile whose Host Integration Table row names session lifecycle hook events. The hook runs `pm-mcp hook session-start --client <client_id>` (link:cli-and-security.adoc#session-start-hook[CLI, Coordination & Security Specification]) and injects its stdout verbatim.
+
+* *Pointer, Never a Body*: The payload is a pointer: `scope_type`, `scope_id`, `phase`, and the literal next call (`pm_state(plan_id="…")` or `pm_state(epic_id="…")`), nothing else. It never carries facts, links, or state content, so it cannot go stale against the stores.
+* *Events*: The hook fires on the host events listed in the table's hook-event column, which cover `startup`, `resume`, `clear`, and `compact` where the host distinguishes them.
+* *Size Ceiling*: The payload is at most 512 bytes UTF-8. The CLI never truncates it; an `*IT` test asserts the ceiling for the largest valid identifiers at build time.
+* *Three Normative Cases*: A live scope bound to the workspace (and, where the profile provides one, to the host session id) yields the pointer; no bound scope yields empty output and exit `0`; an unreadable or tampered scope state yields a one-line notice naming the scope and `pm-mcp status`, exit `0`. The hook never fails the host session, and it never suppresses the bundle drift notice that shares the seam (`PM-DIST-4`).
+* *Fallback Without Hooks*: On a host without lifecycle hooks, `pm_plans` and `pm_epics` mark the scope last entered by the connection's `client_session_id` in their `last_entered` column (link:mcp-tools.adoc[MCP Tools Specification]).
 
 == Embedded Client Bundle `bundle-manifest.json` Schema
 _See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
