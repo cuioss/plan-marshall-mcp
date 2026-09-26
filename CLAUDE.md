@@ -5,12 +5,15 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 ## Project
 
 plan-marshall-mcp (PM-MCP) is a local MCP server that takes over the process logic of plan-marshall
-through a hypermedia-driven workflow. The design lives in `doc/concept/` (start at
-`doc/concept/README.adoc`); it describes the target state, most of which is not implemented yet.
+through a hypermedia-driven workflow. The design describes the target state, most of which is not
+implemented yet: requirements in `doc/Requirements.adoc` (modules in `doc/requirements/`), technical
+specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
+`doc/roadmap.adoc`.
 
 Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
 `@QuarkusIntegrationTest` integration tests against the packaged application. No container image
-is built (the target is a native `pm-mcp` binary on the host, `doc/concept/10-technology.adoc`).
+is built (the target is a native `pm-mcp` binary on the host: an always-on runtime reached through
+the `pm-mcp serve` STDIO relay, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
 
 ## Modules
 
@@ -20,8 +23,8 @@ is built (the target is a native `pm-mcp` binary on the host, `doc/concept/10-te
 
 New modules from the concept are added with their first code, not as empty shells: a plain Java
 `pm-mcp-core` (primitives, workflow DSL and engine, stores) with the module renamed to
-`pm-mcp-server`, then `pm-mcp-dist` for the release layout (`doc/concept/16-implementation.adoc`,
-Modules).
+`pm-mcp-server`, then `pm-mcp-dist` for the release layout (PM-IMPL-1 in
+`doc/requirements/14-implementation.adoc`).
 
 ## Development Notes
 
@@ -88,8 +91,9 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 ## Documentation
 
-AsciiDoc (`.adoc`) for all project documentation. Concept decisions go into `doc/concept/`,
-analyses and variants into `doc/concept/discussions/`. Don't create new documents without asking.
+AsciiDoc (`.adoc`) for all project documentation. Requirements go into `doc/requirements/`,
+technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`),
+analyses and variants into `doc/discussions/`. Don't create new documents without asking.
 
 ## Git Workflow
 
