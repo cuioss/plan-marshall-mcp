@@ -78,7 +78,7 @@ _See link:specification/runtime-model.adoc[Runtime & Interaction Model Specifica
 * [ ] Implement `~/.plan-marshall/mcp/` directory permission audit (`0700`/`0600`) at runtime start
 * [ ] Implement the runtime lock manager (in-process lock per key plus one `FileChannel.lock()` per lock file), main-anchored plan/epic locks (`.plan/local/locks/`), machine store locks (`locks/{merge,review-bot,build-slots}.lock`), lease records, and stale lease sweep (PID plus start instant)
 * [ ] Implement runtime drain on `SIGTERM` / `pm-mcp drain`, startup crash recovery (stale leases, orphaned jobs), binary/runtime version-mismatch detection, and `pm-mcp status`
-* [ ] Implement operator CLI (`pm-mcp operator`) with interactive TTY check, OS keyring / PBKDF2 passphrase verification, workspace confinement (`Path.toRealPath()`), and append-only `logs/audit.jsonl` trail
+* [ ] Implement operator CLI (`pm-mcp operator`) with interactive TTY check, OS keyring / PBKDF2 passphrase verification with back-off persisted in `state/operator-auth.json`, workspace confinement (`Path.toRealPath()`), and append-only, `prev_hash`-chained `logs/audit.jsonl` trail verified at runtime start
 * [ ] Verify relay `stdout` hygiene, absence of TCP/UDP listeners, relay termination during a pending call, continuation via `pm_state` from a second connection, and runtime restart recovery via `McpAssured.newStdioClient()` (`*IT.java`)
 
 === Milestone 3: Core Module, Workflow DSL, State Stores & Scope Entry
@@ -102,10 +102,10 @@ _See link:specification/workflow-dsl.adoc[Workflow DSL Specification], link:spec
 
 * [ ] Structure decoupled plain-Java module `pm-mcp-core` alongside Quarkus STDIO assembly module `pm-mcp-server`
 * [ ] Implement typed `Primitive<P, R>` interface with closed outcome enumerations and in-process content validators (`OutlineValidator`, `AsciiDocValidator`, `ConventionalCommitValidator`)
-* [ ] Implement Workflow DSL parser, immutable AST model, parameterized `subworkflow` / `call_stack` execution engine (`PM-WF-16`), static AST verifier (including outcome bijection and acyclic call-graph DAG checks, `PM-TEST-3`), property-based transition fuzzer, and PlantUML/ASCII diagram generator
+* [ ] Implement Workflow DSL parser, immutable AST model, parameterized `subworkflow` / `call_stack` execution engine (`PM-WF-16`), static AST verifier (including outcome bijection and acyclic call-graph DAG checks, `PM-TEST-3`), property-based transition fuzzer, and Mermaid/AsciiDoc-table/ASCII diagram generator
 * [ ] Implement deterministic native TOON encoder (official specification, pinned version) for state representations and links
 * [ ] Implement versioned JSON/JSONL store substrate with `format_version` validation and atomic write-and-rename
-* [ ] Implement `pm-mcp enter --client <claude|opencode|antigravity|codex|neutral>` writing `mcp/entry.json` with 3-tier environment mismatch detection (`MATCHED`, `UNVERIFIED`, `CONTRADICTED`)
+* [ ] Implement `pm-mcp enter --client <claude|opencode|antigravity|codex|neutral>` writing `mcp/entry.json` (or, for a not-yet-created plan, the pending record `.plan/local/mcp/pending/<entry_id>.json` whose `entry_id` `pm_start` consumes) with 3-tier environment mismatch detection (`MATCHED`, `UNVERIFIED`, `CONTRADICTED`)
 
 === Milestone 4: Job Runtime, Waits & Legacy Executor Adapter (Migration Stage 1)
 _See Requirements:_
@@ -122,13 +122,13 @@ _See Requirements:_
 * _See Requirement link:Requirements.adoc#PM-TEST-5[PM-TEST-5: Security Boundary & Confinement Adversarial Testing]_
 * _See Requirement link:Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
 
-_See link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/move-journal.adoc[Move Journal Specification] for implementation details_
+_See link:specification/job-runtime.adoc[Job Runtime Specification], link:specification/move-journal.adoc[Move Journal Specification], and link:specification/mcp-tools.adoc[MCP Tools Specification] for implementation details_
 
 * [ ] Implement project enrolment store (`~/.plan-marshall/mcp/enrolments.json`), verify-not-resolve pipeline (worktree check, SHA-256 tool/wrapper check, argument schema check), and adversarial security boundary tests (`PM-TEST-5`)
 * [ ] Implement direct subprocess job runner (`build`, `git`, `script`, `project_script`) with OS process-group isolation via the `pm-mcp job-exec` shim (`setpgid` + `execve` via FFM), in-memory `stdin` payload streaming (`Optional<byte[]> stdinPayload`, zero temp files), and `SIGTERM` -> `SIGKILL` escalation
 * [ ] Implement bounded long-poll wait (`wait` link) and progress-reset wait primitives
 * [ ] Implement write-ahead `move-journal.json` and startup crash recovery for atomic plan directory relocation
-* [ ] Expose legacy Python script executor adapter with pinned `python3` interpreter and executor digest verification
+* [ ] Expose legacy Python script executor adapter with pinned `python3` interpreter and executor digest verification, reachable through the transitional MCP tool `pm_legacy_script(notation, args)` (registered argument schema validation, verified `script` job under the addressed scope's lock, TOON result)
 * [ ] Implement machine cutover in `plan-marshall` (executor refuses direct invocation outside a `PM-MCP` `script` job; bundles drop `execute-script.py` allowlist entries) and `pm-mcp operator rollback`
 
 == Ported Core Stores & Platform Services
@@ -299,8 +299,8 @@ _See Requirements:_
 _See link:specification/mcp-tools.adoc[MCP Tools Specification] and link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details_
 
 * [ ] Implement session-scoped warm LSP instance pool per workspace and language over `stdio` (`LSP4J`) with idle eviction and crash restart
-* [ ] Expose semantic navigation and workspace edit operations (`workspace_symbol`, `document_symbol`, `definition`, `references`, `hover`, `diagnostics`, `rename`) via `pm_lsp`
-* [ ] Implement selective upstream MCP proxy (`~/.plan-marshall/mcp/conf/upstream-mcp.json`) with per-upstream Token-Lane credential isolation and `_meta` untrusted provenance tagging
+* [ ] Expose semantic navigation and workspace edit operations (`workspace_symbol`, `document_symbol`, `definition`, `references`, `hover`, `diagnostics` via LSP 3.17 pull diagnostics with published-diagnostics fallback, `rename`) via `pm_lsp`
+* [ ] Implement selective upstream MCP proxy (`~/.plan-marshall/mcp/conf/upstream-mcp.json`) with per-upstream Token-Lane credential isolation and untrusted provenance tagging under the `_meta` key `de.cuioss.pm-mcp/source`
 
 === Milestone 13: Dynamic Skill Serving & Client Bundle Distribution (Migration Stage 6)
 _See Requirements:_
@@ -316,13 +316,15 @@ _See Requirements:_
 * _See Requirement link:Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
 * _See Requirement link:Requirements.adoc#PM-CLIENT-4[PM-CLIENT-4: Neutral Fallback Profile for Unknown Clients]_
 * _See Requirement link:Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy]_
+* _See Requirement link:Requirements.adoc#PM-MIG-1[PM-MIG-1: Six-Stage Incremental Seam Migration]_
 
-_See link:specification/client-profiles.adoc[Client Profiles Specification] and link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] for implementation details_
+_See link:specification/client-profiles.adoc[Client Profiles Specification], link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], and link:specification/mcp-tools.adoc[MCP Tools Specification] for implementation details_
 
 * [ ] Implement on-the-fly client profile translation engine (`claude`, `opencode`, `antigravity`, `codex`, `neutral`) with `schema_version` validation
 * [ ] Expose vocabulary skills via `pm_skills`, `pm_skill`, `pm_skill_file`, and standard MCP `resources/templates/list` + `resources/read` (`skill://pm/.../SKILL.md`)
 * [ ] Embed client bundles (`classpath:/bundles/<client>/`) and `bundle-manifest.json` SHA-256 digests directly into the `pm-mcp` binary
-* [ ] Implement `pm-mcp client install|update|remove|status` CLI with `state/install-records.json` ownership and shared-file digest conflict detection across the host configuration files of the link:specification/client-profiles.adoc#host-integration-table[Host Integration Table]
+* [ ] Implement `pm-mcp client install|update|remove|status` CLI with `state/install-records.json` ownership, the interactive-terminal gate (no `--yes`) for `remove` and deny-rule-weakening changes, and shared-file digest conflict detection across the host configuration files of the link:specification/client-profiles.adoc#host-integration-table[Host Integration Table]
 * [ ] Retire legacy static multi-target generator and plugin-cache distribution for process skills
+* [ ] Remove the transitional `pm_legacy_script` tool from the tool surface, client bundles, and host permissions once no unported script remains
 
 

@@ -33,6 +33,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7: Data Store Invariants, Footprint Reconciliation & Lock Ordering]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
 
 == Status: PLANNED
 
@@ -45,6 +46,8 @@ _See Requirements:_
 == Scope Entry Record (`mcp/entry.json`)
 
 Written by `pm-mcp enter --client <client>` when a session enters a plan, epic, or project steward scope. Read on every subsequent MCP call within that scope (`PM-ARCH-4`).
+
+When the entered plan does not exist yet, `pm-mcp enter` writes the same record as a pending entry record `.plan/local/mcp/pending/<entry_id>.json` (with `scope_id: null`) and prints the `entry_id`. `pm_start(entry_id, ...)` sets `scope_id` to the new `plan_id` and relocates the record atomically to `.plan/local/plans/<plan_id>/mcp/entry.json`; a consumed `entry_id` no longer exists, so each pending record starts at most one plan.
 
 [source,json]
 ----
@@ -78,7 +81,7 @@ Written by `pm-mcp enter --client <client>` when a session enters a plan, epic, 
     "scope_id": {
       "type": ["string", "null"],
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-      "description": "Plan ID or Epic ID; null when scope_type == 'project' (steward entry)."
+      "description": "Plan ID or Epic ID; null when scope_type == 'project' (steward entry) and in a pending entry record before pm_start."
     },
     "client_id": {
       "type": "string",
@@ -281,6 +284,20 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
           },
           "started_at": { "type": "string", "format": "date-time" }
         }
+      }
+    },
+    "pending_decision": {
+      "type": ["object", "null"],
+      "description": "Operator decision a *.blocked state waits for; its decision_id is addressed by the link wait:decision:<decision_id> (PM-SEC-3).",
+      "required": ["decision_id", "decision", "operator_command", "requested_at"],
+      "additionalProperties": false,
+      "properties": {
+        "decision_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "decision": { "type": "string", "description": "Escalation decision identifier from the workflow definition (e.g. 'loop_limit_extension')." },
+        "operator_command": { "type": "string" },
+        "requested_at": { "type": "string", "format": "date-time" },
+        "resolution": { "type": ["string", "null"] },
+        "resolved_at": { "type": ["string", "null"], "format": "date-time" }
       }
     },
     "facts": {
@@ -786,11 +803,16 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/audit-record.json",
   "title": "AuditRecord",
   "type": "object",
-  "required": ["format_version", "event_id", "timestamp", "category", "event", "actor", "outcome"],
+  "required": ["format_version", "event_id", "prev_hash", "timestamp", "category", "event", "actor", "outcome"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "event_id": { "type": "string", "format": "uuid" },
+    "prev_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 (lowercase hex) of the previous record's canonical line; 64 '0' characters for the first record of the log."
+    },
     "timestamp": { "type": "string", "format": "date-time" },
     "category": { "type": "string", "enum": ["transition", "job", "operator", "security", "identity", "credential"] },
     "event": { "type": "string" },
@@ -802,6 +824,8 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
   }
 }
 ----
+
+*Hash chain (`PM-SEC-6`)*: The canonical line of a record is its exact UTF-8 byte sequence in `audit.jsonl`, excluding the terminating newline. A writer appends only under the log's `FileChannel.lock()`, after reading the current last line to compute `prev_hash`. The runtime verifies the chain at startup; a mismatch or unparsable line is reported to the operator and recorded as an `audit_chain_broken` record (`category: security`, `details.first_broken_line`), and the log is never rewritten or repaired.
 
 == Data Layer Integrity & Concurrency Invariants (`PM-IMPL-7`)
 
@@ -858,11 +882,11 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 |Disposition |Target Surface in `PM-MCP` |Verification Strategy
 
 |*Ported (Data Layer, Redesigned Store Format)*
-|Canonical store read/write invariants of `manage-status.py`, `manage-tasks.py`, `manage-findings.py`, `manage-references.py`, `manage-change-ledger.py`, `manage-execution-manifest.py`, and `manage-lessons.py`
+|Canonical store read/write invariants of `manage-status.py`, `manage-tasks.py`, `manage-findings.py`, `manage-references.py`, `manage-change-ledger.py`, and `manage-lessons.py`; the worktree SHA-256 freshness hash (`worktree_sha`); and the pure output parsers and classifiers of the git and CI integrations (`workflow-integration-{git,github,gitlab,sonar}`)
 |100% differential equivalence testing (`PM-TEST-2`) over shared fixture corpuses before cutover, comparing the Java result with the Python result mapped through the store's legacy -> target converter (<<legacy-store-formats>>). Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion).
 
 |*Redesigned (Hypermedia & Native Services)*
-|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `workflow-integration-{git,github,gitlab,sonar}`
+|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `manage-execution-manifest.py` (the execution manifest is composed in-process by `ExecutionManifestResolver`), and the workflow-integration verbs of `workflow-integration-{git,github,gitlab,sonar}` (replaced by workflow primitives and sub-workflows such as `git.commit_and_push`)
 |Workflow DSL AST verification (`PM-TEST-3`), `ConfigMigrationChainTest` version/idempotency verification, scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
 
 |*Retired (Obsolete Infrastructure)*

@@ -10,7 +10,7 @@ link:../Specification.adoc[Specification] » MCP Tool & Resource Surface (link:.
 
 == Overview
 
-This document defines the normative Model Context Protocol (MCP) tool schemas, resource URI templates, skill delivery surface, and error/result envelope contracts for *plan-marshall-mcp* (`PM-MCP`). It specifies the JSON Schema (Draft 2020-12) definitions for the core workflow verbs (`pm_start`, `pm_state`, `pm_do`), discovery tools (`pm_plans`, `pm_epics`), orthogonal service tools (`pm_build`, `pm_lsp`), and tool-based skill retrieval (`pm_skill`, `pm_skills`, `pm_skill_file`), alongside the strict separation between MCP protocol faults (`isError: true`) and domain workflow failure states (`isError: false`).
+This document defines the normative Model Context Protocol (MCP) tool schemas, resource URI templates, skill delivery surface, and error/result envelope contracts for *plan-marshall-mcp* (`PM-MCP`). It specifies the JSON Schema (Draft 2020-12) definitions for the core workflow verbs (`pm_start`, `pm_state`, `pm_do`), discovery tools (`pm_plans`, `pm_epics`), orthogonal service tools (`pm_build`, `pm_lsp`), tool-based skill retrieval (`pm_skill`, `pm_skills`, `pm_skill_file`), and the transitional legacy script tool (`pm_legacy_script`, Migration Stages 1–5), alongside the strict separation between JSON-RPC protocol errors, tool execution errors (`isError: true`), and domain workflow failure states (`isError: false`).
 
 == Traceability
 
@@ -37,6 +37,8 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6: Native Build Output Parsers & Fallback Diagnostics]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-3[PM-EXT-3: Module Discovery, Build Map & Architecture Enrichment]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Six-Stage Incremental Seam Migration]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Exclusive Runtime per Machine & Routed Legacy Script Execution]_
 
 == Status: PLANNED
 
@@ -49,7 +51,7 @@ _See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel I
 
 === Architectural Constraints
 
-1. *Small, Stable Verb Set*: PM-MCP exposes a fixed set of top-level MCP tools (`pm_start`, `pm_state`, `pm_do`, `pm_plans`, `pm_epics`, `pm_build`, `pm_lsp`, `pm_skills`, `pm_skill`, `pm_skill_file`) rather than one tool per workflow step or script. Across all phases and domains, the resident tool surface remains constant, and privileged operator actions are strictly excluded from the MCP tool surface (`PM-SEC-3`).
+1. *Small, Stable Verb Set*: PM-MCP exposes a fixed set of top-level MCP tools (`pm_start`, `pm_state`, `pm_do`, `pm_plans`, `pm_epics`, `pm_build`, `pm_lsp`, `pm_skills`, `pm_skill`, `pm_skill_file`) rather than one tool per workflow step or script. Across all phases and domains, the resident tool surface remains constant, and privileged operator actions are strictly excluded from the MCP tool surface (`PM-SEC-3`). The one documented exception is the transitional `pm_legacy_script` tool, present only during Migration Stages 1–5 and removed at Stage 6 (<<transitional-legacy-script-tool>>).
 2. *Portable Naming Convention*: Every tool name conforms to `^pm_[a-z0-9_]+$`, ensuring identical identifiers across Claude Code, OpenCode, Antigravity, Codex, and raw model tool-calling APIs without escaping or translation.
 3. *Closed Top-Level Schemas*: Every tool `inputSchema` conforms to JSON Schema Draft 2020-12 (`https://json-schema.org/draft/2020-12/schema`) and declares `"additionalProperties": false` at the top-level object boundary.
 4. *TOON Text Output Only (No `outputSchema`)*: Tools intentionally omit `outputSchema` and `structuredContent`. Every tool result is returned in a single MCP `TextContent` block (`type: "text"`) encoded in deterministic TOON (link:hypermedia-format.adoc[Hypermedia Format Specification]). This avoids resident output-schema token overhead while optimizing token density on every turn.
@@ -61,7 +63,7 @@ _See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Ve
 
 === `pm_start` — Initialize a Plan Scope
 
-Creates a new plan directory from one of the four supported initialization sources (`request`, `issue_number`, `lesson_id`, or `recipe_id`) following a plan-mode `pm-mcp enter` invocation, relocates the project-level `mcp/entry.json` record into `.plan/local/plans/<plan_id>/mcp/entry.json`, initializes `mcp/status.json`, and returns the initial TOON hypermedia representation.
+Creates a new plan directory from one of the four supported initialization sources (`request`, `issue_number`, `lesson_id`, or `recipe_id`) following a plan-mode `pm-mcp enter` invocation, consumes the pending entry record `.plan/local/mcp/pending/<entry_id>.json` whose `entry_id` that invocation printed by relocating it atomically into `.plan/local/plans/<plan_id>/mcp/entry.json`, initializes `mcp/status.json`, and returns the initial TOON hypermedia representation. Concurrent entries for different new plans therefore never share a slot.
 
 [source,json]
 ----
@@ -71,6 +73,11 @@ Creates a new plan directory from one of the four supported initialization sourc
   "description": "Create a new plan from a request, issue, lesson, or recipe and return its initial hypermedia representation.",
   "type": "object",
   "properties": {
+    "entry_id": {
+      "type": "string",
+      "pattern": "^ent-[0-9a-f]{8,32}$",
+      "description": "Identifier printed by 'pm-mcp enter' for the pending entry record this plan consumes."
+    },
     "request": {
       "type": "string",
       "minLength": 1,
@@ -121,6 +128,7 @@ Creates a new plan directory from one of the four supported initialization sourc
     { "required": ["lesson_id"] },
     { "required": ["recipe_id"] }
   ],
+  "required": ["entry_id"],
   "additionalProperties": false
 }
 ----
@@ -208,9 +216,9 @@ The sole state transition verb in PM-MCP. Executes the transition identified by 
     },
     "link": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_-]*(:[A-Za-z0-9_.-]+)?$",
+      "pattern": "^[a-z][a-z0-9_-]*(:(decision:)?[A-Za-z0-9][A-Za-z0-9_.-]*)?$",
       "maxLength": 128,
-      "description": "Link identifier from the current representation (e.g., 'push', 'triage:F-12', 'wait:b-2291', 'returned:dsp-PLAN-042-0001-a9f3c2')."
+      "description": "Link identifier from the current representation (e.g., 'push', 'triage:F-12', 'wait:b-2291', 'wait:decision:dec-7f3a', 'returned:dsp-PLAN-042-0001-a9f3c2')."
     },
     "args": {
       "type": "object",
@@ -235,7 +243,7 @@ The sole state transition verb in PM-MCP. Executes the transition identified by 
 
 ==== Two-Stage Schema Validation for `pm_do`
 
-1. *Stage 1 (MCP Protocol Boundary)*: Validates that the incoming payload conforms to the `pm_do` JSON Schema above (`additionalProperties: false`, valid `plan_id`/`epic_id`, syntactic `link` pattern, `args` is a JSON object).
+1. *Stage 1 (MCP Protocol Boundary)*: Validates that the incoming payload conforms to the `pm_do` JSON Schema above (`additionalProperties: false`, valid `plan_id`/`epic_id`, syntactic `link` pattern, `args` is a JSON object); a violation is answered with a JSON-RPC `-32602` invalid-params error.
 2. *Stage 2 (Workflow Engine Link Schema)*: Under the scope's exclusive lock, the engine resolves the active `LinkSpec` for `link` in the current state and validates `args` against the link's dynamically derived closed JSON Schema (`additionalProperties: false`, exact required free parameter keys, closed enum values, string length bounds, and integer ranges). If `args` fails Stage 2 validation or `link` is not offered in the current state, the engine returns `isError: false` with a structured `rejected` block and the fresh representation (see <<protocol-errors-vs-domain-workflow-failure-states>>).
 
 == Orthogonal Service Capability Tool Schemas (`pm_build`, `pm_lsp`)
@@ -391,6 +399,7 @@ Queries or applies verified workspace edits against the session's warm LSP pool 
 ==== Warm LSP Pool Lifecycle (`PM-SVC-2`)
 
 * *Pool Keying & Lazy Spawn over `stdio`*: The runtime maintains a warm in-memory pool of LSP server child processes, shared by all host connections, keyed by `(canonical_worktree_path, language_id)` using language servers enrolled in `~/.plan-marshall/mcp/enrolments.json` and managed via `org.eclipse.lsp4j:org.eclipse.lsp4j` over `stdio`. Processes start lazily on the first `pm_lsp` or Axis C symbol-edge query and shut down automatically after `idle_timeout_seconds` (default 900s), when the plan worktree is removed, or when the runtime drains or stops.
+* *Diagnostics (`diagnostics`)*: When the language server advertises the LSP 3.17 pull-diagnostics capability (`diagnosticProvider`), `pm-mcp` requests the file's current diagnostics with `textDocument/diagnostic`. Otherwise it returns the diagnostics the server last published for that file through the `textDocument/publishDiagnostics` notification, which the pool caches per document, and marks the result `source: published`.
 * *Server-Applied `WorkspaceEdit` (`rename`)*: When `op == "rename"`, `pm-mcp` validates that every target URI in the LSP `WorkspaceEdit` resolves inside the plan's worktree (`PM-SEC-2`), applies the text edits atomically on disk, notifies the warm LSP server (`textDocument/didChange`), and appends all modified file paths to the plan's `references.json` realized footprint.
 
 === Selective Upstream MCP Proxy & `_meta` Provenance (`PM-SVC-3`)
@@ -399,7 +408,7 @@ _See Requirement link:../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream
 When a project configures upstream MCP integrations (such as external issue trackers or documentation indexes), `pm-mcp` acts as a selective filter and provenance boundary:
 
 1. *Allowlisted Tool Re-Exposure & Schema Narrowing*: Only upstream tools explicitly listed in the project configuration are re-exposed on the `pm-mcp` tool surface, with unused optional parameters stripped from their `inputSchema` to conserve resident context budget. Upstream skills are never re-exposed as PM-MCP vocabulary skills.
-2. *Provenance Tagging (`_meta.source`)*: Every tool result or resource proxied from an upstream MCP server is wrapped with `_meta: {"source": "upstream_mcp:<server_id>", "trusted": false}` and routed through the untrusted-ingestion validator (`PM-SEC-1`) before any candidate data can enter plan stores.
+2. *Provenance Tagging (`_meta` key `de.cuioss.pm-mcp/source`)*: Every tool result or resource proxied from an upstream MCP server is wrapped with `_meta: {"de.cuioss.pm-mcp/source": "upstream_mcp:<server_id>", "de.cuioss.pm-mcp/trusted": false}`, using PM-MCP's own `_meta` key prefix (MCP `_meta` key prefix convention) so that provenance never collides with or is overwritten by keys the upstream server sets, and routed through the untrusted-ingestion validator (`PM-SEC-1`) before any candidate data can enter plan stores.
 3. *Credential Isolation*: Upstream MCP connections authenticate using server-specific credentials resolved from `CredentialStore` (`<project>/mcp-<server_id>`) over `de.cuioss:cui-http` (or isolated `stdio` subprocess pipes); tokens from other providers are never forwarded.
 
 == Skill Architecture & Retrieval Tool Schemas (`pm_skill`, `pm_skills`, `pm_skill_file`)
@@ -416,7 +425,7 @@ _See Requirement link:../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven 
 === Pure Vocabulary Skills & Dynamic Context Injection (`PM-SKILL-1`, `PM-SKILL-2`, `PM-SKILL-4`)
 
 * *Pure Vocabulary Contract (`PM-SKILL-1`)*: All procedural sequencing, CLI invocations, file path templates, and phase transition rules live exclusively in the compiled workflow engine. Vocabulary skills (`skill://pm/<domain>/<topic>/SKILL.md`) contain strictly domain standards, quality rubrics, architectural principles, and judgment criteria.
-* *Server-Generated & Client-Cached Catalogue (`PM-SKILL-2`)*: Vocabulary skills are compiled into the `pm-mcp` binary, filtered by the project's enabled domains in `.plan/marshal.json`, and translated on the fly for the active client profile (`PM-CLIENT-2`). Every rendered skill includes a deterministic `_meta.sha256` content digest (`SHA-256(canonical_skill_bytes + client_profile_digest + domain_config_digest)`) enabling client-side caching and invalidation via standard MCP `notifications/resources/list_changed`.
+* *Server-Generated & Client-Cached Catalogue (`PM-SKILL-2`)*: Vocabulary skills are compiled into the `pm-mcp` binary, filtered by the project's enabled domains in `.plan/marshal.json`, and translated on the fly for the active client profile (`PM-CLIENT-2`). Every rendered skill includes a deterministic `_meta.sha256` content digest (`SHA-256(canonical_skill_bytes + client_profile_digest + domain_config_digest)`) enabling client-side caching and invalidation: when the rendered content of a skill resource a client has subscribed to (`resources/subscribe`) changes, `pm-mcp` sends `notifications/resources/updated` for that URI; `notifications/resources/list_changed` is sent only when the set of available skill resources changes (for example, when a domain is enabled or disabled).
 * *Dynamic State Context Injection (`PM-SKILL-4`)*: Live plan facts (`plan_id`, `worktree_sha`, active task summary, findings count, and valid `links`) are injected into the turn's TOON hypermedia representation (`skill` + `facts` + `links`), never baked into static `SKILL.md` files.
 
 === `pm_skill` — Retrieve Vocabulary Skill Content
@@ -457,6 +466,51 @@ Fetches a rendered `SKILL.md` document by its canonical `skill://pm/.../SKILL.md
 * `pm_skills`: Accepts optional `plan_id` or `epic_id` (`additionalProperties: false`) and returns the tabular TOON catalogue of all vocabulary skills active for the project's enabled domains (`uri`, `name`, `description`, `sha256`).
 * `pm_skill_file`: Accepts required `uri` (`^skill://pm/[a-z0-9/_-]+/[a-zA-Z0-9_.-]+\.(md|adoc|json|toon)$`) and optional `plan_id`/`epic_id` (`additionalProperties: false`) to retrieve progressive-disclosure reference files linked from a `SKILL.md`.
 * *Standard MCP Resource Template Parity (`PM-SKILL-3`)*: `pm-mcp` simultaneously exposes the RFC 6570 templates `skill://pm/{+path}/SKILL.md` and `skill://pm/{+path}/{file}` (`{+path}` = one or more `/`-separated lowercase segments) via standard MCP `resources/templates/list` and `resources/read`. Unadopted draft custom RPC methods (`skills/list`, `skills/get`) are not exposed.
+
+[#transitional-legacy-script-tool]
+== Transitional Legacy Script Tool (`pm_legacy_script`)
+_See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Six-Stage Incremental Seam Migration]_
+
+_See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Exclusive Runtime per Machine & Routed Legacy Script Execution]_
+
+_See Requirement link:../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+
+After the machine cutover (Stage 1) the host can no longer run `execute-script.py`, while the workflows that are not yet served by the hypermedia engine still call unported `plan-marshall` scripts. `pm_legacy_script` is their only route. It is the one documented exception to the fixed tool set (`PM-TOOL-5`): it is registered only while unported scripts remain (Migration Stages 1–5) and is removed from the tool surface, the client bundles, and the host permissions at Stage 6.
+
+=== `pm_legacy_script` — Run an Unported Script
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_legacy_script",
+  "description": "Transitional (Migration Stages 1-5): run an unported plan-marshall script as a verified script job and return its result as TOON.",
+  "type": "object",
+  "properties": {
+    "notation": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*:[a-z][a-z0-9_-]*$",
+      "maxLength": 192,
+      "description": "Script notation {bundle}:{skill}:{script} (e.g., 'plan-marshall:manage-status:manage_status')."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 65536 },
+      "maxItems": 128,
+      "default": [],
+      "description": "Argument vector passed to the script, validated against the script's registered argument schema."
+    }
+  },
+  "required": ["notation"],
+  "additionalProperties": false
+}
+----
+
+1. *Registered Scripts Only*: `notation` must resolve to a script in the executor adapter's registry (verified script digest and pinned Python interpreter, `PM-EXEC-3`). A script that is not registered, including every ported or retired script, is refused with status `refused`.
+2. *Argument Validation*: `args` is validated against the script's registered argument schema (closed subcommands and flags, typed values) before any process starts. Values are passed as discrete `argv` entries and never through a shell (`PM-EXEC-1`, `PM-SEC-5`).
+3. *Verified `script` Job Under the Scope Lock*: The executor adapter runs the script as a `script` job in the working directory matching the plan's location (never setting `PLAN_BASE_DIR`, `PM-ARCH-5`). The addressed scope is taken from the plan identifier argument declared in the registered schema (the project scope for plan-less scripts); its lock is held for the whole job (`PM-MIG-2`), and the store digests are re-recorded afterwards (link:store-schemas.adoc[Store Schemas Specification]).
+4. *TOON Result*: The result is a TOON document with the job `status` (closed job outcome enum, `PM-EXEC-4`), the script `exit_code`, and the script's own TOON output with secrets redacted (`PM-CRED-5`). A failing script is a normal tool result, not an MCP error.
+5. *No Workflow Transition*: `pm_legacy_script` never advances the PM-MCP workflow state machine; hypermedia-served phases never emit instructions to call it.
 
 == Read-Only MCP Resource URI Surface
 _See Requirement link:../Requirements.adoc#PM-TOOL-3[PM-TOOL-3: Read-Only MCP Resource URI Surface]_
@@ -584,57 +638,61 @@ Large artifacts, logs, architecture views, and ledgers are never inlined into hy
 |===
 
 [#protocol-errors-vs-domain-workflow-failure-states]
-== Protocol Errors (`isError: true`) vs Domain Workflow Failure States (`isError: false`)
+== Protocol Errors, Tool Execution Errors (`isError: true`) & Domain Workflow Failure States (`isError: false`)
 _See Requirement link:../Requirements.adoc#PM-TOOL-4[PM-TOOL-4: Domain Failures as Valid Workflow States]_
 
 _See Requirement link:../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
 
-A foundational invariant of PM-MCP is that *domain failures and transition rejections are workflow states, not MCP protocol errors*.
+A foundational invariant of PM-MCP is that *domain failures and transition rejections are workflow states, not MCP protocol errors*. Three response classes are distinguished:
+
+* *JSON-RPC protocol errors*: a JSON-RPC `error` response (no `CallToolResult`) for malformed JSON-RPC (`-32700` parse error, `-32600` invalid request), unknown tool names (`-32602`), and tool arguments that violate the tool's MCP `inputSchema` (`-32602` invalid params).
+* *Tool execution errors*: a normal `CallToolResult` with `isError: true` when a schema-valid call cannot be executed (unknown scope, unenrolled project, missing entry record, unhandled server exception).
+* *Domain results*: a normal `CallToolResult` with `isError: false` for every workflow outcome, including failures and rejected transitions (`PM-TOOL-4`).
 
 === Normative Classification Matrix
 
 [cols="2,1,2,3"]
 |===
-|Condition |MCP `isError` |Response Structure |Model Recovery Path
+|Condition |MCP Response Class |Response Structure |Model Recovery Path
 
 |Valid transition succeeds (`pm_do`)
-|`false`
+|`isError: false`
 |Next state's TOON representation (`state`, `facts`, `links`).
 |Follow one of the new `links`.
 
 |Build fails, tests fail, or quality gate turns red
-|`false`
+|`isError: false`
 |TOON representation in a remediation state (e.g., `execute.verify.failed`, `finalize.ci-failed`) with structured failure facts and `fix`, `retry`, `loop_back`, or `escalate` links.
 |Inspect failure facts (or `log_uri`), apply code fixes, and follow `fix` / `retry` / `loop_back`.
 
 |Git push rejected (non-fast-forward) or merge conflict
-|`false`
+|`isError: false`
 |TOON representation in `git.sync-required` or `git.sync-escalate` (inside the `git.commit_and_push` sub-workflow) with `sync_rebase` (rel `fix`) / `escalate` links.
 |Follow the offered `sync_rebase` or `escalate` link.
 
 |Host tool modifies files outside the plan's worktree
-|`false`
+|`isError: false`
 |TOON representation in `<phase>.footprint-violation` naming the offending files and offering `fix` and `escalate` links.
 |Revert unauthorized changes and follow `fix`, or `escalate` to operator.
 
 |Stale link followed, entity no longer in accepting state, or `args` fails link parameter validation
-|`false`
+|`isError: false`
 |Authoritative *current* TOON representation plus a top-level `rejected` block (`reason`, `link`, `detail`).
 |Read the current representation and follow one of its valid `links` with corrected `args`.
 
 |Operator approval required or loop-back limit reached
-|`false`
-|TOON representation in `*.blocked` or `finalize.loop-limit-reached` offering `wait` or `escalate`.
-|Follow `escalate` or `wait` for operator action.
+|`isError: false`
+|TOON representation in `*.blocked` offering `wait:decision:<decision_id>` (a bounded wait on the pending operator decision record), or `finalize.loop-limit-reached` offering `escalate`.
+|Follow `escalate`, or `wait:decision:<decision_id>` until the operator resolves the decision.
 
 |Malformed JSON-RPC, unknown tool name, or top-level tool `inputSchema` violation
-|`true`
-|Standard JSON-RPC / MCP `CallToolResult` with `isError: true`, closed `error_code: "schema_validation_failed"`, and `audit_id`.
+|JSON-RPC error
+|JSON-RPC `error` object (`-32700`, `-32600`, or `-32602`) whose `data` carries `audit_id`; no `CallToolResult`.
 |Fix top-level tool invocation syntax.
 
-|Unknown `plan_id` / `epic_id`, unenrolled workspace, or internal server exception
-|`true`
-|MCP `CallToolResult` with `isError: true`, closed `error_code` (`scope_not_found`, `project_not_enrolled`, `internal_fault`), and `audit_id`.
+|Unknown `plan_id` / `epic_id`, unenrolled workspace, missing pending entry record, or internal server exception
+|`isError: true`
+|MCP `CallToolResult` with `isError: true`, closed `error_code` (`scope_not_found`, `project_not_enrolled`, `entry_record_missing`, `internal_fault`), and `audit_id`.
 |Halt or invoke discovery (`pm_plans` / `pm_epics`) or notify operator with `audit_id`.
 |===
 
@@ -664,9 +722,9 @@ links[2]{rel,link,form,free}:
   abort,abort,noop,""
 ----
 
-=== Sanitized Protocol Error Envelope (`isError: true`)
+=== Sanitized Tool Execution Error Envelope (`isError: true`)
 
-When an actual MCP protocol or server error occurs (`isError: true`), the `TextContent` payload is strictly sanitized — stack traces, Java class names, filesystem paths, and credentials are never emitted:
+When a tool call cannot be executed (`isError: true`), the `TextContent` payload is strictly sanitized — stack traces, Java class names, filesystem paths, and credentials are never emitted:
 
 [source,toon]
 ----
@@ -678,12 +736,12 @@ message: "Plan scope 'PLAN-UNKNOWN' does not exist in the enrolled workspace."
 
 Closed `error_code` enumeration for `isError: true`:
 
-* `schema_validation_failed` — Top-level MCP tool arguments violated the tool's JSON Schema.
 * `scope_not_found` — Referenced `plan_id`, `epic_id`, or `entity` does not exist.
 * `project_not_enrolled` — The target repository is not enrolled in `~/.plan-marshall/mcp/enrolments.json`.
-* `entry_record_missing` — `pm_start` was called without a preceding `pm-mcp enter` record in the project.
-* `rate_limit_exceeded` — Client exceeded per-client tool call rate limits.
+* `entry_record_missing` — `pm_start` was called with an `entry_id` for which no pending entry record `.plan/local/mcp/pending/<entry_id>.json` exists (never written by `pm-mcp enter`, or already consumed).
 * `internal_fault` — Unexpected server exception; full diagnostics are written exclusively to `audit.jsonl` under `audit_id`.
+
+JSON-RPC protocol errors are sanitized the same way: the `error.message` is a fixed text per code and `error.data` carries only the `audit_id`.
 
 == Automated MCP Protocol & STDIO Testing with `McpAssured` (`quarkus-mcp-server-test`)
 _See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
@@ -727,7 +785,7 @@ client.when()
 
 === Normative `McpAssured` Verification Requirements
 
-1. *Tool & Resource Schema Conformance*: Every `@Tool` and `@ResourceTemplate` is asserted via `client.when().toolsList(...)` and `client.when().resourcesTemplatesList(...)` to verify closed JSON Schema Draft 2020-12 `inputSchema` definitions (`additionalProperties: false`) and exact URI template registrations.
-2. *Domain Failure vs Protocol Error Assertions*: Every `pm_do` rejection and domain failure state is asserted with `assertThat(response.isError()).isFalse()`, while top-level schema violations and unknown scope queries are asserted with `assertThat(response.isError()).isTrue()` and sanitized `error_code` + `audit_id` payloads.
+1. *Tool & Resource Schema Conformance*: Every `@Tool` and `@ResourceTemplate` is asserted via `client.when().toolsList(...)` and `client.when().resourcesTemplatesList(...)` to verify closed JSON Schema Draft 2020-12 `inputSchema` definitions (`additionalProperties: false`) and exact URI template registrations. The example asserts the Stage 6 tool set; during Migration Stages 1–5 the expected list additionally contains the transitional `pm_legacy_script`.
+2. *Domain Failure vs Protocol Error Assertions*: Every `pm_do` rejection and domain failure state is asserted with `assertThat(response.isError()).isFalse()`, unknown scope queries are asserted with `assertThat(response.isError()).isTrue()` and sanitized `error_code` + `audit_id` payloads, and unknown tools and top-level schema violations are asserted as JSON-RPC error responses (`-32602`) without a `CallToolResult`.
 3. *`stdout` Stream Hygiene & `stderr` Separation*: `setStderrHandler(...)` captures all diagnostic output on `stderr` while `McpStdioTestClient` parses every `stdout` line as a strict JSON-RPC 2.0 frame, proving zero `stdout` pollution across concurrent `pm_build` and `pm_lsp` executions (`PM-SEC-4`, `PM-TEST-5`).
 

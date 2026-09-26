@@ -180,28 +180,59 @@ Properties and limits:
 
 == Native Build Output Parsers
 
-When a build completes with a non-zero exit code or compiler warnings, the runtime extracts structured diagnostics without calling external Python scripts (`PM-IMPL-6`):
+When a build completes with a non-zero exit code or compiler warnings, the runtime extracts structured diagnostics without calling external Python scripts (`PM-IMPL-6`). Each compiled parser ports one `plan-marshall` parser module (`marketplace/bundles/plan-marshall/skills/build-*/scripts/`, plus the domain-owned OpenRewrite parser) and is verified against it by differential tests (`PM-TEST-2`):
 
-[cols="1,2,2"]
+[cols="2,2,3,3"]
 |===
-|Build System |Parser Strategy |Diagnostic Extractions
+|Parser |`plan-marshall` Module |Parser Strategy |Diagnostic Extractions
 
 |*Maven*
-|Regex stream scanner for `\[ERROR\]` lines and compiler plugin reports (`javac`, `maven-compiler-plugin`).
-|File path, line number, column number, error message, compiler diagnostic code.
+|`build-maven/_maven_cmd_parse.py`
+|Line scanner over `[ERROR]` / `[WARNING]` lines with the shared JVM category patterns (compiler, test, dependency, OpenRewrite info), stack-trace collection, deduplication across reactor summary and per-module output, and Surefire/Failsafe test summary.
+|File path, line, column, message, category, severity; test counts; build status.
 
 |*Gradle*
-|Scanner for `e: <path>:(line, col): <message>` Kotlin/Java errors and Gradle task execution failures.
-|Task name, source file, line/col, stack summary.
+|`build-gradle/_gradle_cmd_parse.py`
+|Scanner over Java/Kotlin compiler errors (`e: <path>:(line, col): <message>`), failing tasks, and `N tests completed, M failed` summaries with the shared JVM category patterns.
+|File path, line, column, message, category, failing task; test counts; build status.
 
-|*npm / ESLint*
-|Direct structured JSON parser when invoked with `--format json` or regex parser over standard TAP/Unix lint stream.
-|Rule ID, severity (`error`/`warning`), file path, line/col, repair message.
+|*npm errors*
+|`build-npm/_npm_parse_errors.py`
+|Scanner over `npm ERR!` lines, classifying error codes (`ERESOLVE`, `E404`, and others).
+|Error code, conflicting package / peer dependency, message.
 
-|*Python / Pytest*
-|JUnit XML / Cobertura report parser or regex scanner over standard traceback blocks.
-|Test class, test method, failure type, file path, line number, failure diff.
+|*TypeScript*
+|`build-npm/_npm_parse_typescript.py`
+|Scanner over `tsc` diagnostics in both `path(line,col): error TSnnnn: message` and `path:line:col - error TSnnnn: message` forms.
+|File path, line, column, `TS` code, message.
+
+|*ESLint*
+|`build-npm/_npm_parse_eslint.py`
+|Scanner over the stylish formatter output (file header lines followed by `line:col severity message rule` rows) and the problem summary.
+|File path, line, column, severity, rule ID, message; error and warning counts.
+
+|*Jest*
+|`build-npm/_npm_parse_jest.py`
+|Scanner over `FAIL <suite>` blocks and the `Tests:` summary line.
+|Failing test file and test name, failure message; test counts.
+
+|*TAP*
+|`build-npm/_npm_parse_tap.py`
+|Scanner over `not ok N - <name>` lines and the `# tests` / `# pass` / `# fail` / `# skipped` summary.
+|Failing test name; test counts.
+
+|*Python (pyproject)*
+|`build-pyproject/_pyproject_cmd_parse.py`
+|Tool-detecting scanner for pytest (`FAILED` and collection/setup `ERROR` short-summary lines, with the deepest traceback frame for the location), ruff (`path:line:col: CODE message`), and mypy (`path:line: error: message`).
+|File path, line, rule code or test node ID, message; test counts.
+
+|*OpenRewrite*
+|`pm-dev-java-cui:parse-rewrite-log` (domain verb `rewrite-log-parse`, consumed by `build-maven/_maven_cmd_rewrite_log.py`)
+|Scanner over the structured OpenRewrite `WARN` finding lines in the Maven log, run only when the build reached the `rewrite:run` goal and the java-cui domain is active; fail-closed verdicts `observed`, `not_observed`, `domain_inactive`, `parse_error`.
+|Recipe finding per line (newly detected vs pre-existing), verdict.
 |===
+
+Coverage reports are parsed separately (<<Native Coverage Report Parsers>>).
 
 === Unparseable Output Fallback (`failed_unparsed`)
 
@@ -223,10 +254,10 @@ If a build fails (exit code != 0) but the output parser cannot extract any struc
 
 === Native Coverage Report Parsers
 
-The build runtime parses coverage artifacts natively after test execution to evaluate threshold compliance:
+The build runtime parses coverage artifacts natively after test execution to evaluate threshold compliance, porting `plan-marshall`'s format-agnostic coverage parser (`script-shared/scripts/build/_coverage_parse.py`, formats JaCoCo, Cobertura, LCOV, and Istanbul JSON):
 
 * *JaCoCo (`jacoco.xml`)*: StAX XML reader extracting `INSTRUCTION`, `BRANCH`, and `LINE` counters per package, class, and source file.
-* *Cobertura (`coverage.xml`)*: StAX XML reader extracting `line-rate` and `branch-rate` per module and file.
+* *Cobertura (`coverage.xml`, as written by `coverage.py` for pytest)*: StAX XML reader extracting `line-rate` and `branch-rate` per module and file.
 * *LCOV (`lcov.info`)*: Line-oriented parser over `SF:`, `DA:`, `LF:`, `LH:`, `BRF:`, `BRH:` records.
 * *Istanbul (`coverage-summary.json`)*: Jackson streaming reader extracting `lines`, `statements`, `functions`, and `branches` percentages.
 
@@ -238,13 +269,23 @@ Before marking a module or pre-push quality gate as `fresh` in `change-ledger.js
 2. *Gate Coverage*: A module-scoped build (`module-tests`) never satisfies a whole-tree quality gate (`quality-gate` / `verify`).
 3. *Test-Scope Divergence Detection*: Detects and rejects runs where test filtering flags or skipped-test properties excluded tests belonging to modified modules.
 
+[#worktree-sha]
+== Working-Tree Hash (`worktree_sha`, `PM-SVC-1`)
+
+`worktree_sha` stamps every build and change entry in `change-ledger.jsonl` and keys every freshness gate. During staged porting the Java implementation and `plan-marshall`'s `script-shared/scripts/worktree_sha.py` must produce identical digests for identical working trees (differential tests, `PM-TEST-2`):
+
+1. *Inputs*: `git rev-parse HEAD`, `git diff HEAD`, and `git ls-files --others --exclude-standard`, run with the worktree root as working directory. The runtime invokes git with exactly this argument vector and the same environment as `plan-marshall`: no `-c` options, no additional flags, and no injected `GIT_*` variables, so the same system, global, and repository git configuration applies on both sides.
+2. *Framing*: `sha256(strip(HEAD) ‖ NUL ‖ diff ‖ NUL ‖ Σ(path ‖ NUL ‖ bytes ‖ NUL))` over the raw output bytes. Untracked paths are the non-empty output lines, sorted by Unicode code point (Python `sorted()` on `str`, never a locale collation or UTF-16 code unit order), encoded as UTF-8 with undecodable bytes preserved (Python `surrogateescape`). An unreadable file contributes empty bytes; an unresolvable `HEAD` yields no digest.
+3. *Known git-configuration sensitivities*: Because the digest hashes git's textual output, the following settings change it and must therefore be identical for both implementations (they are, as long as rule 1 holds): `diff.noprefix` and `diff.mnemonicPrefix` (path prefixes in `git diff`), `color.diff` (escape sequences when set to `always`), `diff.external` and textconv drivers (`diff.<driver>.textconv` via `.gitattributes`), and `core.quotePath` (quoting of non-ASCII paths in `ls-files`; a quoted path cannot be opened and contributes empty bytes).
+4. *Hash-version bump*: A later coordinated change may make the digest independent of these settings by adding `-c core.quotePath=false --no-color --no-ext-diff` to the git invocations. It must be applied to `plan-marshall` and `PM-MCP` together, as a new hash version, never to one side alone.
+
 == Security Boundary & Confinement Adversarial Testing (`PM-TEST-5`, `PM-SEC-1`, `PM-SEC-2`, `PM-SEC-5`)
 
 The `pm-mcp-core` and `pm-mcp-server` verification suite enforces automated adversarial tests (`PM-TEST-5`) across every job and ingestion boundary:
 
 1. *Workspace & Symlink Escape Rejection (`PM-SEC-2`)*: Adversarial fixtures containing `..` segments, URL-encoded path traversal, and intra-worktree symlinks pointing outside `<workspace-root>` must be rejected with `refused` before any file descriptor or subprocess is opened.
 2. *Tampered Binary & Wrapper Rejection (`PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`)*: Modifying 1 byte of an enrolled `mvnw`, `gradlew`, `pw`, host binary, or `project_script` without operator re-enrolment must fail the SHA-256 preflight check with `refused` and emit a `security` event in `audit.jsonl`.
-3. *Argument Vector Injection & Environment Sanitization (`PM-EXEC-1`, `PM-SEC-5`)*: Passing shell metacharacters (`; rm -rf`, `$(...)`, backticks) or non-allowlisted flags (`-Dexec.executable=...`, `--init-script`) in job parameters must be rejected at schema validation, and spawned child environments must never contain `GITHUB_TOKEN`, `SONAR_TOKEN`, or `JIRA_API_TOKEN`.
+3. *Argument Vector Injection & Environment Sanitization (`PM-EXEC-1`, `PM-SEC-5`)*: Passing shell metacharacters (`; rm -rf`, `$(...)`, backticks) or non-allowlisted flags (`-Dexec.executable=...`, `--init-script`) in job parameters must be rejected at schema validation, and spawned child environments must never contain `GITHUB_TOKEN` or `SONAR_TOKEN`.
 4. *Untrusted Reader Containment (`PM-SEC-1`)*: Sub-agent dispatches targeting `execution-context-reader` are verified to emit zero MCP tool permissions and pass all ingested candidate structs through the deterministic Java validator before writing to `.plan/` stores.
 
 

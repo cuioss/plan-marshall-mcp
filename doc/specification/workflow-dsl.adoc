@@ -43,7 +43,7 @@ The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP tra
 
 |`pm-mcp-core`
 |`de.cuioss.pm.mcp.core.workflow.*`
-|Contains the line-oriented DSL lexer/parser, immutable AST records, compile-time/startup static verifier, `Primitive<P, R>` SPI, deterministic state machine interpreter, and PlantUML/Mermaid/ASCII diagram generators. Depends *only* on the JDK (`java.base`) and `cui-java-tools` / Jackson annotations. Unit tests execute directly in JUnit 5 without Quarkus augmentation.
+|Contains the line-oriented DSL lexer/parser, immutable AST records, compile-time/startup static verifier, `Primitive<P, R>` SPI, deterministic state machine interpreter, and Mermaid/AsciiDoc-table/ASCII diagram generators. Depends *only* on the JDK (`java.base`) and `cui-java-tools` / Jackson annotations. Unit tests execute directly in JUnit 5 without Quarkus augmentation.
 
 |`pm-mcp-server`
 |`de.cuioss.pm.mcp.server.*`
@@ -211,6 +211,23 @@ Every `job` and `composite_job` state implicitly offers two links that are never
 |===
 
 `<job_id>` is the job identifier of a `job` state (for example `wait:b-2291`) and the composite identifier, which equals the state identifier, of a `composite_job` state (for example `wait:finalize.concurrent-wait`). The outcome enumeration of every `job` and `composite_job` primitive contains `cancelled`, so every such state must declare an explicit `cancelled -> <state>` outcome transition; Rule 2 (exhaustive outcome coverage) enforces it. A `job` state's outcome enumeration is the closed job outcome set of `PM-EXEC-4` (`succeeded`, `failed`, `failed_unparsed` for build jobs only, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`); a `composite_job` primitive declares its own closed workflow outcomes (`PM-WF-8`). A DSL link whose identifier pattern collides with an implicit link fails validation.
+
+[#escalation-decision-wait]
+=== Escalation Without Elicitation & the Implicit Decision Wait
+
+An `escalate <decision>` link action requests an operator decision (`PM-SEC-3`). On a connection that declared elicitation support, the engine prompts through `elicitation/create` and takes the link's outcome transition for the answer. Otherwise it records the pending decision in the scope's `mcp/status.json` (`pending_decision` with a fresh `decision_id`, link:store-schemas.adoc[Store Schemas Specification]) and moves the scope to its `<phase>.blocked` state, whose representation carries `facts.operator_command` and offers exactly one implicit link:
+
+[cols="1,1,1,3"]
+|===
+|Link |`rel` |`form` |Semantics
+
+|`wait:decision:<decision_id>`
+|`wait`
+|`wait`
+|Bounded wait (`PM-IMPL-4`) on the pending decision record. Once the operator resolves the decision through `pm-mcp operator`, the escalate link's outcome transition for that resolution is taken and the next state's representation is returned; when the wait bound expires, the unchanged `*.blocked` representation is returned.
+|===
+
+The `wait:decision:` identifier prefix is reserved for this implicit link; a DSL link whose identifier pattern collides with it fails validation.
 
 === Reference Workflow DSL Excerpt (`finalize.pmwf`)
 
@@ -760,7 +777,7 @@ state git.done-aborted terminal aborted
 * *Stage 3 — In-Memory Commit Message Resolution, Validation & Trailer Injection (`git.resolve-message` / `git.compose-message`)*:
 ** When `message_mode` is `auto_deliverable` or `step_or_fallback`, resolves the deterministic commit message in memory (e.g., `feat(<module>): complete deliverable <N> - <title>` or `chore(finalize): apply <step_id> changes`).
 ** When `message_mode == interactive` (or `none_assert_clean` when unexpected dirty files were found), transitions to `git.compose-message`, populates `facts` via `git.diff-summary` (changed file count, module scope, priority-ordered suggested type `fix > feat > perf > refactor > docs > style > test > chore > ci`), and accepts `message: text 1..2000` directly in `pm_do` `args`.
-** Validates Conventional Commits format (`<type>[optional (<scope>)][!]: <subject>`) via `ConventionalCommitValidator` and deterministically appends the configured trailer (`commit-trailer` from `.plan/marshal.json`, defaulting to `Co-Authored-By: plan-marshall <noreply@cuioss.de>`).
+** Validates Conventional Commits format (`<type>[optional (<scope>)][!]: <subject>`) via `ConventionalCommitValidator` and deterministically appends the configured trailer `Co-Authored-By: {name} <{email}>`, resolved as in `plan-marshall` (`manage-run-config` `commit-trailer get`) from `commit_trailer{name,email}` in the git-ignored `.plan/local/run-configuration.json`: each half defaults independently (`plan-marshall`, `noreply@cuioss.de`), and a stored value that is empty, not a string, or contains an angle bracket or line break is treated as absent. `.plan/marshal.json` is never consulted for the trailer.
 * *Stage 4 — Staging, `stdin`-Piped Commit & Change-Ledger Stamping (`git.stage-and-commit`)*:
 ** Stages scoped files (`git -C <tree> add -- <paths>`) and invokes `git -C <tree> commit -F -`, streaming the validated UTF-8 commit message + trailer directly to child `stdin` in memory (`PM-EXEC-5`) with zero `.plan/temp/` files.
 ** Captures `commit_sha` (`git -C <tree> rev-parse HEAD`) and git-sourced `changed_paths` (`git -C <tree> diff-tree --no-commit-id --name-only -r <commit_sha>`), appending a `kind = "change"` entry to `change-ledger.jsonl`.
@@ -845,43 +862,45 @@ When a finalize step (CI failure, quality gate failure, or review finding triage
 ** If `loop_back_iteration >= max_iterations`, the primitive allocates nothing, leaves the counter unchanged, and returns `limit_reached -> finalize.loop-limit-reached`.
 * At the limit, `loop_back` therefore stays offered (subject only to `in_worktree`), and its execution transitions to `finalize.loop-limit-reached`, which offers only `escalate` (requiring operator approval via elicitation or `pm-mcp operator` to grant additional iterations or abort). This is the transition required by `PM-WF-7`; the counter is never evaluated by a guard, so the limit state is always reachable.
 
-== Automated PlantUML, Mermaid, and ASCII Diagram Generation
+== Automated Mermaid, AsciiDoc Table, and ASCII Diagram Generation
 _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
 
 Because workflow definitions are parsed into a typed `WorkflowDefinition` AST in `pm-mcp-core`, all visual documentation and runtime state inspection diagrams are generated deterministically from the AST by `WorkflowDiagramGenerator`.
 
 === Supported Render Targets
 
-1. *PlantUML State Diagram (`renderPlantUml(WorkflowDefinition, Optional<String> activeState)`)*: Emits `@startuml` ... `@enduml` state diagrams grouping `StateNode` entries by `phase`, labeling transitions with `[rel] link_id / outcome`, and styling `activeState` with `#LightGreen` when rendering for a live plan.
-2. *Mermaid State Diagram (`renderMermaid(WorkflowDefinition, Optional<String> activeState)`)*: Emits `stateDiagram-v2` blocks embedded into AsciiDoc documentation under `doc/` and served via the MCP resource `pm://plan/{plan_id}/diagram`.
-3. *Deterministic ASCII Box-and-Transition Table (`renderAscii(WorkflowDefinition, Optional<String> activeState)`)*: Emits a right-border-aligned ASCII state boxes diagram and transition matrix for terminal output (`pm-mcp status`).
+1. *Mermaid State Diagram (`renderMermaid(WorkflowDefinition, Optional<String> activeState)`)*: Emits `stateDiagram-v2` blocks grouping `StateNode` entries by `phase` into composite states, labeling transitions with `rel:link_id [form] [guard] / outcome`, and marking `activeState` with a `classDef active` style when rendering for a live plan. The blocks are embedded into AsciiDoc documentation under `doc/` and served via the MCP resource `pm://plan/{plan_id}/diagram`.
+2. *AsciiDoc State/Link/Outcome Tables (`renderAsciiDocTables(WorkflowDefinition)`)*: Emits one AsciiDoc table per phase group listing every state with its links (`rel`, identifier, `form`, free parameters, guard) and outcome transitions, committed under `doc/` next to the Mermaid diagrams.
+3. *Deterministic ASCII Box-and-Transition Table (`renderAscii(WorkflowDefinition, Optional<String> activeState)`)*: Emits a right-border-aligned ASCII state box diagram and transition matrix for terminal output (`pm-mcp status`).
 
-=== Example Generated PlantUML & ASCII Output
+=== Example Generated Mermaid & ASCII Output
 
 Both examples render an excerpt of the plan workflow's `finalize` phase group from the reference excerpt above, with `finalize.ci-failed` as the active state:
 
-[source,plantuml]
+[source,mermaid]
 ----
-@startuml
-hide empty description
-state "finalize.settle-commit" as finalize_settle_commit : call: git.commit_and_push
-state "finalize.concurrent-wait" as finalize_concurrent_wait : composite_job: finalize.watch-ci-and-bots
-state "finalize.ci-failed" as finalize_ci_failed #LightGreen : skill: pm/finalize/ci-triage\nfacts: ci.failure-summary
-state "finalize.wait-cancelled" as finalize_wait_cancelled : facts: finalize.wait-status
-state "finalize.loop-limit-reached" as finalize_loop_limit_reached : facts: plan.loop-status
-state "execute.dispatch-ready" as execute_dispatch_ready
-
-finalize_settle_commit --> finalize_concurrent_wait : call / committed_and_pushed
-finalize_settle_commit --> finalize_concurrent_wait : call / pushed_clean
-finalize_concurrent_wait --> finalize_ci_failed : composite_job / ci_failed
-finalize_concurrent_wait --> finalize_wait_cancelled : composite_job / cancelled
-finalize_ci_failed --> finalize_settle_commit : fix:fix_in_branch [submit] / recorded
-finalize_ci_failed --> finalize_ci_failed : fix:fix_in_branch [submit] / no_changes
-finalize_ci_failed --> execute_dispatch_ready : loop_back:loop_back [submit] [in_worktree] / allocated
-finalize_ci_failed --> finalize_loop_limit_reached : loop_back:loop_back [submit] [in_worktree] / limit_reached
-finalize_wait_cancelled --> finalize_concurrent_wait : retry:retry [noop] / started
-finalize_loop_limit_reached --> execute_dispatch_ready : escalate:escalate [escalate] / extended
-@enduml
+stateDiagram-v2
+    state "finalize.settle-commit" as finalize_settle_commit
+    state "finalize.concurrent-wait" as finalize_concurrent_wait
+    state "finalize.ci-failed" as finalize_ci_failed
+    state "finalize.wait-cancelled" as finalize_wait_cancelled
+    state "finalize.loop-limit-reached" as finalize_loop_limit_reached
+    state "execute.dispatch-ready" as execute_dispatch_ready
+    finalize_settle_commit : call git.commit_and_push
+    finalize_concurrent_wait : composite_job finalize.watch-ci-and-bots
+    finalize_ci_failed : skill pm/finalize/ci-triage
+    finalize_settle_commit --> finalize_concurrent_wait : call / committed_and_pushed
+    finalize_settle_commit --> finalize_concurrent_wait : call / pushed_clean
+    finalize_concurrent_wait --> finalize_ci_failed : composite_job / ci_failed
+    finalize_concurrent_wait --> finalize_wait_cancelled : composite_job / cancelled
+    finalize_ci_failed --> finalize_settle_commit : fix fix_in_branch [submit] / recorded
+    finalize_ci_failed --> finalize_ci_failed : fix fix_in_branch [submit] / no_changes
+    finalize_ci_failed --> execute_dispatch_ready : loop_back loop_back [submit] [in_worktree] / allocated
+    finalize_ci_failed --> finalize_loop_limit_reached : loop_back loop_back [submit] [in_worktree] / limit_reached
+    finalize_wait_cancelled --> finalize_concurrent_wait : retry retry [noop] / started
+    finalize_loop_limit_reached --> execute_dispatch_ready : escalate escalate [escalate] / extended
+    classDef active fill:#90ee90
+    class finalize_ci_failed active
 ----
 
 [source,text]
