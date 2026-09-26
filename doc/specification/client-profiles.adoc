@@ -375,47 +375,64 @@ Client identity is advisory routing and rendering metadata, never a security cre
 ** Supplied explicitly via `pm-mcp enter --client <client_id> <entry> [plan_id | epic_id]` by the installed client bundle's entry command.
 ** Persisted in `<scope_dir>/mcp/entry.json` alongside `workspace_root`, `entry`, `client_version`, `client_session_id`, and `entered_at`.
 * *Tier 2 — Detected Environment & Protocol Signature (`detected_client`)*:
-** *At Entry (`pm-mcp enter`)*: Evaluated by inspecting the process environment inherited from the host shell against the deterministic signature matrix below.
+** *At Entry (`pm-mcp enter`)*: Evaluated by inspecting the process environment inherited from the host shell against the detection signals and precedence of the <<host-integration-table>>.
 ** *At Tool Call (`stdio`)*: Evaluated from the MCP protocol `clientInfo.name` and `clientInfo.version` fields received during the session's `initialize` handshake (`absent` when omitted).
 * *Tier 3 — Authenticated OS Principal (`os_principal`)*:
 ** The operating system effective user ID (`uid`) and username owning the local `pm-mcp` child process.
 
-=== Normative Environment & Protocol Detection Matrix
+[#host-integration-table]
+=== Host Integration Table (Normative)
 
-[cols="1,2,2,2,2"]
+This table is the single source for host-specific values. Requirements, other specifications, and the roadmap reference it instead of repeating values. Values without a marker are backed by `plan-marshall` (`script-shared/scripts/marketplace_paths.py`, `platform-runtime/scripts/{opencode,antigravity}_runtime.py`, `plan-marshall/standards/effort-levels.md`, verified at commit `1d4a1da37`) or by the host's established MCP configuration format. Values marked _(provisional)_ have no `plan-marshall` evidence and are verified against current host documentation in Milestone 1 before implementation.
+
+[cols="1,2,2,2,2,2,2"]
 |===
-|Profile ID |Environment Signatures (`pm-mcp enter`) |Session ID Env Var |MCP `clientInfo.name` Prefix |Host MCP Config Target (`PM-DIST-3`)
+|Profile |Detection signals |Session ID variable |MCP `clientInfo.name` |MCP config, user scope |MCP config, project scope (owned key) |Agent / command / skill directories
 
 |`claude`
-|`CLAUDECODE=1` OR `AI_AGENT` matches `^claude-code.*`
+|`CLAUDE_CODE_SESSION_ID` present; secondary: `CLAUDECODE=1`
 |`CLAUDE_CODE_SESSION_ID`
-|`claude-code` / `claude`
-|`stdio` (`pm-mcp serve` in `.mcp.json` / `~/.claude.json`)
+|`claude-code` _(provisional)_
+|`~/.claude.json`
+|`.mcp.json` (`mcpServers.plan-marshall`, `{"type": "stdio", "command": "pm-mcp", "args": ["serve"]}`)
+|`~/.claude/{agents,commands}` / `.claude/{agents,commands}`
 
 |`opencode`
-|`OPENCODE=1` OR `AI_AGENT` matches `^opencode.*`
-|`OPENCODE_SESSION_ID`
-|`opencode`
-|`stdio` (`["pm-mcp", "serve"]` in `opencode.json`)
+|`OPENCODE` or `OPENCODE_PID` present
+|_(provisional: none known)_
+|`opencode` _(provisional)_
+|`~/.config/opencode/opencode.json` (or `$OPENCODE_CONFIG_DIR/opencode.json`)
+|`opencode.json` or `.opencode/opencode.json`, an existing file preferred (`mcp.plan-marshall`, `{"type": "local", "command": ["pm-mcp", "serve"], "enabled": true}`)
+|`~/.config/opencode/agent/` / `.opencode/agent/` _(provisional)_
 
 |`antigravity`
-|`ANTIGRAVITY_AGENT=1` OR `ANTIGRAVITY_CLI_ALIAS` present OR `AI_AGENT` matches `^antigravity.*`
-|`ANTIGRAVITY_CONVERSATION_ID`
-|`antigravity` / `google-antigravity`
-|`stdio` (`pm-mcp serve` in `mcp_config.json`)
+|`ANTIGRAVITY_AGENT` present
+|`ANTIGRAVITY_CONVERSATION_ID` _(provisional)_
+|`antigravity` _(provisional)_
+|MCP server configuration location _(provisional)_; `plan-marshall` configures no MCP server for Antigravity, its settings live under `~/.gemini/config/` (`config.json`, `projects/<uuid>.json`)
+|_(provisional)_
+|Skills: `~/.gemini/config/plugins/plan-marshall/skills` / `.agents/skills`
 
 |`codex`
-|`CODEX_SANDBOX` present OR `CODEX_CI=1` OR `AI_AGENT` matches `^codex.*`
-|`CODEX_THREAD_ID`
-|`codex` / `openai-codex`
-|`stdio` (`pm-mcp serve` in `.codex/config.toml` / `~/.codex/config.toml`)
+|`CODEX_SANDBOX`, `CODEX_CI`, or `CODEX_THREAD_ID` present _(provisional)_
+|`CODEX_THREAD_ID` _(provisional)_
+|`codex` _(provisional)_
+|`~/.codex/config.toml` _(provisional)_
+|`.codex/config.toml` (`mcp_servers.plan-marshall`, `command = "pm-mcp"`, `args = ["serve"]`) _(provisional)_
+|_(provisional)_
 
 |`neutral`
 |None of the above matched (`detected_client: "unknown"`)
 |_None_
 |_Any unknown or absent_
-|`stdio` (`pm-mcp serve`)
+|—
+|—
+|—
 |===
+
+*Detection precedence*: Primary signals are evaluated in the fixed order `antigravity` -> `opencode` -> `claude` (the order `plan-marshall` uses, so a host launched from inside another host is attributed to the innermost known agent consistently), then `codex` _(provisional)_; the first match wins. Secondary signals (`CLAUDECODE`, `AI_AGENT`) are consulted only when no primary signal matches. At tool-call time the relay's environment signature and the connection's MCP `clientInfo.name` are evaluated per host connection (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification]).
+
+*Codex tool names*: The Codex columns of the placeholder table above are provisional; in particular Codex has no `write_file` tool and writes files through `apply_patch`.
 
 === Mismatch Resolution & Audit Behavior
 
@@ -433,7 +450,7 @@ Client identity is advisory routing and rendering metadata, never a security cre
 
 |`pm-mcp enter` has `declared_client: "claude"`, but environment matches `opencode` (`CONTRADICTED`)
 |`claude` (honors explicit `--client`, never switches silently)
-|`audit.jsonl` records `event: "client_identity_mismatch"`, `environment_match_tier: "CONTRADICTED"`, `declared_client`, `detected_client`, `os_principal`. `pm-mcp enter` prints a mismatch notice; representations include `profile_warning: client_identity_mismatch`.
+|`audit.jsonl` records `event: "client_identity_mismatch"`, `identity_mismatch: true`, `environment_match_tier: "CONTRADICTED"`, `declared_client`, `detected_client`, `os_principal`. `pm-mcp enter` prints a mismatch notice; representations include `profile_warning: client_identity_mismatch`.
 
 |MCP tool call carries `clientInfo.name: "opencode"`, but `mcp/entry.json` has `client_id: "claude"`
 |`claude` (persisted `entry.json` remains authoritative until re-entered)
