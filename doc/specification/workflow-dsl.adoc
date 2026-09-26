@@ -10,7 +10,7 @@ link:../Specification.adoc[Specification] » Workflow DSL & Engine (link:../Spec
 
 == Overview
 
-This document specifies the declarative Workflow Domain-Specific Language (DSL), Abstract Syntax Tree (AST) model, typed Java `Primitive<P, R>` execution contract, loop-back guard semantics, and automated diagram generation for *plan-marshall-mcp* (`PM-MCP`). The workflow engine and DSL reside in the plain-Java `pm-mcp-core` module with zero runtime framework dependencies and are assembled into the native daemon by `pm-mcp-server`.
+This document specifies the declarative Workflow Domain-Specific Language (DSL), Abstract Syntax Tree (AST) model, typed Java `Primitive<P, R>` execution contract, loop-back guard semantics, automated diagram generation, and the verification harnesses (including the out-of-band behavioural conformance harness for model-facing content) for *plan-marshall-mcp* (`PM-MCP`). The workflow engine and DSL reside in the plain-Java `pm-mcp-core` module with zero runtime framework dependencies and are assembled into the native daemon by `pm-mcp-server`.
 
 == Traceability
 
@@ -31,6 +31,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Legacy Surface Retirement]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine Invariant, Property & McpAssured Protocol Verification]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
+* _See Requirement link:../Requirements.adoc#PM-TEST-6[PM-TEST-6: Behavioural Conformance of Model-Facing Content]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
 
@@ -1026,6 +1027,8 @@ _See Requirement link:../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine In
 
 _See Requirement link:../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
 
+_See Requirement link:../Requirements.adoc#PM-TEST-6[PM-TEST-6: Behavioural Conformance of Model-Facing Content]_
+
 _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Legacy Surface Retirement]_
 
 === Property-Based State-Machine Verification (`PM-TEST-3`)
@@ -1060,6 +1063,75 @@ assert_state completed
 * Simulated `do` arguments use only the DSL parameter types (`text`, `int`, `enum[…]`, `list<…>`); there is no object type, so the six refine confidence dimensions (`correctness`, `completeness`, `consistency`, `non_duplication`, `ambiguity`, `module_mapping`) are submitted as separate `int[0..100]` parameters.
 * Each scenario step supports deterministic assertions (`assert_state`, `assert_links`, `assert_skill`, `assert_rejected`) and simulated actor actions (`do`, `complete_job`, `resolve_elicitation`, `operator_cli`).
 * The mandatory CI regression suite replays scenarios covering: (1) happy-path single-module plan, (2) multi-task envelope dispatch and context-budget yield, (3) CI failure and worktree-constrained `loop_back` to `execute`, (4) review-bot finding triage (`FIX`, `SUPPRESS`, `ACCEPT`), (5) operator escalation via elicitation and CLI fallback, and (6) mid-job daemon restart recovery.
+
+[#behavioural-conformance-harness]
+=== Behavioural Conformance Harness (`PM-TEST-6`)
+
+The deterministic harnesses above verify the engine without a live model. The behavioural conformance harness (`pm-mcp-conformance`) verifies the model-facing content instead: whether a live model, served the rendered vocabulary skills and representations of one client profile, follows the rules they state. It is PM-MCP tooling, not prose: scenario execution, trajectory capture, observation, scoring, and verdict computation are performed by the harness against the runtime's own records, and no step relies on the model's account of what it did.
+
+==== Execution Boundary: Out-of-Band Pre-Release Gate
+
+* The harness is never bound to a Maven lifecycle phase or profile. `verify`, `-Pintegration-tests`, `-Pcoverage`, and the required CI checks (`build / conclusion`, `integration-tests / conclusion`) never invoke a live model.
+* It is run explicitly against a release candidate binary (`pm-mcp` native executable with its embedded client bundles) before a release whose model-facing content changed: vocabulary skill templates, guidance strings, representation wording, client profiles, or tool descriptions. The resulting report is published with the release candidate; a `violated` or `indeterminate` verdict is resolved by a recorded operator decision (see *Evidence, Not Authorization* below), never by the harness.
+* Each run starts an isolated runtime under a temporary `PM_MCP_BASE`, connects the host under test through a real `pm-mcp serve` relay with the client's installed bundle (`pm-mcp client install <client>`), and uses a hermetic fixture repository per scenario.
+
+==== Scenario Records
+
+Behavioural scenarios are declarative records executed against a live model through a real client connection (`pm-mcp serve`) on a fixture repository. Each scenario declares:
+
+* `rule_ref`: the skill URI and section that states the rule, with the canonical (pre-render) SHA-256 of that section.
+* `situation`: the fixture state and the entry command.
+* `pressure`: the prompt or state condition that tempts a violation.
+* `observation`: a predicate over the recorded tool-call trajectory, the returned `rejected.reason` values, and the resulting artifact tree.
+* `binding_context`: where the rule binds, including its scoped exceptions. A scenario never places a rule in a context where its `binding_context` excludes it.
+* `enforcement_class`: the class of the rule under link:mcp-tools.adoc#vocabulary-skill-rule-classification[Vocabulary Skill Rule Classification] (`engine`, `check`, or `guidance`). For an `engine` rule the scenario measures attempts that the engine rejected; the engine's acceptance of a violation is a `PM-TEST-3`/`PM-TEST-4` defect, not a behavioural verdict.
+* `tolerance_band` and `population`: the held-rate band the verdict is mapped against and the number of samples per run.
+* `negative_control`: `true` for a control scenario whose pressure is built to be violated; the harness expects `violated` from it.
+
+Only rules whose violation is mechanically observable in the recorded tool calls or the resulting artifact tree are scored.
+
+==== Trajectory Capture & Observation
+
+* The trajectory is read from the isolated runtime's `audit.jsonl` (every MCP tool call, transition, rejection, and `channel` value, link:cli-and-security.adoc[CLI, Coordination & Security Specification]), from the plan and orchestrator stores, and from the fixture repository's final tree and commits. Host transcripts and model self-reports are never inputs of an observation.
+* *Order-Tolerant Trajectory Predicates*: An observation predicate asserts the reached state, the set of required calls, and the absence of forbidden calls; it asserts call order only when order is itself the rule under test.
+* *Reference Artifact Trees*: A benchmark scenario is a real workflow task on a fixture repository whose expected result is a concrete reference artifact tree (files, commits, recorded lessons), never a prose rubric; recipe-sourced plans skip Phase 2 and therefore run in batch without an operator stand-in.
+* *Representation Parsing*: The baseline of every client includes a representation-parsing scenario in which the model extracts `links` and `facts` from a `pm_state` result in the TOON wire form (`PM-TOOL-5`, `PM-IMPL-2`).
+
+==== Batch Roles
+
+A question-driven scenario runs with three separate roles: the executor (model under test), an operator stand-in that answers `refine.awaiting_answers` through model-relayed `submit` (at most one batched round, matching the re-dispatch ceiling of link:phase-workflows.adoc#_single_batch_clarification_re_dispatch_ceiling[Phase Workflows § Single-Batch Clarification & Re-Dispatch Ceiling]), and the scorer. Authorizing decisions (`PM-WF-12`) are resolved by the harness through the operator channel, never by the stand-in.
+
+==== Scoring & Verdicts
+
+* *Axis Statement*: The harness design lists the five eval axes (task success, tool-use quality, trajectory compliance, hallucination, response quality) and states for each whether it is scored and, if not, why; each scored axis has a rubric that the observation predicate implements.
+* *Deterministic Scorer First*: The scorer is the harness's predicate evaluator, which needs no model call. A judging model is admitted only for a scored axis whose rubric no predicate can decide; it is then fixed across all models under test, and before each run the harness compares its model identifier and family against the model under test and refuses the run with `scorer_not_independent` when the judge is the scored model or its sibling at default configuration.
+* *Verdict Over a Margin*: Each scenario is run over a stated population of samples; the harness computes the held rate and its margin and maps it to `held`, `violated`, or `indeterminate` against the scenario's tolerance band. The per-sample observation is boolean; the three-valued verdict exists only at the aggregated level. A sample that cannot be scored (host error, timeout, unreadable trajectory) is counted as unscorable, and a run whose scored samples fall below the population resolves to `indeterminate`, never to `held`. A single run is reported with `sample: true`, never as a verdict.
+* *Attribution Mode*: Every verdict records `attribution: isolated | realistic_context`; a rule that is also stated in resident content (the `pm/core` skill, entry commands, catalogue descriptions, link:client-profiles.adoc#host-resident-surface-inventory[Host-Resident Surface Inventory]) can only be measured as `realistic_context`.
+
+==== Rule Population & Selection
+
+* *Derived Rule Population*: The baseline's rule population is derived from every resident and served source in the Host-Resident Surface Inventory (entry commands, agent variants, catalogue descriptions, `pm/core`, tool descriptions); the harness reports the derived population size and never asserts completeness.
+* *Selection by Defect Cost*: Rules are selected for scenarios by recorded defect cost (audit rejections such as `invalid_link_args`, `store_tampered`, and historical defect records), never by intuition; the selection records its source.
+* *Negative Controls*: Every baseline contains at least one negative-control scenario; a baseline whose negative control does not score `violated` is itself reported `indeterminate`, because the harness has shown it cannot detect a violation.
+
+==== Digest Binding & Baseline Lifecycle
+
+* *Digest Binding*: Every scenario records the canonical (pre-render) SHA-256 of the skill section that states its rule and every verdict records the rendered per-client `_meta.sha256` (`PM-SKILL-2`); a scenario whose recorded canonical digest differs from the current skill is refused as `stale_scenario` until re-authored.
+* *Baseline Lifecycle*: A baseline is re-recorded when a bound skill digest, the client profile digest, the model identifier, or the binary's major/minor version changes; verdicts whose bound digest no longer matches are marked `invalidated`, never silently kept.
+
+==== Report Fields
+
+Every run report carries `client_id`, model identifier, binary version, client profile digest, bound skill digests, population, per-verdict counts, margin, tolerance band, `attribution`, `sample: true` for single runs, and token consumption per client and model (`unmeasured` when the host reports none, never `0`). Results are grouped by `enforcement_class`. Every report states an absolute reference as well as the delta to the previous baseline, never the delta alone. A client profile without a report of its own is reported as behaviourally untested; structural results (rendering, digests, registration, resolution) never stand in for it.
+
+The store that holds verdict records and baselines (versioned repository artifacts or a runtime store) is not fixed yet; the record content above is independent of that choice.
+
+==== Cost Ceilings & Sizing
+
+Every scoring layer, including a judging model, declares its cost ceiling (runtime, tokens, and money per run) in the harness configuration at design time; the harness stops a run that reaches a ceiling and reports it `indeterminate` with the ceiling that was hit. The sizing of a full baseline (runtime, tokens, and money per client and model) is published before the harness is used as a routine pre-release gate.
+
+==== Evidence, Not Authorization
+
+A verdict is evidence for a separately authorized decision. It never directly authorizes an edit of model-facing content, and a `violated` verdict is scoped to the rule, pressure, model, and client it was measured on. Any per-client or per-model change of wording, emphasis, or scaffolding beyond the vocabulary dimensions of `PM-CLIENT-2` requires a behavioural signal for that client and a recorded decision.
 
 === State-Name Migration Registry & `released-states.txt` Gate (`PM-MIG-4`)
 

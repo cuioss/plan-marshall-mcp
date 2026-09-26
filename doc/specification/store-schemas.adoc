@@ -324,7 +324,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
           "outcome": { "type": "string", "enum": ["unverified", "done", "failed", "skipped", "skipped_by_operator", "indeterminate"] },
           "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
           "work_performed": { "type": ["boolean", "null"] },
-          "landing_delivery": { "type": ["string", "null"], "enum": ["verified", "incomplete", "failed", null], "description": "emit-landing only: read-back verification of the appended landing envelope." },
+          "landing_delivery": { "type": ["string", "null"], "enum": ["verified", "incomplete", "failed", "pending", null], "description": "emit-landing only: read-back verification of the appended landing envelope; pending when the envelope is kept in the plan directory because the epic linkage is indeterminate." },
           "skip_reason": { "type": ["string", "null"] },
           "assurance_verdict": { "type": ["string", "null"], "enum": ["checked", "degraded", "not_reached", "never_performed", "attempted_over_empty_scope", null] },
           "firings": {
@@ -412,6 +412,7 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
     "severity",
     "blocking",
     "status",
+    "resolution",
     "summary",
     "created_at"
   ],
@@ -425,8 +426,26 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
     },
     "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
     "blocking": { "type": "boolean", "description": "Set at write time from the producer's declared class for this finding type; later changed only by triage or operator decision." },
-    "status": { "type": "string", "enum": ["open", "triaged_fix", "triaged_dismiss", "triaged_accept", "resolved"] },
-    "disposition": { "type": ["string", "null"], "enum": ["FIX", "SUPPRESS", "ACCEPT", null] },
+    "status": { "type": "string", "enum": ["open", "triaged_fix", "triaged_dismiss", "triaged_accept", "resolved", "carried"] },
+    "disposition": { "type": ["string", "null"], "enum": ["FIX", "SUPPRESS", "ACCEPT", null], "description": "The triage disposition submitted by the model (triage:F-n) or recorded by the operator." },
+    "resolution": {
+      "type": "string",
+      "enum": ["pending", "fixed", "suppressed", "accepted", "taken_into_account", "rejected"],
+      "default": "pending",
+      "description": "Server-written outcome of the finding (see Server-Written Resolution); never a link parameter. Mirrors plan-marshall's resolution vocabulary."
+    },
+    "scope_class": { "type": ["string", "null"], "enum": ["in_footprint", "out_of_footprint", "unlocated", null], "description": "Server-classified at triage: whether file_path lies in the plan's effective footprint; unlocated when the finding names no path." },
+    "carried_to": {
+      "type": ["object", "null"],
+      "description": "Set when a finding still pending after the merge is carried out of the plan.",
+      "additionalProperties": false,
+      "required": ["target", "ref", "carried_at"],
+      "properties": {
+        "target": { "type": "string", "enum": ["epic_inbox", "lesson"] },
+        "ref": { "type": "string", "description": "Inbox message id or lesson_id." },
+        "carried_at": { "type": "string", "format": "date-time" }
+      }
+    },
     "file_path": { "type": ["string", "null"] },
     "line": { "type": ["integer", "null"], "minimum": 1 },
     "summary": { "type": "string", "minLength": 1 },
@@ -443,7 +462,8 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
       "required": ["class"],
       "properties": {
         "class": { "type": "string", "enum": ["verifier", "substitute", "operator", "none"] },
-        "ref": { "type": ["string", "null"] }
+        "ref": { "type": ["string", "null"], "description": "file:line, job id, or URL the resolution rests on." },
+        "claim_refuted": { "type": "boolean", "default": false, "description": "True when the evidence refutes the finding's claim (refutation sub-state verdict, or substitute evidence with a concrete ref)." }
       }
     },
     "provider_ref": {
@@ -480,6 +500,25 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
 * *Immutable Severity, Mutable Blocking*: `severity` is set at creation and never changed. `blocking` is written from the producer's declared class for the finding type (each producer declares it per finding type in its descriptor, validated at write) and may later change only through triage or an operator decision.
 * *What Is Not a Finding*: Refusals, rate-limit or budget notices, the server's own posted comments and triggers, and participation-only artifacts (summary cards, trigger acknowledgements) are never filed as findings; they update the review participation record only (<<review-participation>>).
 * *Structured Reviewer Identity*: `author` and `bot_kind` come from the provider's structured author field, never from comment text. A comment whose structured author and self-declared bot identity disagree is itself filed as a finding with the provider's `source`. A comment's identity is `(bot_kind, provider_ref.comment_id)` plus `edit_marker`; an edited comment is new information.
+* *Server-Written Resolution*: The model submits only `disposition` (`FIX`, `SUPPRESS`, `ACCEPT`); the triage link grammar has no resolution parameter. The server writes `resolution` from recorded evidence, so a refuted claim, a valid finding that was dismissed, and a finding that is not this plan's concern stay distinguishable:
++
+[cols="1,3,1"]
+|===
+|Disposition |Recorded condition |`resolution`
+
+|— |Finding created, or triaged but its effect not yet recorded |`pending`
+|`FIX` |The fix landed: its fix task passed server verification, or the in-branch settle commit covering the fix's `population` is recorded |`fixed`
+|`SUPPRESS` |`evidence.claim_refuted == true`: the `ext-point-verify` refutation sub-state refuted the claim (`evidence.class: verifier`), or, when that sub-state is unavailable, substitute evidence with a concrete `evidence.ref` (file:line, job id, or URL) |`rejected`
+|`SUPPRESS` |Otherwise (the finding is valid but dismissed) |`suppressed`
+|`ACCEPT` |`scope_class == out_of_footprint` (pre-existing or another owner's code), or the triage cites a standing decision of the plan (an `amendments[]` entry or an ADR id that the server resolves) |`taken_into_account`
+|`ACCEPT` |Otherwise (a known, accepted gap) |`accepted`
+|— |Stale re-anchor: the finding's cited location no longer exists at `HEAD` (link:phase-workflows.adoc[Phase Workflows Specification], Step Records, Re-Fire & Loop-Back Rules) |`taken_into_account`
+|===
++
+`scope_class` is computed by the server at triage from `file_path` against the plan's effective footprint (`declared_files ∪ approved_widening[].path ∪ realized_files`, <<three-way-footprint>>). An operator triage decision (operator CLI or elicitation) may record any terminal resolution directly, with `evidence.class: operator`. `pending` is the only non-terminal resolution: the Blocking Findings Guard and the pre-merge barrier count it, and a `FIX` whose fix has not landed is still `pending`. Every report and landing figure over findings is keyed by `resolution` with every member tallied (stated zeros); the false-positive count of a source is its `rejected` count and never includes `suppressed`. *Deliberate change vs. `plan-marshall`*: `plan-marshall` lets the model choose one of the six resolutions directly; `PM-MCP` keeps the three model dispositions and derives the six-value resolution from evidence the server holds.
+* *Evidence Symmetry*: A resolution rests on evidence of the same kind whichever way it goes: `rejected` requires a concrete `evidence.ref` as a `FIX` requires a landed change, and a disposition that lowers severity cites an executed check.
+* *Re-Disposition of a Transmitted Finding*: A finding whose `transmit_outcome` is `sent` may be re-dispositioned only together with a new `reply_text`; the server then resets `transmit_outcome` to `pending`, re-derives `resolution`, and transmits again. A bare re-disposition (same or no reply) is refused with `invalid_link_args`.
+* *Late Findings Are Carried Out*: After the merge gate (order `> 70`) no step refuses on findings. A blocking finding still `pending` after the merge (filed after the barrier evaluated) is carried out by the server: appended to the parent epic inbox as a `process_finding` message, or, for a plan without an epic, seeded as a lesson (category `bug`, title from `summary`, body from `body`); while the epic linkage is `indeterminate` the message is kept with the undelivered landing envelope and delivered with it. The finding is set to status `carried` with `carried_to`; its `resolution` stays `pending`, so the carried debt remains visible (link:phase-workflows.adoc[Phase Workflows Specification], rows `1000` and `1100`).
 * *Transmission and Resolution Are Separate*: Before the provider call the server persists `transmit_outcome: pending` with the `transmit_disposition` it sends. `responded_at` is stamped after the provider accepted the reply and before the thread is resolved; `resolve_state` is persisted separately, so a resolve-only retry never re-sends the reply. After a crash, a `pending` transmission is reconciled by looking up the reply on the provider before any re-send.
 
 [#component-assessments]
@@ -714,6 +753,95 @@ The plan's `metrics.json` holds the dispatch and phase measurements that `defaul
 * *Stall Rate*: A termination with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
 * *Ledger Divergence*: Where two ledgers can diverge (dispatch rows vs audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
 * *One Writer per Name*: Every metric name has exactly one writer. A second producer over another population uses a different name.
+* *Raw Components Only*: Rows persist measured token components, never a weighted or priced figure. `priced_units` is derived in views from the rows and one named constant table (link:phase-workflows.adoc#post-run-metrics-and-landing[Phase Workflows Specification, Metric Aggregates]); a change of the weights re-derives every figure, including legacy baselines, from the persisted components.
+
+[#quality-report]
+== Quality Report Record (`quality-report.json`)
+
+The plan's `quality-report.json` is written once per firing of `plan-marshall:plan-retrospective` (`995`) by the server's report engine (link:phase-workflows.adoc#post-run-quality-report[Phase Workflows Specification, Post-Run Quality Report]). It is derived only from persisted plan stores; no model-authored text enters it. A re-fire replaces it atomically, and the store is covered by the digest sidecar (<<store-digest-verification>>).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/quality-report.json",
+  "title": "QualityReport",
+  "type": "object",
+  "required": ["format_version", "mode", "plans", "computed_at", "engine_version", "instruments"],
+  "additionalProperties": false,
+  "$defs": {
+    "count": {
+      "type": "object",
+      "description": "Every published count names its population.",
+      "required": ["population"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": ["integer", "number"], "description": "Omitted when the population is empty or the figure is withheld or unmeasured." },
+        "population": { "type": "integer", "minimum": 0 },
+        "state": { "type": "string", "enum": ["measured", "withheld", "unmeasured", "unmeasurable", "floor"], "default": "measured" },
+        "withheld_reason": { "type": ["string", "null"] },
+        "zero_reason": { "type": ["string", "null"], "enum": ["structural", "starved", "gated", "no_count", "disciplinary", "no_block", "fired", null] }
+      }
+    }
+  },
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "mode": { "type": "string", "enum": ["plan", "corpus"] },
+    "plans": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "plan_id values the report covers (one in plan mode)." },
+    "computed_at": { "type": "string", "format": "date-time" },
+    "engine_version": { "type": "string", "description": "Runtime release version (PM-DIST-1) of the engine that computed the report." },
+    "populations": {
+      "type": "object",
+      "description": "Corpus mode: plans per population; plans without an execution manifest form the separately sized indeterminate population.",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "quality_chain": {
+      "type": "object",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["step_id", "presence"],
+            "properties": {
+              "step_id": { "type": "string" },
+              "presence": { "type": "string", "enum": ["not_admitted", "admitted_not_fired", "fired", "fired_but_refused", "after_window", "indeterminate"] },
+              "assurance_verdict": { "type": ["string", "null"], "enum": ["checked", "degraded", "not_reached", "never_performed", "attempted_over_empty_scope", "unadjudicated", null] },
+              "structural_limit": { "type": ["string", "null"], "description": "The step's declared cannotReach class, reported apart from degraded." },
+              "yield": { "type": "object", "description": "Per resolution, source and severity: one $defs/count per enum member." }
+            }
+          }
+        },
+        "coverage": { "$ref": "#/$defs/count" },
+        "escape_distance": { "type": "object", "description": "Per detecting stage (build, self_review, automatic_review, human): one $defs/count." }
+      }
+    },
+    "review_retrospective": { "type": ["object", "null"], "description": "Null when the plan has no pull request (with the reason in instruments)." },
+    "footprint": { "type": "object", "description": "Three-way reconciliation results and the assessment comparison state." },
+    "instruments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["instrument", "gates_merge", "proves", "falsifiable_preconditions", "self_included"],
+        "additionalProperties": false,
+        "properties": {
+          "instrument": { "type": "string" },
+          "gates_merge": { "type": "boolean", "const": false },
+          "proves": { "type": "string" },
+          "falsifiable_preconditions": { "type": "array", "items": { "type": "string" } },
+          "self_included": { "type": "boolean" },
+          "self_included_reason": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["measured", "unmeasured", "withheld"] }
+        }
+      }
+    }
+  }
+}
+----
+
+* *Counts with Populations*: Every published count is a `count` object; a rate is published as numerator and denominator counts, never as a bare ratio. An empty population renders `unmeasurable`; `withheld`, `unmeasured`, and `0` are distinct values. A plan or store the engine cannot read contributes `floor` (a lower bound, never healthy).
+* *Report Instruments Never Gate*: `gates_merge` is `false` for every instrument (schema constant); the report is written after the merge and no step reads it as a precondition.
+* *One Schema for Both Modes*: A corpus report has exactly this schema; it is a fold over the per-plan results of the same engine.
 
 == Task Record (`tasks/TASK-NNN.json`), References Record (`references.json`) & Execution Manifest (`execution-manifest.json`)
 
@@ -1008,7 +1136,11 @@ Stores git-tracked project configuration and the versioned `system` migration le
 [#lesson-record]
 == Lesson Record (main-anchored lesson store)
 
-Lessons live in the main-anchored lesson store of the repository and outlive the plans that create them. Each lesson is a metadata record with the fields below plus a Markdown body (`PM-IMPL-2`); the lesson `submit` transition (link:phase-workflows.adoc[Phase Workflows Specification], Lesson Creation & Body) writes both atomically. The store is a Ported store (`PM-TEST-1`, <<legacy-store-formats>>).
+Lessons live in the main-anchored lesson store of the repository and outlive the plans that create them. Each lesson is one Markdown file whose structured header carries the fields below, followed by its Markdown body (`PM-IMPL-2`); the lesson `submit` transition (link:phase-workflows.adoc[Phase Workflows Specification], Lesson Creation & Body) writes both atomically. The store is a Ported store (`PM-TEST-1`, <<legacy-store-formats>>).
+
+* *Placement*: The store is `.plan/local/lessons-learned/` of the main checkout (link:filesystem-layout.adoc[Filesystem Layout Specification]): git-ignored and machine-local, resolved main-anchored from every worktree, one file `<lesson_id>.md` per lesson, tombstones in `.tombstones/<lesson_id>.json`, and the lesson-store digest sidecar `.digests.json`. The directory name is kept from `plan-marshall` (`manage-lessons` `DIR_LESSONS`, verified at `plan-marshall` `f3de0e14f`), so conversion moves no file. A lesson therefore stays on the machine that recorded it; a second machine or clone does not see it. This trade-off is accepted: lessons reach other machines only through their promotion destinations (`promotions[]`).
+* *File Format*: A lesson file starts with a header block of `key=value` lines (the `manage-lessons` header style), one line per scalar field of the schema below; `promotions` and `tool_version_override` are single-line JSON values. The header ends at the first blank line, followed by the H1 heading, which is the `title` field, and the Markdown body. The server validates the header against the schema, including `format_version`, on every write; a write with a missing or invalid header is rejected, and a file without a parseable header lists as `present_unreadable`.
+* *Lesson-Store Digest*: Every server write, move, or retirement in the lesson store records the size and SHA-256 of each lesson file and tombstone in `.digests.json` (the sidecar format of <<store-digest-verification>>) in the same transaction as the lesson write. On read, a lesson whose file differs from its entry is `store_tampered` for that lesson only; a lesson file that disappeared without a tombstone is reported as `deleted_without_tombstone`, and a file without an entry is reported as `untracked`. None of these states is ever read as `absent`, and an out-of-band edit is accepted only with `pm-mcp operator accept-edit`, which re-baselines that lesson's entry and records the action in `audit.jsonl`.
 
 [source,json]
 ----
@@ -1310,11 +1442,12 @@ The three lease stores in `~/.plan-marshall/mcp/state/` are updated only in shor
 Because `.plan/` files reside in the repository working tree where an agent with filesystem write access could modify them directly outside the MCP server:
 
 * Digests live in the sidecar `mcp/digests.json` (`{"format_version": 1, "stores": {"<relative path>": {"size": <int>, "sha256": "<hex>"}}}`), never inside a store they protect.
-* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, `metrics.json`, the findings, assessment, review-participation, and change-ledger JSONL files, `outline.md`, `request.md`), the server records the file's size and SHA-256 in the sidecar under the plan lock.
+* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, `metrics.json`, `quality-report.json`, the findings, assessment, review-participation, and change-ledger JSONL files, `outline.md`, `request.md`), the server records the file's size and SHA-256 in the sidecar under the plan lock.
 * The digest of a store is updated in the same transaction as the store write. A multi-store transaction that fails part-way re-records the digests of every store it already replaced before it releases the lock. Startup recovery re-verifies a store whose sidecar entry is older than the file against the pending-write marker of the interrupted transaction instead of reporting it as tampered.
 * On every subsequent read inside a transition, the engine verifies size and SHA-256 against the sidecar. Any mismatch triggers an immediate `store_tampered` transition block requiring operator resolution.
 * After a legacy `script` job finishes (it runs under the plan lock, `PM-MIG-2`), the runtime re-records the digests of the stores that job may write, so legitimate legacy writes never raise `store_tampered`.
 * An intentional manual edit is accepted with `pm-mcp operator accept-edit <plan_id> <store>`, which re-baselines that store's digest and records the action in `audit.jsonl`.
+* The main-anchored lesson store keeps its own sidecar with the same format and rules, at lesson granularity (<<lesson-record>>): an out-of-band edit or deletion of one lesson blocks only that lesson.
 
 [#three-way-footprint]
 === Three-Way File Footprint Reconciliation (`references.json`)
@@ -1391,7 +1524,7 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 |100% differential equivalence testing (`PM-TEST-2`) over shared fixture corpuses before cutover, comparing the Java result with the Python result mapped through the store's legacy -> target converter (<<legacy-store-formats>>). Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion) and the rename-aware realized footprint of `compute-footprint` (a *deliberate change*, <<three-way-footprint>>), which is verified by its own fixtures instead.
 
 |*Redesigned (Hypermedia & Native Services)*
-|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `manage-execution-manifest.py` (the execution manifest is composed in-process by `ExecutionManifestResolver`), and the workflow-integration verbs of `workflow-integration-{git,github,gitlab,sonar}` (replaced by workflow primitives and sub-workflows such as `git.commit_and_push`)
+|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `manage-execution-manifest.py` (the execution manifest is composed in-process by `ExecutionManifestResolver`), the workflow-integration verbs of `workflow-integration-{git,github,gitlab,sonar}` (replaced by workflow primitives and sub-workflows such as `git.commit_and_push`), and `plan-retrospective/scripts/*` (`compile-report`, `collect-fragments`, the `check-*` checks, `extract-chat-signal`) together with `audit-archived-plan-retrospectives` (replaced by the server's post-run quality report engine and its corpus mode, link:phase-workflows.adoc#post-run-quality-report[Phase Workflows Specification, Post-Run Quality Report])
 |Workflow DSL AST verification (`PM-TEST-3`), `ConfigMigrationChainTest` version/idempotency verification, scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
 
 |*Retired (Obsolete Infrastructure)*
@@ -1423,7 +1556,7 @@ IMPORTANT: The legacy formats below were verified against `plan-marshall` commit
 
 |Findings
 |`artifacts/findings/{type}.jsonl` (one file per type), `artifacts/findings/qgate-{phase}.jsonl`, `artifacts/findings/assessments.jsonl`; 6-character `hash_id`; 14 types `bug\|improvement\|anti-pattern\|triage\|tip\|insight\|best-practice\|build-error\|test-failure\|lint-issue\|sonar-issue\|arch-constraint\|pr-comment\|pr-comment-overflow` (`tools-file-ops/scripts/constants.py`, verified at `plan-marshall` `f3de0e14f`); severity `error\|warning\|info`; resolution `pending\|fixed\|suppressed\|accepted\|taken_into_account\|rejected` (`manage-findings/scripts/_findings_core.py`)
-|Merge per-type files into the target store; convert `assessments.jsonl` into the assessment store (<<component-assessments>>), never into `findings.jsonl`; map each legacy `hash_id` to a newly allocated `finding_id` and record the pair in the cutover receipt (*Mapped Identifiers*), from which the reverse converter restores `hash_id` (the target record keeps no alias field); map resolutions to target dispositions; map severity `error` -> `major`, `warning` -> `minor`, `info` -> `info`. Map types to `source`: `sonar-issue` -> `sonar`; `pr-comment` and `pr-comment-overflow` -> `github_pr` or `gitlab_mr` (the plan's CI provider); `build-error`, `test-failure`, `lint-issue` -> `compiler`; `arch-constraint` -> `arch_gate`; every record of `qgate-{phase}.jsonl` -> `qgate`. The target `source` of the seven knowledge types (`bug`, `improvement`, `anti-pattern`, `triage`, `tip`, `insight`, `best-practice`) must be fixed before the converter is implemented; an unmapped type is never dropped silently.
+|Merge per-type files into the target store; convert `assessments.jsonl` into the assessment store (<<component-assessments>>), never into `findings.jsonl`; map each legacy `hash_id` to a newly allocated `finding_id` and record the pair in the cutover receipt (*Mapped Identifiers*), from which the reverse converter restores `hash_id` (the target record keeps no alias field); map resolutions 1:1 onto `resolution` and derive `status` and `disposition` from them: `pending` -> `open`/`null`, `fixed` -> `resolved`/`FIX`, `suppressed` -> `triaged_dismiss`/`SUPPRESS`, `rejected` -> `triaged_dismiss`/`SUPPRESS` (with `evidence.claim_refuted: true`), `accepted` -> `triaged_accept`/`ACCEPT`, `taken_into_account` -> `triaged_accept`/`ACCEPT`; the reverse converter restores the resolution from `resolution`, and no second resolution vocabulary exists for any other adopter (CI failure taxonomy, landing facts); map severity `error` -> `major`, `warning` -> `minor`, `info` -> `info`. Map types to `source`: `sonar-issue` -> `sonar`; `pr-comment` and `pr-comment-overflow` -> `github_pr` or `gitlab_mr` (the plan's CI provider); `build-error`, `test-failure`, `lint-issue` -> `compiler`; `arch-constraint` -> `arch_gate`; every record of `qgate-{phase}.jsonl` -> `qgate`. The target `source` of the seven knowledge types (`bug`, `improvement`, `anti-pattern`, `triage`, `tip`, `insight`, `best-practice`) must be fixed before the converter is implemented; an unmapped type is never dropped silently.
 
 |References
 |`references.json` with `affected_files`, `read_intent_files`, `realized_footprint`; the structured-derived set is recomputed, never stored (`manage-references/scripts/_references_crud.py`)
@@ -1431,7 +1564,7 @@ IMPORTANT: The legacy formats below were verified against `plan-marshall` commit
 
 |Lessons
 |Main-anchored `.plan/local/lessons-learned/{id}.md`: Markdown with a `key=value` metadata header (`id`, `component`, `category` `bug\|improvement\|anti-pattern\|arch-constraint`, `created`, optional `bundle`, and for `arch-constraint` `rule`, `recurrence_count`, `last_seen`; `status` `active\|superseded\|removed`), an H1 title, and the body; lessons with a YAML-frontmatter header coexist; tombstones at `.tombstones/{id}.json`; applied lessons moved to `.plan/local/plans/{plan_id}/lesson-{id}.md` (`manage-lessons/standards/file-format.md`, verified at `plan-marshall` `f3de0e14f`)
-|Converted once per enrolled project at cutover into the target lesson record (<<lesson-record>>): both header formats convert to the one target format, `id` -> `lesson_id`, `created` -> `created_at`, `tool_version` as `absent` or `undetermined` per the version provenance rule. A lesson whose header cannot be parsed is listed in the cutover receipt as `unreadable` with a named diagnostic and kept verbatim, never dropped; every converted lesson that lists is addressable by its id. Tombstones are kept. The reverse converter restores the legacy layout.
+|Converted once per enrolled project at cutover into the target lesson record (<<lesson-record>>): both header formats convert to the one target format, `id` -> `lesson_id`, `created` -> `created_at`, `tool_version` as `absent` or `undetermined` per the version provenance rule. A lesson whose header cannot be parsed is listed in the cutover receipt as `unreadable` with a named diagnostic and kept verbatim, never dropped; every converted lesson that lists is addressable by its id. Tombstones are kept. The conversion writes the initial lesson-store digest sidecar, from which every later out-of-band edit or deletion is detectable. The reverse converter restores the legacy layout.
 
 |Change ledger
 |Repository-level `.plan/work/change-ledger.jsonl` (not plan-scoped, `NO_PLAN` rows) with `timestamp_iso`, `duration_seconds`, status `success\|error\|timeout\|killed\|unknown` (`manage-change-ledger/scripts/_ledger_core.py`)
@@ -1443,7 +1576,11 @@ IMPORTANT: The legacy formats below were verified against `plan-marshall` commit
 
 |Plan ID grammar
 |`^[a-z][a-z0-9-]*$` (`tools-input-validation/scripts/input_validation.py`); epic slugs are validated with the same function (`plan-orchestrator/scripts/orchestrator.py`, verified at `plan-marshall` `f3de0e14f`)
-|Legacy plan IDs and epic slugs of 3–64 characters that do not end in `-` are valid target IDs (phase-workflows.adoc, Plan ID Derivation) and are kept unchanged; any other legacy ID is an unmappable identifier and refuses the switch for its store (*Mapped Identifiers* above). The reverse converter refuses plans whose IDs fall outside the legacy grammar.
+|Legacy plan IDs and epic slugs of 3–64 characters that do not end in `-` are valid target IDs (phase-workflows.adoc, Plan ID Derivation) and are kept unchanged; any other legacy ID is an unmappable identifier and refuses the switch for its store (*Mapped Identifiers* above). The reverse converter refuses plans whose IDs fall outside the legacy grammar. Epic queue ordinals (`PLAN-03`, `PLAN-TRUTH-126`, `PLAN-PR-025B`) are not plan IDs and are never validated against either plan grammar (see the epic ledger row).
+
+|Epic ledger
+|`.plan/orchestrator/<epic>/` (active) and `.plan/archived-orchestrators/<epic>-<YY-MM-DD>/` (archived): `status.json` (`kind`, `title`, `phase`, `workstreams[{id,slug,title}]`), `epic.md`, `plans/PLAN-NN-<slug>.md`, `workstreams/WS-NN-<slug>.md`, `queue/<ordinal>.json` (`id`, `slug`, `workstream`, `status`, `plan_marshall_plan_id`, `pr`, `landing`, `seq`), `inbox/*.md` with `inbox/archive/<plan>/*.md`, `landings/PLAN-NN.md`, `resume_anchor.md`, `queue-view.md`, `settled.md`, git-ignored `logs/` (verified at `plan-marshall` `f3de0e14f`)
+|Converted once for the whole population (all active and archived epics, not per epic on first touch). Queue rows become `queue/<plan_id>.json` keyed by the child plan (link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Git-Distributed Epic Ledger): `plan_marshall_plan_id` (else `slug`) -> `plan_id`, legacy `id` -> the display-only `ordinal`, status mapped onto the queue vocabulary; a row whose status or `plan_id` cannot be mapped refuses the conversion and lists the rows (*Mapped Identifiers*). Archived inbox messages become `inbox.jsonl` records with status `processed`, open ones `pending`; landing documents become `landings.jsonl` records; spec and workstream documents are kept. The reverse converter restores `id` from `ordinal`, the ordinal file names, and the Markdown files.
 |===
 
 === Differential Equivalence Harness & Executor Shadow Routing (`PM-TEST-2`, `PM-MIG-1`)
