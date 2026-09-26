@@ -158,21 +158,25 @@ The Job Runtime manages a bounded pool of warm Language Server Protocol (LSP) su
 * *Verify-Not-Resolve Launch*: Each language server binary (`jdtls`, `pyright-langserver`, `typescript-language-server`, `rust-analyzer`, or the marketplace corpus language server) is verified against `enrolments.json -> projects.<id>.language_servers` before launch.
 * *Lifecycle & Eviction*: Instances are keyed by `(workspace_root, language_id)`, initialized lazily on the first `pm_lsp` call (`PM-TOOL-2`, `PM-SVC-4`), evicted cleanly (`shutdown` -> `exit` -> `SIGTERM`) after 15 minutes of inactivity or when the runtime drains or stops, and restarted automatically (up to 2 retries) on unexpected exit.
 
-== Linux Filesystem Confinement (`systemd-run`)
+== Linux Filesystem Confinement (Landlock)
 
-On Linux hosts with systemd (`PM-SEC-5`, `PM-TECH-4`), the runtime wraps subprocess execution in a transient user scope:
+On Linux (`PM-SEC-5`, `PM-TECH-4`), the `job-exec` shim (<<Process-Group Creation via the `job-exec` Shim>>) confines every job before `execve`:
 
-[source,bash]
-----
-systemd-run --user --scope --quiet \
-  --property=ProtectSystem=strict \
-  --property=ProtectHome=read-only \
-  --property=ReadWritePaths="<worktree-path> ~/.m2/repository ~/.gradle/caches /tmp" \
-  --property=PrivateTmp=true \
-  -- <verified-executable> <argv...>
-----
+. `prctl(PR_SET_NO_NEW_PRIVS, 1)`: the job and all its descendants can never gain privileges (setuid/setgid binaries, file capabilities).
+. A Landlock ruleset (Linux >= 5.13, applied via FFM) that grants read and execute access to the whole filesystem and write access only to:
+** every enrolled project root (which contains all of that project's worktrees under `.plan/local/worktrees/`),
+** the build toolchain caches declared in the enrolment (for example `~/.m2/repository`, `~/.gradle`),
+** `~/.plan-marshall/`,
+** the system temporary directory (`/tmp`; the JVM ignores `TMPDIR` for `java.io.tmpdir`) and device nodes under `/dev`.
 
-This prevents rogue build scripts, poisoned dependencies, or test fixtures from writing outside the project tree, package caches, and temporary directories.
+The ruleset is inherited across `fork`/`execve` and cannot be removed by the job. The runtime passes the writable set to the shim as an argument vector computed from `enrolments.json` at job start, so enrolment changes take effect for the next job without restarting anything.
+
+Properties and limits:
+
+* *Warm build daemons*: A Gradle daemon or `mvnd` started from a confined job keeps that job's ruleset. Because the ruleset covers all enrolled project roots, later builds of any enrolled project can reuse it; after enrolling a new project, the operator stops running warm daemons once so the next build starts one with the extended ruleset.
+* *Container runtimes*: Docker, Docker Compose, and Testcontainers talk to the container daemon over its socket; writes performed by the daemon itself are outside the job's confinement (`PM-EXEC-4`).
+* *Not covered*: Landlock does not restrict network address families and does not provide a private `/tmp`. `RestrictAddressFamilies` and `PrivateTmp` are therefore not enforced.
+* *Unavailable Landlock*: On kernels without Landlock (older kernels, some WSL2 kernels), jobs run with `PR_SET_NO_NEW_PRIVS` only; the runtime records `confinement: unavailable` in each job record and in `pm-mcp status`, and this is an accepted residual platform risk (`PM-SEC-5`).
 
 == Native Build Output Parsers
 
