@@ -77,7 +77,7 @@ The planning lifecycle is a server-enforced state machine spanning `phase-1-init
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │ Phase 4: plan                                                                    │
 │  plan.derive-tasks (DAG cycle check, profile mapping, skill resolution)          │
-│  -> plan.describe-tasks -> plan.pack-envelopes -> plan.compose-manifest          │
+│  -> plan.describe-tasks (+ server-side cost sizing, envelope packing & manifest) │
 │  -> [plan.qgate (<=3x)] -> execute.worktree-init                                 │
 └──────────────────────────────────────────────────────────────────────────────────┘
 ----
@@ -171,7 +171,7 @@ Every option string in `options` is authored as a two-sided contract whose label
 
 ==== Phase Entry & Baseline Reconciliation
 
-At `phase-2-refine` entry, the engine caches loop-invariant inputs (`request.md`, `references.json`, `module_mapping.toon`, and the architecture overview) so they are read once per phase rather than re-read inside the confidence loop. When a base branch is configured, `refine.baseline-reconcile` runs a non-mutating `git merge-tree` probe against upstream and classifies drift into three outcomes:
+At `phase-2-refine` entry, the engine caches loop-invariant inputs (`request.md`, `references.json`, `module_mapping.json`, and the architecture overview) so they are read once per phase rather than re-read inside the confidence loop. When a base branch is configured, `refine.baseline-reconcile` runs a non-mutating `git merge-tree` probe against upstream and classifies drift into three outcomes:
 
 * `no_overlap`: Upstream commits touch disjoint files; advances directly to `refine.analyze`.
 * `overlap_no_content_conflict`: Overlapping files merge cleanly; records `auto_reconcilable: true` without mutating the tree (deferring the actual rebase to Phase 5/6) and advances to `refine.analyze`.
@@ -336,7 +336,7 @@ Once the outline and its Q-Gate pass complete, the engine transitions to `outlin
 
 === Phase 4 (`plan`): Task Derivation, DAG Validation & Manifest Resolver
 
-Phase 4 transforms the approved structured deliverables in `outline.md` into executable `TASK-NNN.json` files, dispatch envelopes, and the per-plan execution manifest (`execution-manifest.json`, with legacy `execution.toon` read compatibility under `PM-MIG-3`).
+Phase 4 transforms the approved structured deliverables in `outline.md` into executable `TASK-NNN.json` files, dispatch envelopes, and the per-plan execution manifest (`execution-manifest.json`).
 
 ==== Deterministic Task Derivation & DAG Cycle Detection
 
@@ -344,7 +344,10 @@ Phase 4 transforms the approved structured deliverables in `outline.md` into exe
 2. *Dependency DAG Construction & Cycle Rejection*: Inter-deliverable `depends:` declarations map the head task of $D_i$ to the tail task of each prerequisite deliverable $D_j$. `TaskGraphValidator` runs Kahn's topological sort and depth-first cycle detection over the complete task graph; any self-dependency, unresolved deliverable reference, or cycle (`TASK-A -> ... -> TASK-A`) fails validation before any task file is written.
 3. *Two-Tier Skill Resolution*: Each task is assigned `skills[]` (`skill://pm/...` URIs) by combining system persona skills (`skill://pm/core`, profile vocabulary skill) with domain-resolved skills for the deliverable's `(domain, module, profile)` tuple.
 4. *Atomic Non-Idempotent Task Creation*: All derived tasks are persisted in a single atomic batch (`batch-add`). Task creation is strictly non-idempotent: once `tasks/TASK-*.json` files exist for the plan, the engine omits the task-creation link on any re-entry into Phase 4, preventing duplicate task generation.
-5. *Envelope Bin-Packing*: `EnvelopePacker` groups topologically ordered tasks into context-budget-bounded dispatch envelopes (`envelope-1..M`) so that related tasks (such as a deliverable's `implementation` and `module_testing` pair) share one leaf sub-agent context window without exceeding host token limits.
+5. *Server-Side Cost Sizing, Envelope Bin-Packing & Manifest Composition*: Upon `plan.describe-tasks` submission, the server automatically executes three deterministic passes in-process (without exposing separate LLM-driven `pack-envelopes` or `compose-manifest` states):
+** `TaskCostEstimator` computes `cost_size` (`small | medium | large`) and `predicted_cost_tokens` for each task from its step count, target file count, and profile.
+** `EnvelopePacker` groups topologically ordered tasks into context-budget-bounded dispatch envelopes (`envelope-1..M`) and stamps `envelope_id` on each `TASK-NNN.json` so related tasks (such as a deliverable's `implementation` and `module_testing` pair) share one leaf sub-agent context window without exceeding host token limits.
+** `ExecutionManifestResolver` writes `execution-manifest.json` (including structured `phase_6.dropped_steps: [{step_id, gate, reason}]` for every pruned step).
 
 ==== Shared Execution Manifest & Posture Preview Resolver
 
@@ -352,7 +355,7 @@ Both the Phase 1/Phase 4 *posture preview* and the Phase 4 *execution manifest c
 
 * *Posture Lattice*: `minimal` $\sqsubset$ `standard` $\sqsubset$ `full`.
 * *Floor Immunity*: Core and derived-state workflow steps (`push`, `branch-cleanup`, `record-metrics`, `emit-landing`, `archive-plan`, and mandatory freshness/quality gates) carry floor immunity: an operator or config override setting a floor-immune step to `off` is ignored and recorded as a diagnostic note in `facts`.
-* *Prune Predicates*: Conditional steps (such as `sonar-roundtrip`, `automatic-review`, `adr-propose`, or `architecture-refresh`) evaluate their provider availability and footprint prune predicates; an unresolved `ask` seed is dropped only when its backing provider is unconfigured.
+* *Prune Predicates & Structured `dropped_steps`*: Conditional steps (such as `sonar-roundtrip`, `automatic-review`, `adr-propose`, or `architecture-refresh`) evaluate their provider availability and footprint prune predicates; an unresolved `ask` seed is dropped only when its backing provider is unconfigured, and every pruned step is recorded in `execution-manifest.json -> phase_6.dropped_steps` with its `gate` (`posture`, `provider_unconfigured`, `footprint_disjoint`, `change_type_exempt`, or `recipe_override`) and human-readable `reason`.
 
 === Planning Transition Guards & Real-World Invariants
 
@@ -376,7 +379,7 @@ Every phase transition out of Phases 1, 2, 3, and 4 executes a deterministic ser
 
 |*Outside-World Invariants* (`main_sha`, `worktree_path`, `config_hash`)
 |Phase entries (Phases 2–6)
-|Verifies `main_sha` baseline drift, `.plan/marshal.json` `config_hash`, and worktree consistency: when `use_worktree == true`, `worktree_path` must be empty in Phases 1–4 and must resolve to a live git worktree in Phases 5–6 (no deferred-window carve-out). Drift is never auto-rationalized; loop-back re-entry drift is auto-accepted exactly once, and worktree refusal errors are never bypassed.
+|Verifies `main_sha` baseline drift, `.plan/marshal.json` `config_hash` / `system.schema_version` (`PM-EXT-7`), and worktree consistency: when `use_worktree == true`, `worktree_path` must be empty in Phases 1–4 and must resolve to a live git worktree in Phases 5–6 (no deferred-window carve-out). If `.plan/marshal.json` was upgraded via `ConfigReconciler` while a plan is in Phases 4–6, the server automatically re-composes the plan's `execution-manifest.json` in-process so it reflects the migrated configuration. Baseline drift is never auto-rationalized; loop-back re-entry drift is auto-accepted exactly once, and worktree refusal errors are never bypassed.
 
 |*Store Integrity & Digest Guard*
 |Every `pm_state` / `pm_do` read
@@ -674,8 +677,8 @@ The Phase 6 (`finalize`) pipeline is a banded integer `order` space partitioned 
 
 |*Post-Run Review*
 |`900..999`
-|Shared bundle (`991..999`) + reserved gap (`900..989`)
-|Backward-looking analysis and reporting steps (`post_run_review: true`, `mutates_source: false`) that depend on post-merge evidence: `lessons-capture` (`991`), `preference-emitter` (`992`), `record-metrics` (`998`), `phase-breakdown` (`999`).
+|Shared bundle (`991..998`) + reserved gap (`900..989`)
+|Backward-looking analysis and reporting steps (`post_run_review: true`, `mutates_source: false`) that depend on post-merge evidence: `lessons-capture` (`991`), `preference-emitter` (`992`), `record-metrics` (`998`).
 
 |*Terminal Emission*
 |`1000..1099`
@@ -740,7 +743,7 @@ The Phase 6 (`finalize`) pipeline is a banded integer `order` space partitioned 
 |`true`
 |`true`
 |—
-|Server deterministically surfaces structural self-review candidates (`requires_prompt_fields: [candidates]`, delta-anchored to previous `head_at_completion`); model submits verdict and fixes; routes through `finalize.settle-commit`.
+|Server deterministically surfaces structural self-review candidates (surfacing `candidates` in `facts`, delta-anchored to previous `head_at_completion`); model submits verdict and fixes; routes through `finalize.settle-commit`.
 
 |`9`
 |`default:architecture-refresh`
@@ -844,15 +847,7 @@ The Phase 6 (`finalize`) pipeline is a banded integer `order` space partitioned 
 |`false`
 |`false`
 |_Produces `metrics`_
-|`post_run_review: true`. Aggregates phase durations from `audit.jsonl` and sub-agent token usage from `returned:<dispatch_id>` reports (`unmeasured` when omitted by host, never `0`). Records `total_tokens`, `total_wall_seconds`, `any_phase_missing_end_time`.
-
-|`999`
-|`default:phase-breakdown`
-|Post-Run (`>70`)
-|`false`
-|`false`
-|`reads: [metrics]`
-|`post_run_review: true`. Renders the per-phase duration and token breakdown table from `record-metrics` facts.
+|`post_run_review: true`. Aggregates phase durations from `audit.jsonl` and sub-agent token usage from `returned:<dispatch_id>` reports (`unmeasured` when omitted by host, never `0`), records `total_tokens`, `total_wall_seconds`, `any_phase_missing_end_time`, and renders the per-phase duration and token breakdown table in `facts`.
 
 |`1000`
 |`default:emit-landing`
@@ -882,7 +877,7 @@ Whenever any Phase 6 step declaring `mutatesSource == true` (`order < 70`) compl
 
 === Java `FinalizeStepDescriptor` Record Schema & Static Checks
 
-Every built-in, bundle, or project-local finalize step is represented in `pm-mcp-core` by an immutable `FinalizeStepDescriptor` record capturing all ten step descriptor facts:
+Every built-in, bundle, or project-local finalize step is represented in `pm-mcp-core` by an immutable `FinalizeStepDescriptor` record capturing all step descriptor facts:
 
 [source,java]
 ----
@@ -904,8 +899,7 @@ public record FinalizeStepDescriptor(
     boolean postRunReview,
     List<String> reads,
     List<String> destroys,
-    List<String> recordsFacts,
-    List<String> requiresPromptFields
+    List<String> recordsFacts
 ) {
     public static final int PUSH_ORDER = 11;
     public static final int PRE_PUSH_QUALITY_GATE_ORDER = 10;
@@ -923,8 +917,8 @@ public record FinalizeStepDescriptor(
 2. *Pre-Push Quality Gate Placement*: `default:pre-push-quality-gate` must have $\text{order} == 10$, `default:push` must have $\text{order} == 11$, and no step may occupy an order between them.
 3. *Source-Mutation Before Merge Gate (`mutatesSource`)*: Every descriptor with `mutatesSource == true` must satisfy $\text{order} < \text{branchCleanup.order}()$ (`70`). Every step with $\text{order} \ge 70$ must explicitly declare `mutatesSource == false` (supported at runtime by the post-run source guard, which checks `git status --porcelain` after every post-merge step to detect stray tracked writes).
 4. *Post-Run Review & Source-Mutation Mutual Exclusion (`P1 \land P2`)*: No descriptor may declare both `postRunReview == true` and `mutatesSource == true`. Every descriptor with `postRunReview == true` must satisfy $900 \le \text{order} < 1000$.
-5. *`reads` / `destroys` Data-Dependency Ordering*: For every artifact token $X \in A.\text{reads}()$ and any step $D$ with $X \in D.\text{destroys}()$, $A.\text{order}() < D.\text{order}()$ (no read-after-destroy: e.g., all `reads: [worktree]` steps precede `branch-cleanup` at `70`; all steps precede `archive-plan` at `1100` which `destroys: [plan-directory]`). For `X == "metrics"`, every consumer declaring `reads: [metrics]` (`phase-breakdown` at `999`, `emit-landing` at `1000`) must satisfy $\text{order} > \text{recordMetrics.order}()$ (`998`).
-6. *Anchor & Fact Contract Completeness*: `verdictInputs` may be non-empty only when `headDependent == true` (remote-state steps `ci-verify`, `automatic-review`, `sonar-roundtrip` and open-ended repository steps must have `verdictInputs.isEmpty() == true`); every step whose `done` outcome is reachable through a no-op/skipped branch as well as a work-performing branch must include `"work_performed"` in `recordsFacts` and emit `work_performed=true|false`; and every non-exempt prompt field (`requiresPromptFields`, excluding `{name, plan_id, skills, workflow, instructions, WORKTREE, caller_phase, iteration, producer, session_id}`) must match the step's prompt template and input parameter schema in both directions ($\exists$ no orphan declaration, $\forall$ no undeclared field).
+5. *`reads` / `destroys` Data-Dependency Ordering*: For every artifact token $X \in A.\text{reads}()$ and any step $D$ with $X \in D.\text{destroys}()$, $A.\text{order}() < D.\text{order}()$ (no read-after-destroy: e.g., all `reads: [worktree]` steps precede `branch-cleanup` at `70`; all steps precede `archive-plan` at `1100` which `destroys: [plan-directory]`). For `X == "metrics"`, every consumer declaring `reads: [metrics]` (`emit-landing` at `1000`) must satisfy $\text{order} > \text{recordMetrics.order}()$ (`998`).
+6. *Anchor & Fact Contract Completeness*: `verdictInputs` may be non-empty only when `headDependent == true` (remote-state steps `ci-verify`, `automatic-review`, `sonar-roundtrip` and open-ended repository steps must have `verdictInputs.isEmpty() == true`); and every step whose `done` outcome is reachable through a no-op/skipped branch as well as a work-performing branch must include `"work_performed"` in `recordsFacts` and emit `work_performed=true|false`.
 
 === Re-Entry & `head_at_completion` Verdict Currency Rules
 
@@ -1052,7 +1046,7 @@ _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission
 
 ==== Cross-Plan Merge Mutex & FIFO Admission Queue
 
-When multiple plans execute concurrently across worktrees of the same repository, `default:branch-cleanup` (`order = 70`) serializes their rebase-and-merge critical sections through the daemon-owned **Cross-Plan Merge Mutex** (`MergeMutexManager`), backed on disk by the main-anchored `<repo_main>/.plan/local/locks/merge-mutex.json` store (which also co-tenants cross-plan review-bot `rate_windows` claims) for coexistence with legacy Python sessions (`PM-MIG-3`):
+When multiple plans execute concurrently across worktrees of the same repository, `default:branch-cleanup` (`order = 70`) serializes their rebase-and-merge critical sections through the **Cross-Plan Merge Mutex** (`MergeMutexManager`), coordinated across `pm-mcp serve` processes via an OS kernel `FileChannel.lock()` on `~/.plan-marshall/mcp/locks/merge.lock` and backed on disk by `~/.plan-marshall/mcp/state/merge-queue.json` (while cross-plan review-bot rate-window claims are coordinated separately via `~/.plan-marshall/mcp/locks/review-bot.lock` and `~/.plan-marshall/mcp/state/review-bot-windows.json`):
 
 [source,text]
 ----
@@ -1070,10 +1064,10 @@ Plan A (branch-cleanup) ──► [Enqueue FIFO] ──► [Acquire Holder Slot]
                                             [Release Mutex & Pop]
 ----
 
-1. *FIFO Admission Queue*: Plans requesting the merge mutex enter an ordered FIFO `waiting[]` (aliased as `admission_queue[]`) keyed by `plan_id` and `enqueued_at`. A plan may acquire the active `holder` slot only when it is at the head of the FIFO queue and `holder == null`.
+1. *FIFO Admission Queue*: Plans requesting the merge mutex enter an ordered per-repository FIFO `waiting[]` (aliased as `admission_queue[]`) keyed by `plan_id`, `owner_pid`, and `enqueued_at`. A plan may acquire the active `holder` slot only when it is at the head of the FIFO queue and `holder == null`.
 2. *Widened Hold across Rebase-to-Merge*: Unlike a narrow lock around `gh pr merge`, the merge mutex is acquired **before** `branch-cleanup` rebases the feature branch onto `main` and held through the merge execution so a sibling plan cannot land a conflicting commit on `main` between rebase and merge.
 3. *Mandatory Release on Every Wait & Abort*: A plan must **never** hold the merge mutex while blocked in an asynchronous wait (`wait:finalize.concurrent-wait` for post-rebase CI, review-bot rate-window wait, merge-queue landing wait, or operator elicitation/escalation) or on abort. Entering any `wait` or `escalate` state inside `branch-cleanup` atomically releases `holder = null` while preserving the plan's FIFO queue position, allowing ready sibling plans to merge without head-of-line blocking.
-4. *Atomic Stale-Holder & Budget Reclaim*: Reaping runs inside the same atomic lock transaction as admission. An active `holder` is forcibly reclaimed if and only if it is provably stale — either the holding `plan_id` no longer exists or is in a terminal state (`completed`, `aborted`), or the holder's lease budget (`lease_expires_at`, default 15 minutes without a heartbeat transition) has expired and no active git/CI job for that plan is running in the daemon.
+4. *Atomic Stale-Holder & Budget Reclaim*: Reaping runs inside the same atomic `FileChannel.lock()` transaction as admission. An active `holder` is forcibly reclaimed if and only if it is provably stale — either its owning `pm-mcp serve` process is no longer alive (`ProcessHandle.of(owner_pid).isPresent() == false` and no active git/CI job for that plan is running), the holding `plan_id` is in a terminal state (`completed`, `aborted`), or the holder's lease budget (`lease_expires_at`, default 15 minutes without a heartbeat transition) has expired.
 5. *Closed Merge Dispatch Set*: `branch-cleanup` executes merges exclusively through one of two closed mechanisms: direct `safe-merge` (squash/merge via enrolled CI provider when branch is up-to-date and green) or `merge-queue` enqueue (when repository merge queue is enabled, transitioning to `finalize.merge-queue-wait` after releasing the mutex).
 
 ==== Epic Plan Emission (`emit:<plan_id>`)

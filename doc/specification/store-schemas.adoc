@@ -32,6 +32,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-2[PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7: Data Store Invariants, Footprint Reconciliation & Lock Ordering]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
+* _See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
 
 == Status: PLANNED
 
@@ -295,7 +296,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
 
 == Findings Ledger Record (`findings.jsonl`)
 
-Each line in `findings.jsonl` is a standalone JSON object representing a finding from Q-Gate validation, code review, static analysis, Sonar, or PR review bots.
+Each line in `findings.jsonl` is a standalone JSON object representing a finding from Q-Gate validation, code review, static analysis, Sonar, or PR review bots. External provider identifiers (`provider_ref`) are persisted as a typed sub-object rather than packed into free-text `detail` strings.
 
 [source,json]
 ----
@@ -328,6 +329,19 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
     "file_path": { "type": ["string", "null"] },
     "line": { "type": ["integer", "null"], "minimum": 1 },
     "summary": { "type": "string", "minLength": 1 },
+    "provider_ref": {
+      "type": ["object", "null"],
+      "description": "Structured external provider coordinates for outbound reply/dismissal transmission (replaces legacy free-text detail key-value packing).",
+      "additionalProperties": false,
+      "properties": {
+        "pr_number": { "type": ["integer", "null"], "minimum": 1 },
+        "thread_id": { "type": ["string", "null"] },
+        "comment_id": { "type": ["string", "null"] },
+        "comment_kind": { "type": ["string", "null"], "enum": ["review_thread", "issue_comment", "review_body", null] },
+        "sonar_issue_key": { "type": ["string", "null"] },
+        "edit_term": { "type": ["string", "null"] }
+      }
+    },
     "disposition_rationale": { "type": ["string", "null"] },
     "fix_task_id": { "type": ["string", "null"] },
     "response_transmitted": { "type": "boolean", "default": false },
@@ -373,7 +387,7 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
 }
 ----
 
-== Task Record (`tasks/TASK-NNN.json`) & References Record (`references.json`)
+== Task Record (`tasks/TASK-NNN.json`), References Record (`references.json`) & Execution Manifest (`execution-manifest.json`)
 
 === Task Record Schema (`tasks/TASK-NNN.json`)
 
@@ -404,6 +418,9 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
     "profile": { "type": "string", "enum": ["implementation", "module_testing", "integration_testing", "documentation", "verification"] },
     "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "blocked", "skipped"] },
     "effort_role": { "type": "string" },
+    "cost_size": { "type": "string", "enum": ["XS", "S", "M", "L", "XL"] },
+    "predicted_cost_tokens": { "type": "integer", "minimum": 0 },
+    "envelope_id": { "type": ["string", "null"], "pattern": "^envelope-[0-9]+$" },
     "skills": { "type": "array", "items": { "type": "string" } },
     "target_files": { "type": "array", "items": { "type": "string" } },
     "verification_command": { "type": ["string", "null"] },
@@ -453,6 +470,172 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
     },
     "realized_files": { "type": "array", "items": { "type": "string" } },
     "lessons_consulted": { "type": "array", "items": { "type": "string" } }
+  }
+}
+----
+
+=== Execution Manifest Store Schema (`execution-manifest.json`)
+
+Composed deterministically in-process by `ExecutionManifestResolver` during Phase 4 (`plan`). Records both the active Phase 5/Phase 6 step lists and the structured `dropped_steps` audit list so prune decisions are inspectable directly from JSON without scraping free-text logs.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/execution-manifest.json",
+  "title": "ExecutionManifestRecord",
+  "type": "object",
+  "required": [
+    "format_version",
+    "posture",
+    "phase_5",
+    "phase_6",
+    "composed_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "posture": { "type": "string", "enum": ["minimal", "standard", "full"] },
+    "phase_5": {
+      "type": "object",
+      "required": ["verification_steps"],
+      "additionalProperties": false,
+      "properties": {
+        "verification_steps": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "phase_6": {
+      "type": "object",
+      "required": ["steps", "dropped_steps"],
+      "additionalProperties": false,
+      "properties": {
+        "steps": { "type": "array", "items": { "type": "string" } },
+        "dropped_steps": {
+          "type": "array",
+          "description": "Structured record of conditional steps omitted by prune predicates or posture selection.",
+          "items": {
+            "type": "object",
+            "required": ["step_id", "gate", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "step_id": { "type": "string" },
+              "gate": { "type": "string", "enum": ["posture", "provider_unconfigured", "footprint_disjoint", "change_type_exempt", "recipe_override"] },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "composed_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+== Project Configuration Store (`.plan/marshal.json`, `PM-EXT-6`, `PM-EXT-7`)
+
+Stores git-tracked project configuration and the versioned `system` migration ledger reconciled atomically by `ConfigReconciler` via the Command-Pattern `ConfigMigrationCommand` chain (see link:domain-extensions.adoc[Domain Extensions Specification]).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/marshal-config.json",
+  "title": "MarshalConfigRecord",
+  "type": "object",
+  "required": [
+    "format_version",
+    "system",
+    "project",
+    "domains",
+    "providers",
+    "plan"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "system": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "baseline_version",
+        "applied_migrations",
+        "provisioned_binary_version",
+        "config_seed_fingerprint"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Highest ConfigMigrationCommand.targetVersion() applied to this configuration."
+        },
+        "baseline_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Compaction floor (MINIMUM_SUPPORTED_SCHEMA_VERSION); migrations <= baseline_version are compacted."
+        },
+        "applied_migrations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^M\\d{3}_[a-z0-9_]+$"
+          },
+          "description": "Ordered list of applied ConfigMigrationCommand IDs above baseline_version."
+        },
+        "provisioned_binary_version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Semantic version of the pm-mcp binary that last reconciled this file."
+        },
+        "config_seed_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA-256 digest of compiled-in default schema, enabled domain config_defaults, and finalize step order."
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "required": ["default_base_branch"],
+      "properties": {
+        "default_base_branch": { "type": "string", "default": "main" },
+        "working_prefixes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "domains": {
+      "type": "object",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Active domain descriptor IDs (replaces legacy frozen skill_domains snapshots)."
+        }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "description": "Non-secret VCS (1), CI (<=1), and code-quality/issue (0..N) provider selections and HTTPS origins."
+    },
+    "build_map": {
+      "type": "object",
+      "description": "Write-once file-glob to module/whole-tree verification routing rules."
+    },
+    "plan": {
+      "type": "object",
+      "description": "Per-phase workflow posture, *_without_asking flags, effort role overrides, verification_steps, and ordered phase-6-finalize.steps."
+    },
+    "orchestrator": {
+      "type": "object",
+      "description": "Epic orchestrator settings and effort clamps."
+    },
+    "client_profiles": {
+      "type": "object",
+      "description": "Optional repository-scoped model-pin overrides per client ID."
+    }
   }
 }
 ----
@@ -679,21 +862,22 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 |Disposition |Target Surface in `PM-MCP` |Verification Strategy
 
 |*Ported (1:1 Data Layer)*
-|`manage_status.py`, `manage_tasks.py`, `manage_findings.py`, `manage_references.py`, `manage_change_ledger.py`, `manage_execution_manifest.py`, `manage_locks.py`, `manage_lessons.py`
-|100% differential equivalence testing (`PM-TEST-2`) over shared JSON/JSONL fixture corpuses before cutover.
+|Canonical store read/write invariants of `manage_status.py`, `manage_tasks.py`, `manage_findings.py`, `manage_references.py`, `manage_change_ledger.py`, `manage_execution_manifest.py`, and `manage_lessons.py`
+|100% differential equivalence testing (`PM-TEST-2`) over shared JSON/JSONL fixture corpuses before cutover. Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion).
 
 |*Redesigned (Hypermedia & Native Services)*
-|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage_personas.py`, `manage_providers.py`, `workflow-integration-{git,github,gitlab,sonar}`
-|Workflow DSL AST verification (`PM-TEST-3`), scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
+|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage_config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage_locks.py` (replaced by OS `FileChannel.lock()` + `ProcessHandle.of(pid)`), `manage_personas.py`, `manage_providers.py`, `workflow-integration-{git,github,gitlab,sonar}`
+|Workflow DSL AST verification (`PM-TEST-3`), `ConfigMigrationChainTest` version/idempotency verification, scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
 
 |*Retired (Obsolete Infrastructure)*
-|`execute-script.py` proxy, `permission-doctor` / `permission-fix`, static multi-host bundle transpilers, and shell-command composition helpers
+|`execute-script.py` proxy, `argparse_surface.py`, `permission-doctor` / `permission-fix`, `inject_project_dir.py`, static multi-host bundle transpilers, and shell-command composition helpers
 |Retired at stage exit gates (`PM-MIG-4`) once zero active plans reference the legacy surface.
 |===
 
 === Differential Equivalence Harness & Executor Shadow Routing (`PM-TEST-2`, `PM-MIG-1`)
 
-* *Shared Corpus Differential Runner (`PM-TEST-2`)*: In JUnit 5 (`pm-mcp-core`), parameterized differential tests execute each `Ported` Java store primitive and its reference Python counterpart against identical initial `.plan/` directory trees. The harness canonicalizes JSON/JSONL outputs (normalizing generated UUIDs and ISO-8601 timestamps) and asserts zero structural diff across both returned payloads and on-disk files.
+* *Shared Corpus Differential Runner (`PM-TEST-2`)*: In JUnit 5 (`pm-mcp-core`), parameterized differential tests execute each `Ported` Java store primitive and its reference Python counterpart against identical initial `.plan/` directory trees. The harness canonicalizes JSON/JSONL outputs (normalizing generated UUIDs and ISO-8601 timestamps) and asserts zero structural diff across both returned payloads and on-disk files for all canonical store read/write invariants.
 * *Executor Shadow Routing (`PM-MIG-1`)*: During Migration Stages 1 and 2, `execute-script.py` supports shadow-routing `Ported` read/write operations through the local `PM-MCP` daemon while comparing results against the Python baseline, logging any divergence to `audit.jsonl` and triggering automatic fallback (`PM-MIG-5`) if a discrepancy occurs.
+
 
 

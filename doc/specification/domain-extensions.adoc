@@ -25,6 +25,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
+* _See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
 
 == Status: PLANNED
 
@@ -933,4 +934,150 @@ The daemon maintains learned operational metrics and job journals in Tier 3 serv
 1. *Adaptive Timeout Learning (`build-timings.json` / `timeouts.json`)*: Keyed by the canonical normalized argument vector `(build_system, canonical_verb, module_id, sorted_profiles)`. Given observed successful run durations, the server maintains an exponentially smoothed baseline $T_{\text{learned}} = 0.8 \times T_{\max} + 0.2 \times T_{\min}$ and sets the execution timeout to $T_{\text{limit}} = \max\left(T_{\text{engine\_floor}},\; \lceil 1.25 \times T_{\text{learned}} \rceil\right)$. Per-engine minimum floors (Maven/Gradle: `120s`, npm/pyproject: `60s`) are never violated, even if an explicit bound is configured, and durations from `killed`, `cancelled`, or `timed_out` runs are **never** incorporated into $T_{\text{learned}}$.
 2. *Gate Honesty & Examined Population Tracking*: Before a green build or quality gate clears open findings in `findings.jsonl`, the server's compiled log and report parsers verify that for Maven and Gradle the build log explicitly contains the engine's terminal success marker (e.g., `BUILD SUCCESS` / `BUILD SUCCESSFUL`) in addition to exit code `0`, and that the tool examined a non-empty file/test population capable of reaching the finding's file and category (e.g., `mypy` gates run with `--no-incremental` / cache disabled so untouched files with broken cross-module types are not skipped).
 3. *Crash Replay & Atomic Fate Recording*: Every spawned job is recorded in the daemon's write-ahead job journal prior to `ProcessBuilder.start()`. Request status (`running`) is never treated as terminal fate; terminal fate (`succeeded`, `failed`, `timed_out`, `cancelled`, `killed`, `indeterminate`) is written atomically at process termination. If the daemon restarts while a job record is still `running`, journal replay marks the orphaned job `killed` ("do not retry blindly") and attaches no synthetic error findings.
+
+== Systematized `marshal.json` Upgrades: Command-Pattern Migration Chain & Zero-CoT Reconciliation (`PM-EXT-7`)
+_See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
+
+In legacy `plan-marshall`, schema and default updates to `.plan/marshal.json` were split across ad-hoc hooks inside `manage_config.py -> sync-defaults` (`RETIRED_STEP_KEY_RENAMES`, `run_at_all -> lane`, lane materialization), separate CLI canonicalizers (`steps-sort`, `normalize-keys`), and one-shot subcommands in `marshall-steward/scripts/upgrade.py` (`migrate-bot-lists`, `validate-bot-lists`). Every new migration required adding prose instructions to `upgrade-flow.md` that the LLM had to read into its context window and execute via separate `Bash` calls—polluting the model's Chain of Thought (CoT) with historical schema trivia even on already-current repositories.
+
+`PM-MCP` replaces ad-hoc config updates with a self-contained, version-tracked **Command-Pattern** subsystem (`de.cuioss.pm.mcp.core.config.migration`) executed atomically inside the server.
+
+=== 1. Version Tracking & Migration Ledger in `.plan/marshal.json`
+
+Every `.plan/marshal.json` root document carries a `system` tracking block managed exclusively by `ConfigReconciler` (see link:store-schemas.adoc[Store Schemas Specification]):
+
+[source,json]
+----
+{
+  "format_version": 1,
+  "system": {
+    "schema_version": 4,
+    "baseline_version": 1,
+    "applied_migrations": [
+      "M002_rename_retired_step_keys",
+      "M003_migrate_run_at_all_to_lane",
+      "M004_split_enabled_bots_to_participation_lists"
+    ],
+    "provisioned_binary_version": "1.0.0",
+    "config_seed_fingerprint": "a94f6e2c81b3d04e7f1298a0b5c6d7e8f90123456789abcdef0123456789abcd"
+  }
+}
+----
+
+* `schema_version`: Monotonically increasing integer (`1..CURRENT_SCHEMA_VERSION`) identifying the highest `ConfigMigrationCommand.targetVersion()` applied to this file.
+* `baseline_version`: Integer epoch floor (`MINIMUM_SUPPORTED_SCHEMA_VERSION`). Migration IDs with `targetVersion <= baseline_version` are compacted out of `applied_migrations` at major epoch bumps so `.plan/marshal.json` never accumulates unbounded historical entries.
+* `applied_migrations`: Ordered array of `migrationId` strings for all commands applied above `baseline_version`.
+* `provisioned_binary_version`: Semantic version of the `pm-mcp` binary that last reconciled the file; only advances when a valid binary version is present (never blanked).
+* `config_seed_fingerprint`: Deterministic SHA-256 digest of the compiled-in default configuration tree, active domain `config_defaults` for `domains.enabled`, and `FinalizeStepDescriptor` ordering table.
+
+=== 2. Command-Pattern Architecture (`ConfigMigrationCommand`)
+
+Each version-specific structural or value migration ($v-1 \to v$) is implemented as a standalone, immutable Java class implementing the sealed `ConfigMigrationCommand` interface:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.config.migration;
+
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.util.List;
+import java.util.Set;
+
+public record MigrationContext(
+    Set<String> enabledDomains,
+    Set<String> registeredBotKinds,
+    List<String> orderedFinalizeStepIds
+) {}
+
+public record MigrationMutation(
+    String kind,        // "renamed" | "migrated" | "stripped" | "seeded"
+    String jsonPointer,
+    String detail
+) {}
+
+public record MigrationWarning(
+    String code,        // e.g., "unknown_bot_tokens", "unrecognized_top_level_key"
+    String jsonPointer,
+    String message,
+    List<String> offendingValues,
+    List<String> allowedValues
+) {}
+
+public record MigrationStepResult(
+    int targetVersion,
+    String migrationId,
+    boolean mutated,
+    List<MigrationMutation> mutations,
+    List<MigrationWarning> warnings
+) {}
+
+public sealed interface ConfigMigrationCommand
+    permits M001_StripLegacySkillDomainsAndExecBindings,
+            M002_RenameRetiredStepKeys,
+            M003_MigrateRunAtAllToLane,
+            M004_SplitEnabledBotsToParticipationLists {
+
+    /** Strictly monotonic target schema version (e.g., 1, 2, 3, 4). */
+    int targetVersion();
+
+    /** Stable unique identifier (e.g., "M004_split_enabled_bots_to_participation_lists"). */
+    String migrationId();
+
+    /** Concise human-readable summary for audit.jsonl and operator receipts. */
+    String description();
+
+    /**
+     * Applies an idempotent structural/value transformation to the raw Jackson ObjectNode AST.
+     * Must preserve operator overrides (Rule 3) and never throw on already-migrated trees.
+     */
+    MigrationStepResult execute(ObjectNode root, MigrationContext context);
+}
+----
+
+* *AST-Before-Binding Isolation*: `ConfigMigrationCommand.execute(...)` transforms the raw Jackson `ObjectNode` tree **before** the tree is deserialized into the strongly typed `MarshalConfigRecord`. Consequently, `MarshalConfigRecord` and runtime readers (`ConfigService`) represent **only** the current canonical schema and never carry `@JsonAlias` annotations, deprecated record components, or fallback branches for retired keys.
+* *Lossless Override Preservation*: Every command must move or transform existing operator values in place rather than resetting to defaults (e.g., renaming `default:automated-review` $\to$ `plan-marshall:automatic-review` carries the step's nested parameter block verbatim, or drops the retired key if the canonical key already exists; migrating `enabled_bots` $\to$ `required_bots` / `optional_bots` never overwrites an existing operator-answered `bot_lists_provenance`).
+
+=== 3. Five-Phase Atomic Reconciliation Pipeline (`ConfigReconciler`)
+
+All updates to `.plan/marshal.json` (whether triggered during `steward` setup/upgrade, `pm-mcp operator upgrade-config`, or automatic forward migration) pass through a single deterministic in-process method `ConfigReconciler.reconcile(Path marshalJsonPath)`:
+
+[source,text]
+----
+Raw .plan/marshal.json (ObjectNode)
+  │
+  ├─► Phase 1: Pending Command Chain (v_cur + 1 .. CURRENT_SCHEMA_VERSION)
+  │     Executes each unapplied ConfigMigrationCommand in ascending targetVersion order
+  │
+  ├─► Phase 2: Non-Destructive Default Seeding (syncDefaults)
+  │     Deep-merges missing keys from DefaultMarshalConfig + enabled domain config_defaults
+  │     (key-exists preservation: existing operator values and lists are never overwritten)
+  │
+  ├─► Phase 3: Deterministic Canonicalization (stepsSort + normalizeKeys)
+  │     Re-orders plan.phase-6-finalize.steps by FinalizeStepDescriptor.order() ascending
+  │     and orders all top-level/nested object keys into canonical schema order
+  │
+  ├─► Phase 4: Registry & Post-Condition Validation
+  │     Validates against MarshalConfigRecord schema, checks required_bots/optional_bots
+  │     against registered bot kinds, and flags unrecognized top-level keys as warnings
+  │
+  └─► Phase 5: Epoch Compaction, Stamp & Conditional Atomic Write
+        Compacts applied_migrations <= baseline_version, updates system.schema_version,
+        provisioned_binary_version, and config_seed_fingerprint, and atomically writes
+        .plan/marshal.json ONLY if canonical JSON bytes changed
+----
+
+=== 4. Anti-CoT-Clutter & Lifecycle Compaction Guarantees
+
+To ensure configuration upgrades never degrade model reasoning or bloat context windows:
+
+1. *Zero Migration Prose in Skills (`PM-SKILL-1`, `PM-EXT-7`)*: No vocabulary skill (`skill://pm/...`) or workflow state prompt ever instructs the model to run `sync-defaults`, `steps-sort`, `normalize-keys`, or `migrate-*` commands, nor mentions retired configuration keys (`enabled_bots`, `run_at_all`, `default:automated-review`, `skill_domains`).
+2. *Silent $O(1)$ Fast-Path When Current*: At `pm_start`, phase handshakes, and `pm-mcp enter`, the server compares `(system.schema_version, system.config_seed_fingerprint)` against `(CURRENT_SCHEMA_VERSION, CURRENT_SEED_FINGERPRINT)`. When they match, verification completes in memory in $<1\text{ ms}$ and emits **zero** facts, links, or warnings into the state representation.
+3. *Single Server-Side Reconcile Transition*: When `schema_version < CURRENT_SCHEMA_VERSION` or `config_seed_fingerprint` differs, `steward` (or `pm-mcp operator upgrade-config`) runs the entire 5-phase `ConfigReconciler` pipeline in one atomic step (`config.reconcile`) and emits a compact receipt containing only non-empty deltas (`from_schema_version`, `to_schema_version`, `applied_migrations[]`, `added_defaults_count`, `warnings[]`).
+4. *Epoch Compaction (`MINIMUM_SUPPORTED_SCHEMA_VERSION`)*: At major releases, `MINIMUM_SUPPORTED_SCHEMA_VERSION` advances. `ConfigMigrationCommand` classes with `targetVersion <= MINIMUM_SUPPORTED_SCHEMA_VERSION` are deleted from the active command chain, and `ConfigReconciler` compacts their IDs out of `system.applied_migrations` into `system.baseline_version`. If a repository presents a `schema_version < MINIMUM_SUPPORTED_SCHEMA_VERSION`, `ConfigReconciler` fails closed with an explicit `unsupported_legacy_config_epoch` error naming the required bridge version.
+5. *Three-Surface Synchronization (In-Flight `execution-manifest.json` Re-Composition)*: Whenever `ConfigReconciler` updates `.plan/marshal.json` in a repository that has active in-flight plans (Phases 4–6), the next phase handshake (`phase-workflows.adoc`) detects that the plan's recorded `config_hash` / `schema_version` trails `.plan/marshal.json` and automatically re-runs `ExecutionManifestResolver` in-process so the in-flight plan's `execution-manifest.json` immediately reflects the migrated configuration.
+6. *Build-Time Chain Integrity Verification (`ConfigMigrationChainTest`)*: JUnit 5 build tests in `pm-mcp-core` enforce:
+** Contiguous gap-free `targetVersion()` numbering from `MINIMUM_SUPPORTED_SCHEMA_VERSION + 1` to `CURRENT_SCHEMA_VERSION`.
+** Globally unique `migrationId()` strings matching `^M\d{3}_[a-z0-9_]+$`.
+** Strict idempotency: running `ConfigReconciler.reconcile(...)` a second time on any migrated fixture yields `mutated == false` and zero byte diff.
+** Lossless override preservation across per-version fixture pairs (`v1 -> v2 -> ... -> vN`).
+
 

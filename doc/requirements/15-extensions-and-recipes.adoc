@@ -72,3 +72,26 @@ In legacy `plan-marshall`, `marshal.json` mixed git-tracked project preferences 
 * The system must never read executable paths, wrapper names, or shell command strings from `.plan/marshal.json` or any other file in the repository working tree.
 
 See the link:specification/domain-extensions.adoc[Domain Extensions Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
+
+[#PM-EXT-7]
+=== PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation
+
+Upgrades to the core project configuration (`.plan/marshal.json`) must be executed through a deterministic, version-tracked Command-Pattern pipeline inside the server rather than ad-hoc one-shot scripts or LLM-orchestrated multi-step CLI sequences.
+
+* The system must maintain an explicit `system` tracking block in `.plan/marshal.json` recording `schema_version` (monotonically increasing integer), `baseline_version` (epoch compaction floor), `applied_migrations` (ordered list of applied migration command identifiers above `baseline_version`), `provisioned_binary_version`, and `config_seed_fingerprint` (SHA-256 digest of compiled-in defaults and enabled domain `config_defaults`).
+* The system must encapsulate every version-specific structural or value migration ($v-1 \to v$) as an isolated, idempotent Java command implementing a sealed `ConfigMigrationCommand` interface (`targetVersion()`, `migrationId()`, `description()`, `execute(ObjectNode, MigrationContext)`), operating on the raw JSON AST prior to typed deserialization so runtime configuration records (`MarshalConfigRecord`) remain free of deprecated fields and legacy compatibility branches.
+* The system must execute all `.plan/marshal.json` updates through a single atomic in-process reconciliation pipeline (`ConfigReconciler`) that sequentially runs:
+** Pending `ConfigMigrationCommand` instances where `targetVersion > system.schema_version` in strictly ascending version order, preserving operator overrides losslessly.
+** Non-destructive write-once default seeding (`syncDefaults`) from compiled-in defaults and enabled domain `config_defaults`.
+** Deterministic canonicalization of `plan.phase-6-finalize.steps` order (`stepsSort` by `FinalizeStepDescriptor.order()`) and canonical top-level/nested JSON key order (`normalizeKeys`).
+** Registry and schema post-condition validation (such as verifying configured review-bot tokens against registered bot kinds).
+** Conditional atomic write-and-rename that persists `.plan/marshal.json` if and only if the canonical JSON content or `system` stamps changed.
+* The system must prevent configuration upgrade clutter in the model's Chain of Thought (CoT) and codebase:
+** Vocabulary skills and workflow prompts must never contain prose instructions for historical field migrations or multi-step CLI choreography (retiring separate model-invoked `sync-defaults`, `steps-sort`, `normalize-keys`, and `migrate-*` calls).
+** When `system.schema_version` and `system.config_seed_fingerprint` match the running binary, configuration verification at plan startup or phase handshakes must execute as a silent $O(1)$ check emitting zero context tokens.
+** Migration commands at or below `MINIMUM_SUPPORTED_SCHEMA_VERSION` must be retired at major epoch boundaries and compacted into `system.baseline_version`, bounding the size of both `system.applied_migrations` and the active command registry.
+* When a `.plan/marshal.json` upgrade modifies configuration consumed by an in-flight plan's `execution-manifest.json`, the server must automatically re-compose the stale `execution-manifest.json` at the next phase handshake.
+* Automated build-time JUnit tests (`PM-TEST-3`) must verify that registered `ConfigMigrationCommand` implementations form a contiguous, gap-free integer sequence from `MINIMUM_SUPPORTED_SCHEMA_VERSION + 1` to `CURRENT_SCHEMA_VERSION` with unique identifiers and 100% idempotency on re-run.
+
+See the link:specification/domain-extensions.adoc[Domain Extensions Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
+
