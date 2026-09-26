@@ -70,8 +70,8 @@ Before spawning any subprocess, the runtime validates the job request through a 
              Spawn Subprocess (Direct)
 ----
 
-* *Working Directory Confinement (`PM-SEC-2`)*: The working directory must resolve canonically via `Path.toRealPath()` to the project's enrolled root or a live linked git worktree verified via `git worktree list --porcelain`. Arbitrary paths or symlink escapes are rejected with outcome `refused`.
-* *Working Directory Selection (`PM-ARCH-5`)*: Jobs for plans in Phases 1–4 and plan-less jobs run in the main checkout; jobs for plans in Phase 5 or later run in the plan's worktree root. Legacy `script` jobs thereby resolve their runtime-state root (`.plan/local`) by plan-marshall's working-directory rule (ADR-002). The legacy override `PLAN_BASE_DIR` is never set for production jobs, because plan-marshall treats it as a replacement for the main checkout's `.plan/local` and would redirect main-anchored stores (lessons, merge lock).
+* *Working Directory Confinement (`PM-SEC-2`)*: The working directory must resolve canonically via `Path.toRealPath()` to the project's enrolled root or a live linked git worktree verified via `git worktree list --porcelain`. Arbitrary paths or symlink escapes are rejected with outcome `refused` and reason `path_traversal_rejected`.
+* *Working Directory Selection (`PM-ARCH-5`)*: The working directory is derived from the plan's persisted `location` at job start, never from the phase: jobs for plans with `location == MAIN_CHECKOUT` and plan-less jobs run in the main checkout; jobs for plans with `location == WORKTREE` run in the plan's worktree root. A job that removes a worktree never runs with a working directory inside that worktree. Legacy `script` jobs thereby resolve their runtime-state root (`.plan/local`) by plan-marshall's working-directory rule (ADR-002). The legacy override `PLAN_BASE_DIR` is never set for production jobs, because plan-marshall treats it as a replacement for the main checkout's `.plan/local` and would redirect main-anchored stores (lessons, merge lock).
 * *Verify-Not-Resolve Executable Resolution (`PM-EXEC-1`, `PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`)*: The runtime *never* searches the system `PATH`:
 ** *Wrapper Jobs (`mvnw`, `gradlew`, `pw`)*: The wrapper must be committed at the root of the tree, must match an enrolled wrapper name in `~/.plan-marshall/mcp/enrolments.json`, and its SHA-256 content hash must match the enrolled digest.
 ** *Host Tools (`git`, `gh`, `glab`, `python3`, `npm`, `npx`)*: The runtime invokes the exact absolute `executable_path` recorded in `enrolments.json` after verifying that the file's current SHA-256 matches the enrolment record.
@@ -140,7 +140,7 @@ When a job exceeds its configured timeout (`PM-EXEC-4`) or when the user/client 
 1. *SIGTERM Escalation*: `pm-mcp` sends `SIGTERM` to the job's process group (`kill(-pid, SIGTERM)` via Java FFM, `PM-TECH-4`), whose ID equals the job PID (see <<Process-Group Creation via the `job-exec` Shim>>).
 2. *Grace Period*: `pm-mcp` waits up to 5,000 milliseconds for all processes in the group to exit cleanly.
 3. *SIGKILL Cleanup*: If any process remains alive after the grace period, `pm-mcp` issues `kill(-pid, SIGKILL)` to immediately terminate the remaining process group.
-4. *Closed-Enum Outcome Assignment*: Cancelled requests return `cancelled`; wall-clock timeout expirations return `timed_out`; jobs interrupted by a runtime crash or drain are recorded as `killed` (on drain, or by crash recovery at the next runtime start); relay termination never affects a job.
+4. *Closed-Enum Outcome Assignment*: Cancelled requests return `cancelled`; wall-clock timeout expirations return `timed_out`; jobs interrupted by a runtime crash or drain are recorded as `killed` (on drain, or by crash recovery at the next runtime start); relay termination never affects a job. In every roll-up (landing facts, metrics, gate facts, CI taxonomy) a `timed_out` job counts as `no_verdict`, never as `failed`.
 5. *Live Orphans after a Runtime Crash*: Each job record stores the job PID and the process start instant. At the next runtime start, a record left `running` whose process group still exists (PID and start instant match, ruling out PID reuse) is terminated with steps 1–3 and recorded as `killed`; it is never adopted or re-executed (link:runtime-model.adoc[Runtime & Interaction Model Specification], Startup Sequence).
 
 === Bounded Long-Poll & Progress-Reset Waiting Primitives (`PM-WF-8`, `PM-IMPL-4`)
@@ -150,6 +150,7 @@ When a workflow transition spawns a long-running `build`, `ci`, or `project_scri
 * *Bounded Wait Slice*: The server holds the request open for at most `bounded_wait_seconds` (configured per client profile in `15s`–`3600s`, default `240s` / 4 minutes). If the job completes within the window, the server immediately evaluates the completion guard and returns the next workflow state.
 * *Progress Notifications*: When the client profile supports `progress_resets_timeout == true` and supplies a `_meta.progressToken`, the job runner emits periodic `notifications/progress` frames (every 5 seconds with current build stage and elapsed time) over the calling host connection (relayed to the host by `pm-mcp serve`).
 * *Non-Blocking Wait Links*: If the job is still running when `bounded_wait_seconds` elapses, the call returns a valid hypermedia state with `form: wait` (`rel: wait`) and `form: submit` (`rel: abort`) links (`PM-WF-8`), never failing with an MCP transport timeout.
+* *Wait Attribution*: Every wait slice records `wait_reason` (closed enum `build`, `ci`, `review_bot_window`, `operator_decision`, `merge_queue`, `precondition_poll`) and `deliberate` (`true` for an operator ruling or a rate window). `record-metrics` sums wait time per reason and reports deliberate waits separately from poll misses, never as one "waste" figure.
 
 === Warm Language Server Pool & Orthogonal Service Access (`PM-SVC-2`, `PM-SVC-4`, `PM-TOOL-2`)
 
@@ -232,6 +233,8 @@ When a build completes with a non-zero exit code or compiler warnings, the runti
 |Recipe finding per line (newly detected vs pre-existing), verdict.
 |===
 
+Test counts are aggregated over every summary block of a multi-module run. When a successful build's summaries cannot be aggregated, the result reports `tests_population: unmeasured`, never `tests_run: 0`; a `no_tests_ran` verdict requires a positive marker, not a zero count. In the Maven parser, failure-trailer advice lines (`Re-run Maven using the -X switch…`, `[Help 1] http…`, `After correcting the problems, you can resume the build…`, `mvn <args> -rf :<module>`) are dropped, and an unrecognised `[ERROR]` line is categorised `unrecognized`, never assigned a real category.
+
 Coverage reports are parsed separately (<<Native Coverage Report Parsers>>).
 
 === Unparseable Output Fallback (`failed_unparsed`)
@@ -283,7 +286,7 @@ Before marking a module or pre-push quality gate as `fresh` in `change-ledger.js
 
 The `pm-mcp-core` and `pm-mcp-server` verification suite enforces automated adversarial tests (`PM-TEST-5`) across every job and ingestion boundary:
 
-1. *Workspace & Symlink Escape Rejection (`PM-SEC-2`)*: Adversarial fixtures containing `..` segments, URL-encoded path traversal, and intra-worktree symlinks pointing outside `<workspace-root>` must be rejected with `refused` before any file descriptor or subprocess is opened.
+1. *Workspace & Symlink Escape Rejection (`PM-SEC-2`)*: Adversarial fixtures containing `..` segments, URL-encoded path traversal, and intra-worktree symlinks pointing outside `<workspace-root>` must be rejected (`path_traversal_rejected`: job outcome `refused` for a job, `rejected.reason` for a `pm_do` argument) before any file descriptor or subprocess is opened.
 2. *Tampered Binary & Wrapper Rejection (`PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`)*: Modifying 1 byte of an enrolled `mvnw`, `gradlew`, `pw`, host binary, or `project_script` without operator re-enrolment must fail the SHA-256 preflight check with `refused` and emit a `security` event in `audit.jsonl`.
 3. *Argument Vector Injection & Environment Sanitization (`PM-EXEC-1`, `PM-SEC-5`)*: Passing shell metacharacters (`; rm -rf`, `$(...)`, backticks) or non-allowlisted flags (`-Dexec.executable=...`, `--init-script`) in job parameters must be rejected at schema validation, and spawned child environments must never contain `GITHUB_TOKEN` or `SONAR_TOKEN`.
 4. *Untrusted Reader Containment (`PM-SEC-1`)*: Sub-agent dispatches targeting `execution-context-reader` are verified to emit zero MCP tool permissions and pass all ingested candidate structs through the deterministic Java validator before writing to `.plan/` stores.

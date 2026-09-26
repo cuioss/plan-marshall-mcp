@@ -1,0 +1,192 @@
+= Job Runtime Implementation Watch
+:toc: left
+:toclevels: 2
+:toc-title: Table of Contents
+:sectnums:
+:nofooter:
+
+link:../ImplementationWatch.adoc[Implementation Watch] » Job Runtime
+
+== Overview
+
+Watch items for the link:../specification/job-runtime.adoc[Job Runtime Specification]: job outcome derivation, git
+and CI subprocesses, bounded waits, build output parsers and timeout verdicts. The sections mirror the
+specification. Item format and lifecycle: link:../ImplementationWatch.adoc[Implementation Watch].
+
+== Verify-Not-Resolve Execution Pipeline
+
+[#PM-WATCH-JOB-1]
+=== PM-WATCH-JOB-1: Job outcomes are derived at the boundary
+
+Anchor:: link:../specification/job-runtime.adoc#_verify_not_resolve_execution_pipeline[Job Runtime § Verify-Not-Resolve Execution Pipeline],
+link:../specification/domain-extensions.adoc#_standard_output_payload_stdout[Domain Extensions § Standard Output Payload],
+link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4]
+Hazard:: Two vocabularies (`indeterminate` in the wrapper, `unknown` at the boundary) named one state, and a wrapper
+could claim a status the boundary never derived.
+Guard:: The runtime derives job outcomes itself; a `project_script` output `status` is validated against the
+observed exit and parse evidence and never adopted blindly.
+Source:: truthful-signals PLAN-TRUTH-155 D5.
+
+== Subprocess Lifecycle & Process-Group Isolation
+
+[#PM-WATCH-JOB-2]
+=== PM-WATCH-JOB-2: Test and production git seams share one environment policy
+
+Anchor:: link:../specification/job-runtime.adoc#_process_group_creation_via_the_job_exec_shim[Job Runtime § Process-Group Creation via the `job-exec` Shim],
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5], link:../Requirements.adoc#PM-EXEC-5[PM-EXEC-5]
+Hazard:: The test fixture scrubbed environment-injected git configuration, but about 20 production scripts did not.
+Guard:: The runtime clears the child environment and applies the allowlist while keeping file-based developer git
+configuration; a test launches the runtime with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0` set and asserts that no git job sees them, exercising the production
+seam, not a test-only scrub.
+Fixture:: CodeRabbit finding `5ed953` (PR #1585).
+Source:: orchestrator-refactor epic Open Defect (PLAN-08).
+
+[#PM-WATCH-JOB-3]
+=== PM-WATCH-JOB-3: A git timeout is not a refusal
+
+Anchor:: link:../specification/job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime § Process Termination & Cancellation Protocol],
+link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4]
+Hazard:: A git timeout was treated like a refusal and answered with `--force`; a timed-out worktree removal could
+leave a partially deleted tree.
+Guard:: `timed_out` git jobs never trigger `--force`; a timed-out `worktree remove` is re-checked for partial
+deletion before a retry; git timeouts adapt for large checkouts.
+Fixture:: the 60 s budget fired twice on one plan.
+Source:: code-intelligence-substrate PLAN-CIS-052 fold-N6.
+
+[#PM-WATCH-JOB-4]
+=== PM-WATCH-JOB-4: A worktree is never removed from inside itself
+
+Anchor:: link:../specification/filesystem-layout.adoc#_plan_directory_relocation_sequence[Filesystem Layout § Plan Directory Relocation Sequence],
+link:../Requirements.adoc#PM-ARCH-5[PM-ARCH-5]
+Hazard:: A forked finalize agent inherited the worktree as its working directory and could not finish
+branch-cleanup.
+Guard:: The branch-cleanup job spec runs `git worktree remove` with the main checkout as working directory; a test
+asserts it, and a relay or host started inside the worktree does not affect it (jobs never inherit the host's
+working directory).
+Fixture:: forked finalize agent with its working directory inside `.plan/local/worktrees/<plan_id>/` (lesson
+`2026-09-20-08-010`).
+Source:: process-compliance PLAN-13 D3.
+
+[#PM-WATCH-JOB-5]
+=== PM-WATCH-JOB-5: Bounded waits are wall-clock and say what happened
+
+Anchor:: link:../specification/job-runtime.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4]
+Hazard:: A wait budget passed as an iteration count expired in seconds and reported a bot "absent" while it was
+running; a wait at its ceiling could not tell waiting from re-polling finished work; wait cost was invisible.
+Guard:: Wait jobs use monotonic wall-clock deadlines (test with fast pollers); an exhausted poll is `unproven`, not
+absent; a bounded wait returning `running` reports whether the job state changed during the window; a wait on an
+already-settled job returns immediately. The wait population below is the baseline for bounded-wait metrics.
+Fixture:: 600 s budget burned in seconds ("CodeRabbit absent" while running); 2,051 wait calls, 14,423,580 ms:
+build_server 27.4%, ci 27.3%, ci_complete_precondition 23.1% (77.8% together).
+Source:: review-apparatus PLAN-PR-048 D2; lessons-routing lesson 2026-09-23-05-003; post-run-quality PLAN-PRQ-11 D0.
+
+[#PM-WATCH-JOB-6]
+=== PM-WATCH-JOB-6: A verdict is bound to its job identity
+
+Anchor:: link:../specification/job-runtime.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2]
+Hazard:: Re-attaching to a build wait returned a previous job's verdict.
+Guard:: Every wait and `pm_build` result carries the job id and the `worktree_sha` it was computed for; a test
+re-attaches after a runtime restart and after a second job for the same command started.
+Source:: truthful-signals PLAN-TRUTH-150 D1.
+
+[#PM-WATCH-JOB-7]
+=== PM-WATCH-JOB-7: A silent non-zero exit is its own outcome
+
+Anchor:: link:../specification/job-runtime.adoc#_unparseable_output_fallback_failed_unparsed[Job Runtime § Unparseable Output Fallback],
+link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6]
+Hazard:: Jobs exited non-zero without a diagnostic, and the failure carried nothing to act on. The bounded output tail
+is specified for builds only.
+Guard:: Non-build jobs (`git`, `ci`, scripts) exiting non-zero without a parsed diagnostic also attach the exception
+class, subject, bounded output tail and log URI.
+Source:: lessons-routing lesson 2026-09-23-05-006.
+
+[#PM-WATCH-JOB-8]
+=== PM-WATCH-JOB-8: A formatter never dirties a clean base
+
+Anchor:: link:../specification/job-runtime.adoc#_subprocess_lifecycle_process_group_isolation[Job Runtime § Subprocess Lifecycle],
+link:../Requirements.adoc#PM-WF-10[PM-WF-10]
+Hazard:: A local auto-fixing formatter rewrote committed files that CI accepted, dirtying every worktree before the
+clean-tree guard ran (no longer reproduced with ruff 0.16.8).
+Guard:: Quality-gate and format jobs run on a fresh worktree of the base leave `git status --porcelain` empty; test
+in a nested-worktree location.
+Fixture:: 4 rewrites of `test/test_shared_harness_parse_ns_{defaults,no_seam}.py` in one run.
+Source:: lessons-routing lesson 2026-09-23-23-001.
+
+[#PM-WATCH-JOB-9]
+=== PM-WATCH-JOB-9: CI runs are looked up by head SHA
+
+Anchor:: link:../specification/phase-workflows.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows § Normative Step Catalogue] (`ci-verify`, order 22)
+Hazard:: Filtering CI runs by `pull_requests[].number` missed fork PRs, where the field is routinely empty.
+Guard:: `ci-verify` resolves runs by head SHA (and branch), never by `pull_requests[]`; fixture with an empty
+`pull_requests`.
+Source:: review-apparatus PLAN-PR-026 lesson.
+
+== Native Build Output Parsers
+
+[#PM-WATCH-JOB-10]
+=== PM-WATCH-JOB-10: Green-build test counts aggregate every summary block
+
+Anchor:: link:../specification/job-runtime.adoc#_native_build_output_parsers[Job Runtime § Native Build Output Parsers]
+Hazard:: A successful multi-module build reported `tests_run: 0` (sixth recurrence).
+Guard:: Parser test over the fixture below: counts aggregate every summary block; an aggregation failure reports the
+test population as unmeasured, never 0.
+Fixture:: 15-module `verify -Ppre-commit`, BUILD SUCCESS, 3,083 tests, reported `tests_run: 0`.
+Source:: truthful-signals PLAN-TRUTH-150 D5.
+
+[#PM-WATCH-JOB-11]
+=== PM-WATCH-JOB-11: A test filter matching nothing reports zero tests
+
+Anchor:: link:../specification/mcp-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools § `pm_build`],
+link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2]
+Hazard:: A scoped Maven test filter (`-Dtest=<package>.*`) matching zero classes failed the surefire build instead of
+reporting zero tests.
+Guard:: The Maven adapter passes `-Dsurefire.failIfNoSpecifiedTests=false` (or equivalent) and reports `tests_run: 0`
+distinctly; test with a non-matching filter.
+Fixture:: cui-jsf lesson `2026-06-16-09-001`.
+Source:: lessons-routing stranded lessons (PLAN-LR-01 D3).
+
+[#PM-WATCH-JOB-12]
+=== PM-WATCH-JOB-12: pytest-xdist group suffixes are normalised
+
+Anchor:: link:../specification/job-runtime.adoc#_native_build_output_parsers[Job Runtime § Native Build Output Parsers]
+Hazard:: pytest-xdist appends `@<group>` to the node ids of `xdist_group` tests, so a passing test was reported
+missing.
+Guard:: The pytest parser strips `@<group>` before test identity matching.
+Fixture:: `…::test_concurrent_appends_both_survive@orchestrator_add_row_contention` passed but was reported missing.
+Source:: lessons-routing lesson 2026-09-24-09-007.
+
+[#PM-WATCH-JOB-13]
+=== PM-WATCH-JOB-13: Every build is a change-ledger row
+
+Anchor:: link:../specification/store-schemas.adoc#_change_ledger_record_change_ledger_jsonl[Store Schemas § Change Ledger Record],
+link:../Requirements.adoc#PM-SVC-4[PM-SVC-4]
+Hazard:: The build-row writer missed builds: 796 ledger rows scanned, 0 summed, while 27 real builds ran.
+Guard:: Test that N builds (plan-scoped and orthogonal `pm_build`) produce N `kind = "build"` rows.
+Fixture:: `ledger_rows_scanned: 796`, `summed_rows: 0`, `build_count: 0`, `total_build_seconds: unavailable` vs 27
+builds (PR #1550); acceptance `summed_rows == 27`.
+Source:: post-run-quality PLAN-PRQ-08 fold-005.
+
+[#PM-WATCH-JOB-14]
+=== PM-WATCH-JOB-14: Truncated payloads report forwarded and total size
+
+Anchor:: link:../specification/job-runtime.adoc#_unparseable_output_fallback_failed_unparsed[Job Runtime § Unparseable Output Fallback],
+link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6]
+Hazard:: A payload was truncated in forwarding (2,475 bytes / 4 turns emitted, ~575 bytes / 2 turns forwarded) while
+its counts still described the original.
+Guard:: Any truncated payload, such as the `failed_unparsed` tail, reports forwarded and total sizes.
+Source:: truthful-signals (quality-aspect) PLAN-217 D4.
+
+== Adaptive Build Timeouts, Coverage Parsers & Gate Honesty
+
+[#PM-WATCH-JOB-15]
+=== PM-WATCH-JOB-15: A timeout over a passing build is no verdict
+
+Anchor:: link:../specification/job-runtime.adoc#_adaptive_timeout_learning[Job Runtime § Adaptive Timeout Learning],
+link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
+Hazard:: Timeouts were read as failures.
+Guard:: Matched tests: a failing build stays `failed`; a timeout over a build that would pass yields no verdict.
+Fixture:: job `dbbc60f9`.
+Source:: truthful-signals PLAN-TRUTH-169 D4.

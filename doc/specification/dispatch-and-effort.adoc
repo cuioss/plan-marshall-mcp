@@ -18,6 +18,7 @@ In the legacy script-and-prose architecture, sub-agent orchestration relied on p
 
 _See Requirements:_
 
+* _See Requirement link:../Requirements.adoc#PM-ARCH-5[PM-ARCH-5: Worktree-Bound Plan Location & Main-Bound Orchestrator Location]_
 * _See Requirement link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint]_
 * _See Requirement link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
 * _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
@@ -332,12 +333,37 @@ When the sub-agent finishes (or fails/cancels in the host harness), the parent s
 
 === Post-Return Integrity Invariants
 
-The workflow engine enforces four non-negotiable post-return invariants when processing `returned:<dispatch_id>`:
+The workflow engine enforces five non-negotiable post-return invariants when processing `returned:<dispatch_id>`:
 
-1. *Unmeasured Token Usage Never Fabricates Zero*: If `token_usage` is omitted or `null` in `returned:<dispatch_id>`, the server persists `"token_usage": "unmeasured"` in the dispatch ledger and phase metrics store (`metrics.json`). It **must never** record `0`, because a zero token count corrupts cost aggregations and masks missing host telemetry.
+1. *Unmeasured Token Usage Never Fabricates Zero*: If `token_usage` is omitted or `null` in `returned:<dispatch_id>`, the server persists `"token_usage": "unmeasured"` in the dispatch ledger and phase metrics store (`metrics.json`). It **must never** record `0`, because a zero token count corrupts cost aggregations and masks missing host telemetry. A step that runs inline by design (for example when the neutral profile converts a dispatch into an inline step, `PM-CLIENT-4`) records `"token_usage": "inline"`; `unmeasured` and `inline` are declared before any scoring and never collapse into each other or into `0`. Every token total aggregated from the dispatch ledger is published as a population-stamped aggregate (`rows`, `rows_unmeasured`, `population_count`, with the population `dispatched`; link:store-schemas.adoc#metrics-store[Store Schemas Specification, Metrics Store]); when `rows_unmeasured > 0` the total is marked `total_is_floor: true` and never wins a reconciliation against another source.
 2. *Submit-Before-Return Verification (No Synthesized Submissions)*: When `returned:<dispatch_id>` is called with `status: "success"`, the server inspects the persisted state of the target `entity`. If the entity reached its required terminal submission state (e.g., `envelope.completed`, or the expected outline/triage artifact was submitted via `pm_do`), the return succeeds and advances the parent workflow. If the entity has **not** recorded its required `submit` transition (for example, the sub-agent edited files or answered in prose and returned `"success"` without calling `pm_do(link="submit:...")`), the server **never synthesizes a missing submission**. Instead, it marks the dispatch record `INCOMPLETE_SUBMISSION`, logs an attribution defect in the audit log, and transitions the parent state to `<phase>.dispatch-incomplete` offering `resume:<entity>` (to complete or re-dispatch after inspecting disk state) and `escalate`.
 3. *No Blind Retry on Unconfirmed Dispatches*: When a dispatch fails to return (`harness_cancellation`, empty return, or host crash) or remains `UNCLAIMED` / `CLAIMED` without completion, the server never retries the sub-agent blindly. It inspects the worktree (`worktree_sha`) and entity store on disk first, exposes the observed partial progress (e.g., tasks $t_1$ completed, $t_2$ pending in `envelope-1`) in `facts`, and issues a fresh `dispatch_id` only for the remaining uncompleted tasks in the envelope.
-4. *Citations-Only Return for Read-Only Workers*: Read-only worker dispatches (such as deep-lane codebase exploration or verification sweeps) persist their detailed findings and component assessments via entity-scoped `submit` links during execution and return only aggregate counts in `display_detail` (e.g., `"3 modules analyzed, 2 findings recorded"`), keeping raw findings out of the parent orchestrator's context window.
+4. *Citations-Only Return for Read-Only Workers*: Read-only worker dispatches (such as deep-lane codebase exploration or verification sweeps) persist their detailed findings and component assessments via entity-scoped `submit` links during execution and return a short `display_detail`, keeping raw findings out of the parent session's context window. The server computes the aggregate counts from the records the entity submitted and renders them as `facts` of the parent representation; `display_detail` is display text only and is never read as evidence of a count.
+5. *Dispatch Reconciliation*: The `[DISPATCH]` audit record written on render and the `returned:<dispatch_id>` entry of the dispatch ledger are two records of one dispatch. Every `[DISPATCH]` record ends in exactly one terminal disposition: `RETURNED`, `SUPERSEDED`, or `UNCONFIRMED` (still `UNCLAIMED` or `CLAIMED` when its phase closes). `record-metrics` publishes, per divergence class (`row_absent_from_return_ledger`, `row_absent_from_dispatch_audit`, `boundary_never_closed`, `phase_re_entered`), the row count and the token mass the divergence hides.
+
+[#spend-accounting-budget-anchors]
+== Spend Accounting & Budget Anchors
+_See Requirement link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+Measured spend is compared against a fixed anchor table keyed by the plan's `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`, link:phase-workflows.adoc[Phase Workflows Specification]) and its `ChangeType` (`feature`, `bug_fix`, `tech_debt`, `enhancement`, `verification`, `analysis`). Every pair of the full cross-product is either `anchored` or `fallback`; no pair is left undefined. The Phase 4 budget projection compares the summed predicted task cost with the anchor of the plan's pair.
+
+[cols="2,2,2,2"]
+|===
+|`scope_estimate` |`ChangeType` |Warning (tokens / wall minutes) |Error (tokens / wall minutes)
+
+|`surgical` |`feature`, `tech_debt` |600,000 / 45 |1,000,000 / 75
+|`surgical` |`bug_fix` |500,000 / 30 |800,000 / 45
+|`single_module` |`feature`, `tech_debt` |1,000,000 / 75 |1,600,000 / 120
+|`single_module` |`bug_fix` |800,000 / 60 |1,300,000 / 90
+|`multi_module` |`feature`, `tech_debt` |1,500,000 / 120 |2,500,000 / 180
+|`multi_module` |`bug_fix` |1,200,000 / 90 |2,000,000 / 150
+|`broad` |`feature`, `tech_debt` |2,000,000 / 180 |3,500,000 / 240
+|`broad` |`bug_fix` |1,500,000 / 120 |2,500,000 / 180
+|===
+
+All other pairs (every pair with `scope_estimate` `none`, and every pair with `ChangeType` `enhancement`, `verification`, or `analysis`) are `fallback` pairs. A fallback pair has no absolute anchor and is checked against normalized ceilings instead: tokens per changed file above 50,000, worked seconds per task above 900 (unanchored), a single phase's share of the plan's tokens above 0.50, or tokens per deliverable above 500,000. The canonical reference plan for the table is a surgical bug fix of 958,064 tokens over 2 files.
+
+The values mirror `plan-marshall`'s budget anchors; re-verify them against the latest `plan-marshall` version before implementing.
 
 == Sub-Agent Question Batching & Non-Blocking Escalation
 _See Requirements link:../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
@@ -515,7 +541,7 @@ Because agent hosts such as Claude Code and OpenCode load sub-agent definitions 
 * **Rendered at Install Time**: Variant files are rendered from the templates in the embedded bundle and the effective ladder (`.plan/local/effort-ladder.json` or the compiled defaults). The bundle manifest marks them `rendered`; the installer verifies the template digest and records the rendered digest in `install-records.json`. A ladder change takes effect after `pm-mcp client update` and a host restart.
 * **Mandatory MCP Tool Inclusion**: Every installed `execution-context` worker variant **must** include the `PM-MCP` tool surface (`mcp__plan-marshall__pm_state`, `mcp__plan-marshall__pm_do`, `mcp__plan-marshall__pm_build`, `mcp__plan-marshall__pm_lsp`, `mcp__plan-marshall__pm_skill` or host-equivalent wildcard `mcp__plan-marshall__*`) alongside host file/shell tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`). Without these MCP tool permissions, a sub-agent cannot execute `start: pm_state(...)` or submit its work via `pm_do`.
 * **Concise Universal Worker Body**: The prompt body of every `execution-context-*` variant is reduced to a deterministic 5-step execution loop:
-** Load `skill://pm/core` and every URI listed in `skills[]`.
+** Load `skill://pm/core` and every URI listed in `skills[]` via `pm_skill` (or `resources/read`); if any load fails or returns no content, stop without performing work and return `status: error` with `display_detail: "skill load failed: <uri>"`.
 ** Call the exact `start: pm_state(...)` command from the dispatch prompt.
 ** Perform the judgment or code/test authoring required by the returned state representation.
 ** Follow `pm_do(scope="entity", link="...", args={...})` until the entity representation reaches a terminal state (`links[0]`).
@@ -549,7 +575,7 @@ Untrusted External Source (Web / Issue / PR Body)
                               │ Plain-text response to parent session
                               ▼
 ┌──────────────────────────────────────────────────────────┐
-│ Parent Orchestrator Session                              │
+│ Parent Session (dispatching plan or epic)                │
 │  • Treats reader output as opaque untrusted candidate    │
 │  • Calls pm_do(link="ingest_candidates:<dispatch_id>",   │
 │                args={candidates, status, display_detail})│
@@ -586,6 +612,8 @@ A plan (`scope = "plan"`) is a top-level workflow that dispatches its own leaf s
 Instead, the epic state machine exposes the **`emit:<plan_id>`** hypermedia link (`rel = "emit"`, `form = "submit"`):
 
 * *Surface Disjointness Gate*: While building the epic representation, the server computes the expected file/module footprint surface of every staged plan waiting in the workstream queue against all currently live (`launched` or `running`) plans. A single server-side reader evaluates expected surfaces; an `indeterminate` surface is **never** treated as disjoint, and `absent`, `unlistable`, and `unreadable` surfaces remain distinct states (ADR-019). Only plans whose expected surface is provably disjoint from all active plans (and whose prerequisite plans have `shipped`) have an `emit:<plan_id>` link rendered.
+** *Surface Entries*: Expected surfaces may contain files, directories, and globs; directories are prefix-matched and globs expanded, never dropped. An entry must name a git-tracked path or glob inside the plan's write boundary; an entry under a git-ignored tree (for example `.plan/local/**`) or outside the workspace makes the surface `unreadable` with reason `untracked_surface`. An entry that cannot be evaluated makes the surface `indeterminate`; neither is ever read as disjoint.
+** *Stated Tallies*: The gate publishes per-state tallies over the whole candidate population in `facts` (`disjoint`, `overlapping`, `indeterminate`, `absent`, `unlistable`, `unreadable`), each with a stated zero. An empty overlap list beside a non-zero `indeterminate` count is reported as `unchecked`, never as a pass, and underivable surfaces are never folded into the disjoint count.
 * *Emission Transition (`launched`, Never `running`)*: When the model follows `pm_do(scope="epic", link="emit:<plan_id>", args={})`, the server atomically updates the plan's queue row `.plan/orchestrator/<epic_id>/queue/<plan_id>.json` to `status: "launched"` (with `emitted_at` timestamp) and returns the exact operator entry command in `facts.emitted_command`:
 +
 [source,text]
@@ -614,21 +642,55 @@ To allow epic state to merge cleanly across worktrees and machines via Git witho
 |One file per staged plan tracking the 10-state plan vocabulary partitioned into `live` (`staged`, `ready`, `launched`, `running`, `blocked`), `terminal.shipped` (`merged`, `completed`), and `terminal.closed_unshipped` (`abandoned`, `superseded`, `split`). Executing child plans **never** write to `queue/` directly.
 
 |`inbox.jsonl`
-|Append-only via plan-scope outbox link; claim-on-consumption under epic lock.
-|Structured cross-scope envelopes written by executing child plans (scope deviations, blocker reports, landing notifications). Supports only three valid in-place status mutations (`pending` -> `claimed` -> `processed`) and distinguishes the three empty states (`no_file`, `empty_file`, `all_processed`).
+|Append-only via the plan-scope outbox link (<<plan-scope-outbox-link>>); claim-on-consumption under epic lock.
+|Structured cross-scope envelopes written by executing child plans (scope deviations, blocker reports, process findings, landing notifications). Supports only three valid in-place status mutations (`pending` -> `claimed` -> `processed`) and distinguishes the three empty states (`no_file`, `empty_file`, `all_processed`) from `unreadable` (reported with the failing line), which is never read as empty.
 
 |`landings.jsonl`
 |Append-only under epic lock when a landing notification is reconciled.
-|Structured landing history records for completed or closed child plans.
+|Structured landing history records for completed or closed child plans (<<server-derived-landing-facts>>). Each landing carries the plan's whole findings ledger as `findings[]`, so the epic never depends on the archived plan directory to read them.
+
+|`spec.md`
+|Written only through epic-scope `submit` links.
+|The epic specification: workstream and staged-plan sections, including each staged plan's claim sections and expected surface. Served as `pm://epic/{epic_id}/spec/{section}` (link:mcp-tools.adoc[MCP Tools Specification]).
 
 |`resume_anchor.md`
 |Daemon-rendered markdown artifact.
 |Human- and clone-readable queue overview and resumption summary. Regenerated automatically on merge conflict; regeneration refuses with an explicit diagnostic if any `queue/<PLAN-ID>.json` source file is unreadable.
 |===
 
+[#plan-scope-outbox-link]
+==== Plan-Scope Outbox Link (`outbox:send`)
+
+Every plan state of a plan whose `mcp/entry.json` carries `from_epic` offers `outbox:send` (rel `submit`, form `submit`, free `kind:enum[scope_deviation|blocker_report|process_finding|landing_notification],summary:text[1..200],body:text[1..16384]`). The target inbox is derived by the store from `from_epic` and the sending `plan_id`; the caller supplies no path or epic identifier. `landing_notification` is emitted only by `emit-landing`. Following the link appends one message and never changes the plan's own state.
+
+[#epic-landing]
+=== Epic Landing (`land`)
+_See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+
+Ledger changes are edited in the shared epic worktree (link:filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification]) and reach the default branch only through the `land` link of an epic scope:
+
+1. *One Landing for All Epics*: A landing covers every pending change in the shared epic worktree, whatever epic made it, in one pull request from the epic branch. There are never concurrent per-epic landing pull requests.
+2. *Repository-Wide Serialization*: The landing holds the repository-wide epics-worktree lock for its git steps; a concurrent `land` waits for the lock or is answered with the open pull request.
+3. *Ledger Paths Only*: The landing stages and commits only `.plan/orchestrator/**`, even though the worktree holds nothing else.
+4. *Pull-Request Reuse & Composition*: A repeated landing reuses the open pull request of the epic branch and never opens a duplicate; title and body are composed from the landing snapshot (epics touched, queue rows changed, landings and inbox records added), never from plan artifacts.
+5. *Gate*: Required CI checks only. The plan pre-merge review barrier (link:phase-workflows.adoc[Two Fail-Closed Barrier Predicates]) does not apply: a ledger-only diff draws no review-bot participation (`.plan/**` is excluded from review bots), so Predicate 2 could never be satisfied.
+6. *Merge Confirmation*: The landing waits for a terminal outcome (`merged`, `ejected`, `closed`, or `timed_out`) and is stamped `landed` only from the provider's observed pull-request state (`merged`, with the merge commit on the base branch), never from a merge command's return value or exit code.
+7. *Post-Merge*: The primary checkout's default branch is fast-forwarded when it is clean and checked out; the epic branch is resynced to the new default branch without removing the worktree and without discarding ledger writes made after the landing snapshot.
+8. *Failure*: CI failure, queue ejection, or wait timeout stops the landing and reports it; worktree and branch are left exactly as they were (no reset), so following `land` again resumes.
+
+[#server-derived-landing-facts]
 === Server-Derived Landing Facts, Spec Re-Grounding & Cross-Plan Locks
 
+[[_server_derived_landing_facts_spec_re_grounding_cross_plan_locks]]
 1. *Server-Derived Landing Facts (`n/a` vs. `unknown`)*: When a child plan reaches `completed` and merges, the daemon derives objective landing facts directly from the git commit history, plan audit log, and realized footprint store (commits merged, files changed, tasks completed, loop-back count, test/coverage deltas). Values that do not apply to the plan's profile are recorded as `"n/a"`, while values that could not be read due to missing artifacts are recorded as `"unknown"`—degraded answers are never folded into `"n/a"`. The model in the epic session submits only the semantic landing analysis and downstream impact judgment via `submit_landing:<plan_id>`.
+** *Landing Shape*: A landing record is the landing envelope that `emit-landing` writes, defined once in link:phase-workflows.adoc#_landing_envelope_emit_landing[Phase Workflows Specification, Landing Envelope] (identity and merge facts, figures, step record, review facts, `findings[]`, narrative and amendments, completeness, one landing per `(plan_id, landing_kind)`, and the non-landing record written when nothing merged); `landings.jsonl` stores it unchanged.
+** *Squash-Aware Landing Commit*: The landing commit is located as the base-branch commit whose subject ends with `(#<pr_number>)`; a two-parent merge-commit lookup is never the only tier.
+** *Fact States*: `"n/a"` is legal at the pull-request and merge keys only for `ad_hoc` landings, and every `"n/a"` names the rule, derived from plan data, that made the fact inapplicable. A fact whose source question no longer applies after the observed event (for example the provider's mergeable state after the pull request merged) is recorded as `"not_applicable_after_merge"`, distinct from both `"n/a"` and `"unknown"`; a genuinely failed read stays `"unknown"` and keeps the landing incomplete. A fact that is `"unknown"` on every landing of an epic is surfaced as a detector defect.
+** *No Partial Landing*: A landing without its fact block is refused at write time (`landing_facts_missing`); it is never persisted partially.
+** *Shipped-Without-Landing Reconciliation*: Every epic representation compares the queue rows in `terminal.shipped` with `landings.jsonl`. Rows without a landing record are listed in `facts.unlanded_shipped` (count and `plan_id` values; the count is always stated, zero included) and offer `reconcile_landing:<plan_id>`, which derives the landing facts server-side from the child plan's archived stores and git history. A shipped row is never treated as landed without a landing record.
 2. *Specification Corpus Re-Grounding*: When reviewing staged specifications against repository `HEAD`, the epic workflow offers read-only analysis dispatches (or an inline fallback link) whose entity scope exposes only a draft `submit` link (enforcing no direct ledger writes). Every persisted re-grounding claim verdict is explicitly labeled `observed` or `hypothesis`, where every `hypothesis` must name the specific repository file or artifact that confirms or refutes it.
+** *Claim-Section Parse States*: Every claim section of a staged specification (`spec.md`) parses to exactly one of `absent`, `empty`, `unreadable` (a table or prose where a bullet list is expected, or a heading that matches only case-insensitively), or `parsed`. `unreadable` blocks admission of that row (no `emit` link; the reason is stated in `facts`) and never passes vacuously; `absent` and `empty` are reported as distinct states.
+** *Verdict Record*: A persisted re-grounding verdict record carries `claim` (section and claim index), `label` (`observed` | `hypothesis`), `verdict` (`corroborated` | `contradicted` | `partially_exercised` | `unverifiable`), `checked_at` (the commit SHA the claim was checked against), `by` (the `dispatch_id` or scope that produced it), `scope_change` (`none` | `rescoped`), `exercised_path` (the components actually tested, for example `reader -> classifier`), and `evidence` (text). `contradicted` is admissible only when `exercised_path` covers every component the claim names; otherwise the verdict is `partially_exercised`.
+** *Running Rows Are Not Re-Scoped*: The epic offers no spec-editing or re-scoping link for a queue row in `launched` or `running`; a re-grounding verdict that would re-scope such a row is recorded as pending and applied only after the row reaches a terminal state. Overlapping work waits for the running plan to land.
 3. *Fixed Lock Hierarchy & Cross-Plan Coordination Primitives*: All representation and resource reads execute against atomic filesystem snapshots without holding scope locks during long-running script or build jobs, and whenever an operation mutates multiple scopes, short transaction locks are acquired in a strict global order (`plan` lock -> `epic` lock -> `machine` lock), while long-lived claims are leases (link:store-schemas.adoc[Store Schemas Specification], `PM-IMPL-7`). The server serializes PR merge execution across concurrent plans via a fair per-repo FIFO admission queue and merge lease in `~/.plan-marshall/mcp/state/merge-queue.json`, while shared review-bot rate-window claims (e.g., CodeRabbit hourly windows) are leases in `~/.plan-marshall/mcp/state/review-bot-windows.json`. Machine-wide build concurrency is bounded by the slot cap in `~/.plan-marshall/mcp/machine-config.json`, where stale slot reaping (`ProcessHandle.of(pid)`) executes inside the same atomic state transition as new job admission and the FIFO queue never drops a submitted build.
 

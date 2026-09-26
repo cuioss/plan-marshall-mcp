@@ -18,6 +18,10 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-ARCH-4[PM-ARCH-4: Stateless Requests & Explicit Scope Addressing]_
 * _See Requirement link:../Requirements.adoc#PM-ARCH-6[PM-ARCH-6: Filesystem State Persistence & Cache-Only Process Memory]_
 * _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+* _See Requirement link:../Requirements.adoc#PM-WF-11[PM-WF-11: Q-Gate Validation Loop, Change-Type & Scope-Deviation Contracts]_
+* _See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+* _See Requirement link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+* _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
 * _See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
 * _See Requirement link:../Requirements.adoc#PM-CRED-3[PM-CRED-3: Permission-Guarded Fallback File Credential Store]_
@@ -37,11 +41,15 @@ _See Requirements:_
 
 == Status: PLANNED
 
+[#format-versioning]
 == Format Versioning & Atomic Write Discipline
 
+[[_format_versioning_atomic_write_discipline]]
 1. *Version Envelope*: Every server-owned JSON store root object and every JSONL header/record must declare `"format_version": 1` (positive integer). The git-tracked `.plan/marshal.json` (versioned by `system.schema_version`) and the operator-edited credential files (`PM-CRED-3`) are the only exceptions. When the runtime opens a store with a lower `format_version`, it upgrades the structure in memory and writes the migrated store atomically. If a store has a `format_version` higher than the binary supports, the daemon refuses to mutate the store and requests a binary upgrade.
 2. *Atomic Write-and-Rename*: All JSON file updates are written to a sibling temporary file (`<filename>.tmp.<uuid>`), flushed to disk (`FileChannel.force(true)`), and atomically renamed over the target file (`StandardCopyOption.ATOMIC_MOVE`, `StandardCopyOption.REPLACE_EXISTING`).
 3. *Single Writer Set*: Legacy scripts never run in parallel with `PM-MCP`; during staged porting they run only as `script` jobs of the runtime under the addressed scope's lock (`PM-MIG-2`, `PM-MIG-3`), so all read-modify-write operations on shared stores are serialized by the runtime's own locks and no cross-runtime lock protocol exists.
+4. *Absent vs Unparseable*: Every store and document reader returns one of `absent`, `empty`, `parsed`, or `unreadable` (with the failing line or offset). An input that yields no parsable content is `unreadable`, never an empty record and never `absent`. Consumers handle `unreadable` explicitly: they fail closed or report `indeterminate`.
+5. *One Wire Shape per Instant*: Every persisted or exchanged instant is an RFC 3339 UTC string (`"format": "date-time"`, `Z` suffix); epoch numbers are never persisted. A process start instant is taken from the OS (`ProcessHandle.Info.startInstant()`) and stored in the same shape. Durations are integers whose field name carries the unit (`duration_ms`, `*_seconds`).
 
 == Scope Entry Record (`mcp/entry.json`)
 
@@ -80,8 +88,8 @@ When the entered plan does not exist yet, `pm-mcp enter` writes the same record 
     },
     "scope_id": {
       "type": ["string", "null"],
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-      "description": "Plan ID or Epic ID; null when scope_type == 'project' (steward entry) and in a pending entry record before pm_start."
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Plan ID or Epic ID, both in the canonical plan ID grammar (phase-workflows.adoc, Plan ID Derivation); null when scope_type == 'project' (steward entry) and in a pending entry record before pm_start."
     },
     "client_id": {
       "type": "string",
@@ -95,8 +103,8 @@ When the entered plan does not exist yet, `pm-mcp enter` writes the same record 
     },
     "from_epic": {
       "type": ["string", "null"],
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-      "description": "Parent orchestrator epic ID when the plan was emitted via emit:<plan_id>."
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Parent orchestrator epic ID when the plan was emitted via emit:<plan_id>. pm_start copies it into the immutable mcp/status.json origin block; re-entry may overwrite this record, never the origin."
     },
     "workspace_root": {
       "type": "string",
@@ -117,7 +125,7 @@ When the entered plan does not exist yet, `pm-mcp enter` writes the same record 
 
 == Workflow State Store (`mcp/status.json`)
 
-Tracks the authoritative state machine position, phase, persisted sub-workflow `call_stack`, active jobs, loop-back iteration counters, store SHA-256 digests, merge authorizations, and composite wait facts for a plan or epic (`PM-ARCH-6`, `PM-WF-7`, `PM-WF-16`, `PM-IMPL-7`).
+Tracks the authoritative state machine position, phase, persisted sub-workflow `call_stack`, active jobs, loop-back iteration counters, per-step outcome records, merge authorizations, and composite wait facts for a plan or epic (`PM-ARCH-6`, `PM-WF-7`, `PM-WF-13`, `PM-WF-16`, `PM-IMPL-7`). Store digests live in the sidecar `mcp/digests.json` (<<store-digest-verification>>).
 
 [source,json]
 ----
@@ -148,7 +156,25 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     },
     "scope_id": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Plan ID or Epic ID in the canonical plan ID grammar (phase-workflows.adoc, Plan ID Derivation)."
+    },
+    "main_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Base-branch HEAD the plan was created against (git rev-parse origin/<base_branch>); written once by phase-1-init and re-stamped only by the sync-baseline and branch-cleanup rebases. Absent only in converted legacy plans, where consumers treat the baseline as unknown."
+    },
+    "origin": {
+      "type": "object",
+      "description": "Plan scopes only: immutable provenance stamped once by pm_start for every source. Never rewritten by re-entry.",
+      "required": ["source", "stamped_at"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "enum": ["request", "issue", "lesson", "recipe"] },
+        "source_ref": { "type": ["string", "null"], "description": "Issue number, lesson_id, or recipe_id; null for a free-text request." },
+        "epic_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
+        "stamped_at": { "type": "string", "format": "date-time" }
+      }
     },
     "phase": {
       "type": "string",
@@ -229,11 +255,11 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     },
     "metadata": {
       "type": "object",
-      "description": "Plan-level metadata including planning_lane, complexity, domains, and recipe_id."
+      "description": "Plan-level metadata including planning_lane, complexity, domains, recipe_id, scope_estimate, the immutable scope_estimate_pre_route, and scope_estimate_provenance[] (phase-workflows.adoc, Deterministic Init Classifiers)."
     },
     "freshness_reconcile": {
       "type": ["object", "null"],
-      "description": "Recorded by git.commit_and_push when a mutates_source finalize step at order >= 10 commits after pre-push-quality-gate.",
+      "description": "Recorded by git.commit_and_push when a mutates_source finalize step at order >= 10 commits after pre-push-quality-gate. Never recorded when no successful build exists (prior_build_worktree_sha is required); the refusal then names no_successful_build.",
       "required": ["commit_sha", "step_id", "prior_build_worktree_sha", "recorded_at"],
       "additionalProperties": false,
       "properties": {
@@ -256,6 +282,23 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
         }
       }
     },
+    "amendments": {
+      "type": "array",
+      "description": "Append-only intent changes after refinement (operator answers in *.awaiting_user states, deviation guidance, in-triage refutations that redefine intent).",
+      "items": {
+        "type": "object",
+        "required": ["amendment_id", "at", "phase", "source", "text"],
+        "additionalProperties": false,
+        "properties": {
+          "amendment_id": { "type": "string", "pattern": "^A-[0-9]+$" },
+          "at": { "type": "string", "format": "date-time" },
+          "phase": { "type": "string" },
+          "source": { "type": "string", "enum": ["operator", "refutation"] },
+          "text": { "type": "string", "minLength": 1 },
+          "supersedes": { "type": ["string", "null"], "pattern": "^A-[0-9]+$" }
+        }
+      }
+    },
     "merge_authorizations": {
       "type": "array",
       "items": {
@@ -264,9 +307,44 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
         "properties": {
           "kind": { "type": "string", "enum": ["barrier-ask-override", "pre-merge-consent", "red-ci-override", "rereview-timeout-override"] },
           "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-          "gap_class": { "type": "string", "enum": ["review_barrier_gap", "merge_action", "red_ci_gate", "rereview_timeout"] },
+          "gap_class": { "type": "string", "enum": ["review_barrier_gap", "merge_action", "red_ci_gate", "rereview_timeout", "find_step_completion"] },
           "rationale": { "type": "string" },
           "authorized_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "steps": {
+      "type": "object",
+      "description": "One record per manifest step id (Phase 5 verification steps and Phase 6 finalize steps).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["outcome", "firings"],
+        "additionalProperties": false,
+        "properties": {
+          "outcome": { "type": "string", "enum": ["unverified", "done", "failed", "skipped", "skipped_by_operator", "indeterminate"] },
+          "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+          "work_performed": { "type": ["boolean", "null"] },
+          "landing_delivery": { "type": ["string", "null"], "enum": ["verified", "incomplete", "failed", null], "description": "emit-landing only: read-back verification of the appended landing envelope." },
+          "skip_reason": { "type": ["string", "null"] },
+          "assurance_verdict": { "type": ["string", "null"], "enum": ["checked", "degraded", "not_reached", "never_performed", "attempted_over_empty_scope", null] },
+          "firings": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["fired_at", "cause", "loop_back_iteration", "outcome"],
+              "additionalProperties": false,
+              "properties": {
+                "fired_at": { "type": "string", "format": "date-time" },
+                "cause": { "type": "string", "enum": ["first", "loop_back", "failure", "error", "input_changed"] },
+                "loop_back_iteration": { "type": "integer", "minimum": 0 },
+                "dispatch_id": { "type": ["string", "null"] },
+                "outcome": { "type": "string", "enum": ["done", "failed", "skipped", "skipped_by_operator", "indeterminate"] },
+                "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+                "refused": { "type": ["string", "null"], "description": "Reason when a requested outcome change was refused." }
+              }
+            }
+          }
         }
       }
     },
@@ -312,6 +390,10 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
 }
 ----
 
+* *Step Records Count Firings*: Every firing of a step appends to its `firings[]`; a re-fire never replaces the history. When `VerdictCurrencyEvaluator` decides to re-fire, the step's `outcome` is set to `unverified` before the step runs and is then replaced by the new firing's terminal outcome, so a prior `done` never survives a re-fire. The current `outcome` and `head_at_completion` are always those of the last firing; no force flag exists. A requested outcome change that the engine refuses appends a firing with `refused` set and leaves no stale outcome silently current. Re-fire counts per cause are `firings` minus one, grouped by `cause`, never counted from log lines. A record without `assurance_verdict` reads `unadjudicated`, never as a pass.
+* *Origin and Epic Linkage*: Every consumer (landing emission, outbox link offering, epic observation) reads epic membership from `origin.epic_id` through one resolver, which derives `epic_linkage`: `not_orchestrated` iff `origin.epic_id` is null, `indeterminate` iff it is set but the epic's `status.json` is absent or unreadable, otherwise `orchestrated`. `indeterminate` is never read as `not_orchestrated`.
+* *Amendments*: Every intent-changing answer after refinement appends an `amendments[]` entry; every later representation that renders the request (outline review, `create-pr`, landing) includes the amendments in order.
+
 == Findings Ledger Record (`findings.jsonl`)
 
 Each line in `findings.jsonl` is a standalone JSON object representing a finding from Q-Gate validation, code review, static analysis, Sonar, or PR review bots. External provider identifiers (`provider_ref`) are persisted as a typed sub-object rather than packed into free-text `detail` strings.
@@ -328,6 +410,7 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
     "finding_id",
     "source",
     "severity",
+    "blocking",
     "status",
     "summary",
     "created_at"
@@ -341,12 +424,28 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
       "enum": ["sonar", "github_pr", "gitlab_mr", "self_review", "arch_gate", "compiler", "qgate", "security_audit", "code_review"]
     },
     "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
-    "blocking": { "type": "boolean", "default": true },
+    "blocking": { "type": "boolean", "description": "Set at write time from the producer's declared class for this finding type; later changed only by triage or operator decision." },
     "status": { "type": "string", "enum": ["open", "triaged_fix", "triaged_dismiss", "triaged_accept", "resolved"] },
     "disposition": { "type": ["string", "null"], "enum": ["FIX", "SUPPRESS", "ACCEPT", null] },
     "file_path": { "type": ["string", "null"] },
     "line": { "type": ["integer", "null"], "minimum": 1 },
     "summary": { "type": "string", "minLength": 1 },
+    "body": { "type": ["string", "null"], "description": "Promoted full text of the finding (review comment text, Sonar message). Stored verbatim and treated as untrusted content." },
+    "author": { "type": ["string", "null"], "description": "Structured provider author login of a review comment; never parsed from comment text." },
+    "bot_kind": { "type": ["string", "null"], "description": "Review-bot registry key resolved from author (<<review-bot-registry>>)." },
+    "raised_at_head": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "description": "HEAD the finding was raised against; required for self_review, qgate, code_review, security_audit, and arch_gate findings." },
+    "reviewed_commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "description": "Commit the reviewer covered, taken only from provider evidence (<<review-participation>>); null when the evidence names no commit." },
+    "edit_marker": { "type": ["string", "null"], "format": "date-time", "description": "Provider updated_at of the ingested comment when it differs from its created_at." },
+    "evidence": {
+      "type": ["object", "null"],
+      "description": "Evidence a resolution rested on.",
+      "additionalProperties": false,
+      "required": ["class"],
+      "properties": {
+        "class": { "type": "string", "enum": ["verifier", "substitute", "operator", "none"] },
+        "ref": { "type": ["string", "null"] }
+      }
+    },
     "provider_ref": {
       "type": ["object", "null"],
       "description": "Structured external provider coordinates for outbound reply/dismissal transmission (replaces legacy free-text detail key-value packing).",
@@ -362,12 +461,194 @@ Each line in `findings.jsonl` is a standalone JSON object representing a finding
     },
     "disposition_rationale": { "type": ["string", "null"] },
     "fix_task_id": { "type": ["string", "null"] },
-    "response_transmitted": { "type": "boolean", "default": false },
+    "transmit_outcome": {
+      "type": "string",
+      "enum": ["pending", "sent", "not_sent", "sent_unresolved", "skipped_no_address", "partial"],
+      "default": "pending",
+      "description": "Outcome of the outbound reply or dismissal for this finding's disposition."
+    },
+    "transmit_reason": { "type": ["string", "null"], "description": "Reason for not_sent, skipped_no_address, or partial." },
+    "transmit_disposition": { "type": ["string", "null"], "description": "The disposition value the last transmission carried; (finding_id, transmit_disposition) is the idempotency key." },
+    "responded_at": { "type": ["string", "null"], "format": "date-time", "description": "Stamped after the provider accepted the reply, before thread resolution." },
+    "resolve_state": { "type": "string", "enum": ["unresolved", "resolved", "not_applicable"], "default": "not_applicable" },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": ["string", "null"], "format": "date-time" }
   }
 }
 ----
+
+* *Immutable Severity, Mutable Blocking*: `severity` is set at creation and never changed. `blocking` is written from the producer's declared class for the finding type (each producer declares it per finding type in its descriptor, validated at write) and may later change only through triage or an operator decision.
+* *What Is Not a Finding*: Refusals, rate-limit or budget notices, the server's own posted comments and triggers, and participation-only artifacts (summary cards, trigger acknowledgements) are never filed as findings; they update the review participation record only (<<review-participation>>).
+* *Structured Reviewer Identity*: `author` and `bot_kind` come from the provider's structured author field, never from comment text. A comment whose structured author and self-declared bot identity disagree is itself filed as a finding with the provider's `source`. A comment's identity is `(bot_kind, provider_ref.comment_id)` plus `edit_marker`; an edited comment is new information.
+* *Transmission and Resolution Are Separate*: Before the provider call the server persists `transmit_outcome: pending` with the `transmit_disposition` it sends. `responded_at` is stamped after the provider accepted the reply and before the thread is resolved; `resolve_state` is persisted separately, so a resolve-only retry never re-sends the reply. After a crash, a `pending` transmission is reconciled by looking up the reply on the provider before any re-send.
+
+[#component-assessments]
+== Component Assessment Record (`assessments.jsonl`)
+
+Read-only workers persist component assessments through their entity `submit` (link:dispatch-and-effort.adoc[Dispatch & Effort Specification]). Assessments are a second schema beside findings: they are never written to `findings.jsonl`, and no finding histogram or count reads this store (`PM-WF-11`).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/assessment-record.json",
+  "title": "AssessmentRecord",
+  "type": "object",
+  "required": ["format_version", "assessment_id", "component", "certainty", "confidence", "agent", "effective_from"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "assessment_id": { "type": "string", "pattern": "^AS-[0-9]+$" },
+    "component": { "type": "string", "minLength": 1, "description": "Repository-relative path or module id." },
+    "certainty": { "type": "string", "enum": ["include", "exclude", "uncertain"] },
+    "confidence": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "agent": { "type": "string", "description": "dispatch_id or step id that produced the assessment." },
+    "evidence": { "type": ["string", "null"] },
+    "effective_from": { "type": "string", "format": "date-time" },
+    "supersedes": { "type": ["string", "null"], "pattern": "^AS-[0-9]+$" }
+  }
+}
+----
+
+* *Append-Only Supersession*: A line is never rewritten. A superseding record names the record it replaces in `supersedes`; the superseded record's validity window is `[effective_from, effective_from of the superseding record)`. Superseded assessments stay readable, never live.
+* *Widening Supersedes*: An accepted scope deviation (`approved_widening`, <<three-way-footprint>>) or an outline revision that changes a deliverable's footprint appends superseding assessments for the affected components.
+* *Grading Against the Judgement in Force*: A consumer that grades a recorded action against an assessment uses the assessment whose window contains the action's timestamp. A write to a path whose live assessment is `exclude` is `violated_live_exclusion`; a write admitted by a later approved widening is `superseded_by_approved_widening`, not a violation.
+
+[#review-participation]
+== Review Participation Record (`review-participation.jsonl`)
+
+The plan's `review-participation.jsonl` holds one record per `(pr_number, round, bot_kind)`, written by `automatic-review` at review time for every bot of `required_bots ∪ optional_bots` (`PM-WF-13`). The pre-merge barrier and every post-merge reader take review participation only from these records.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/review-participation.json",
+  "title": "ReviewParticipationRecord",
+  "type": "object",
+  "required": ["format_version", "pr_number", "round", "bot_kind", "state", "roster_class", "roster_provenance", "head_at_observation", "observed_at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "pr_number": { "type": "integer", "minimum": 1 },
+    "round": { "type": "integer", "minimum": 1 },
+    "bot_kind": { "type": "string" },
+    "state": {
+      "type": "string",
+      "enum": ["participated", "participated_but_empty", "participated_stale", "refused", "declined", "absent", "not_triggered", "not_wired",
+               "rereview_silent_failure", "run_stuck", "in_progress", "unproven", "unreadable", "silent", "unsatisfiable", "unregistered_kind"],
+      "description": "Per-bot state; the closed enumeration is defined in hypermedia-format.adoc, Closed Status Enumerations."
+    },
+    "roster_class": { "type": "string", "enum": ["required", "optional", "unclassified"] },
+    "roster_provenance": { "type": "string", "enum": ["never_asked", "migrated", "answered"] },
+    "head_at_observation": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "covered_commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "sha_source": { "type": ["string", "null"], "enum": ["structured", "body", null] },
+    "reviewer_login": { "type": ["string", "null"] },
+    "evidence": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["review_object", "declared_clean_verdict", "check_run", "inline_comment"] },
+        "object_id": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "refusal": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["rate", "weekly_quota", "size", "no_unreviewed_commit", "unknown"], "description": "refusal_mode of hypermedia-format.adoc, Closed Status Enumerations." },
+        "body": { "type": "string" },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "eta": { "type": ["string", "null"], "format": "date-time" },
+        "eta_state": { "type": "string", "enum": ["parsed", "eta_unparsed", "none_published"] },
+        "cap": { "type": ["string", "null"] },
+        "tier": { "type": ["string", "null"], "description": "Plan tier named by the notice, extracted per notice." },
+        "answers_trigger_id": { "type": ["string", "null"] }
+      }
+    },
+    "observed_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+* *Covered Commit from Evidence Only*: `covered_commit_sha` is taken only from provider evidence (the review's commit id, or the registry's `reviewed_sha_pattern` in the body) and `sha_source` keeps structured and body-derived values distinct. It is `null` when no evidence names a commit; a refusal never sets it. `head_at_observation` is stored separately and is never copied into it.
+* *Per Round*: A looped-back pull request has no single reviewed tree. Participation is recorded per `round`; no single reviewed SHA is synthesised for a multi-round pull request.
+* *Refusal Capture*: A refusal is recorded with its `body` and `observed_at` when first seen; a later absence of the notice is not a refutation.
+* *No Backfill*: Missing records for already-merged pull requests are never synthesised. A post-merge reader treats an absent, unreadable, malformed, or stale record as `indeterminate` (never clean) and names the case.
+
+[#review-bot-registry]
+== Review-Bot Registry Record
+
+One record per `bot_kind` is compiled into the binary; a project may add records through its project configuration (`.plan/marshal.json`). `required_bots` and `optional_bots` are resolved against the registry only through one shared reader. A bot token that matches no record fails loudly (`unregistered_kind`) with the same disposition everywhere and is never counted in a ratio denominator.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/review-bot-registry.json",
+  "title": "ReviewBotRegistryRecord",
+  "type": "object",
+  "required": ["bot_kind", "author_login", "trigger_token", "publish_shapes", "participation_evidence", "participation_requires_update", "reviewed_sha_carrier", "rate_limit_class"],
+  "additionalProperties": false,
+  "properties": {
+    "bot_kind": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "author_login": { "type": "string", "description": "Identity used for author binding." },
+    "trigger_token": { "type": "string", "description": "The single trigger the server posts; never chosen per call." },
+    "trigger_verbs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "incremental": { "type": "string" }, "full": { "type": "string" } }
+    },
+    "trigger_events": { "type": "array", "items": { "type": "string" }, "description": "Pull-request events the bot subscribes to." },
+    "publish_shapes": { "type": "array", "items": { "enum": ["conversation", "inline_thread", "pr_review"] } },
+    "participation_evidence": { "type": "array", "items": { "enum": ["conversation", "inline_thread", "pr_review", "check_run"] } },
+    "participation_markers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pattern", "validated_on_prs"],
+        "additionalProperties": false,
+        "properties": { "pattern": { "type": "string" }, "validated_on_prs": { "type": "integer", "minimum": 1 } }
+      },
+      "description": "Anchored (start-of-block or structural) patterns, each with the sample size it was validated on."
+    },
+    "participation_requires_update": { "type": "boolean", "description": "Currency-exempt bots derive from this field only." },
+    "reviewed_sha_carrier": { "type": "string", "enum": ["structured", "body_pattern", "none"] },
+    "reviewed_sha_pattern": { "type": ["string", "null"] },
+    "completion_check_name": { "type": ["string", "null"] },
+    "refusal_patterns": { "type": "array", "items": { "type": "string" } },
+    "refusal_size_patterns": { "type": "array", "items": { "type": "string" } },
+    "refusal_wrapper_markers": { "type": "array", "items": { "type": "string" } },
+    "rate_limit_eta_patterns": { "type": "array", "items": { "type": "string" } },
+    "rate_limit_class": { "type": "string", "enum": ["awaitable_window", "hard_quota", "unknown"] },
+    "rate_interval_seconds": { "type": ["integer", "null"], "minimum": 1 },
+    "attempt_ceiling": { "type": "integer", "minimum": 1, "default": 10 },
+    "structural_caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "max_files": { "type": ["integer", "null"] }, "max_diff_chars": { "type": ["integer", "null"] } }
+    },
+    "actionable_content_markers": { "type": "array", "items": { "type": "string" } },
+    "contentless_review_markers": { "type": "array", "items": { "type": "string" } },
+    "ignore_patterns": { "type": "array", "items": { "type": "string" } },
+    "severity_map": { "type": "object", "additionalProperties": { "type": "string" } },
+    "config_verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "verdict", "decided_at"],
+        "additionalProperties": false,
+        "properties": { "key": { "type": "string" }, "verdict": { "type": "string" }, "decided_at": { "type": "string", "format": "date" } }
+      }
+    }
+  }
+}
+----
+
+The compiled-in records carry the data verified in `plan-marshall` `automatic-review/standards/` (re-verify before implementing): `coderabbit` (one review per hour, `awaitable_window`, `max_files: 100`, trigger verbs `@coderabbitai review` / `@coderabbitai full review`, CodeRabbit refusal wrapper `<details><summary>⚠️ Action not completed</summary>`), `sourcery` (`hard_quota` of 250,000 diff characters per 7 days, per pull request 150,000 characters or 300 files), and `cuioss-review-bot` (`unknown`, reviewed SHA only in the body). `coderabbit` and `sourcery` declare `participation_requires_update: false`. The provider comment body cap (GitHub 65,536 characters) is a provider limit, not a bot record.
 
 == Change Ledger Record (`change-ledger.jsonl`)
 
@@ -403,12 +684,36 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
     "job_id": { "type": ["string", "null"] },
     "commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "changed_paths": { "type": "array", "items": { "type": "string" } },
+    "change_origin": {
+      "type": ["string", "null"],
+      "enum": ["plan_change", "quality_gate_autofix", null],
+      "description": "For kind == 'change': quality_gate_autofix marks commits produced by a quality gate's auto-fix; footprint reconciliation reports those paths separately from deliverable changes."
+    },
+    "expect": {
+      "type": ["string", "null"],
+      "enum": ["green", "red", null],
+      "description": "For kind == 'build': the pm_build expect parameter. A failed run with expect == 'red' is expected_red (no finding); a succeeded run with expect == 'red' is expected_red_went_green; an expect == 'red' row never satisfies a freshness gate (mcp-tools.adoc, pm_build)."
+    },
     "deliverable_id": { "type": ["string", "null"] },
     "task_id": { "type": ["string", "null"] },
     "recorded_at": { "type": "string", "format": "date-time" }
   }
 }
 ----
+
+[#metrics-store]
+== Metrics Store (`metrics.json`)
+
+The plan's `metrics.json` holds the dispatch and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Post-Return Integrity Invariants). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
+
+* *Rows*: One row per dispatch (`dispatch_id`, `phase`, `step_id` or null, `status`, `cause_class`, `population`, and the usage columns of the `returned:<dispatch_id>` link, each a measured integer, `"unmeasured"`, or, for a step that runs inline by design, `"inline"`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:job-runtime.adoc[Job Runtime Specification], Wait Attribution), and one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `step_firings` as a map from step id to firing count).
+* *Aggregates*: Every sum (per phase, per cause class, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total.
+* *Populations*: Every token figure carries a `population` stamp (`dispatched` or `main_context`); an absent stamp reads `dispatched`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
+* *Re-Entry*: Re-entry is derived from observables (rows timestamped after the phase's recorded `end_time`), never from a close counter. A re-entered phase is labelled `re_entered` and accumulates across closes.
+* *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`) is a total function over the dispatch `status` enum plus `INCOMPLETE_SUBMISSION`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
+* *Stall Rate*: A termination with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
+* *Ledger Divergence*: Where two ledgers can diverge (dispatch rows vs audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
+* *One Writer per Name*: Every metric name has exactly one writer. A second producer over another population uses a different name.
 
 == Task Record (`tasks/TASK-NNN.json`), References Record (`references.json`) & Execution Manifest (`execution-manifest.json`)
 
@@ -446,7 +751,16 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
     "envelope_id": { "type": ["string", "null"], "pattern": "^envelope-[0-9]+$" },
     "skills": { "type": "array", "items": { "type": "string" } },
     "target_files": { "type": "array", "items": { "type": "string" } },
-    "verification_command": { "type": ["string", "null"] },
+    "verification": {
+      "type": "object",
+      "required": ["commands", "criteria"],
+      "additionalProperties": false,
+      "properties": {
+        "commands": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "criteria": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Stored verbatim, multi-line text preserved." },
+        "manual": { "type": "boolean", "default": false }
+      }
+    },
     "steps": {
       "type": "array",
       "minItems": 1,
@@ -463,6 +777,8 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
   }
 }
 ----
+
+A deliverable may declare several verification command and criterion pairs; the task carries them all in `verification`. A task with profile `implementation`, `module_testing`, or `integration_testing` requires at least one command and at least one criterion. An empty or truncated criterion rejects task creation; it is never downgraded to a warning.
 
 === References & Footprint Store Schema (`references.json`)
 
@@ -491,7 +807,43 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
         "read_only_references": { "type": "array", "items": { "type": "string" } }
       }
     },
+    "approved_widening": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "deviation_task_id", "approved_via", "phase", "approved_at"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "deviation_task_id": { "type": "string" },
+          "approved_via": { "type": "string", "enum": ["elicitation", "operator_cli"] },
+          "phase": { "type": "string" },
+          "approved_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
     "realized_files": { "type": "array", "items": { "type": "string" } },
+    "realized_renames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "additionalProperties": false,
+        "properties": { "from": { "type": "string" }, "to": { "type": "string" } }
+      }
+    },
+    "realized_state": {
+      "type": "object",
+      "required": ["state"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "type": "string", "enum": ["measured", "unresolved"] },
+        "cause": { "type": ["string", "null"], "enum": ["pending", "disabled", null], "description": "Set when state == unresolved: pending (worktree not yet materialised) or disabled (use_worktree == false)." },
+        "base_ref": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "base_commits_behind": { "type": ["integer", "null"], "minimum": 0 },
+        "captured_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
     "lessons_consulted": { "type": "array", "items": { "type": "string" } }
   }
 }
@@ -533,6 +885,17 @@ Composed deterministically in-process by `ExecutionManifestResolver` during Phas
       "additionalProperties": false,
       "properties": {
         "steps": { "type": "array", "items": { "type": "string" } },
+        "composed_inputs": {
+          "type": "object",
+          "description": "Inputs the manifest was composed from; re-computed at every phase handshake and at Phase 6 entry, where any difference re-composes the manifest (domain-extensions.adoc, Three-Surface Synchronization).",
+          "additionalProperties": false,
+          "properties": {
+            "config_hash": { "type": "string" },
+            "realized_footprint_digest": { "type": ["string", "null"] },
+            "change_type": { "type": ["string", "null"] },
+            "providers_digest": { "type": "string" }
+          }
+        },
         "dropped_steps": {
           "type": "array",
           "description": "Structured record of conditional steps omitted by prune predicates or posture selection.",
@@ -632,7 +995,7 @@ Stores git-tracked project configuration and the versioned `system` migration le
     },
     "plan": {
       "type": "object",
-      "description": "Per-phase workflow posture, *_without_asking flags, effort role levels (level-1..level-7 | inherit; never model pins), verification_steps, and ordered phase-6-finalize.steps."
+      "description": "Per-phase workflow posture, *_without_asking flags, effort role levels (level-1..level-7 | inherit; never model pins), verification_steps, ordered phase-6-finalize.steps, and phase-6-finalize.review_rate_window_floor_seconds (operator floor for a review-bot rate-window wait, default 5400, applied only when the refusal publishes no ETA)."
     },
     "orchestrator": {
       "type": "object",
@@ -641,6 +1004,89 @@ Stores git-tracked project configuration and the versioned `system` migration le
   }
 }
 ----
+
+[#lesson-record]
+== Lesson Record (main-anchored lesson store)
+
+Lessons live in the main-anchored lesson store of the repository and outlive the plans that create them. Each lesson is a metadata record with the fields below plus a Markdown body (`PM-IMPL-2`); the lesson `submit` transition (link:phase-workflows.adoc[Phase Workflows Specification], Lesson Creation & Body) writes both atomically. The store is a Ported store (`PM-TEST-1`, <<legacy-store-formats>>).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/lesson-record.json",
+  "title": "LessonRecord",
+  "type": "object",
+  "required": ["format_version", "lesson_id", "title", "component", "category", "status", "created_at", "tool_version"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "lesson_id": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}-\\d{2}-\\d{3,}$", "description": "UTC date and hour of creation plus a per-hour sequence." },
+    "title": { "type": "string", "minLength": 1 },
+    "component": { "type": "string", "minLength": 1 },
+    "category": { "type": "string", "enum": ["bug", "improvement", "anti-pattern", "arch-constraint"] },
+    "bundle": { "type": ["string", "null"] },
+    "rule": { "type": ["string", "null"], "description": "Required for arch-constraint, where it is the dedup key; absent otherwise." },
+    "recurrence_count": { "type": ["integer", "null"], "minimum": 1, "description": "arch-constraint only." },
+    "last_seen": { "type": ["string", "null"], "format": "date", "description": "arch-constraint only (UTC)." },
+    "status": { "type": "string", "enum": ["active", "superseded", "removed"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "tool_version": { "type": "string", "minLength": 1, "description": "Release version of the runtime that created the lesson, or 'absent' / 'undetermined' for converted legacy lessons." },
+    "tool_version_override": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["value", "audit_id"],
+      "properties": { "value": { "type": "string" }, "audit_id": { "type": "string" } }
+    },
+    "promotions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "ref", "at"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["epic", "requirement", "plan", "issue"] },
+          "ref": { "type": "string" },
+          "at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}
+----
+
+Every retirement writes a tombstone that outlives the lesson:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/lesson-tombstone.json",
+  "title": "LessonTombstone",
+  "type": "object",
+  "required": ["format_version", "lesson_id", "retired_at", "reason", "by", "coverage_verdict", "lesson_state"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "lesson_id": { "type": "string" },
+    "retired_at": { "type": "string", "format": "date-time" },
+    "reason": { "type": "string", "minLength": 1 },
+    "by": { "type": "string", "description": "Step id, plan_id, or operator principal that retired the lesson." },
+    "coverage_verdict": { "type": "string", "enum": ["completely_covered", "redundant", "superseded", "obsolete"] },
+    "covering_clause": { "type": ["string", "null"] },
+    "covering_input": { "type": ["string", "null"] },
+    "lesson_state": { "type": "string", "enum": ["found", "present_unreadable"] }
+  }
+}
+----
+
+* *One Resolver, Four States*: Listing and lookup use one resolver over the lesson store. Every listed lesson resolves by the exact id it is listed under to one of `found`, `absent`, `present_unreadable` (metadata missing or invalid; listed with its path, never omitted), or `empty_shell` (valid metadata, empty body). `present_unreadable` is never reported as `absent`, and `empty_shell` is never a content verdict. A lesson write without valid metadata is rejected.
+* *Lifecycle*: `status` is `active`, `superseded`, or `removed` (the last exists only as a tombstone). `applied` (moved into a plan directory; inverse: carry-back, <<lesson-carry-back-veto>>) and `stalled` (stranded in a non-terminal plan directory) are derived from the file location and never stored.
+* *arch-constraint Recurrence*: An add whose `rule` matches an active `arch-constraint` lesson reinforces it (increments `recurrence_count`, refreshes `last_seen`) instead of allocating a new lesson. A quiet-window retirement retires every active `arch-constraint` lesson whose `last_seen` is older than the window.
+* *Retirement*: A retirement (supersede, remove, quiet-window retirement) requires a `coverage_verdict` from the closed set, with no default. `completely_covered` also requires `covering_clause` and a concrete `covering_input` that the clause's worked example resolves; a whitespace-only value counts as missing. The tombstone is written before the lesson is removed. A retirement acts only on a lesson resolved `found`, or on a `present_unreadable` lesson through an explicit operator action; in every other state it changes nothing and reports the state.
+* *No Bulk Mutation*: The lesson store is never wiped or bulk-mutated; no bulk-mutation verb exists. A removal answering `absent` is not proof that the lesson never existed and is never retried automatically; it is reported together with the store-resolution discriminator.
+* *Version Provenance*: The runtime stamps `tool_version` from its own release version (`PM-DIST-1`) at creation; it is never a `submit` parameter. An operator override is stored in `tool_version_override` beside the stamped value. Converted legacy lessons keep three states apart: no version field in the legacy lesson → `absent`; a field that cannot be resolved → `undetermined`; otherwise the recorded version. Conversion never backfills a version.
+* *Promotion Provenance*: `promotions[]` records every destination that absorbed the lesson. A routing sweep or the `lesson-cleanup` harvester reports a lesson with a matching destination as `already_promoted` and never routes it again as new.
 
 == Project Enrolment Store (`~/.plan-marshall/mcp/enrolments.json`)
 
@@ -738,8 +1184,10 @@ Stores operator-authorized project roots, build wrappers, pinned host tool SHA-2
 
 == Machine Configuration, Credentials & Security Audit Stores
 
+[#machine-config]
 === Machine Configuration Store (`~/.plan-marshall/mcp/machine-config.json`)
 
+[[_machine_configuration_store_plan_marshallmcpmachine_config_json]]
 Configures machine-wide build concurrency limits, warm LSP pool sizing, and machine-local derivation resolver enablement (`PM-EXT-6`).
 
 [source,json]
@@ -827,40 +1275,86 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
 
 *Hash chain (`PM-SEC-6`)*: The canonical line of a record is its exact UTF-8 byte sequence in `audit.jsonl`, excluding the terminating newline. A writer appends only under the log's `FileChannel.lock()`, after reading the current last line to compute `prev_hash`. The runtime verifies the chain at startup; a mismatch or unparsable line is reported to the operator and recorded as an `audit_chain_broken` record (`category: security`, `details.first_broken_line`), and the log is never rewritten or repaired.
 
+[#machine-lease-stores]
+== Machine Lease Stores (`merge-queue.json`, `review-bot-windows.json`, `build-slots.json`)
+
+The three lease stores in `~/.plan-marshall/mcp/state/` are updated only in short transactions under their machine store locks (<<lock-free-snapshot-reads>>; `PM-IMPL-7`, `PM-WF-15`). Every lease owner has the same shape, and every instant follows the one wire shape (<<format-versioning>> item 5), so a lease written by one component and reclaimed by another round-trips byte-identical instants.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/lease-owner.json",
+  "title": "LeaseOwner",
+  "type": "object",
+  "required": ["plan_id", "runtime_pid", "runtime_started_at"],
+  "additionalProperties": false,
+  "properties": {
+    "plan_id": { "type": "string" },
+    "runtime_pid": { "type": "integer", "minimum": 1 },
+    "runtime_started_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+* *`merge-queue.json`*: `{"format_version": 1, "repositories": {"<repository key>": {"holder": <lease> | null, "waiting": [<entry>]}}}`. A `holder` lease carries `owner`, `acquired_at`, `heartbeat_at`, and `lease_expires_at`; a `waiting` entry carries `owner` and `enqueued_at`, in FIFO order.
+* *`build-slots.json`*: `{"format_version": 1, "slots": [<lease>]}`, each lease with `owner`, `job_id`, `acquired_at`, and `lease_expires_at`; the slot count never exceeds `max_build_slots` (<<machine-config>>).
+* *`review-bot-windows.json`*: `{"format_version": 1, "windows": {"<org>/<bot_kind>": <window>}}`. Rate windows are org-scoped, so a window claim is keyed by organisation and `bot_kind`; attempt counters inside a window are keyed by `(repository, pr_number, bot_kind)`, so one pull request never reports another's attempts. A window stores `owner`, `claimed_at`, the absolute `reset_at`, `attempts`, and `answers_trigger_id` (the review request the refusal answered). A wait on a window computes its remainder from `reset_at`, so a killed waiter or a runtime restart resumes the remainder; re-reading the same refusal never restarts a window that has already been waited out. A contended claim returns `reason`, `holder`, and `seconds_remaining`.
+
 == Data Layer Integrity & Concurrency Invariants (`PM-IMPL-7`)
 
+[#store-digest-verification]
 === Store Digest Verification Against Out-of-Band Edits
 
+[[_store_digest_verification_against_out_of_band_edits]]
 Because `.plan/` files reside in the repository working tree where an agent with filesystem write access could modify them directly outside the MCP server:
 
 * Digests live in the sidecar `mcp/digests.json` (`{"format_version": 1, "stores": {"<relative path>": {"size": <int>, "sha256": "<hex>"}}}`), never inside a store they protect.
-* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, the findings and change-ledger JSONL files, `outline.md`, `request.md`), the server records the file's size and SHA-256 in the sidecar under the plan lock.
+* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, `metrics.json`, the findings, assessment, review-participation, and change-ledger JSONL files, `outline.md`, `request.md`), the server records the file's size and SHA-256 in the sidecar under the plan lock.
+* The digest of a store is updated in the same transaction as the store write. A multi-store transaction that fails part-way re-records the digests of every store it already replaced before it releases the lock. Startup recovery re-verifies a store whose sidecar entry is older than the file against the pending-write marker of the interrupted transaction instead of reporting it as tampered.
 * On every subsequent read inside a transition, the engine verifies size and SHA-256 against the sidecar. Any mismatch triggers an immediate `store_tampered` transition block requiring operator resolution.
 * After a legacy `script` job finishes (it runs under the plan lock, `PM-MIG-2`), the runtime re-records the digests of the stores that job may write, so legitimate legacy writes never raise `store_tampered`.
 * An intentional manual edit is accepted with `pm-mcp operator accept-edit <plan_id> <store>`, which re-baselines that store's digest and records the action in `audit.jsonl`.
 
+[#three-way-footprint]
 === Three-Way File Footprint Reconciliation (`references.json`)
 
+[[_three_way_file_footprint_reconciliation_references_json]]
 The `references.json` store tracks three distinct file-footprint sets for a plan:
 
-* *Declared Footprint (`declared_files`)*: Files explicitly listed during refinement/outline.
+* *Declared Footprint (`declared_files`)*: Files explicitly listed during refinement/outline. `declared_files` is immutable after `outline.review` approval. A path admitted later by an accepted scope deviation is recorded in `approved_widening[]` with its provenance (deviation task, `approved_via`, phase, time), never appended to `declared_files`. The effective declaration is `declared_files ∪ approved_widening[].path`, and every reconciliation result names which of the two admitted a path.
 * *Structured-Derived Footprint (`derived_files`)*: Re-derived by set union over the solution outline's structured deliverables and partitioned into two disjoint keys:
 ** `expected_modifications`: Files the plan intends to create, modify, or delete.
 ** `read_only_references`: Files inspected for context that must remain unmodified.
-* *Realized Footprint (`realized_files`)*: Captured from the worktree via `git` jobs as the union of `git diff --name-only <base_ref>...HEAD` and the paths parsed from `git status --porcelain` (parity with `manage-references compute-footprint`).
+* *Realized Footprint (`realized_files`)*: Captured from the plan's own worktree via `git` jobs as the union of `git diff --name-status -M <base_ref>...HEAD` and `git status --porcelain=v1 -z`. A rename or copy contributes both its old and its new path to `realized_files` and is also recorded as a pair in `realized_renames[]`. *Deliberate change vs. `plan-marshall`*: `compute-footprint` uses `--name-only`, which drops the old path of a rename.
 
-Pairwise reconciliation computes the **symmetric difference in both directions** ($A \setminus B$ and $B \setminus A$) across all three sets so that two equal-sized but disjoint file sets are reported as 100% disagreeing rather than matching by count.
+Resolution and capture rules:
 
+* *Base Reference*: `<base_ref>` is `git merge-base HEAD origin/<base_branch>`, computed after the most recent fetch (after `sync-baseline`, the rebased-onto tip). It is never the SHA the plan was created against and never a local `<base_branch>` ref. Every footprint, scope, and self-review diff of the plan reads this one `base_ref`, recorded in `realized_state.base_ref`; after a `sync-baseline` or `branch-cleanup` rebase the realized footprint is re-derived against the new merge-base. When the local `<base_branch>` trails `origin/<base_branch>`, `realized_state.base_commits_behind` records by how many commits, so a stale local ref is visible although it is never used.
+* *Own Tree Only*: The realized footprint resolves only from the plan's own worktree, through one resolver whose tiers (the live diff, then the persisted capture) apply identically to every consumer. A pending or absent worktree yields `realized_state.state: unresolved` with cause `pending` (not yet materialised) or `disabled` (`use_worktree == false`), never another tree's measured-empty set; `unresolved` and "measured, both sides empty" stay distinct. A diff-fed step without a resolvable footprint records `indeterminate` with the cause, never a clean `done`.
+* *Capture Before Destruction*: `realized_files` is captured and persisted (`realized_state.captured_at`) at the latest before `branch-cleanup` (order 70) removes the worktree. Post-merge consumers read the persisted set; a post-merge git-derived empty set is never evidence of no change, and a missing persisted set makes the consumer report `indeterminate`. Steps that compute the footprint publish its size (`files_total`, `insertions_total`, and a source-vs-data split) as facts.
+* *Consumer Scope and Provenance*: Every consumer that derives a scope from `references.json` names the set it reads. Footprint-scoped consumers (the self-review surfacer, `simplify`, `security-audit`) scope on `declared_files ∪ approved_widening[].path ∪ derived_files.expected_modifications ∪ realized_files`, re-read at each firing, and carry each path's provenance (`declared`, `widened`, `derived`, `realized`); a union is never passed on without it. `derive-verification` keeps reading the realized set only.
+
+Pairwise reconciliation computes the **symmetric difference in both directions** ($A \setminus B$ and $B \setminus A$) across all three sets so that two equal-sized but disjoint file sets are reported as 100% disagreeing rather than matching by count. In addition:
+
+* `derived_files \ realized_files` is reported split by intent: untouched `read_only_references` are expected, while untouched `expected_modifications` are reported as `modify_shortfall`.
+* Paths from change-ledger entries with `change_origin: quality_gate_autofix` are reported separately from deliverable changes.
+* Results are published per deliverable (from the deliverable's `Affected files` and its task and chain-tail change entries) beside the plan-level figures; a plan-level average never replaces them.
+
+[#lesson-carry-back-veto]
 === Fail-Closed Lesson Carry-Back Veto on Plan Deletion
 
+[[_fail_closed_lesson_carry_back_veto_on_plan_deletion]]
 When the operator invokes plan deletion (`delete-plan` via elicitation or CLI):
 
 1. The server scans the plan directory for any lessons created or carried during the plan's execution.
 2. It executes `restore-from-plan` against the main-anchored global lesson store, producing a 4-state outcome (`restored`, `restore_incomplete`, `no_lesson_file`, `plan_dir_unresolved`; `not_attempted` when carry-back is explicitly opted out) plus a store-resolution discriminator confirming the main store was resolved and scanned. Only `restored` and `no_lesson_file` permit deletion; `restore_incomplete` and `plan_dir_unresolved` veto it.
 3. If any carried lesson fails to land in the main-anchored store, the deletion is **vetoed fail-closed** and the plan directory is preserved intact.
 
+[#lock-free-snapshot-reads]
 === Lock-Free Snapshot Reads, Transaction Locks & Leases (`PM-IMPL-7`)
 
+[[_lock_free_snapshot_reads_transaction_locks_leases_pm_impl_7]]
 * *Lock-Free Snapshot Reads*: Because every store update uses atomic write-and-rename (`<file>.tmp.<uuid>` -> `<file>`), all read-only operations (`pm_state`, `pm_plans`, `pm_epics`, `pm://` resources) read the current inode snapshot directly without acquiring file locks.
 * *Transaction Locks*: Short locks held only for one transaction. When a transaction spans several scopes, they are acquired strictly in this order to prevent deadlocks:
 ** plan lock: `<main>/.plan/local/locks/plan-<plan_id>.lock`
@@ -868,8 +1362,19 @@ When the operator invokes plan deletion (`delete-plan` via elicitation or CLI):
 ** machine store locks: `~/.plan-marshall/mcp/locks/{merge,review-bot,build-slots}.lock`
 +
 Plan and epic locks live outside the directories they protect, so relocating a plan directory (link:move-journal.adoc[Move Journal Specification]) or editing an epic in a worktree never splits a lock.
-* *Leases*: Long-lived claims (merge holder in `merge-queue.json`, review-bot windows in `review-bot-windows.json`, build slots in `build-slots.json`) are lease records with an owner (`plan_id` plus runtime instance PID and start instant) and an expiry. A lease is claimed or released inside a short transaction on the machine store lock and is never held as an OS lock, so holding a lease while taking a plan lock does not invert the lock order.
+* *Leases*: Long-lived claims (merge holder in `merge-queue.json`, review-bot windows in `review-bot-windows.json`, build slots in `build-slots.json`) are lease records with an owner (`plan_id` plus runtime instance PID and start instant) and an expiry (<<machine-lease-stores>>). A lease is claimed or released inside a short transaction on the machine store lock and is never held as an OS lock, so holding a lease while taking a plan lock does not invert the lock order.
 * *Lock Manager*: All acquisitions in the runtime go through one lock manager (link:runtime-model.adoc#_in_process_lock_manager[Runtime & Interaction Model Specification]).
+
+[#evidence-based-removal-sweeps]
+=== Evidence-Based Removal Sweeps
+
+Every removal sweep (legacy-surface retirement, retention purges of logs, archived plans and superseded lessons, worktree orphan sweeps, converter and migration-command retirement):
+
+* runs as a dry run unless the operator explicitly applies it;
+* reports for every kept item the first keep-rule that fired, and for every removed item the trigger that fired;
+* reports the source (compiled default, `.plan/marshal.json`, machine configuration) of every configuration value it used;
+* reports an empty population as one of `root_absent`, `root_unreadable`, `nothing_listed`, or `all_kept`, never as a bare zero;
+* never removes an item on absence of evidence: a missing marker, record, or audit tombstone keeps the item and reports it as `skipped_no_evidence`.
 
 == Script Disposition Classification & Differential Equivalence Testing (`PM-TEST-1`, `PM-TEST-2`, `PM-MIG-1`..`PM-MIG-5`)
 
@@ -883,7 +1388,7 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 
 |*Ported (Data Layer, Redesigned Store Format)*
 |Canonical store read/write invariants of `manage-status.py`, `manage-tasks.py`, `manage-findings.py`, `manage-references.py`, `manage-change-ledger.py`, and `manage-lessons.py`; the worktree SHA-256 freshness hash (`worktree_sha`); and the pure output parsers and classifiers of the git and CI integrations (`workflow-integration-{git,github,gitlab,sonar}`)
-|100% differential equivalence testing (`PM-TEST-2`) over shared fixture corpuses before cutover, comparing the Java result with the Python result mapped through the store's legacy -> target converter (<<legacy-store-formats>>). Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion).
+|100% differential equivalence testing (`PM-TEST-2`) over shared fixture corpuses before cutover, comparing the Java result with the Python result mapped through the store's legacy -> target converter (<<legacy-store-formats>>). Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion) and the rename-aware realized footprint of `compute-footprint` (a *deliberate change*, <<three-way-footprint>>), which is verified by its own fixtures instead.
 
 |*Redesigned (Hypermedia & Native Services)*
 |Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `manage-execution-manifest.py` (the execution manifest is composed in-process by `ExecutionManifestResolver`), and the workflow-integration verbs of `workflow-integration-{git,github,gitlab,sonar}` (replaced by workflow primitives and sub-workflows such as `git.commit_and_push`)
@@ -891,13 +1396,16 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 
 |*Retired (Obsolete Infrastructure)*
 |`execute-script.py` proxy, `argparse_surface.py`, `permission-doctor` / `permission-fix`, `inject_project_dir.py`, static multi-host bundle transpilers, and shell-command composition helpers
-|Retired at stage exit gates (`PM-MIG-4`) once zero active plans reference the legacy surface.
+|Retired at stage exit gates (`PM-MIG-4`) once a reference census over every active and archived plan and epic root reports zero references. The census reports per root `exists`, `entries_scanned`, and `unreadable`; an absent, empty, or unreadable root is never read as zero (<<evidence-based-removal-sweeps>>).
 |===
 
 [#legacy-store-formats]
 === Legacy Store Formats & One-Time Conversion (`PM-MIG-3`, `PM-MIG-5`)
 
 The schemas in this document are the target formats. Legacy `plan-marshall` stores differ; each store switches exactly once, in the stage that ports it, through a legacy -> target converter, and every legacy script touching that store is ported or retired in the same stage. Each converter has a reverse converter used by `pm-mcp operator rollback`.
+
+* *No Defaulted Fields*: A converter that cannot populate a target field from legacy data never defaults it. The cutover receipt records `{source_format, missing_fields[]}` for every partially converted record, keyed by its identifier, together with the count per store, and consumers treat those fields as absent.
+* *Mapped Identifiers*: Each store conversion writes a cutover receipt that lists every in-flight plan and epic whose stored identifiers (`from_epic`, spec references, queue row identifiers) the converter mapped, and refuses the switch for that store when any identifier cannot be mapped.
 
 IMPORTANT: The legacy formats below were verified against `plan-marshall` commit `1d4a1da37`. `plan-marshall` keeps evolving: before implementing a converter, re-verify the legacy format of that store against the latest `plan-marshall` version and update this table.
 
@@ -911,15 +1419,19 @@ IMPORTANT: The legacy formats below were verified against `plan-marshall` commit
 
 |Tasks
 |`tasks/TASK-NNN.json` with `number`, `deliverable` (int), `domain`, `origin`, `description`, `depends_on`, `verification{commands,criteria,manual}`; task status `pending\|in_progress\|done\|blocked\|infeasible\|failed`, step status `done\|skipped\|failed` (`manage-tasks/scripts/_tasks_core.py`)
-|Map field names and status enums; keep task numbers.
+|Map field names and status enums; keep task numbers; `verification{commands,criteria,manual}` maps unchanged to the target `verification` object.
 
 |Findings
-|`artifacts/findings/{type}.jsonl` (one file per type), `artifacts/findings/qgate-{phase}.jsonl`, `artifacts/findings/assessments.jsonl`; 6-character `hash_id`; severity `error\|warning\|info`; resolution `pending\|fixed\|suppressed\|accepted\|taken_into_account\|rejected` (`manage-findings/scripts/_findings_core.py`)
-|Merge per-type files into the target store; keep `hash_id` as a legacy alias; map resolutions to target dispositions.
+|`artifacts/findings/{type}.jsonl` (one file per type), `artifacts/findings/qgate-{phase}.jsonl`, `artifacts/findings/assessments.jsonl`; 6-character `hash_id`; 14 types `bug\|improvement\|anti-pattern\|triage\|tip\|insight\|best-practice\|build-error\|test-failure\|lint-issue\|sonar-issue\|arch-constraint\|pr-comment\|pr-comment-overflow` (`tools-file-ops/scripts/constants.py`, verified at `plan-marshall` `f3de0e14f`); severity `error\|warning\|info`; resolution `pending\|fixed\|suppressed\|accepted\|taken_into_account\|rejected` (`manage-findings/scripts/_findings_core.py`)
+|Merge per-type files into the target store; convert `assessments.jsonl` into the assessment store (<<component-assessments>>), never into `findings.jsonl`; map each legacy `hash_id` to a newly allocated `finding_id` and record the pair in the cutover receipt (*Mapped Identifiers*), from which the reverse converter restores `hash_id` (the target record keeps no alias field); map resolutions to target dispositions; map severity `error` -> `major`, `warning` -> `minor`, `info` -> `info`. Map types to `source`: `sonar-issue` -> `sonar`; `pr-comment` and `pr-comment-overflow` -> `github_pr` or `gitlab_mr` (the plan's CI provider); `build-error`, `test-failure`, `lint-issue` -> `compiler`; `arch-constraint` -> `arch_gate`; every record of `qgate-{phase}.jsonl` -> `qgate`. The target `source` of the seven knowledge types (`bug`, `improvement`, `anti-pattern`, `triage`, `tip`, `insight`, `best-practice`) must be fixed before the converter is implemented; an unmapped type is never dropped silently.
 
 |References
 |`references.json` with `affected_files`, `read_intent_files`, `realized_footprint`; the structured-derived set is recomputed, never stored (`manage-references/scripts/_references_crud.py`)
 |Map key names; do not persist the derived set unless the target schema requires it.
+
+|Lessons
+|Main-anchored `.plan/local/lessons-learned/{id}.md`: Markdown with a `key=value` metadata header (`id`, `component`, `category` `bug\|improvement\|anti-pattern\|arch-constraint`, `created`, optional `bundle`, and for `arch-constraint` `rule`, `recurrence_count`, `last_seen`; `status` `active\|superseded\|removed`), an H1 title, and the body; lessons with a YAML-frontmatter header coexist; tombstones at `.tombstones/{id}.json`; applied lessons moved to `.plan/local/plans/{plan_id}/lesson-{id}.md` (`manage-lessons/standards/file-format.md`, verified at `plan-marshall` `f3de0e14f`)
+|Converted once per enrolled project at cutover into the target lesson record (<<lesson-record>>): both header formats convert to the one target format, `id` -> `lesson_id`, `created` -> `created_at`, `tool_version` as `absent` or `undetermined` per the version provenance rule. A lesson whose header cannot be parsed is listed in the cutover receipt as `unreadable` with a named diagnostic and kept verbatim, never dropped; every converted lesson that lists is addressable by its id. Tombstones are kept. The reverse converter restores the legacy layout.
 
 |Change ledger
 |Repository-level `.plan/work/change-ledger.jsonl` (not plan-scoped, `NO_PLAN` rows) with `timestamp_iso`, `duration_seconds`, status `success\|error\|timeout\|killed\|unknown` (`manage-change-ledger/scripts/_ledger_core.py`)
@@ -930,13 +1442,14 @@ IMPORTANT: The legacy formats below were verified against `plan-marshall` commit
 |Imported once at machine cutover (and at the first enrolment of a later project) into the machine-level `~/.plan-marshall/mcp/state/build-timings.json`, keyed by project and canonical command; existing entries are kept, unmappable keys are listed in the cutover receipt; the reverse converter writes the learned values back to their originating keys.
 
 |Plan ID grammar
-|`^[a-z][a-z0-9-]*$` (`tools-input-validation/scripts/input_validation.py`)
-|Legacy IDs are a subset of the target grammar; the reverse converter refuses plans whose IDs fall outside the legacy grammar.
+|`^[a-z][a-z0-9-]*$` (`tools-input-validation/scripts/input_validation.py`); epic slugs are validated with the same function (`plan-orchestrator/scripts/orchestrator.py`, verified at `plan-marshall` `f3de0e14f`)
+|Legacy plan IDs and epic slugs of 3–64 characters that do not end in `-` are valid target IDs (phase-workflows.adoc, Plan ID Derivation) and are kept unchanged; any other legacy ID is an unmappable identifier and refuses the switch for its store (*Mapped Identifiers* above). The reverse converter refuses plans whose IDs fall outside the legacy grammar.
 |===
 
 === Differential Equivalence Harness & Executor Shadow Routing (`PM-TEST-2`, `PM-MIG-1`)
 
 * *Shared Corpus Differential Runner (`PM-TEST-2`)*: In JUnit 5 (`pm-mcp-core`), parameterized differential tests execute each `Ported` Java store primitive and its reference Python counterpart against identical initial `.plan/` directory trees. The harness maps the Python result through the store's legacy -> target converter, canonicalizes JSON/JSONL outputs (normalizing generated UUIDs and ISO-8601 timestamps), and asserts zero structural diff across both returned payloads and resulting stores for all canonical store read/write invariants.
+* *Known-Defect Baseline*: A known defect of the Python reference is either fixed in `plan-marshall` before the differential run or recorded as a named *deliberate change* with its own fixture, for which the harness asserts the corrected behaviour. A differential run never adopts a known defect as the equivalence baseline, and an equivalence proof for a structural refactor is taken only after every behaviour fix touching the same code has landed.
 * *Executor Shadow Routing (`PM-MIG-1`)*: During Migration Stages 1 and 2, the runtime's executor adapter supports shadow-routing `Ported` read/write operations to the Java primitive while comparing results against the Python baseline (mapped through the converter), logging any divergence to `audit.jsonl` and triggering automatic fallback (`PM-MIG-5`) if a discrepancy occurs.
 
 

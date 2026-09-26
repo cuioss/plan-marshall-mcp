@@ -16,6 +16,7 @@ This document specifies the declarative Workflow Domain-Specific Language (DSL),
 
 _See Requirements:_
 
+* _See Requirement link:../Requirements.adoc#PM-ARCH-5[PM-ARCH-5: Worktree-Bound Plan Location & Main-Bound Orchestrator Location]_
 * _See Requirement link:../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
 * _See Requirement link:../Requirements.adoc#PM-WF-3[PM-WF-3: Capability Enforcement by Link Omission]_
 * _See Requirement link:../Requirements.adoc#PM-WF-4[PM-WF-4: Entity-Scoped Links & Fine-Grained Concurrency]_
@@ -23,7 +24,10 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
 * _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
 * _See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+* _See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
 * _See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+* _See Requirement link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4: Direct Host Subprocess Management & Process-Group Isolation]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Legacy Surface Retirement]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine Invariant, Property & McpAssured Protocol Verification]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
@@ -242,8 +246,8 @@ state finalize.settle-commit
   phase finalize
   call git.commit_and_push (message_mode=step_or_fallback, push_mode=post_pr_conditional)
     committed_local      -> finalize.next-step
-    committed_and_pushed -> finalize.concurrent-wait
-    pushed_clean         -> finalize.concurrent-wait
+    committed_and_pushed -> finalize.review-cap-check
+    pushed_clean         -> finalize.review-cap-check
     clean                -> finalize.next-step
     aborted              -> finalize.aborted
 
@@ -256,15 +260,55 @@ state finalize.push-barrier
     clean                -> finalize.create-pr
     aborted              -> finalize.aborted
 
+state finalize.review-cap-check
+  phase finalize
+  auto review.check-structural-caps
+    within_caps         -> finalize.concurrent-wait
+    cap_exceeded        -> finalize.review-structural
+
 state finalize.concurrent-wait
   phase finalize
   composite_job finalize.watch-ci-and-bots
-    all_green           -> finalize.merge-gate
-    findings_open       -> finalize.triage
-    ci_failed           -> finalize.ci-failed
-    bot_rate_limited    -> finalize.review-escalate
-    bot_timed_out       -> finalize.review-escalate
+    all_green                -> finalize.merge-gate
+    findings_open            -> finalize.triage
+    ci_failed                -> finalize.ci-failed
+    bot_refused_awaitable    -> finalize.review-window-wait
+    bot_refused_hard         -> finalize.review-escalate
+    bot_refused_structural   -> finalize.review-structural
+    bot_no_unreviewed_commit -> finalize.review-full-trigger
+    bot_unproven             -> finalize.review-escalate
+    cancelled                -> finalize.wait-cancelled
+
+state finalize.review-window-wait
+  phase finalize
+  facts review.window-status
+  job review.await-rate-window
+    succeeded           -> finalize.review-retrigger
+    failed              -> finalize.review-escalate
+    refused             -> finalize.review-escalate
     cancelled           -> finalize.wait-cancelled
+    timed_out           -> finalize.review-escalate
+    killed              -> finalize.review-escalate
+    indeterminate       -> finalize.review-escalate
+
+state finalize.review-retrigger
+  phase finalize
+  auto review.retrigger-unproven
+    triggered           -> finalize.review-cap-check
+    window_closed       -> finalize.review-window-wait
+
+state finalize.review-escalate
+  phase finalize
+  facts review.window-status
+  link retry retry:<bot_kind> [noop] ()
+    guard predicate:review.window-open
+    do review.retrigger-bot
+      triggered         -> finalize.review-cap-check
+      window_closed     -> finalize.review-window-wait
+  link escalate escalate [escalate] (reason: text 1..500)
+    escalate review_barrier_gap
+      approved          -> finalize.merge-gate
+      denied            -> finalize.aborted
 
 state finalize.ci-failed
   phase finalize
@@ -307,7 +351,10 @@ state finalize.aborted terminal
   phase aborted
 ----
 
-* *Hard CI failure (`PM-WF-9`)*: `finalize.ci-failed` offers both remediation paths. `fix_in_branch` (rel `fix`) is followed after the model has applied the fix in the worktree; `finalize.record-in-branch-fix` records `fix_summary` and routes through `finalize.settle-commit` (`call git.commit_and_push` with `push_mode=post_pr_conditional`), whose `committed_and_pushed` outcome re-enters `finalize.concurrent-wait` so CI and review bots re-evaluate the new `HEAD`. A clean worktree yields `no_changes` and leaves the plan in `finalize.ci-failed`. `loop_back` returns to `execute` for cross-task remediation (<<loop-back-bounds>>).
+* *Hard CI failure (`PM-WF-9`)*: `finalize.ci-failed` offers both remediation paths. `fix_in_branch` (rel `fix`) is followed after the model has applied the fix in the worktree; `finalize.record-in-branch-fix` records `fix_summary` and routes through `finalize.settle-commit` (`call git.commit_and_push` with `push_mode=post_pr_conditional`), whose `committed_and_pushed` outcome re-enters `finalize.concurrent-wait` (through `finalize.review-cap-check`) so CI and review bots re-evaluate the new `HEAD`. A clean worktree yields `no_changes` and leaves the plan in `finalize.ci-failed`. `loop_back` returns to `execute` for cross-task remediation (<<loop-back-bounds>>).
+* *Pre-wait cap gate*: Before `finalize.concurrent-wait` is entered, `finalize.review-cap-check` measures the diff (changed files, diff characters) against the structural caps each required review bot declares in the review-bot registry (link:phase-workflows.adoc[Phase Workflows Specification]). An exceeded cap records the bot as `refused` with mode `size` pre-emptively, names the cap and the measurement in `facts`, and routes to `finalize.review-structural` instead of waiting; under every cap the flow is unchanged.
+* *Review-bot refusal modes*: The composite outcomes of `finalize.watch-ci-and-bots` separate the refusal modes, because a single rate-limit outcome cannot express them. `bot_refused_awaitable` (a rate window that reopens) enters `finalize.review-window-wait`, a job that waits for the registered window (the registered interval times the attempt ceiling; a published ETA is a floor that is re-checked, never skipped) and then re-triggers the unproven bots automatically. `bot_refused_hard` (weekly or hard quota) and `bot_unproven` (no review evidence for the current `HEAD` after the wait) enter `finalize.review-escalate`. `bot_refused_structural` (size) enters `finalize.review-structural`, which offers split, accept, and disable-for-this-PR but never a wait; when a path partition (for example test sources versus the rest) brings each part under the cap, it proposes that concrete split. `bot_no_unreviewed_commit` enters `finalize.review-full-trigger`, which posts the registry's full-review trigger verb.
+* *Window-gated re-trigger*: `finalize.review-escalate` offers `retry:<bot_kind>` only while the predicate `review.window-open` holds, so a trigger is never posted inside a closed rate window (a trigger in a closed window extends it; closing and reopening the PR does not reset it). The `<bot_kind>` placeholder expands over the bots of the required set that have no review evidence for the current `HEAD`, selected after the round's own comment fetch and never by comment recency; a required bot that never published is selectable. A closed window at execution time routes to `finalize.review-window-wait`.
 * *Implicit job links*: `finalize.concurrent-wait` is a `composite_job` state and therefore offers `wait:finalize.concurrent-wait` and `cancel:finalize.concurrent-wait` without declaring them (<<implicit-job-links>>). Following `cancel` yields the composite outcome `cancelled`, handled by `finalize.wait-cancelled`.
 * *Cross-file targets*: `execute.dispatch-ready` is declared in `execute.pmwf`; the target is valid because all phase files form one definition unit (<<workflow-definition-units>>).
 
@@ -452,7 +499,7 @@ _See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound 
 
 _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Legacy Surface Retirement]_
 
-`WorkflowValidator` verifies every `WorkflowDefinition` both in JUnit build tests and at daemon startup (failing closed if any rule is violated). A `WorkflowDefinition` is always a complete definition unit (<<workflow-definition-units>>): the merged union of all phase files of the plan workflow, a single-file top-level workflow, or one sub-workflow. Rules 2, 3, and 5 run over that union, never over an individual phase file:
+`WorkflowValidator` verifies every `WorkflowDefinition` both in JUnit build tests and at daemon startup (failing closed if any rule is violated). A `WorkflowDefinition` is always a complete definition unit (<<workflow-definition-units>>): the merged union of all phase files of the plan workflow, a single-file top-level workflow, or one sub-workflow. Rules 2, 3, 5, and 8 run over that union, never over an individual phase file:
 
 1. *Primitive Binding & Parameter Equivalence*: Every `primitiveId` in `do`, `auto`, `job`, `facts`, and `predicate:` must resolve to a registered `Primitive<P, R>`. For every `LinkSpec`, the declared `freeParams` list must exactly match the name, type, and constraints of the `Record` components annotated as `@FreeParam` on `P`.
 2. *Exhaustive Outcome Coverage*: For every `auto`, `job`, `composite_job`, and `link` action backed by `Primitive<P, R>`, the set of `OutcomeTransition.outcomeName` entries must form an exact 1-to-1 bijection with the enum constants of `R` (`R.getEnumConstants()`). For `job` and `composite_job` states this includes `cancelled`, the outcome of the implicit `cancel:<job_id>` link (<<implicit-job-links>>). Missing or unknown outcome names fail validation with the source file and line number.
@@ -461,6 +508,8 @@ _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteri
 5. *Backwards-Compatible State Migration (`PM-MIG-4`)*: Every state name present in the committed `released-states.txt` baseline must either exist in `states` or appear as `oldStateId` in a `migrate <old> -> <new>` declaration whose target exists in `states`.
 6. *Sub-Workflow Outcome Bijection & Parameter Binding (`PM-WF-16`)*: Every `StateBehavior.SubWorkflowCall` (`call <subWorkflowId>`) must reference a registered `WorkflowDefinition` whose `scope == WorkflowScope.SUBWORKFLOW`. Every terminal `StateNode` in a `SUBWORKFLOW` must declare a non-empty `terminalOutcome` (`state <id> terminal <outcome_id>`), and the set of `OutcomeTransition.outcomeName` entries on each `call` site must form an exact 1-to-1 bijection with the target sub-workflow's declared `terminalOutcome` values. The `paramBindings` of every `call` site are checked against the target's `params` (`param` declarations): every declared parameter must be bound exactly once, no binding may name an undeclared parameter, and every bound value must match the declared type (membership in the `enum[…]` value set, or an integer within the declared `int` range).
 7. *Acyclic Call-Graph DAG & Bounded Depth (`PM-WF-16`)*: Across all registered `WorkflowDefinition` instances, the static `call` graph must form a strict directed acyclic graph (DAG) with zero cycles and a maximum static call-stack depth $\le 4$.
+8. *Gate Artifact Producer Coverage*: For every guard or gating primitive that declares a required artifact (`requiredArtifacts()`, for example `pr_title`, `outline.md`, or `execution-manifest.json`), every path from the unit's `startState` to that guard or state, including recipe and lane shortcuts, must pass a state whose primitive declares the artifact in `producedArtifacts()`. A path without a producer fails validation, so a gate can never refuse for an artifact its lane could not produce.
+9. *Failure Outcomes Never Map to Success*: Every outcome constant of every primitive, `composite_job` outcome set, and sub-workflow terminal outcome declares an `OutcomeClass` (<<primitive-outcome-classes>>). Only an outcome of class `SUCCESS` may lead to a step completion record `done`; a `FAILURE` or `INDETERMINATE` outcome must never be mapped to a transition that records the step `done`. A composite primitive whose sub-operations report any `FAILURE` outcome yields a `FAILURE` outcome itself.
 
 == Typed Java `Primitive<P, R>` Interface & Transition Validation
 _See Requirement link:../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
@@ -475,9 +524,17 @@ package de.cuioss.pm.mcp.core.workflow.spi;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+
+public enum OutcomeClass { SUCCESS, SKIP, FAILURE, INDETERMINATE, UNSETTLED }
 
 public interface PrimitiveOutcome {
     String wireName();
+
+    /**
+     * Class of the outcome; decides which step record the engine writes (see Outcome Classes).
+     */
+    OutcomeClass outcomeClass();
 }
 
 public record PrimitiveResult<R extends Enum<R> & PrimitiveOutcome>(
@@ -507,8 +564,28 @@ public interface Primitive<P extends Record, R extends Enum<R> & PrimitiveOutcom
      * Execute the operation within the locked scope context and return one of the closed outcomes.
      */
     PrimitiveResult<R> execute(WorkflowExecutionContext context, P parameters);
+
+    /**
+     * Artifacts this primitive produces as side effects (Rule 8), e.g. "pr_title".
+     */
+    default Set<String> producedArtifacts() { return Set.of(); }
+
+    /**
+     * Artifacts this primitive requires before it can pass (Rule 8), e.g. a gate requiring "pr_title".
+     */
+    default Set<String> requiredArtifacts() { return Set.of(); }
 }
 ----
+
+[#primitive-outcome-classes]
+==== Outcome Classes & Step Records
+
+Every outcome constant declares one `OutcomeClass`, and the engine derives the step record from it, never from the outcome name:
+
+* *`SUCCESS`*: The step completed with its work; the engine records `done`.
+* *`SKIP`*: The step had nothing to do. A primitive with an optional input declares a `skipped_<reason>` outcome of this class for the absent-input case; the step record stores `skipped`, `work_performed: false`, and the reason, and downstream steps treat it as neither a failure nor produced content.
+* *`FAILURE`* and *`INDETERMINATE`*: The step record stores `failed` or `indeterminate`; neither is ever recorded as `done`, and `INDETERMINATE` is never folded into success or failure (`PM-EXEC-4`).
+* *`UNSETTLED`*: Outcomes that hand the step back without settling it (`loop_back`, defer). The engine writes no completion record, so a re-fired step never produces two completions.
 
 === Concrete Primitive Example (`GitCommitPrimitive`)
 
@@ -520,13 +597,18 @@ public final class GitCommitPrimitive
     public record Params(@FreeParam(minLength = 1, maxLength = 2000) String message) {}
 
     public enum Outcome implements PrimitiveOutcome {
-        OK("ok"),
-        NOTHING_TO_COMMIT("nothing_to_commit"),
-        HOOK_FAILED("hook_failed");
+        OK("ok", OutcomeClass.SUCCESS),
+        NOTHING_TO_COMMIT("nothing_to_commit", OutcomeClass.SKIP),
+        HOOK_FAILED("hook_failed", OutcomeClass.FAILURE);
 
         private final String wireName;
-        Outcome(String wireName) { this.wireName = wireName; }
+        private final OutcomeClass outcomeClass;
+        Outcome(String wireName, OutcomeClass outcomeClass) {
+            this.wireName = wireName;
+            this.outcomeClass = outcomeClass;
+        }
         @Override public String wireName() { return wireName; }
+        @Override public OutcomeClass outcomeClass() { return outcomeClass; }
     }
 
     @Override public String id() { return "git.commit"; }
@@ -542,15 +624,17 @@ public final class GitCommitPrimitive
 }
 ----
 
+[#independent-transition-validation]
 === Independent Server-Side Transition & Parameter Validation (`PM-WF-6`)
 
+[[_independent_server_side_transition_parameter_validation_pm_wf_6]]
 When `pm_do(scope_id, link, args, dispatch_id)` arrives, the workflow engine executes a single atomic transaction under the scope's exclusive `FileChannel` lock:
 
 1. *Load Authoritative State*: Read `mcp/status.json` for `scope_id` (applying any `migrate` mapping if `status.json` references a legacy state) and resolve the active `StateNode` (within the top `CallFrame.subWorkflowId()` if `call_stack` is non-empty, or the root workflow otherwise).
-2. *Verify Dispatch Claim (if `dispatch_id` present)*: If `dispatch_id` is superseded or expired, reject immediately with `reason: "superseded_dispatch_id"`.
+2. *Verify Dispatch Claim (if `dispatch_id` present)*: If `dispatch_id` is superseded or expired, reject immediately with `reason: "stale_dispatch_id"`.
 3. *Re-Compute Active Links & Guards*: Evaluate all `LinkSpec` entries on `StateNode`, expanding entity placeholders (`triage:<finding_id>`) against current persisted stores (`findings.jsonl`, `tasks/TASK-*.json`) and evaluating each link's `GuardExpr`.
-4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set (including any attempt to invoke an omitted operator transition or an already-closed entity), return `isError: false` with `rejected.reason = "link_not_available"` and the current representation.
-5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges) and execute any attached content validator (`OutlineValidator`, `AsciiDocValidator`, `ConventionalCommitValidator`) in-process on submitted text payloads. If validation fails, return `isError: false` with `rejected.reason = "invalid_link_args"` and the current representation.
+4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set, return `isError: false` with the current representation and a `rejected.reason` from the closed enumeration (link:mcp-tools.adoc#rejection-reasons[MCP Tool & Resource Surface Specification]): `operator_only` for an operator transition, which is never offered to the model; `stale_entity` for an entity-addressed link whose entity is no longer in an accepting state; `link_not_available` for any other identifier, including invented or paraphrased ones.
+5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges) and execute any attached content validator (`OutlineValidator`, `AsciiDocValidator`, `ConventionalCommitValidator`) in-process on submitted text payloads. If validation fails, return `isError: false` with the current representation and `rejected.reason` `undeclared_param` (a key the link does not declare), `missing_param` (a required key is absent), or `invalid_link_args` (type, range, or content-validator violation); `detail` names the offending parameter.
 6. *Verify Workspace Footprint*: For task `submit` and git `commit` links, verify that no files outside the plan's worktree were dirtied by host tools; on violation, transition immediately to `<phase>.footprint-violation`.
 7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions`, persist the new `state` (and updated `call_stack` if entering or exiting a `SubWorkflowCall`) in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` and `call` steps until an interactive link state, async job state, or root terminal state is reached).
 
@@ -764,7 +848,7 @@ state git.done-aborted terminal aborted
 ==== Six-Stage Execution Contract of `git.commit_and_push`
 
 * *Stage 1 — Working-Tree Inspection (`git.inspect-worktree`)*:
-** Resolves the target checkout path from the locked scope context (`worktree_path` when `location == WORKTREE`, or `workspace_root` when `MAIN_CHECKOUT` / `epic` / `steward`).
+** Resolves the target checkout path from the locked scope context: `worktree_path` when `location == WORKTREE`, `workspace_root` when `MAIN_CHECKOUT` or `steward`, and the shared epic worktree (link:filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification]) when `epic`. Git-tracked orchestrator state is never committed on the primary checkout (`PM-ARCH-5`).
 ** Executes `git -C <tree> status --porcelain` (ignoring `.plan/local/**`).
 ** If uncommitted changes exist (`staged`, `unstaged`, or `untracked`), returns `dirty -> git.detect-artifacts`.
 ** If the working tree is clean: returns `clean_skip_push -> git.done-clean` when `push_mode == never`; otherwise returns `clean_needs_push_check -> git.evaluate-push-policy` so clean-tree push barriers (`finalize.push-barrier` or post-rebase pushes) proceed directly to the freshness and parity checks without creating an empty commit.
@@ -773,21 +857,26 @@ state git.done-aborted terminal aborted
 ** Fails closed (`oracle_failed -> git.artifact-escalate`) if the `.gitignore` oracle cannot be evaluated.
 ** Unconditionally excludes `.plan/**` and any nested git worktrees or submodules (`git submodule status` / `.git` file markers) from deletion.
 ** Automatically deletes `safe` untracked artifact files and records `artifacts_deleted` in the audit log.
-** Transitions to `git.artifact-review` only if `uncertain` tracked files match artifact patterns (`tracked_resolved == false`) or prohibited secret files (`.env*`, `*.pem`, `*.key`, `credentials.json`) are staged/untracked.
+** Transitions to `git.artifact-review` only for paths in the change set of this commit (porcelain entries: staged, unstaged, untracked) that match artifact patterns and are `uncertain`, or for prohibited secret files (`.env*`, `*.pem`, `*.key`, `credentials.json`) in that change set. Unchanged tracked files are never candidates; unchanged tracked files that match artifact patterns are reported only as a count (`facts.tracked_pattern_matches`).
 * *Stage 3 — In-Memory Commit Message Resolution, Validation & Trailer Injection (`git.resolve-message` / `git.compose-message`)*:
 ** When `message_mode` is `auto_deliverable` or `step_or_fallback`, resolves the deterministic commit message in memory (e.g., `feat(<module>): complete deliverable <N> - <title>` or `chore(finalize): apply <step_id> changes`).
 ** When `message_mode == interactive` (or `none_assert_clean` when unexpected dirty files were found), transitions to `git.compose-message`, populates `facts` via `git.diff-summary` (changed file count, module scope, priority-ordered suggested type `fix > feat > perf > refactor > docs > style > test > chore > ci`), and accepts `message: text 1..2000` directly in `pm_do` `args`.
 ** Validates Conventional Commits format (`<type>[optional (<scope>)][!]: <subject>`) via `ConventionalCommitValidator` and deterministically appends the configured trailer `Co-Authored-By: {name} <{email}>`, resolved as in `plan-marshall` (`manage-run-config` `commit-trailer get`) from `commit_trailer{name,email}` in the git-ignored `.plan/local/run-configuration.json`: each half defaults independently (`plan-marshall`, `noreply@cuioss.de`), and a stored value that is empty, not a string, or contains an angle bracket or line break is treated as absent. `.plan/marshal.json` is never consulted for the trailer.
+** The resolved trailer is the only authority: a `Co-Authored-By:` line in a model-supplied `message` is rejected (`invalid_link_args`, `detail` names the line), and the only trailer in the commit is the one the server appends. The commit facts record `trailer_source: {name, email}`, each half `configured`, `default`, or `invalid_ignored` (a stored value that was treated as absent).
 * *Stage 4 — Staging, `stdin`-Piped Commit & Change-Ledger Stamping (`git.stage-and-commit`)*:
-** Stages scoped files (`git -C <tree> add -- <paths>`) and invokes `git -C <tree> commit -F -`, streaming the validated UTF-8 commit message + trailer directly to child `stdin` in memory (`PM-EXEC-5`) with zero `.plan/temp/` files.
+** Derives the staging set from the plan, never from whatever the working tree holds: the dirty paths intersected with the declared footprint, the accepted deviations, the task `target_files`, and the step-declared outputs (for epic scopes, `.plan/orchestrator/**`; for the steward, `.plan/marshal.json`). A dirty path outside that set is never staged; the engine's workspace footprint check (<<independent-transition-validation>>, item 6) moves the scope to `<phase>.footprint-violation` naming it.
+** Stages the scoped files (`git -C <tree> add -- <paths>`) and invokes `git -C <tree> commit -F -`, streaming the validated UTF-8 commit message + trailer directly to child `stdin` in memory (`PM-EXEC-5`) with zero `.plan/temp/` files.
 ** Captures `commit_sha` (`git -C <tree> rev-parse HEAD`) and git-sourced `changed_paths` (`git -C <tree> diff-tree --no-commit-id --name-only -r <commit_sha>`), appending a `kind = "change"` entry to `change-ledger.jsonl`.
 ** When invoked from a Phase 6 `mutates_source: true` step: re-stamps `head_at_completion = commit_sha` on `head_dependent: true` steps in `mcp/status.json`, and for steps with `order >= 10` (`pre-push-quality-gate.order`), writes a `freshness_reconcile` record (`commit_sha`, `step_id`, `prior_build_worktree_sha` from the latest passing build row in `change-ledger.jsonl`) so the downstream push gate recognizes the finalize-internal commit without requiring a redundant full build when no source-affecting inputs changed.
 ** If `git commit` exits non-zero due to a repository pre-commit hook, returns `hook_failed -> git.commit-fix`.
 * *Stage 5 — Config-Driven Push Policy & Freshness Precondition (`git.evaluate-push-policy` -> `git.verify-freshness`)*:
 ** Evaluates `push_mode` together with `.plan/marshal.json -> /plan/phase-5-execute/commit_and_push` (default `true`): `push_mode == never` skips push (`skip_push_committed -> git.done-committed-local`); `push_mode == if_configured` requires push if and only if `commit_and_push == true`; `push_mode == post_pr_conditional` requires push if and only if `commit_and_push == true` and the calling finalize step has `order > 20` (after `create-pr`), automating post-PR re-push for late source-mutating steps (`adr-propose` or triage fixes); `push_mode == always` requires push unconditionally.
 ** Before any push, `git.pre-commit-verify-freshness` verifies `change-ledger.jsonl` freshness (`fresh` corroborated on both notation and scope dimensions against the current `worktree_sha`, `exempt` when `build-decision == not_necessary`, or reconciled via `freshness_reconcile`). If `stale` or `undecidable`, transitions to `git.freshness-blocked` (offering `run_verification_build` or operator `escalate`).
+** When no reconciliation record names the live `HEAD`, `git.freshness-status` reports `stale_reason: reconciliation_record_absent` together with the causes that absence admits (`admitted_causes` ⊆ `source_drift_unbuilt`, `no_successful_build`, `record_owed_not_emitted`, `commit_outside_reconcile_membership`). The refusal reports what it observed and never asserts a single inferred cause; the fail-closed halt is unchanged.
+** `git.freshness-blocked` renders, beside `stale_reason`, the evidence it would accept: the required build notation(s), the scope (`whole_tree` or a module list), and the current `worktree_sha`.
 * *Stage 6 — Branch Sync Parity Probe & Push Execution (`git.check-branch-parity` -> `git.execute-push`)*:
 ** `git.push-barrier-decision` first reads the persisted fact `branch_pushed_at` in `mcp/status.json`. When it is unset, the branch has never been pushed by this plan and the decision is `first_push` (`git -C <tree> push --set-upstream origin <branch>`) without consulting the probe. When it is set (re-entry), the decision follows `plan-marshall`'s push-barrier mapping (`workflow-integration-git/scripts/git-workflow.py`, `push_barrier_action`, verified at commit `1d4a1da37`; re-verify before implementing): it runs `git.branch-sync-state` and returns `refire` only for `ahead`; `synced`, `remote_absent_landed`, `remote_absent_unverified`, and any unrecognised state return `skip`. `remote_absent_unverified` never pushes, because a never-pushed branch and a squash-merged-and-deleted branch are indistinguishable locally and re-pushing would resurrect a landed branch.
+** `git.branch-sync-state` classifies the plan's recorded `branch_name` (`mcp/status.json`), never the ambient `HEAD` of the checkout, and fetches the remote ref before classifying. A classification made without a fetch in the same transaction is labelled unverified (as `remote_absent_unverified` already is) and is never used to claim that the branch is unpushed.
 ** `git.execute-push` sets `branch_pushed_at` (timestamp and pushed `HEAD`) in `mcp/status.json` on the first successful push.
 ** If `git push` is rejected as non-fast-forward (`rejected_non_ff`), transitions to `git.sync-required` (offering `sync_rebase` or operator `force_push_with_lease` escalation).
 
@@ -822,17 +911,22 @@ state git.done-aborted terminal aborted
 |`always`
 |Commits PR remediation fixes, verifies build freshness, and pushes the updated branch to re-trigger CI/review checks.
 
-|`orchestrator.pmwf` / `steward.pmwf` -> `*.commit-changes`
+|`orchestrator.pmwf` -> `orchestrate.commit-ledger`
+|`step_or_fallback`
+|`never`
+|Commits epic ledger updates in the shared epic worktree on the fixed epic branch, staging only `.plan/orchestrator/**` paths. Never commits on the primary checkout; ledger changes reach the default branch only through the epic landing (link:dispatch-and-effort.adoc#epic-landing[Dispatch & Effort Specification]).
+
+|`steward.pmwf` -> `steward.commit-changes`
 |`step_or_fallback`
 |`if_configured`
-|Commits epic ledger updates or `.plan/marshal.json` steward reconfigurations on the primary checkout with full artifact cleanup and trailer injection.
+|Commits `.plan/marshal.json` steward reconfigurations on the primary checkout with full artifact cleanup and trailer injection.
 |===
 
 [#loop-back-bounds]
 == Worktree-Constrained Loop-Back & Iteration Bounds
 _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
 
-When a finalize step (CI failure, quality gate failure, or review finding triage) requires code changes, the workflow transitions from `finalize` back to `execute` via a `loop_back` link governed by three strict server-side invariants:
+When a finalize step (CI failure, quality gate failure, or review finding triage) requires code changes, the workflow transitions from `finalize` back to `execute` via a `loop_back` link governed by two strict server-side invariants:
 
 === 1. Worktree Confinement Guard (`in_worktree`)
 
@@ -861,6 +955,9 @@ When a finalize step (CI failure, quality gate failure, or review finding triage
 ** If `loop_back_iteration < max_iterations`, `loop_back_iteration` is atomically incremented by `1` in `mcp/status.json`, fresh task files (`TASK-NNN.json`) and a fresh dispatch envelope (`envelope-M` with a new `dispatch_id`) are allocated in the worktree — completed tasks are never mutated or reopened — and the primitive returns `allocated -> execute.dispatch-ready`.
 ** If `loop_back_iteration >= max_iterations`, the primitive allocates nothing, leaves the counter unchanged, and returns `limit_reached -> finalize.loop-limit-reached`.
 * At the limit, `loop_back` therefore stays offered (subject only to `in_worktree`), and its execution transitions to `finalize.loop-limit-reached`, which offers only `escalate` (requiring operator approval via elicitation or `pm-mcp operator` to grant additional iterations or abort). This is the transition required by `PM-WF-7`; the counter is never evaluated by a guard, so the limit state is always reachable.
+* `finalize.loop-limit-reached`, like every other limit state, renders the resolved limit and its source in `facts` (for example `max_iterations: 14`, `max_iterations_source: marshal.json` or `default`), so an escalation never quotes the documented default instead of the configured value.
+* Only `loop_back` allocations count against `max_iterations`. Waiting for a review bot's rate window (`finalize.review-window-wait`) and re-triggering a bot never consume a loop-back iteration; their budgets derive from the bot's registered interval.
+* A refusal whose reason cannot change between rounds at an unchanged `HEAD` (for example a verifier that cannot apply to the plan's content) is recorded once and closes the step or escalates once; it never offers `loop_back` and never increments `loop_back_iteration`.
 
 == Automated Mermaid, AsciiDoc Table, and ASCII Diagram Generation
 _See Requirement link:../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
@@ -881,16 +978,19 @@ Both examples render an excerpt of the plan workflow's `finalize` phase group fr
 ----
 stateDiagram-v2
     state "finalize.settle-commit" as finalize_settle_commit
+    state "finalize.review-cap-check" as finalize_review_cap_check
     state "finalize.concurrent-wait" as finalize_concurrent_wait
     state "finalize.ci-failed" as finalize_ci_failed
     state "finalize.wait-cancelled" as finalize_wait_cancelled
     state "finalize.loop-limit-reached" as finalize_loop_limit_reached
     state "execute.dispatch-ready" as execute_dispatch_ready
     finalize_settle_commit : call git.commit_and_push
+    finalize_review_cap_check : auto review.check-structural-caps
     finalize_concurrent_wait : composite_job finalize.watch-ci-and-bots
     finalize_ci_failed : skill pm/finalize/ci-triage
-    finalize_settle_commit --> finalize_concurrent_wait : call / committed_and_pushed
-    finalize_settle_commit --> finalize_concurrent_wait : call / pushed_clean
+    finalize_settle_commit --> finalize_review_cap_check : call / committed_and_pushed
+    finalize_settle_commit --> finalize_review_cap_check : call / pushed_clean
+    finalize_review_cap_check --> finalize_concurrent_wait : auto / within_caps
     finalize_concurrent_wait --> finalize_ci_failed : composite_job / ci_failed
     finalize_concurrent_wait --> finalize_wait_cancelled : composite_job / cancelled
     finalize_ci_failed --> finalize_settle_commit : fix fix_in_branch [submit] / recorded

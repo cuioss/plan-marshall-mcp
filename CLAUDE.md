@@ -8,7 +8,8 @@ plan-marshall-mcp (PM-MCP) is a local MCP server that takes over the process log
 through a hypermedia-driven workflow. The design describes the target state, most of which is not
 implemented yet: requirements in `doc/Requirements.adoc` (modules in `doc/requirements/`), technical
 specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
-`doc/roadmap.adoc`.
+`doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
+`doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification).
 
 Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
 `@QuarkusIntegrationTest` integration tests against the packaged application. No container image

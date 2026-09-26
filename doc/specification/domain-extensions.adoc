@@ -656,6 +656,9 @@ Module discovery combines compiled-in descriptor parsers with optional enrolled 
 |Project metadata, `[project.dependencies]`, `[tool.pytest]`, `[tool.mypy]`, `[tool.ruff]`, top-level package directories and test roots.
 |===
 
+* **Live Crawl, Snapshot as Cache**: Discovery always crawls the live worktree, including uncommitted descriptors. The descriptor tree hash covers the live descriptor content, not `HEAD`. The persisted snapshot is a denormalized cache, never the gatekeeper: a module directory present on disk but absent from the snapshot is still discovered.
+* **Per-Descriptor Failure Isolation**: A malformed descriptor (the root descriptor or one workspace member) is reported for its module with the parse diagnostic and does not abort discovery of the remaining modules.
+
 === Build Map & Deterministic `derive-verification` (ADR-004)
 
 The file-to-build contract lives at `build.map` in `.plan/marshal.json` (peer of `build.queue`): a domain-keyed inventory `{"<domain>": [{"glob", "role", "build_class"}]}` with roles `production`, `test`, and `config` and the closed build classes `compile`, `module-tests`, `verify`, and `none`. Phase 4 (`plan`) calls `derive-verification` with each task's changed-artifact list and stamps the returned canonical command set into the task's `verification.commands`; Phase 5 (`execute`) runs the stamped commands. The seeding, editing, and reseeding rules mirror `plan-marshall` (`manage-config/scripts/_cmd_build_map.py`, `manage-config/standards/data-model.md` § build.map, `marshall-steward/references/build-map-setup.md`, `phase-4-plan/SKILL.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
@@ -699,8 +702,11 @@ Instead of invoking Python CLI scripts via Bash to inspect repository structure,
 |Transitive downstream blast radius and derived verification set (`derive-verification`) for the specified modules or active plan footprint.
 
 |`pm://architecture/drift`
-|Descriptor regression and module-diff report comparing the current working tree against the cached architecture snapshot.
+|Descriptor regression and module-diff report comparing the current working tree against the cached architecture snapshot: `changed[]` for modules whose comparison is certified as different, and `indeterminate[]{module, reason}` for modules the hash surface cannot certify. An uncertifiable comparison is `indeterminate`, never `changed`.
 |===
+
+* **Resource Contracts**: Every `pm://architecture/*` resource documents its arguments, its payload, and its zero-result and error semantics. An empty result is returned only for a population that was actually examined; a resource that could not examine its population returns an explicit error or `indeterminate` entry, never an empty list.
+* **Two Capability Vocabularies**: Capability status uses two distinct vocabularies that are never mixed: `derivable` / `not_derivable` for derivation capabilities (a discovery tier or resolver can produce the fact) and `available` / `unavailable` for content capabilities (the content can be read or searched).
 
 === Architecture Enrichment Judgment Links & Project Setup State Machine
 
@@ -794,7 +800,7 @@ In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `disp
 
 |`key_packages`
 |No
-|List of `{package, description, components}`: `package` is a repository-relative path that must resolve to an existing location (the path is the identity key), `description` is 1–2 sentences and required, and `components` optionally names the package's key types.
+|List of `{package, description, components}`: `package` is a repository-relative path that must resolve to an existing location (the path is the identity key), `description` is 1–2 sentences and required, and `components` optionally names the package's key types. A dotted package identifier is rejected with `invalid_link_args` whose `detail` names `non_resolving_package_key` (link:mcp-tools.adoc#rejection-reasons[closed rejection reasons]); only the server-derived `packages` facts of `pm://architecture/modules/{module_id}` may carry dotted names.
 |===
 
 The reasoning fields carry the enrichment rationale required by `PM-EXT-3` and are persisted next to the values they justify. *Deliberate hardening vs. `plan-marshall`*: `purpose` is validated against the closed enum; `plan-marshall` documents the same eight values but its CLI accepts any string. The state cannot transition to `setup.commit-changes` until the **`every_module_enriched`** guard evaluates to `true` (every discovered module has a `responsibility`).
@@ -1060,13 +1066,19 @@ The scoring and routing rules mirror `plan-marshall` (`script-shared/scripts/rec
 3. *Auto-Route or Ask*: When `plan.phase-1-init.auto_route_recipe` is `true` (default) and the top confidence is at least `plan.phase-1-init.auto_route_recipe_threshold` (default `0.6`), the engine selects that recipe without asking. Otherwise, if candidates remain, it enters `init.recipe-candidate` (an `*.awaiting_user` state) offering `use_recipe:<recipe_key>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for the others) and `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
 4. [[recipe-plan-id]]*Recipe Plan ID*: A recipe plan's `plan_id` is `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC), so every run gets a fresh branch name. *Deliberate change vs. `plan-marshall`*: `plan-marshall` uses hour precision (`{yyyy-mm-dd-hh}`), which collides when the same recipe runs twice within an hour.
 5. *Server-Side Target Harvesting & Deliverable Generation*: When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`) and verifying coverage at completion.
+6. *Auditable, Idempotent Harvest Runs*: A recipe run records one disposition per harvested target; for `recipe-lesson-cleanup` over `stalled_lessons` the dispositions are `routed`, `reclassified`, and `retired` (with a mandatory `retired_reason`). Re-running on unchanged input is a no-op keyed on the target's dedup key. If the population differs between harvesting and action, the run reports the delta (added and removed target ids) and never adopts it silently.
 
 === Pre-Submission Self-Review Surfacer Contract (`ext-self-review-*`)
 
 During `phase-6-finalize`, the pre-submission structural self-review step runs deterministic candidate detectors over the plan's realized diff to surface high-risk patterns (unvalidated boundary inputs, asymmetric function pairs, description-vs-body mismatches, stale ordinal prose, unguarded flags) as structured facts for model review:
 
-* **Not Run Is Not Clean Invariant**: When no self-review surfacer is registered for any of the plan's active domains, the server records `"status": "not_run: no_surfacer_resolved"` in the finalize ledger—never `"clean"` or `"passed"`. Every active surfacer records its `scope_statement`, `structural_limit`, and `delta_coverage`; a detector class with zero matching files in the diff is recorded as `unapplicable`, never counted toward measured clean coverage.
-* **Delta Round Narrowing Invariant**: On subsequent finalize iterations after a fix, delta self-review rounds narrow only the candidate file set to files modified since the previous reviewed `worktree_sha`, never narrowing the hunk basis against the plan's base commit. If the base commit or previous `worktree_sha` is unresolvable, the step fails closed with an explicit error rather than silently widening or skipping. A delta round alone can never close the step if a prior full-round finding remains unresolved.
+* **Applicability by Content Class**: A surfacer is applicable when its declared content classes cover at least one content class of the realized footprint; a footprint whose paths all fall in content class `other` has no applicable surfacer. An inapplicable surfacer is never run: the step records `not_covered` with the uncovered content classes and completes non-blocking, never as `clean`. The refusal reasons `no_domain_surfacer`, `no_covered_content_class`, and `zero_detectors` are round-invariant at an unchanged `HEAD`.
+* **Not Run Is Not Clean Invariant**: When no self-review surfacer is applicable, the server records `"status": "not_run: no_surfacer_resolved"` in the finalize ledger—never `"clean"` or `"passed"`. Every active surfacer records its `scope_statement`, `structural_limit`, and `delta_coverage`; a detector class with zero matching files in the diff is recorded as `unapplicable`, never counted toward measured clean coverage.
+* **Which Zero Coverage**: Per content class the surfacer records `files`, `files_with_candidates`, and `detectors`; a class with `files > 0` and `detectors == 0` is recorded as `gap`, never as clean. The reach map is derived from the registered detectors. Every realized path with no applicable detector is listed as `not_scanned` in the step facts and the landing facts, and a round over only `not_scanned` paths is `not_covered`. Per-file candidate counts distinguish `examined_zero` (an applicable detector ran on the file and found nothing) from `not_scanned`.
+* **Run-Emitted Diagnostics**: Diagnostics emitted by the plan's own run (build, validator, or gate output) whose subject overlaps the plan footprint are surfaced as candidates alongside the detector findings.
+* **Out-of-Surface Findings**: Findings identified outside the surface go into a non-blocking `observed_out_of_surface` list whose count reaches the step summary, so `clean`, `nothing_found`, and `suppressed` stay distinct outcomes.
+* **Round Accounting**: `cohort_size` is published per round and cumulatively. A finding at a file and line of a prior round's finding is marked `repeat_site` with its repeat count. A finding classified `self_seeded` (introduced by the previous round's fix) records that classification at WARNING level; its remedy is the deletion of the added clause, gated on that recorded classification.
+* **Delta Round Narrowing Invariant**: On subsequent finalize iterations after a fix, delta self-review rounds narrow only the candidate file set to files modified since the previous reviewed `worktree_sha`, never narrowing the hunk basis against the plan's base commit. The plan's base commit is the footprint `base_ref` defined in link:store-schemas.adoc[Store Schemas Specification] (§ Three-Way File Footprint Reconciliation). Before computing candidates the step fetches `origin/<base_branch>` itself; the fail-closed refusal applies only when the base commit or the previous `worktree_sha` is still unresolvable after that fetch, and then the step fails with an explicit error rather than silently widening or skipping. When the previous round's `worktree_sha` is not an ancestor of `HEAD` (the branch was rebased), delta resolution is skipped, open findings stay pending, and a full round is required: an endpoint diff across an upstream advance never marks a finding fixed. A delta round can never close the step: a clean delta round is followed by exactly one full-surface round over the whole plan diff, and only a clean full-surface round records `done` (`may_close = true`). A delta round that surfaces findings loops back without a confirmation round.
 
 == Out-of-Process Project Script Jobs (`project_script`) & Domain Workers
 _See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
@@ -1257,6 +1269,7 @@ To prevent argument injection without requiring the operator to re-enrol the pro
 ----
 
 * **Typed Placeholder Validation at Job Time**: When the daemon constructs a build job, it substitutes `{module}` and `{profile}` and validates them against its own cached module discovery snapshot (`{module}` must be a discovered module path/coordinate in the repository; `{profile}` must be a profile declared in that module's build descriptor).
+* **Enrolled Template Precedence**: An enrolled template for a canonical verb replaces the compiled default template for that project; every build representation names the template source (`enrolled` or `compiled_default`). Templates are never read from `.plan/marshal.json` (`PM-EXT-6`).
 * **Forbidden Free Flags**: Arbitrary user- or model-supplied flags—specifically `-D`, `-f`, `--file`, `-s`, `--settings`, `--init-script`, or shell metacharacters—are never accepted in canonical build jobs.
 * **Machine-Wide Slot Cap & Source Discrimination**: `machine-config.json` holds `max_concurrent_builds`. On every build submission, the scheduler resolves the cap and reports both the value and its resolution `source` (`machine_config`, `default`, `invalid`, or `unreadable`); `invalid` and `unreadable` configuration files are surfaced explicitly in diagnostics and never silently folded into `"default"`.
 
@@ -1392,14 +1405,16 @@ Raw .plan/marshal.json (ObjectNode)
   │     and orders all top-level/nested object keys into canonical schema order
   │
   ├─► Phase 4: Registry & Post-Condition Validation
-  │     Validates against MarshalConfigRecord schema, checks required_bots/optional_bots
-  │     against registered bot kinds, and flags unrecognized top-level keys as warnings
+  │     Validates every key at every level against the MarshalConfigRecord schema and checks
+  │     required_bots/optional_bots against registered bot kinds; unknown keys are reported
   │
   └─► Phase 5: Epoch Compaction, Stamp & Conditional Atomic Write
         Compacts applied_migrations <= baseline_version, updates system.schema_version,
         provisioned_version, and config_seed_fingerprint, and atomically writes
         .plan/marshal.json ONLY if canonical JSON bytes changed
 ----
+
+*Undeclared Keys Are Refused, Never Kept Unread*: A setup or config link that would write a key not declared in `MarshalConfigRecord` is refused (`invalid_link_args`). Unknown keys found in a hand-edited `.plan/marshal.json` are reported as `unknown_config_key` findings naming the key path; they are never silently kept as unread settings.
 
 === 4. Anti-CoT-Clutter & Lifecycle Compaction Guarantees
 
@@ -1409,7 +1424,7 @@ To ensure configuration upgrades never degrade model reasoning or bloat context 
 2. *Silent $O(1)$ Fast-Path When Current*: At `pm_start`, phase handshakes, and `pm-mcp enter`, the server compares `(system.schema_version, system.config_seed_fingerprint)` against `(CURRENT_SCHEMA_VERSION, CURRENT_SEED_FINGERPRINT)`. When they match, verification completes in memory in $<1\text{ ms}$ and emits **zero** facts, links, or warnings into the state representation.
 3. *Single Server-Side Reconcile Transition*: When `schema_version < CURRENT_SCHEMA_VERSION` or `config_seed_fingerprint` differs, `steward` (or `pm-mcp operator upgrade-config`) runs the entire 5-phase `ConfigReconciler` pipeline in one atomic step (`config.reconcile`) and emits a compact receipt containing only non-empty deltas (`from_schema_version`, `to_schema_version`, `applied_migrations[]`, `added_defaults_count`, `warnings[]`).
 4. *Epoch Compaction (`MINIMUM_SUPPORTED_SCHEMA_VERSION`)*: At major releases, `MINIMUM_SUPPORTED_SCHEMA_VERSION` advances. `ConfigMigrationCommand` classes with `targetVersion <= MINIMUM_SUPPORTED_SCHEMA_VERSION` are deleted from the active command chain, and `ConfigReconciler` compacts their IDs out of `system.applied_migrations` into `system.baseline_version`. If a repository presents a `schema_version < MINIMUM_SUPPORTED_SCHEMA_VERSION`, `ConfigReconciler` fails closed with an explicit `unsupported_legacy_config_epoch` error naming the required bridge version.
-5. *Three-Surface Synchronization (In-Flight `execution-manifest.json` Re-Composition)*: Whenever `ConfigReconciler` updates `.plan/marshal.json` in a repository that has active in-flight plans (Phases 4–6), the next phase handshake (`phase-workflows.adoc`) detects that the plan's recorded `config_hash` / `schema_version` trails `.plan/marshal.json` and automatically re-runs `ExecutionManifestResolver` in-process so the in-flight plan's `execution-manifest.json` immediately reflects the migrated configuration.
+5. *Three-Surface Synchronization (In-Flight `execution-manifest.json` Re-Composition)*: Whenever `ConfigReconciler` updates `.plan/marshal.json` in a repository that has active in-flight plans (Phases 4–6), the next phase handshake (`phase-workflows.adoc`) detects that the plan's recorded `config_hash` / `schema_version` trails `.plan/marshal.json` and automatically re-runs `ExecutionManifestResolver` in-process so the in-flight plan's `execution-manifest.json` immediately reflects the migrated configuration. The manifest records its `composed_inputs` (`config_hash`, `realized_footprint_digest`, `change_type`, `providers_digest`); at Phase 6 entry the resolver re-computes every recorded input, and any difference re-composes the manifest and records the changed inputs in `facts`. `config_hash` is computed over the `.plan/marshal.json` of the plan's current location (the worktree copy from Phase 5 on), so a deliverable that edits a configuration knob re-composes the manifest at the next handshake.
 6. *Build-Time Chain Integrity Verification (`ConfigMigrationChainTest`)*: JUnit 5 build tests in `pm-mcp-core` enforce:
 ** Contiguous gap-free `targetVersion()` numbering from `MINIMUM_SUPPORTED_SCHEMA_VERSION + 1` to `CURRENT_SCHEMA_VERSION`.
 ** Globally unique `migrationId()` strings matching `^M\d{3}_[a-z0-9_]+$`.

@@ -26,6 +26,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-WF-11[PM-WF-11: Q-Gate Validation Loop, Change-Type & Scope-Deviation Contracts]_
 * _See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
 * _See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+* _See Requirement link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
 * _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
 * _See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
@@ -113,7 +114,7 @@ The planning lifecycle is a server-enforced state machine spanning `phase-1-init
 
 The server derives or validates `plan_id` against a strict lexical grammar before creating any directory on disk:
 
-1. *Canonical Slug Pattern*: `^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$` (with recipe plans suffixed by `-\d{8}-\d{6}`).
+1. *Canonical Slug Pattern*: `^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`; recipe plans are `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (link:domain-extensions.adoc#recipe-plan-id[Recipe Plan ID]), which the length bound admits. This is the single definition of the plan ID grammar; every schema that restates it (`plan_id` tool properties, `scope_id`, queue rows) matches it exactly. Epic IDs use the same grammar (mirroring `plan-marshall`, which validates the epic slug with its plan-id validator).
 2. *Phantom-ID Refusal*: The validator explicitly rejects any candidate `plan_id` or `slug` matching either a lesson identifier pattern (`^\d{4}-\d{2}-\d{2}-\d{2}-\d{3,}$`) or a UUID / hex-digest pattern (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`, a bare hex string of 12 or more characters `^[0-9a-fA-F]{12,}$`, or a token beginning case-insensitively with `execution-context` or `agent-`). Rejecting these shapes prevents callers from accidentally passing a lesson ID or dispatch/session UUID into `plan_id` and creating a phantom plan directory.
 
 ==== Deterministic Init Classifiers & Workflow Settings
@@ -121,9 +122,12 @@ The server derives or validates `plan_id` against a strict lexical grammar befor
 During `init.classify`, the engine executes pure, model-free classifiers in a fixed order:
 
 1. *Recipe Match before Lane Routing*: When `plan_source == request` and `auto_route_recipe == true`, the registry-wide recipe scorer evaluates the request narrative first. An explicit `recipe` source selection is never overridden by the scorer.
-2. *Initial Planning-Lane Router*: Computes the initial `planning_lane` (`light` or `deep`) and pre-route `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`).
+2. *Initial Planning-Lane Router*: Computes the initial `planning_lane` (`light` or `deep`) and pre-route `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`). `scope_estimate` is derived from expected-modification paths only; read-only references never raise it. The pre-route value is persisted immutably as `scope_estimate_pre_route`; every later update of `scope_estimate` (Phase 2 or Phase 3) records its own provenance under `scope_estimate_provenance[]` instead of overwriting the pre-route evidence.
 3. *Sibling Collision Detector*: Scans live plans for overlapping target modules or affected file paths; if an overlap is found, transitions to `init.awaiting_user` to resolve the collision (`proceed`, `rename`, or `abort`).
 4. *Workflow Settings Resolution*: Reads project workflow configuration from `.plan/marshal.json` (`init_without_asking`, `plan_without_asking`, `execute_without_asking`, `auto_route_recipe`, `confidence_threshold`, `compatibility`, `simplicity`, and execution posture `minimal | standard | full`) to determine which interactive states are entered vs auto-advanced.
+5. *Base Stamp*: Stamps `main_sha` in `mcp/status.json` from `git rev-parse origin/<base_branch>`. It is written once here and re-stamped only by the `sync-baseline` and `branch-cleanup` rebases; the Outside-World Invariants guard reads it as the producer of the baseline-drift check.
+
+At `phase-4-plan` entry the lane predicate is re-evaluated with the settled inputs (declared deliverables and their expected modifications) and the result is logged as `lane_reevaluation` in `audit.jsonl`; the re-evaluation never re-routes the plan (see <<_lane_ratchet_rules>>).
 
 === Routine User Interaction vs Operator-Authorizing Decisions
 _See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
@@ -144,6 +148,8 @@ _See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialo
 |Host MCP Elicitation, or Authenticated Operator CLI (`pm-mcp operator ...`).
 |*Strict Link Omission (`PM-WF-3`)*: No model-invocable `submit` or `noop` link is ever emitted to approve or force these gates. If the host does not support MCP elicitation, the state transitions to `<phase>.blocked`, emits the exact `pm-mcp operator` command in `facts.operator_command`, and offers only the link `wait:decision:<decision_id>` (rel `wait`), a bounded wait on the pending operator decision record, until the operator acts.
 |===
+
+*Intent Amendments*: Phase 2 answers are written into `request.md` (`## Clarifications`). Every later answer that changes the plan's intent (a `*.awaiting_user` answer in Phases 3–6, deviation guidance, or a refuted premise) is persisted as an entry of `mcp/status.json -> amendments[]` (`at`, `phase`, `source: operator | refutation`, `text`, `supersedes`). Every later representation that renders the request (outline, `create-pr`, landing envelope) includes the amendments, so a superseded statement of the request never reaches a later phase unmarked.
 
 ==== Typed Question Envelope Schema (`*.awaiting_user`)
 
@@ -177,9 +183,16 @@ At `phase-2-refine` entry, the engine caches loop-invariant inputs (`request.md`
 * `overlap_no_content_conflict`: Overlapping files merge cleanly; records `auto_reconcilable: true` without mutating the tree (deferring the actual rebase to Phase 5/6) and advances to `refine.analyze`.
 * `overlap_with_content_conflict`: Content conflicts exist; emits blocking Q-Gate findings so the conflict is absorbed during request refinement.
 
+* *Probe Parsing*: The probe runs `git merge-tree --write-tree --name-only -z` with `LC_ALL=C` and reads only the conflicted-file section; informational and message lines are never paths. The conflict count is the number of distinct conflicted paths. The locale pin applies to this parse job only, not to the `worktree_sha` git invocations (link:job-runtime.adoc[Job Runtime Specification]).
+* *Overlap Population*: Overlap is computed between the upstream changed paths and the plan's declared ∪ derived footprint known at that point, never only the in-flight diff (which is empty before execution), so a first Phase 5 entry never reports `conflict_count: 0` merely because nothing was written yet.
+* *Drift Routing*: Content overlap (`overlap_with_content_conflict`) is the only drift routed to refinement. A `main_sha` ancestry drift is cleared only by a sync or rebase transition (`sync_rebase`) or by operator escalation; a refine re-dispatch is never offered as its remedy.
+
 ==== Five Quality Dimensions & Fixed-Weight Confidence Aggregation
 
 During `refine.analyze`, the dispatched refine sub-agent executes source-premise verification (checking cited files, flags, and APIs against the codebase) and proposed-fix verification (constructing a semantic probe to verify whether a proposed fix resolves the stated symptom), maps affected modules, estimates scope (`none`, `surgical`, `single_module`, `multi_module`, `broad`), authors a conventional-commit `pr_title` ($\le 72$ characters, distinct from the human plan `title`), and submits raw scores (`0..100`) for the five quality dimensions plus architectural module mapping.
+
+* *Premise Verdicts*: Source-premise verification records each premise with the verdict record of epic Spec Re-Grounding (link:dispatch-and-effort.adoc#_server_derived_landing_facts_spec_re_grounding_cross_plan_locks[Dispatch & Effort Specification, Verdict Record]): label `observed` or `hypothesis`, verdict `corroborated | contradicted | partially_exercised | unverifiable`, and `scope_change` (`none | rescoped`); no second vocabulary exists. A command flag mandated by the request is a premise and must name a module of the command's actual reactor that the flag affects.
+* *Open Hypotheses of Emitted Plans*: For a plan emitted from an epic (`from_epic`), every `hypothesis`-labelled claim of its spec section is surfaced in `facts.open_hypotheses`. `submit:refine` must carry a verdict per claim (`confirmed` or `refuted`, citing the named artifact), and any `refuted` claim routes to `refine.awaiting_answers` for re-scoping instead of `refine.ready`.
 
 The server-side `ConfidenceAggregator` computes the overall confidence deterministically using fixed weights (zero LLM arithmetic):
 
@@ -214,7 +227,7 @@ The server-side `ConfidenceAggregator` computes the overall confidence determini
 
 $$\text{confidence} = \lfloor 0.20 \cdot S_{\text{corr}} + 0.20 \cdot S_{\text{comp}} + 0.20 \cdot S_{\text{cons}} + 0.10 \cdot S_{\text{nondup}} + 0.20 \cdot S_{\text{ambig}} + 0.10 \cdot S_{\text{mod}} \rfloor$$
 
-* Any omitted dimension defaults to `0` and is recorded in `missing_dimensions` (never silently ignored).
+* All six dimensions are required parameters of `submit:refine`; a submission omitting one is rejected with `invalid_link_args`, so no absent score is ever folded into the aggregate as `0`.
 * The aggregated score is persisted to `status.metadata.confidence` and compared against `confidence_threshold` (configured in `.plan/marshal.json -> /plan/phase-2-refine/confidence_threshold`, default: `95`).
 * The server also validates that `compatibility` (`breaking | deprecation | smart_and_ask`, mandatory with no fallback) and `simplicity` (`lean | pragmatic | defensive`, defaulting to `lean`) are resolved and persisted.
 
@@ -225,6 +238,7 @@ Once concrete `affected_files` are identified in `refine.analyze`, the server ru
 $$\text{domains}_{\text{new}} = \text{domains}_{\text{cached}} \cup \text{detect}(\text{affected\_files})$$
 
 * *Monotonic Widening Invariant*: Phase 2 may **only widen** `references.domains`, never narrow it, ensuring convergence across refine iterations. If `affected_files` produce zero narrative or glob matches, `domain-detect` returns all offerable domains under `reason = "over_provisioned_resolve"`; that temporary over-provisioning is narrowed exactly once in Phase 3 after deliverables are declared.
+* *Match Provenance*: `domain-detect` returns, per domain, its `source` (`always_on`, `glob`, or `narrative`) and `matches: N`, rendered in `facts`. A result resting only on `always_on` legs with zero matches is reported `floor_only`, never as a confident single-domain answer.
 
 ==== Single-Batch Clarification & Re-Dispatch Ceiling
 
@@ -272,7 +286,7 @@ Every entry under a deliverable's `**Affected files:**` list must carry an expli
 
 |`read`
 |``- `src/main/java/Foo.java` (read)``
-|Consulted as read-only reference; file **must exist** on disk prior to execution. Recorded in `references.json` under read-only references, disjoint from expected modifications.
+|Consulted as read-only reference. The `files_exist` gate is satisfied when the path (after glob expansion) exists on disk, or when a deliverable in the transitive `depends:` closure declares it `write-new`; a glob is judged on its expansion, never on the literal. Recorded in `references.json` under read-only references, disjoint from expected modifications.
 
 |`write-new`
 |``- `src/main/java/Bar.java` (write-new)``
@@ -284,10 +298,10 @@ Every entry under a deliverable's `**Affected files:**` list must carry an expli
 
 |`delete`
 |``- `src/main/java/Old.java` (delete)``
-|Removed by the deliverable; file **must exist** on disk prior to execution and triggers the whole-tree verification gate in Phase 5.
+|Removed by the deliverable; file **must exist** on disk prior to execution (with the same glob-expansion and `depends:`-closure rule as `read`) and triggers the whole-tree verification gate in Phase 5.
 |===
 
-Any `Affected files` line lacking a valid `(read|write-new|write-replace|delete)` suffix is rejected immediately with `rejected.reason = "invalid_link_args"`. Furthermore, if a deliverable changes a default value, constant, or enum member, the *value-change test-sweep rule* requires all existing test files asserting the old value (discovered identifier-first) to be listed in `Affected files` with `(write-replace)`.
+An `Affected files` entry is recognised only as a list bullet anchored at line start (after indentation) whose first token is a back-quoted path; a line that does not match is rejected as `unparsed` with its line number and is never re-scanned from an interior hyphen. The same rule applies to every other path-bearing list of the outline (for example survey lists). The validator publishes `bullets_seen` and `bullets_parsed` per list and fails the submission when they differ. Any `Affected files` line lacking a valid `(read|write-new|write-replace|delete)` suffix is rejected immediately with `rejected.reason = "invalid_link_args"`. Furthermore, if a deliverable changes a default value, constant, or enum member, the *value-change test-sweep rule* requires all existing test files asserting the old value (discovered identifier-first) to be listed in `Affected files` with `(write-replace)`.
 
 ==== 2. Six-Bucket File-Type Classifier & `module_testing` Profile Requirement
 
@@ -340,14 +354,15 @@ Phase 4 transforms the approved structured deliverables in `outline.md` into exe
 
 ==== Deterministic Task Derivation & DAG Cycle Detection
 
-1. *Profile-to-Task Mapping*: For each deliverable $D_i$ in `outline.md`, the engine generates one task per declared profile in fixed intra-deliverable order (`implementation` $\rightarrow$ `module_testing` $\rightarrow$ `verification`), copying the deliverable's `Intent gloss` verbatim into each derived task's description.
+1. *Profile-to-Task Mapping*: For each deliverable $D_i$ in `outline.md`, the engine generates one task per declared profile in fixed intra-deliverable order (`implementation` $\rightarrow$ `module_testing` $\rightarrow$ `verification`), copying the deliverable's `Intent gloss` verbatim into each derived task's description. A verification command the deliverable declares is copied verbatim into `verification.commands` of its tasks (placeholders are substituted at execute); a deliverable that declares a command whose tasks would receive none is a derivation failure, never a silent fallback to a module-level command.
 2. *Dependency DAG Construction & Cycle Rejection*: Inter-deliverable `depends:` declarations map the head task of $D_i$ to the tail task of each prerequisite deliverable $D_j$. `TaskGraphValidator` runs Kahn's topological sort and depth-first cycle detection over the complete task graph; any self-dependency, unresolved deliverable reference, or cycle (`TASK-A -> ... -> TASK-A`) fails validation before any task file is written.
 3. *Two-Tier Skill Resolution*: Each task is assigned `skills[]` (`skill://pm/...` URIs) by combining system persona skills (`skill://pm/core`, profile vocabulary skill) with domain-resolved skills for the deliverable's `(domain, module, profile)` tuple.
 4. *Atomic Non-Idempotent Task Creation*: All derived tasks are persisted in a single atomic batch (`batch-add`). Task creation is strictly non-idempotent: once `tasks/TASK-*.json` files exist for the plan, the engine omits the task-creation link on any re-entry into Phase 4, preventing duplicate task generation.
 5. *Server-Side Cost Sizing, Envelope Bin-Packing & Manifest Composition*: Upon `plan.describe-tasks` submission, the server automatically executes three deterministic passes in-process (without exposing separate LLM-driven `pack-envelopes` or `compose-manifest` states):
-** `TaskCostEstimator` computes `cost_size` (`small | medium | large`) and `predicted_cost_tokens` for each task from its step count, target file count, and profile.
+** `TaskCostEstimator` computes `cost_size` (`XS | S | M | L | XL`, see link:dispatch-and-effort.adoc[Dispatch & Effort Specification]) and `predicted_cost_tokens` for each task from its step count, target file count, and profile.
 ** `EnvelopePacker` groups topologically ordered tasks into context-budget-bounded dispatch envelopes (`envelope-1..M`) and stamps `envelope_id` on each `TASK-NNN.json` so related tasks (such as a deliverable's `implementation` and `module_testing` pair) share one leaf sub-agent context window without exceeding host token limits.
 ** `ExecutionManifestResolver` writes `execution-manifest.json` (including structured `phase_6.dropped_steps: [{step_id, gate, reason}]` for every pruned step).
+6. *Declared-Path Discipline in Task Descriptions*: A task description or step submitted via `plan.describe-tasks` that names a path outside its deliverable's `Affected files` is rejected with `invalid_link_args` naming the path; the outline must be revised or the path declared, and the step is never silently dropped.
 
 ==== Shared Execution Manifest & Posture Preview Resolver
 
@@ -356,7 +371,7 @@ Both the Phase 1/Phase 4 *posture preview* and the Phase 4 *execution manifest c
 * *Posture Lattice*: `minimal` $\sqsubset$ `standard` $\sqsubset$ `full`.
 * *Floor Immunity*: Steps whose lane class is `core` or `derived-state` carry floor immunity (currently `sync-baseline`, `pre-push-quality-gate`, `push`, `create-pr`, `ci-verify`, `branch-cleanup`, `preference-emitter`, `record-metrics`, `print-phase-breakdown`, `emit-landing`, `archive-plan`, and `architecture-refresh`): an operator or config override setting a floor-immune step to `off` is ignored and recorded as a diagnostic note in `facts`. Steps without a `lane` block are not lane-participating and are always kept.
 * *Local-Only Runs*: When `plan.phase-5-execute.commit_and_push == false`, the resolver strips `push`, `pre-push-quality-gate`, and `pre-submission-self-review` from the Phase 6 manifest at composition time and records them in `dropped_steps` (as `plan-marshall` does).
-* *Prune Predicates & Structured `dropped_steps`*: Conditional steps (such as `sonar-roundtrip`, `automatic-review`, or `adr-propose`) evaluate their provider availability and footprint prune predicates; an unresolved `ask` seed is dropped only when its backing provider is unconfigured, and every pruned step is recorded in `execution-manifest.json -> phase_6.dropped_steps` with its `gate` (`posture`, `provider_unconfigured`, `footprint_disjoint`, `change_type_exempt`, or `recipe_override`) and human-readable `reason`.
+* *Prune Predicates & Structured `dropped_steps`*: Conditional steps (such as `sonar-roundtrip`, `automatic-review`, or `adr-propose`) evaluate their provider availability and footprint prune predicates; an unresolved `ask` seed is dropped only when its backing provider is unconfigured, and every pruned step is recorded in `execution-manifest.json -> phase_6.dropped_steps` with its `gate` (`posture`, `provider_unconfigured`, `footprint_disjoint`, `change_type_exempt`, or `recipe_override`) and human-readable `reason`. A `footprint_disjoint` prune evaluates the structured-derived footprint (`references.json -> derived_files.expected_modifications`); an absent, unreadable, or empty footprint is `indeterminate` and keeps the step (never pruned, never reported clean), mirroring `VerdictCurrencyEvaluator`: absence of a footprint never means "disjoint from everything".
 
 === Planning Transition Guards & Real-World Invariants
 
@@ -380,15 +395,15 @@ Every phase transition out of Phases 1, 2, 3, and 4 executes a deterministic ser
 
 |*Outside-World Invariants* (`main_sha`, `worktree_path`, `config_hash`)
 |Phase entries (Phases 2–6)
-|Verifies `main_sha` baseline drift, `.plan/marshal.json` `config_hash` / `system.schema_version` (`PM-EXT-7`), and worktree consistency: when `use_worktree == true`, `worktree_path` must be empty in Phases 1–4 and must resolve to a live git worktree in Phases 5–6 (no deferred-window carve-out). If `.plan/marshal.json` was upgraded via `ConfigReconciler` while a plan is in Phases 4–6, the server automatically re-composes the plan's `execution-manifest.json` in-process so it reflects the migrated configuration. Baseline drift is never auto-rationalized; loop-back re-entry drift is auto-accepted exactly once, and worktree refusal errors are never bypassed.
+|Verifies `main_sha` baseline drift, `.plan/marshal.json` `config_hash` / `system.schema_version` (`PM-EXT-7`), and worktree consistency keyed on the plan's `location` in `mcp/status.json`: when `location == WORKTREE`, `worktree_path` must resolve to a live git worktree of `branch_name`; when `location == MAIN_CHECKOUT`, `worktree_path` must be `null` (Phases 1–4, and Phase 6 steps after `branch-cleanup` at order `> 70`, which therefore never refuse on the removed worktree). If `.plan/marshal.json` was upgraded via `ConfigReconciler` while a plan is in Phases 4–6, the server automatically re-composes the plan's `execution-manifest.json` in-process so it reflects the migrated configuration. Baseline drift is never auto-rationalized; loop-back re-entry drift is auto-accepted exactly once, and worktree refusal errors are never bypassed.
 
 |*Store Integrity & Digest Guard*
 |Every `pm_state` / `pm_do` read
-|Every server write to `.plan/` stores (`status.json`, `references.json`, `findings.jsonl`, `TASK-*.json`) records a SHA-256 content digest. If the model edits files under `.plan/` directly via host file tools, the digest mismatch is detected on the next MCP call and rejected with `store_tampered`.
+|Every server write to `.plan/` stores (`status.json`, `references.json`, `findings.jsonl`, `TASK-*.json`) records a SHA-256 content digest. If the model edits files under `.plan/` directly via host file tools, the digest mismatch is detected on the next MCP call, which enters the `store_tampered` transition block requiring operator resolution (link:store-schemas.adoc#store-digest-verification[Store Digest Verification]); it is a blocked state, not a `rejected.reason`.
 
 |*Blocking Findings Guard* (`pending_findings_blocking_count == 0`)
 |Exits from Phases 2, 3, 4, 5
-|Refuses phase exit while any Q-Gate or verification finding with `blocking == true` remains in `resolution == "pending"`.
+|Refuses phase exit while any Q-Gate or verification finding with `blocking == true` remains in `resolution == "pending"`. A refusal lists each blocking finding (`finding_id`, `source`, `severity`, age since `created_at`, failing predicate) in `facts`, never only a count. Independently of refusals, every phase-transition representation (including Phase 6 entry) carries `pending_findings: {blocking: N, non_blocking: M}` in `facts`.
 |===
 
 === Direct In-Band Text Submissions & Retired Scratch-File Patterns (`PM-WF-2`, `PM-WF-6`)
@@ -405,7 +420,7 @@ In legacy `plan-marshall`, passing multi-line markdown or prose over Bash CLI ar
 
 |*PR / MR & Issue Bodies and Replies* (`create-pr`, `triage:F-n`, issue mirror)
 |`ci pr prepare-body` / `prepare-comment` / `ci issue prepare-body` -> host `Write` to `<plan>/work/ci-bodies/*.md` -> `ci pr create --body-file ...`
-|Model submits `body: text[1..32768]` or `reply_text: text[1..4000]` directly in `pm_do` `args`. Server injects deterministic sections (`## Scope Deviations` from `accepted_deviations[]`) in memory and streams to `gh pr create --body-file -` / `glab` via `stdin`.
+|Model submits `body: text[1..32768]` or `reply_text: text[1..4000]` directly in `pm_do` `args`. Server injects deterministic sections (`## Scope Deviations` from `accepted_deviations[]`) in memory and streams to `gh pr create --body-file -` / `glab` via `stdin`. Server-owned sections are delimited by `<!-- pm-mcp:section:<name> -->` … `<!-- /pm-mcp:section:<name> -->` markers; every render (`create-pr`, `edit_pr_body`, a later accepted deviation) reads the current body first, replaces only the delimited blocks (never appending a second copy), and preserves model-authored text outside the markers. A budgeted server section is truncated only at a paragraph or list-item boundary with an explicit `… (truncated, N chars)` marker, or dropped whole with a marker, never mid-token.
 
 |*Clarified Request Document* (`phase-2-refine`)
 |`manage-plan-documents resolve-path` -> host `Write`/`Edit` on `request.md` -> `manage-plan-documents validate`
@@ -421,7 +436,7 @@ In legacy `plan-marshall`, passing multi-line markdown or prose over Bash CLI ar
 
 |*Lesson Creation & Body* (`lessons-capture`, `split` deviation)
 |`manage-lessons add` -> host `Write` to `work/lesson-body-{id}.md` -> `manage-lessons set-body --file`
-|Single `submit` transition passing `title`, `component`, `category`, `rule`, and full markdown `body: text[1..16384]` in `args`; server writes the main-anchored lesson file atomically.
+|Single `submit` transition passing `title`, `component`, `category: enum[bug\|improvement\|anti-pattern\|arch-constraint]` (mirroring `plan-marshall` `manage-lessons`; re-verify before implementing), `rule`, and full markdown `body: text[1..16384]` in `args`; server writes the main-anchored lesson file atomically. The server stamps the lesson's `tool_version` from its own release version (`PM-DIST-1`); it is never a submit parameter.
 
 |*ADR Authoring* (`adr-propose`)
 |`manage-adr resolve-path` -> host `Write` on `.plan/doc/adr/ADR-NNN-*.adoc` -> `manage-adr validate`
@@ -456,7 +471,13 @@ Quality Gate (`Q-Gate`) validation runs at the tail of Phase 3 (deep lane only; 
 |In Phase 3 (`outline`), when `q_gate_validation != off`, Q-Gate validation is automatically bypassed (logging `(phase-3-outline:qgate-bypass)` to the audit log) if and only if all three conditions hold: `scope_estimate == "surgical"`, `change_type` $\in \{\text{"bug\_fix"}, \text{"tech\_debt"}, \text{"verification"}\}$, and `deliverable_count == 1`.
 
 |*Exit & Exhaustion Semantics*
-|The loop exits to the next state (`refine.ready`, `outline.review`, or `execute.worktree-init`) as soon as `pending_findings_blocking_count == 0`. (In Phase 2 lesson-derived plans, `stale` narrative-vs-code findings are non-blocking signals preserved for Phase 3 confirmation, whereas `invalid` findings are blocking.) If `pending_findings_blocking_count > 0` after iteration 3, the plan transitions to `<phase>.qgate-exhausted` (`*.awaiting_user`), requiring the user/operator to override, edit, or abort.
+|The loop exits to the next state (`refine.ready`, `outline.review`, or `execute.worktree-init`) as soon as `pending_findings_blocking_count == 0`. (In Phase 2 lesson-derived plans, `stale` narrative-vs-code findings are non-blocking signals preserved for Phase 3 confirmation, whereas `invalid` findings are blocking.) If `pending_findings_blocking_count > 0` after iteration 3, the plan transitions to `<phase>.qgate-exhausted` (`*.awaiting_user`), requiring the user/operator to override, edit, or abort. A Q-Gate pass over zero recorded component assessments is `not_evaluated` and never exits the loop as clean.
+
+|*Convergence Record*
+|Each iteration records `findings_raised`, `findings_self_seeded` (findings located in lines changed by the previous iteration's fix) and, on exhaustion, `findings_at_ceiling` (raised in the last iteration, whose fixes no round reviews). The exit renders `converged` vs `oscillating` from these figures, never from the last count alone.
+
+|*Deterministic Ordering Check*
+|Ordering phrases (`before`, `after`, `gate`, `first`, `then`, `depends on`) in a deliverable's narrative that name another deliverable without a corresponding `depends:` edge are filed as non-blocking Q-Gate findings; `depends:` edges between deliverables that name each other symmetrically are audited for cycles and omissions.
 |===
 
 === Single-Writer `change_type` Contract
@@ -547,7 +568,7 @@ public enum DeviationDisposition {
 
 |`accept`
 |**Mandatory** `rationale: text[1..2000]`
-|Persists the operator's `rationale` in `mcp/status.json` (`accepted_deviations[]`), appends `unplannedFiles` into the declared modification footprint in `references.json`, writes a `[DEVIATION:ACCEPT]` audit entry, unblocks `TASK-NNN`, and deterministically renders the deviation description and operator `rationale` into the Pull Request body's `## Scope Deviations` section during `create-pr` (order `20`).
+|Persists the operator's `rationale` in `mcp/status.json` (`accepted_deviations[]`), records `unplannedFiles` in `references.json -> approved_widening[]` with their provenance (`deviation_task_id`, `approved_via: elicitation \| operator_cli`, `phase`, `approved_at`) and never in the declared files, which stay immutable after `outline.review` approval (the effective declaration is `declared ∪ approved_widening[].path`, and every reconciliation result names which of the two admitted a path), writes a `[DEVIATION:ACCEPT]` audit entry, unblocks `TASK-NNN`, and deterministically renders the deviation description and operator `rationale` into the Pull Request body's `## Scope Deviations` section during `create-pr` (order `20`).
 
 |`split`
 |Lesson title/summary (`text[1..1000]`)
@@ -604,21 +625,21 @@ At Phase 5 entry (`execute.worktree-init`), the daemon creates the plan's featur
 ==== Task Envelope Execution & Independent Server Verification
 
 1. *Envelope Dispatch*: `execute.dispatch-ready` offers `dispatch:envelope-M` (`form: dispatch`) paired with `returned:<dispatch_id>` (`form: submit`). The dispatched sub-agent calls `pm_state(plan_id, entity="envelope-M", dispatch_id)` and receives only the current active task (`TASK-NNN`) and its resolved `skill://pm/...` URIs.
-2. *Independent Verification on `submit:TASK-NNN`*: The server never trusts a sub-agent's self-reported completion. When `submit:TASK-NNN` is invoked, the daemon independently verifies: (a) *Non-Empty Diff & Footprint Check* — for write-intent tasks, verifies that `git status --porcelain` in the worktree contains changes, that no files outside the worktree were touched, and that modified paths match the deliverable's declared `Affected files` (`verify_failure_scope` / scope-creep check), forbidding batched destructive `git checkout` commands; (b) *Obfuscation & Marker Check* — scans modified lines for prohibited suppression comments, `TODO`/`FIXME` markers, or rewrite markers; and (c) *Independent Command Re-Run* — executes the task's declared verification command via the daemon's build runner and verifies a passing verdict artifact.
-3. *Context Budget Yield & Infeasibility*: If a sub-agent approaches its context window limit before finishing all tasks in `envelope-M`, it invokes `yield:envelope-M` (`budget_yield`) and the server splits the remaining unstarted tasks of `envelope-M` into a new envelope `envelope-(M+1)` with a fresh `dispatch_id`. If a task is genuinely impossible as specified, the sub-agent submits `infeasible:TASK-NNN` with evidence; `infeasible` is terminal for that deliverable and transitions the plan to `execute.blocked` (operator escalation), and substituting a weaker deliverable under the same name is strictly prohibited.
+2. *Independent Verification on `submit:TASK-NNN`*: The server never trusts a sub-agent's self-reported completion. When `submit:TASK-NNN` is invoked, the daemon independently verifies: (a) *Non-Empty Diff & Footprint Check* — for write-intent tasks, verifies that `git status --porcelain` in the worktree contains changes, that no files outside the worktree were touched, and that every modified path is a write-intent entry (`write-new`, `write-replace`, `delete`) of the deliverable's `Affected files` or of `approved_widening[]` (`verify_failure_scope` / scope-creep check) — a modified `(read)` entry is its own outcome `read_only_modified` (blocking finding), never absorbed as in scope — forbidding batched destructive `git checkout` commands; (b) *Obfuscation & Marker Check* — scans modified lines for prohibited suppression comments, `TODO`/`FIXME` markers, or rewrite markers; and (c) *Independent Command Re-Run* — executes the task's declared verification command via the daemon's build runner and verifies a passing verdict artifact.
+3. *Context Budget Yield & Infeasibility*: If a sub-agent approaches its context window limit before finishing all tasks in `envelope-M`, it invokes `yield:envelope-M` (`budget_yield`, free parameter `yield_reason:enum[budget|blocked_dependency]`, persisted as data beside the dispatch classification in the metrics store) and the server splits the remaining unstarted tasks of `envelope-M` into a new envelope `envelope-(M+1)` with a fresh `dispatch_id`. If a task is genuinely impossible as specified, the sub-agent submits `infeasible:TASK-NNN` with evidence; `infeasible` is terminal for that deliverable and transitions the plan to `execute.blocked` (operator escalation), and substituting a weaker deliverable under the same name is strictly prohibited.
 
 === Per-Deliverable Chain-Tail Commit & Module Build (`git.commit_and_push`)
 
 Individual tasks never run `git commit`. When the last task belonging to deliverable $D_i$ (the *chain tail*) passes independent verification:
 
 1. *Chain-Tail Commit via `call git.commit_and_push`*: The server transitions to `execute.chain-tail-commit`, which invokes the reusable compound sub-workflow `call git.commit_and_push (message_mode=auto_deliverable, push_mode=never)` (`PM-WF-16`, see link:workflow-dsl.adoc[Workflow DSL Specification]). The sub-workflow cleans untracked build/temp artifacts against `artifact-patterns.json` (respecting `.gitignore` and excluding `.plan/**`), formats the conventional commit message (`feat(<module>): complete deliverable <N> - <title>`) with the configured `Co-Authored-By` trailer, streams the message over `stdin` to `git -C <worktree> commit -F -`, and appends a `kind = "change"` entry to `change-ledger.jsonl` stamped with the new `commit_sha` and git-sourced `changed_paths`.
-2. *Per-Deliverable Module Build*: Immediately after `git.commit_and_push` returns `committed_local` (or `clean` for read-only deliverables), the server spawns a module-scoped build job (`canonical = "module-tests"`, scoped to $D_i$'s module) and records a `kind = "build"` entry in `change-ledger.jsonl`. If the module build passes, the envelope advances to the next deliverable's tasks (or completes the envelope); if the module build fails, the envelope transitions immediately to `execute.verification-feedback` (`triage_required`).
+2. *Per-Deliverable Module Build*: Immediately after `git.commit_and_push` returns `committed_local` (or `clean` for read-only deliverables), the server spawns a module-scoped build job (`canonical = "module-tests"`, scoped to $D_i$'s module) and records a `kind = "build"` entry in `change-ledger.jsonl`. If the module build passes, the envelope advances to the next deliverable's tasks (or completes the envelope); if the module build fails, the envelope transitions immediately to `execute.verification-feedback` (`triage_required`). A module build ending `timed_out`, `killed`, `indeterminate`, `refused`, or `failed_unparsed` never advances the envelope either: it transitions to `execute.verification-feedback` with a no-verdict reason and offers `retry`, because an absent verdict is never admitted as a pass.
 
 === Whole-Tree Verification Gates & `triage_required` Routing
 
 Once all task envelopes reach completion, `execute.verify-sweep` runs the end-of-phase verification pipeline declared in `manifest.phase_5.verification_steps` (ordered by the `ext-point-build-verify-step` descriptors: `module-tests`, `quality-gate`, `coverage`, and domain `arch-gate`):
 
-* *Footprint-Driven Scope & Relocation Override*: The server compares the realized git footprint (`references.json:realized_footprint`) against project modules to scope build executions. However, if any deliverable in the plan performed a **file relocation or deletion** (any `Affected files` entry with `delete` intent or a git rename `R`), the server unconditionally forces a **whole-tree build and verification sweep** across all modules to catch broken cross-module imports or references.
+* *Footprint-Driven Scope & Relocation Override*: The server compares the realized git footprint (`references.json:realized_footprint`) against project modules to scope build executions. However, if any deliverable in the plan performed a **file relocation or deletion** (any `Affected files` entry with `delete` intent or a git rename `R`), the server unconditionally forces a **whole-tree build and verification sweep** across all modules to catch broken cross-module imports or references. A realized path claimed by no module but routed by the build map as build-neutral (for example `.github/**`) is classified `no_module`: it neither blocks nor widens a module-scoped gate to whole-tree, and the scope decision lists it.
 * *`triage_required` -> Verification-Feedback Transition*: Whenever any per-deliverable module build or end-of-phase verification step fails, the engine ingests the parsed build/test/arch-gate failures into `findings.jsonl`, sets the phase sub-state to `execute.verification-feedback` (`triage_required`), and offers a `dispatch:verify-feedback` link (or inline `fix` links) that diagnoses the root cause against `verify_failure_scope`, applies the fix, commits via `call git.commit_and_push (message_mode=interactive, push_mode=never)`, and re-enters `execute.verify-sweep`.
 
 === Phase 5 Exit Barrier: Dual Freshness & Pending-Tasks Gates
@@ -626,7 +647,9 @@ Once all task envelopes reach completion, `execute.verify-sweep` runs the end-of
 Transitioning from `phase-5-execute` to `phase-6-finalize` is governed by an atomic dual-gate barrier in `execute.exit-barrier`. **Both gates are always evaluated together before acting on either** so a single diagnostics payload surfaces all reasons if both fail:
 
 1. *Pending-Tasks & Clean-Tree Gate*: Every `tasks/TASK-*.json` record in the plan must have `status == "completed"` (`pending_count == 0`, `in_progress_count == 0`, `blocked_count == 0`), and the worktree must have zero uncommitted modifications (`git status --porcelain` is empty).
-2. *Worktree Freshness Gate (`worktree_sha`)*: Freshness is keyed strictly on `worktree_sha` — the composite SHA-256 digest of `HEAD` commit SHA plus staged index, unstaged working-tree diff, and untracked file paths/contents — never on `HEAD` commit SHA alone (which would misclassify an unbuilt dirty tree as fresh). The gate queries the change ledger (`change-ledger.jsonl`) and reads the explicit closed-enum `status` member (`fresh`, `exempt`, `stale`, `undecidable`), never inferring freshness from a process exit code or from `"not stale"`: `fresh` requires that every required build notation for the realized footprint has a passing `kind = "build"` ledger entry whose recorded `worktree_sha` equals the current live `worktree_sha` and every ledger row matches a registered build notation of the project; `exempt` applies when the realized footprint touches exclusively non-buildable documentation/markdown paths (`documentation_only` across the entire plan), verified against the build extension path classifiers; `stale` / `undecidable` fails the barrier with an explicit `stale_reason` (`tree_modified_since_build`, `missing_module_build`, `unrecognized_build_notation`, or `ledger_unreadable`), routing back to `execute.verify-sweep`.
+2. *Worktree Freshness Gate (`worktree_sha`)*: Freshness is keyed strictly on `worktree_sha` — the composite SHA-256 digest of `HEAD` commit SHA plus staged index, unstaged working-tree diff, and untracked file paths/contents — never on `HEAD` commit SHA alone (which would misclassify an unbuilt dirty tree as fresh). The gate queries the change ledger (`change-ledger.jsonl`) and reads the explicit closed-enum `status` member (`fresh`, `exempt`, `stale`, `undecidable`), never inferring freshness from a process exit code or from `"not stale"`: `fresh` requires that every required build notation for the realized footprint has a passing `kind = "build"` ledger entry whose recorded `worktree_sha` equals the current live `worktree_sha` and every ledger row matches a registered build notation of the project; `exempt` applies when the realized footprint touches exclusively non-buildable documentation/markdown paths (`documentation_only` across the entire plan), verified against the build extension path classifiers; `stale` / `undecidable` fails the barrier with an explicit `stale_reason` (`tree_modified_since_build`, `last_build_failed`, `no_successful_build`, `missing_module_build`, `unrecognized_build_notation`, `reconciliation_record_absent`, or `ledger_unreadable`), routing back to `execute.verify-sweep`.
++
+`last_build_failed` (the latest build row for a required notation is not `succeeded`) is a different operator action than `tree_modified_since_build` (source edited after a passing build) and is never reported as it; when no successful build exists at all the reason is `no_successful_build` and no `freshness_reconcile` is recorded (it requires a `prior_build_worktree_sha`). `reconciliation_record_absent` lists in `facts.admitted_causes` the causes that absence admits (`source_drift_unbuilt`, `no_successful_build`, `record_owed_not_emitted`, `commit_outside_reconcile_membership`), so the refusal reports what it observed rather than guessing one cause. Where the step records show that `HEAD` is a finalize-internal commit, the refusal names the committing step.
 
 ---
 
@@ -636,6 +659,8 @@ _See Requirement link:../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained
 _See Requirement link:../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
 
 _See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
 
 _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
 
@@ -707,7 +732,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |`reads: [worktree]`
 |`core`, on
-|Git fetch + rebase job onto target base branch (`advances_main_via_rebase: true`). Records `action`, `upstream_commit_count`, `work_performed`. Escalates to operator if overlap exceeds rebase conflict threshold.
+|Git fetch; if `origin/<base_branch>` is already an ancestor of `HEAD` (`git merge-base --is-ancestor`, including when the base was absorbed through merge commits), the rebase is skipped and the step records `action = "noop"`, `upstream_commit_count = 0`, `work_performed = false`; otherwise a rebase job onto `origin/<base_branch>` (`advances_main_via_rebase: true`). Records `action`, `upstream_commit_count`, `work_performed`. Escalates to operator if overlap exceeds rebase conflict threshold.
 
 |`4`
 |`project:finalize-step-lessons-housekeeping`
@@ -754,6 +779,10 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`adversarial`, on
 |Server deterministically surfaces structural self-review candidates (required prompt field `candidates`, delta-anchored to the previous `head_at_completion`); the model submits the verdict. Problems are filed as findings and handled by loop-back; the step itself never commits. Records `acceptance`, `may_close`, `work_performed`.
 
+A delta round never closes the step: a clean delta round is followed by exactly one full-surface round over the whole plan diff, and only a full-surface clean round records `may_close = true`; a delta round that surfaces findings loops back without a confirmation round. An owed further round (`may_close = false`) is step state only; the step never files a finding for it. An inapplicable surfacer is never run: the step records `not_covered` with the uncovered content classes and completes non-blocking (never `clean`). A refusal whose reason is round-invariant at unchanged `HEAD` is recorded once and closes the step as `not_covered` or escalates once; it never offers `loop_back` and never increments `loop_back_iteration`.
+
+*Review chain terminus*: after the last remediation commit that follows the final review-bot round, the engine runs exactly one self-review pass over the residual delta since the last bot-reviewed head; its findings are filed and shown to the operator at the pre-merge gate, never auto-fixed, and no further chaining occurs.
+
 |`9`
 |`default:architecture-refresh`
 |Settle (`<11`)
@@ -770,7 +799,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`true`
 |`reads: [worktree]`
 |`core`, on
-|Runs build jobs per affected bundle, whole-tree compile, test-compile, and module-test divergence checks. The quality gate may auto-fix tracked files; such changes are committed through `finalize.settle-commit`. Strictly last in the `<11` Settle band.
+|Runs build jobs per affected bundle, whole-tree compile, test-compile, and module-test divergence checks. The quality gate may auto-fix tracked files; such changes are committed through `finalize.settle-commit` and tagged `change_origin: quality_gate_autofix` in the change ledger, so footprint reconciliation reports these paths separately from deliverable changes. Strictly last in the `<11` Settle band.
 
 |`11`
 |`default:push`
@@ -788,7 +817,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |—
 |`core`, on
-|Model submits PR `body: text[1..32768]` directly in `pm_do` `args` (with deterministic `pr_title` from Phase 2 and any `accepted_deviations` from Phase 5 injected by the server in memory), streamed via `stdin` to `gh pr create --body-file -` / `glab`. Records `pr_number`.
+|Model submits PR `body: text[1..32768]` directly in `pm_do` `args` (with deterministic `pr_title` from Phase 2 and any `accepted_deviations` from Phase 5 injected by the server in memory), streamed via `stdin` to `gh pr create --body-file -` / `glab`. Records `pr_number`. The PR body records the `head_sha` it describes. After the PR exists, every finalize state up to `branch-cleanup` offers `edit_pr_body` (`submit`, `body:text[1..32768]`), which re-renders the server-owned sections and streams the result to `gh pr edit --body-file -` / `glab mr update`; a `HEAD` advance flags the body for re-render. No host-side provider CLI call is ever required to change the PR.
 
 |`21`
 |`project:finalize-step-era-stamp-fill`
@@ -815,7 +844,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`true`
 |—
 |`adversarial`, on; `requires: [ci-complete]`
-|Tracks configured review bots (CodeRabbit, Copilot, Gemini, Codex) against pushed `HEAD` (`verdict_inputs: []`). Coordinates cross-plan review-bot rate windows, awaits bot completion buffer, and ingests comments into the findings store. Fix commits for accepted findings go through `finalize.settle-commit` and the post-PR re-push. A red review arm still executes its finding ingestion pass.
+|Tracks the review bots of `required_bots ∪ optional_bots`, resolved against the review-bot registry (compiled-in kinds `coderabbit`, `cuioss-review-bot`, `sourcery`, mirroring `plan-marshall` `automatic-review/standards/`; re-verify before implementing), against pushed `HEAD` (`verdict_inputs: []`). Coordinates cross-plan review-bot rate windows and ingests comments into the findings store on every firing and on every re-entry of `finalize.concurrent-wait`, recording `reviewed_commit_sha` per finding (see <<automatic-review>>). Records `done` only when no finding it filed is untriaged; its facts publish the per-bot yield. Fix commits for accepted findings go through `finalize.settle-commit` and the post-PR re-push. A red review arm still executes its finding ingestion pass.
 
 |`40`
 |`default:sonar-roundtrip`
@@ -835,6 +864,8 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |—
 |Triggered whenever `ci-verify`, `automatic-review`, or `sonar-roundtrip` files open findings. For producers declaring a `verification_profile`, runs an adversarial refutation sub-state (`ext-point-verify`) first. Model submits `triage:F-n` (`disposition: enum[FIX\|SUPPRESS\|ACCEPT]`, `reply_text: text[1..4000]`). `FIX` transitions via `loop_back` to Phase 5 (if cross-task) or settles in-branch via `finalize.settle-commit` and re-runs from the Settle band; server transmits replies/dismissals via `stdin` or REST to GitHub/GitLab/Sonar.
 
+The triage `submit` is refused when the chosen disposition contradicts the finding's own detail classification (checked at the write seam, never coerced from prose). `FIX` carries `population: text[1..2000]` naming the sites the fix covers (the whole co-reference population of the defect, never only the named site), recorded on the finding. A disposition that lowers a finding's severity must cite an executed check (build or test job id); raising it needs only a rationale. A disposition whose remedy is documentary (`reply_text` promising a change) is recorded as a commitment `{finding_id, promised_change, anchor_paths}` and re-checked against the merge-candidate diff before the barrier; an unmet commitment fails Predicate 1, and reconciliation over zero commitments records `not_reached` with `population: 0`. When the `ext-point-verify` refutation sub-state is unavailable, the triage records the substitute evidence the resolution rested on (`evidence.class: substitute`). The triage facts carry round-scoped counters (replies sent, threads resolved, unanswered findings).
+
 |`62`
 |`default:adr-propose`
 |Post-Push (`12..69`)
@@ -851,7 +882,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |`destroys: [worktree]`
 |`core`, on
-|Evaluates the Pre-Merge Review Barrier, acquires the Cross-Plan Merge Mutex, rebases onto base (`advances_main_via_rebase: true`), awaits post-rebase CI/review, executes closed merge (`safe-merge` or `merge-queue`), removes worktree, and runs `move-journal.json` to relocate the plan directory back to `.plan/local/plans/<plan_id>/`. Records `action`, `upstream_commit_count`, `merge_mechanism`, `merge_state`, `work_performed`, `cleanup_owed`.
+|Evaluates the Pre-Merge Review Barrier, acquires the Cross-Plan Merge Mutex, rebases onto base (`advances_main_via_rebase: true`), awaits post-rebase CI/review, executes closed merge (`safe-merge` or `merge-queue`), captures the realized footprint into `references.json` (<<realized-footprint-capture>>), removes worktree, and runs `move-journal.json` to relocate the plan directory back to `.plan/local/plans/<plan_id>/`. After the merge the server reads the merged PR for the branch head from the CI provider and records `merged_pr_numbers`; a difference from the stamped `pr_number` is recorded as `pr_reconciled: false`. Branch removal reports each ref separately (`local`, `remote`, `remote_tracking`) as `deleted \| already_absent \| failed`: an absent ref is `already_absent`, the remote-tracking ref is still pruned, one ref's failure never stops an independent one, and `cleanup_owed` lists the failed refs. Records `action`, `upstream_commit_count`, `merge_mechanism`, `merge_state`, `work_performed`, `cleanup_owed`.
 
 |`81`
 |`project:finalize-step-deploy-target`
@@ -914,7 +945,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |_Produces `metrics`_
 |`core`, on
-|`post_run_review: true`. Aggregates phase durations from `audit.jsonl` and sub-agent token usage from `returned:<dispatch_id>` reports (`unmeasured` when omitted by host, never `0`), and records `total_tokens`, `total_wall_seconds`, `any_phase_missing_end_time`.
+|`post_run_review: true`. Aggregates phase durations from `audit.jsonl` and sub-agent token usage from `returned:<dispatch_id>` reports (`unmeasured` when omitted by host, never `0`) into the population-stamped aggregates defined in <<post-run-metrics-and-landing>>.
 
 |`999`
 |`default:finalize-step-print-phase-breakdown`
@@ -923,7 +954,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |`reads: [metrics]`
 |`core`, on
-|`post_run_review: true`. Renders the per-phase duration and token breakdown table from the recorded metrics in `facts`.
+|`post_run_review: true`. Renders the per-phase duration and token breakdown table from the recorded metrics in `facts`, as a view of the composed figures (<<post-run-metrics-and-landing>>); it never re-derives them.
 
 |`1000`
 |`default:emit-landing`
@@ -932,7 +963,7 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |`reads: [metrics]`
 |`core`, on
-|`post_run_review: true`. Writes the structured landing envelope (`merge_state`, `cleanup_owed`, `pr_number`, `total_tokens`, `total_wall_seconds`, realized footprint) to the parent epic's append-only inbox (`.plan/orchestrator/<epic_id>/inbox.jsonl`). Records `work_performed`.
+|`post_run_review: true`. Writes the structured landing envelope (<<post-run-metrics-and-landing>>) to the parent epic's append-only inbox (`.plan/orchestrator/<epic_id>/inbox.jsonl`), reads it back, and records `landing_delivery`. Mandatory whenever `from_epic` is set: the step is never pruned or dropped for an epic-emitted plan. Records `work_performed`.
 
 |`1100`
 |`default:archive-plan`
@@ -941,8 +972,121 @@ The catalogue mirrors the finalize step roster of `plan-marshall` (step identifi
 |`false`
 |`destroys: [plan-directory]`
 |`core`, on
-|Moves the completed plan directory to `.plan/local/archive/<plan_id>/` and transitions the workflow to the immutable `completed` terminal state.
+|Moves the completed plan directory to `.plan/local/archive/<plan_id>/` and transitions the workflow to the immutable `completed` terminal state. The `completed` representation carries `facts.landing_delivery` from `emit-landing`.
 |===
+
+[[automatic-review]]
+=== Automatic Review: Registry, Participation, Refusals & Ingestion
+
+`plan-marshall:automatic-review` (order `30`) and the composite wait `finalize.concurrent-wait` work from one server-owned review-bot registry and write one participation record per `(pr_number, round, bot_kind)` into the plan's `review-participation.jsonl` at review time, each stamped with the `HEAD` it observed (link:store-schemas.adoc#review-participation[Store Schemas Specification, Review Participation Record]). The rules mirror `plan-marshall` `automatic-review` (`SKILL.md`, `standards/*.md`), verified at `plan-marshall` commit `f3de0e14f`; re-verify against the latest `plan-marshall` version before implementing.
+
+==== Review-Bot Registry
+
+The registry holds one compiled-in record per `bot_kind`; a project may add records.
+
+[cols="1,4"]
+|===
+|Field group |Content
+
+|Identity & trigger
+|`bot_kind` and `author_login` (the identity used for author binding). One `trigger_token`: the server posts only this token, never one chosen per call; `trigger_verbs{incremental, full}` (CodeRabbit `@coderabbitai review` / `@coderabbitai full review`). `trigger_events`: the PR events the bot subscribes to (pr-agent does not subscribe to `synchronize`).
+
+|Publish shapes
+|`publish_shapes` ⊆ `{conversation, inline_thread, pr_review}` and `participation_evidence` (which shapes prove a review). Participation markers are anchored patterns (start of block or structural element, never a bare substring), and each marker records the sample (PR count) it was validated on. Observed shapes the registry does not declare raise a `registry_drift` finding; a missing optional shape is not non-participation.
+
+|Currency
+|`participation_requires_update` (the currency-exempt set derives from this field only; `coderabbit` and `sourcery` declare `false`); `reviewed_sha_carrier` (`structured`, `body_pattern`, or `none`) with `reviewed_sha_pattern` (cuioss-review-bot: body "Review updated until commit `<sha>`"); `completion_check_name` (nullable).
+
+|Refusal recognition
+|`refusal_patterns`, `refusal_size_patterns`, `refusal_wrapper_markers` (CodeRabbit `<details><summary>⚠️ Action not completed</summary>`), and `rate_limit_eta_patterns` (including "reset in 57 minutes"; the CodeRabbit reset notice may omit its trailing phrases). Sourcery phrasings: "your pull request is larger than the review limit of", "reached your weekly rate limit of", "you've used your own review budget of N diff characters".
+
+|Rate class & caps
+|`rate_limit_class` (`awaitable_window`, `hard_quota`, or `unknown`), `rate_interval_seconds`, `attempt_ceiling` (default `10`), and `structural_caps{max_files, max_diff_chars}`.
+
+|Content classification
+|`actionable_content_markers`, `contentless_review_markers`, `ignore_patterns`, `severity_map`, and dated per-bot `config_verdicts[]` (for example CodeRabbit `enable_prompt_for_ai_agents`).
+|===
+
+Compiled-in data (re-verify before implementing): `coderabbit` (one review per hour, `awaitable_window`, `max_files: 100`); `sourcery` (`hard_quota`, 250,000 diff characters per 7 days, per PR 150,000 characters or 300 files); `cuioss-review-bot` (`unknown`, reviewed SHA in the body only). The provider cap for a GitHub comment body is 65,536 characters.
+
+* *One Shared Reader*: Required, optional, and enabled populations are resolved only from `required_bots` / `optional_bots` against the registry through one shared reader. An unregistered token fails loud (`unregistered_kind`) with the same disposition everywhere and is never counted in a ratio denominator.
+* *Review Bots Are Not CI*: `ci_status` evaluation excludes check-runs owned by registered review bots. On a bot timeout the engine first checks that the bot's trigger workflow or app is installed for the repository (`not_wired`) before reporting `unproven`.
+* *Size Cap at Fetch Time*: A bot whose structural cap is below the PR's measured diff is classified `refusal_candidate` when comments are fetched; an unmatched comment from it is checked against its refusal phrasings before any participation verdict.
+
+==== Per-Bot Participation States
+
+Per round, every bot of the roster resolves to exactly one per-bot `state` of the closed enumeration defined in link:hypermedia-format.adoc#_closed_status_enumerations_in_finalize_concurrent_wait[Hypermedia Format Specification, Closed Status Enumerations] (with a `refusal_mode` for `refused`); the composite `bot_status` of `finalize.concurrent-wait` is the aggregate of these states over the required bots, and its outcomes route the finalize excerpt (link:workflow-dsl.adoc[Workflow DSL Specification]). The rules below decide which state applies.
+
+* *Review Evidence*: Completion requires a review verdict object (a review, an inline comment of that review, or a completed check-run) authored by the bot's registered `author_login`; per-bot completion waits match `author_login`, because a SHA match proves which commit was reviewed, not who reviewed it. Rate-limit meta-comments, re-served prior-round comments, "Review completed" placeholders without a review, inline comment or check-run, and thread acknowledgements never count. A declared clean verdict ("No major issues detected", "No code suggestions found") counts as `participated_but_empty`.
+* *Refusal Precedence*: A refusal outranks a later edit timestamp, and a refusal observed in the same pass as a clean review of the same bot resolves `refused`. A refusal never sets the covered commit and never advances the `head_at_completion` of `automatic-review`.
+* *Declined vs Unproven*: `declined` requires a named commit that is not the merge candidate; evidence that names no commit resolves `unproven` for a bot with `reviewed_sha_carrier: none`.
+* *Nobody-Reviewed Shapes*: `not_triggered`, `rereview_silent_failure`, and `run_stuck` stay distinct; workflow runs are queried unfiltered by branch. An exhausted poll yields `unproven`, never `absent`.
+* *Opposite Claims*: `unreadable` (the read failed) and `silent` (the read succeeded and nothing was published) are opposite claims; a prediction is recorded as `unrecorded`, never as an observation. A fetch returning zero comments resolves to exactly one of: no review covering `HEAD` (`absent` or `unproven`), reviewed clean (`participated_but_empty`), or fetch unreachable (`unreadable`).
+* *Per-State Remedies*: Each non-participating state carries its own remedy link, never a shared generic `retry`, and a `reopens` axis (`awaitable` or `hard`) derived from the refusal mode. A roster question that was never put renders "question never put"; an awaitable refusal's representation names the governing config key and value.
+* *Partitioned Reporting*: Unproven and blocking sets are reported partitioned by `roster_class` (`required`, `optional`, `unclassified`); only the required partition gates. The roster aggregate is `reviewed`, `incomplete`, `vacuous` (empty required set, answered), or `unestablished` (never asked or migrated); an empty roster never renders `reviewed` or `clean`.
+* *Per-Bot Facts*: `facts.bots` renders per bot `state`, `completion_check`, and `at_head` as separate columns (hypermedia-format.adoc), because "participated", "completion check finished", and "CI check green" prove different things. The participation summary renders per class `required k/|required|`, `optional j/|optional|` (with each silence's state), and `roster r/|roster|`; a bare N-of-M is never emitted.
+
+==== Refusals & Rate Windows
+
+1. *Derived Recognition*: Refusals are recognised by a derived rule (wrapper marker plus registry patterns), tested with controls in both directions. An unrecognised refusal-shaped notice resolves `refused` with mode `unknown`; an unmatched bot comment is never counted as participation.
+2. *Capture on Sight*: The body and `observed_at` of a refusal are captured when first seen; a later absence of the notice is not a refutation, and a body divergence on re-read is reported. Every refusing bot is reported, never only the first.
+3. *Wake on Edits*: Waiters order comments by `max(created_at, updated_at)`.
+4. *Currency of a Notice*: A notice is current only if it answers a trigger this run posted (by trigger id) or its stated window is still open; otherwise it is `stale`. A rate-limit refusal is bound to the request it answered and to its reset time; a window already waited out is never restarted by re-reading the same refusal.
+5. *Window Derivation*: The window is `rate_interval_seconds × attempt_ceiling`. The window's `reset_at` is taken from the bot-stated reset ETA, which is a floor to re-check and beats a configured floor (`review_rate_window_floor_seconds`, applied only when no ETA is published); `3600 s` applies only when no ETA is parseable. Waiting past the ETA records a reason. A detected but unparsed ETA records `eta_unparsed` (a drift signal), never "no ETA". Wait budgets derive from the registered interval, never from a flat timeout, and the waits per plan are bounded (`plan-marshall` policy: at most 10 waits of 90 minutes; re-verify).
+6. *Closed Windows*: A trigger is never posted inside a closed window (a trigger extends the window, close and reopen do not reset it, and windows are organisation-scoped); `retry` is offered only while the window is open.
+7. *Mode Routing*: `size` routes to split, accept, or disable the bot for this PR, never to a wait; `weekly_quota` and `hard_quota` route to `escalate`, never to a wait; `rate` waits for the window and then triggers. A stale bot with a declared comment trigger gets the trigger posted once and a bounded wait, then escalation (never for a quota refusal).
+8. *Satisfying Event*: Every wait names its satisfying event and its producer; if the bot's `trigger_events` cannot fire on this retry path, the wait fails fast with `no_satisfying_event`.
+9. *Re-Trigger Target*: The re-trigger target is the unproven set (including bots that never published), selected after the round's own fetch, never by comment recency. The wait and trigger target set is the unproven part of `required ∪ optional`; the gating set is the required bots only.
+10. *Per-PR Counters*: Rate-window claims (the cross-plan leases in `review-bot-windows.json`) and attempt counters are kept per PR and per bot.
+11. *Pre-Wait Cap Gate*: Before entering `finalize.concurrent-wait`, the engine measures the diff (files and diff characters) against each required bot's `structural_caps`. An exceeded cap records `refused` with mode `size` pre-emptively, names the cap and the measurement, and routes to `finalize.review-structural` (split, accept, or disable for this PR) instead of waiting; when a path partition (for example test sources vs the rest) brings each part under the cap, the state proposes that concrete split. Under every cap the flow is unchanged.
+
+==== Comment Ingestion
+
+1. *Every Firing*: Comments are re-ingested on every firing of `automatic-review` and on every re-entry of `finalize.concurrent-wait`. All three surfaces (conversation, inline threads, PR review bodies) are fetched and classified.
+2. *Own Comments by Provenance*: Own comments are recognised by provenance (server-recorded posted comment ids and trigger ids); headings are secondary. Repository-owner comments are genuine reviews unless provenance matches. Posted triggers are excluded and counted with a reason; a bot comment quoting a trigger is still ingested.
+3. *Noise Filter*: Fenced code, blockquotes, and `<details>` blocks are stripped first; a comment is noise only if an acknowledgement pattern covers the whole remainder; length is an outer bound only. Drops are recorded distinguishably from genuine acknowledgements.
+4. *Actionable Content*: A bot comment becomes a finding only if it matches the registry's `actionable_content_markers` (when declared) after noise stripping; enumerated refusal patterns are the secondary guard.
+5. *Status Line then Remainder*: A `review_body` yields finding candidates only from the text after the bot's status line ("Actionable comments posted: N"). A body consisting only of a status line, an approval notice, or a "Review finished" header is a status record, never a finding, and never enters Predicate 1.
+6. *Complete Fetches*: Every connection is paginated (`pageInfo`) or reports `observed` vs `cap`; a clipped fetch is never success.
+7. *Comment Identity*: A comment's identity is `(bot_kind, comment_id)` plus its edit marker (`updated_at != created_at`); an edited comment is new information.
+8. *Fetch Freshness*: The merge barrier re-fetches immediately before merge; a review newer than the last fetch blocks.
+9. *Summary-Card Overflow*: Overflow folded into a summary card ("Outside diff range comments (N)") is ingested as findings.
+10. *Participation-Only Artifacts*: A persistent summary card or a trigger acknowledgement is participation-only: no finding, no reply. Refusals, rate-limit notices, own comments, and other participation-only artifacts are never filed as findings; they update the participation record only.
+11. *Agent Prompt Blocks*: The bot's "Prompt for AI Agents" block is stripped once, at the triage-representation boundary, and never by length clamping; the stored body keeps it, quarantined as untrusted content.
+
+[[post-run-metrics-and-landing]]
+=== Post-Run Metrics & Landing Envelope
+
+`record-metrics` (`998`) composes the plan's figures once. `print-phase-breakdown` (`999`), the landing envelope of `emit-landing` (`1000`), and the terminal `completed` representation render that composition and never re-derive a figure. The per-dispatch and per-phase rows are persisted in the plan's metrics store (link:store-schemas.adoc[Store Schemas Specification]).
+
+==== Metric Aggregates (`record-metrics`)
+
+* *Population-Stamped Aggregates*: Every published sum is `{value?, rows, rows_unmeasured, population_count}`. A total over an empty population omits `value`, and a structurally unmeasured plan is excluded from composition roll-ups. When `rows_unmeasured > 0` the total is labelled a floor (`total_is_floor: true`, listing the channels lacking evidence) and never wins a max-reconciliation against another source; a channel with no records renders `no_evidence`. This applies to `total_tokens` and `total_wall_seconds` alike.
+* *One Population per Figure*: Every token figure carries its population stamp (`dispatched` or `main_context`); totals are formed only within one population, and figures of different populations are never summed or compared in reports.
+* *Dispatch Accounting*: Per phase, `dispatches_rendered`, `dispatches_returned`, and `dispatches_unreturned` are recorded; a non-zero difference is a recorded gate signal in `facts`.
+* *Phase Time Monotonicity*: Every phase block with both timestamps is validated (`end >= start`; start, end, and duration agree when all three exist), and `phase_blocks_checked` and `phase_time_violations[]` are recorded beside `any_phase_missing_end_time`.
+* *Stall Rate & Ledger Divergence*: A dispatch that terminates with `tasks_remaining > 0` and no blocked cause counts as `stall`; the stall rate and the `yield_reason` counts are published per plan. When two ledgers can diverge (dispatch rows vs audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning instead of picking one ledger.
+* *Build Figures*: `build_count` and build time come from the plan's change ledger (`kind = "build"` rows). An unreadable ledger renders `unavailable`; when the runtime job journal shows build jobs for the plan while the ledger is unavailable or empty, a finding is filed.
+* *No-Verdict Jobs*: In every roll-up (metrics, landing facts, gate facts, CI taxonomy) a `timed_out` job counts as `no_verdict`, never as `failed`.
+* *Wait Lapses*: `wait_lapses` are recorded per kind (`ci_wait_lapsed`, and per lapsed bot wait the `finalize.concurrent-wait` outcome that ended it: `bot_unproven`, `bot_refused_awaitable`, `bot_refused_hard`; link:hypermedia-format.adoc#_closed_status_enumerations_in_finalize_concurrent_wait[Hypermedia Format Specification, Closed Status Enumerations]) together with whether the awaited operation later settled green; the counts enter the landing envelope as policy evidence.
+* *Rendering*: `print-phase-breakdown` renders absent or unmeasured figures as `unmeasured`, never `0`, and renders the coverage verdict whenever coverage is decidable (rows and total persisted together), including when rows exist but the sum is zero.
+
+==== Landing Envelope (`emit-landing`)
+
+The landing envelope carries:
+
+* *Identity & Merge Facts*: `plan_id`, `landing_kind` (`plan` or `ad_hoc`), `prs[]` (all PRs of the plan, re-recorded when a PR is replaced or split), `merged_pr_numbers`, `merge_commit_sha` (required when merged), `merge_state` (`landed`, `open`, `closed`, `enqueued_not_landed`, `unknown`, or `not_applicable_after_merge`, with fallback `unclassified`, which asserts no landing), and `cleanup_owed`.
+* *Figures*: `total_tokens` with its population count (omitted when that count is `0`), `total_wall_seconds`, the `wait_lapses`, and the realized footprint.
+* *Step Record*: `steps[]` with, per finalize step, `step_id`, its firings, the final outcome, `head_at_completion`, `work_performed`, and the dropping or pruning gate, taken from the step records.
+* *Review Facts*: `self_review` (`reviewed`, `not_covered`, or `not_run`, never collapsed into a clean result) and `review_yield` per review bot and for self-review (`findings`, `fixed`, and the counts per triage disposition).
+* *Findings*: `findings[]`, every `FindingRecord` of the plan (all statuses and dispositions), not a curated subset, so the epic never depends on the archived plan directory to read them.
+* *Narrative & Amendments*: `narrative` with its producer named (the PR body submitted in `create-pr` plus the rendering of `accepted_deviations[]`; without a PR it is `n/a` with a reason) and the plan's `amendments[]`.
+* *Completeness*: `complete` and `missing_facts[]`, computed at emission. Each fact is a typed value, `"n/a"`, or `"unknown"`; `complete: false` is emitted only with a non-empty `missing_facts` (the facts that are `unknown`) and is surfaced as a fact on the epic representation; `unknown` and `n/a` are counted separately.
+
+Rules:
+
+* *One Landing per Plan*: Exactly one landing exists per `(plan_id, landing_kind)`; `n/a` is legal at the pull-request and merge keys only for `ad_hoc` landings (fact states: link:dispatch-and-effort.adoc#_server_derived_landing_facts_spec_re_grounding_cross_plan_locks[Dispatch & Effort Specification, Fact States]). When nothing merged, the step emits a non-landing record naming the outcome (`enqueued_not_landed`, `declined`, `no_pr`, `dequeued`, or `local_only`), never a landing with `n/a` values.
+* *Delivery Verification*: After appending, `emit-landing` reads the record back from the epic inbox, validates it against the landing schema, and records `landing_delivery` (`verified`, `incomplete`, or `failed`) in its step record and in `facts`.
 
 === Finalize Commit Instrumentation, Freshness Reconcile & Post-PR Re-Push (`PM-WF-16`)
 
@@ -950,8 +1094,17 @@ Whenever any Phase 6 step declaring `mutatesSource == true` (`order < 70`) compl
 
 1. *Conditional Auto-Commit & Ledger Recording*: If `git status --porcelain` in the worktree is clean, `git.commit_and_push` returns `clean` immediately and the finalize pipeline advances to the next step. If uncommitted modifications exist, `git.commit_and_push` runs `.gitignore`-aware artifact cleanup, resolves the step's commit message (or deterministic fallback `chore(finalize): apply <step_id> changes`) with the `Co-Authored-By` trailer, pipes the message via `stdin` to `git -C <worktree> commit -F -`, and appends a `kind = "change"` entry (`commit_sha`, `changed_paths`, `worktree_sha`) to `change-ledger.jsonl`.
 2. *`head_at_completion` Re-Stamping*: If the completed `mutatesSource == true` step also declares `headDependent == true` (such as `simplify`, `security-audit`, `pre-push-quality-gate`, `automatic-review`, `sonar-roundtrip`), `git.commit_and_push` atomically updates that step's persisted `head_at_completion` in `mcp/status.json` to the newly created `commit_sha` without emitting a duplicate step completion event. This prevents the step's own commit from self-invalidating its verdict on a subsequent re-entry check.
-3. *`freshness_reconcile` for Steps at `order >= 10`*: If a `mutatesSource == true` step at `order >= 10` (`PRE_PUSH_QUALITY_GATE_ORDER`) produces a commit, `git.commit_and_push` records a `freshness_reconcile` entry in `mcp/status.json` containing `(commit_sha, step_id, prior_build_worktree_sha)` where `prior_build_worktree_sha` is read from the latest `status == "succeeded"` build entry in `change-ledger.jsonl`. When the `git.pre-commit-verify-freshness` gate runs before pushing, it consults `freshness_reconcile` so a known non-build-affecting finalize commit (such as an ADR addition in `adr-propose`) is recognized as reconciled, whereas any modification to buildable source paths invalidates `pre-push-quality-gate` and re-runs the Settle quality gate first.
+3. *`freshness_reconcile` for Commits after the Latest Successful Build*: If any `mutatesSource == true` step produces a commit after the latest successful build (not only steps at `order >= 10`, `PRE_PUSH_QUALITY_GATE_ORDER`; for example `architecture-refresh` at `9` committing on re-entry), `git.commit_and_push` records a `freshness_reconcile` entry in `mcp/status.json` containing `(commit_sha, step_id, prior_build_worktree_sha)` where `prior_build_worktree_sha` is read from the latest `status == "succeeded"` build entry in `change-ledger.jsonl`. When the `git.pre-commit-verify-freshness` gate runs before pushing, it consults `freshness_reconcile` so a known non-build-affecting finalize commit (such as an ADR addition in `adr-propose`) is recognized as reconciled, whereas any modification to buildable source paths invalidates `pre-push-quality-gate` and re-runs the Settle quality gate first. A commit whose changed paths are all build-neutral per the build map (for example generated architecture metadata) is reconciled without a rebuild.
 4. *Post-PR Conditional Re-Push (`order > 20`)*: When `finalize.settle-commit` is triggered by a step with `order > 20` (after `default:create-pr`, such as `default:adr-propose` at `62` or an in-branch `finalize.triage` fix) and `.plan/marshal.json -> /plan/phase-5-execute/commit_and_push == true`, `push_mode=post_pr_conditional` evaluates `push_required`, verifies freshness and `branch-sync-state` parity, pushes the new commit to `origin/<branch>`, and returns `committed_and_pushed -> finalize.concurrent-wait` so CI and review bots re-evaluate the updated PR `HEAD`.
+
+[[realized-footprint-capture]]
+=== Realized Footprint Capture & Footprint-Scoped Steps
+
+Finalize steps obtain the realized footprint (link:store-schemas.adoc[Store Schemas Specification], Three-Way File Footprint Reconciliation) through one resolver:
+
+* *Reconcile Before Footprint-Scoped Steps*: At Phase 6 entry and after every `finalize.settle-commit`, the engine re-captures `realized_files` and runs the three-way reconciliation before any step whose scope is the footprint (`simplify`, `security-audit`, `pre-submission-self-review`, `pre-push-quality-gate`) runs.
+* *One Resolver for Diff-Fed Steps*: Every diff-fed step reads the footprint through this resolver, which resolves only from the plan's own worktree. Without a resolvable footprint the step records `indeterminate` with the cause named (`pending` when the worktree is not yet materialised, `disabled` when the plan runs without a worktree), never a clean `done` and never another tree's footprint.
+* *Capture Before Destruction*: `branch-cleanup` persists the realized footprint in `references.json` before it removes the worktree; every post-merge consumer reads the persisted capture.
 
 === Java `FinalizeStepDescriptor` Record Schema & Static Checks
 
@@ -983,7 +1136,8 @@ public record FinalizeStepDescriptor(
     List<String> requires,
     List<ConfigurableKey> configurable,
     Optional<String> persona,
-    List<String> requiresPromptFields
+    List<String> requiresPromptFields,
+    Optional<String> cannotReach
 ) {
     /** Lane data as declared by plan-marshall ({@code lane:} frontmatter block). Absent lane = not lane-participating, always kept. */
     public record Lane(LaneClass laneClass, Optional<String> tier, Optional<String> prunableWhen, String costSize) {}
@@ -998,6 +1152,8 @@ public record FinalizeStepDescriptor(
     public static final int TERMINUS_ARCHIVE_ORDER = 1100;
 }
 ----
+
+*Assurance Verdict*: Every finalize step record carries `assurance_verdict` (`checked`, `degraded`, `not_reached`, `never_performed`, or `attempted_over_empty_scope`); a record without it reads `unadjudicated`, never a pass. A gate step declares in `cannotReach` the defect class it cannot detect (for example `ci-verify`: unreviewed semantics and untested paths), which is rendered with its verdict. An empty examined scope renders "NONE — this pass analysed no dimension; it certifies nothing".
 
 ==== Build-Time & Startup Static Invariant Verification (`FinalizePipelineValidator`)
 
@@ -1018,6 +1174,7 @@ When Phase 6 re-enters after a loop-back from Phase 5, an in-branch settle commi
 
 * Every step with `headDependent == true` must record `head_at_completion: "<40-hex-sha>"` in `mcp/status.json` when transitioning to `done`.
 * Any attempt to record `done` for a `headDependent == true` step without a valid `head_at_completion` SHA is **refused** (`error: "missing_head_at_completion"`).
+* The server derives `head_at_completion` from `git rev-parse HEAD` of the plan's worktree in the same transition that records `done`; no link accepts it as a parameter. The same rule holds for every recorded commit identity (`reviewed_commit_sha`, `commit_sha`, `branch_pushed_at.head_sha`) and for `pr_number`, so an invented or padded SHA can never enter a step record.
 * On re-entry, if a step's persisted record lacks `head_at_completion`, the engine reports the prior record as `unverified` and unconditionally re-fires the step.
 
 ==== Deterministic Verdict Currency Algorithm (`VerdictCurrencyEvaluator`)
@@ -1077,6 +1234,14 @@ public final class VerdictCurrencyEvaluator {
 * *No Re-Stamp on Preserve Invariant*: When `VerdictCurrencyEvaluator` returns `PRESERVED_INPUTS_UNAFFECTED` (because `git diff --name-only <H_rec>..<H_cur>` touched zero paths matching `step.verdictInputs()`), the step is skipped and its persisted `head_at_completion` **remains $H_{\text{rec}}$** — it is **never** overwritten with $H_{\text{cur}}$. Keeping $H_{\text{rec}}$ ensures that subsequent commits are always diffed against the cumulative range since the step actually executed.
 * *Rebase vs No-Op Rebase*: A step declaring `advancesMainViaRebase == true` (`sync-baseline`, `branch-cleanup`) invalidates downstream verdicts (`STALE_REBASE_ADVANCED`) **only** when it actually replayed commits (`action == "rebased"` and `upstream_commit_count > 0`). When the branch was already up-to-date (`work_performed == false`), `HEAD` does not change and existing verdicts remain current.
 
+==== Step Records, Re-Fire & Loop-Back Rules
+
+* *Settled Completions Only*: A step completion record (`done`) is emitted only for settled outcomes. `loop_back` and defer emit none, so a re-fired step never produces two completions.
+* *Firings & Re-Fire Replaces*: The persisted step record keeps one entry per firing (`firings[]` with `dispatch_id`, `started_at`, `outcome`, and `cause`: `first`, `loop_back`, `failure`, `error`, or `input_changed`); the current outcome is the last firing's. When `VerdictCurrencyEvaluator` decides `RE_FIRE`, the step's outcome is set to `unverified` before the step runs and is replaced by the new terminal outcome; a prior `done` never survives a re-fire, a refused outcome change is appended as a firing and never leaves the prior outcome silently current, and no force flag exists. Re-fire counts are derived from the firings per cause, never from the step-outcome log.
+* *Phase-Exit Completeness*: Phase 6 exit (and `branch-cleanup` entry) requires, for every manifest step, an outcome of `done` or `skipped` whose currency verdict against the current `HEAD` is `CURRENT_SAME_HEAD` or `PRESERVED_INPUTS_UNAFFECTED` (for steps that are not `headDependent`, the presence of `done` in the firing of the current `loop_back_iteration`); a stale `done`, or a firing from an earlier iteration, counts as missing.
+* *Operator Skip*: A step the operator skips (operator CLI or elicitation) while its currency verdict is stale is recorded as `skipped_by_operator` with its stale `head_at_completion` kept, never as `done` at the current `HEAD`.
+* *Stale-Finding Re-Anchor*: Before `loop_back` is offered, every open finding is re-anchored against `HEAD` (from the commit it was raised against); a finding whose cited location no longer exists is resolved as `stale` (recorded, never counted as fixed). If only stale findings remain, `loop_back` is omitted and the loop closes.
+
 === Pre-Merge Review Barrier & Operator Merge Authorization Grants
 
 Inside `default:branch-cleanup` (`order = 70`), immediately before executing the merge command (`pr safe-merge` or `merge-queue` enqueue), the engine enforces the fail-closed **Pre-Merge Review Barrier**.
@@ -1085,8 +1250,10 @@ Inside `default:branch-cleanup` (`order = 70`), immediately before executing the
 
 Both predicates must evaluate to `true` against the current worktree `HEAD` SHA ($H_{\text{cur}}$):
 
-1. *Predicate 1 — Zero Unhandled Review Comments*: Every finding in the findings store originating from `automatic-review`, `ci-verify`, or `sonar-roundtrip` must have a persisted, terminal triage disposition (`FIX`, `SUPPRESS`, or `ACCEPT`) whose outbound response or dismissal has been transmitted to the provider (`response_transmitted == true`). *Deliberate change vs. `plan-marshall`*: `plan-marshall` counts only pending PR-comment findings and does not require transmission; `PM-MCP` also covers CI and Sonar findings and requires the response to be transmitted.
-2. *Predicate 2 — Required-Bot Participation on Current `HEAD`*: Every review bot configured as required in the project's review-bot registry must have a verified participation record for $H_{\text{cur}}$ with `completion_state == "completed"`. An `unknown`, `pending`, `rate_limited`, `timed_out`, or `not_triggered` bot state **never** satisfies Predicate 2 and **never** automatically mints a merge grant.
+1. *Predicate 1 — Zero Unhandled Findings*: Every finding in the findings store originating from `automatic-review`, `ci-verify`, or `sonar-roundtrip`, and every other finding with `blocking == true` of any `source` of the findings store's source enumeration (`self_review`, `qgate`, `security_audit`, `code_review`, `arch_gate`, `compiler`), must have a persisted, terminal triage disposition (`FIX`, `SUPPRESS`, or `ACCEPT`; status `triaged_*` or `resolved`). A finding with a provider address (`provider_ref`) must also have its outbound response or dismissal transmitted to the provider (`transmit_outcome == "sent"`), which requires a per-finding reply on the finding's own thread or comment; a bot's own resolution marker or a PR-level note is not a response. An unmet triage commitment (Unified Triage Hook) fails the predicate. *Deliberate change vs. `plan-marshall`*: `plan-marshall` counts only pending PR-comment findings and does not require transmission; `PM-MCP` covers every blocking finding and requires the response to be transmitted.
+2. *Predicate 2 — Required-Bot Participation on Current `HEAD`*: Every review bot configured as required in the project's review-bot registry must have a verified participation record (link:store-schemas.adoc#review-participation[Store Schemas Specification]) for $H_{\text{cur}}$ whose `state` is `participated` or `participated_but_empty`. A `bot_status` other than `completed` (link:hypermedia-format.adoc#_closed_status_enumerations_in_finalize_concurrent_wait[Hypermedia Format Specification, Closed Status Enumerations]), and every other per-bot state (<<automatic-review>>: in particular `not_triggered`, `refused` of any mode, including a spend-capped or quota-exhausted reviewer, `declined`, `unproven`, `unreadable`, and `silent`), **never** satisfies Predicate 2 and **never** automatically mints a merge grant.
+
+If the findings store cannot be evaluated, the barrier routes to an explicit `unknown` disposition: a `review_barrier_gap` in `ask` mode with cause `findings_unevaluable`, neither a hard halt nor a pass. A refusal of the barrier lists each blocking finding (`finding_id`, `source`, `severity`, age, failing predicate) in `facts`, never only a count.
 
 ==== Merge-Authorization Roster & Gap Classes
 
@@ -1119,7 +1286,7 @@ Every mechanism that authorizes advancing past the merge gate mirrors the merge-
 |`automatic-review-force-done`
 |`find_step_completion`
 |Step `head_at_completion`
-|`automatic-review` force-completed with a recorded reason; bound by the step's own `head_dependent` anchor, no separate grant.
+|`automatic-review` force-completed with a recorded reason; bound by the step's own `head_dependent` anchor, no separate grant. Force-done over refused required bots records the refused set in the rationale. Force-done over an `absent` or `unproven` bot state is refused unless `evidence_ref` names a review object, inline comment, or check-run proving the review; without such evidence only a `barrier-ask-override` (`review_barrier_gap`) can proceed.
 
 |`final_merge_without_asking`
 |`merge_action`
@@ -1166,7 +1333,7 @@ public record MergeAuthorizationRecord(
 }
 ----
 
-* *Operator-Only Minting*: Grants are minted exclusively through the authenticated operator channel (MCP elicitation or `pm-mcp operator authorize-merge --plan <plan_id> --head <sha> --gap-class <class> --rationale <text>`). Free-text lines in `decision.log` are never accepted as authorization evidence. A re-grant of the same `kind` replaces the previous record.
+* *Operator-Only Minting*: Grants are minted exclusively through the authenticated operator channel (MCP elicitation or `pm-mcp operator authorize-merge --plan <plan_id> --head <sha> --gap-class <class> --rationale <text>`). Free-text lines in `decision.log` are never accepted as authorization evidence. A re-grant of the same `kind` supersedes the previous record: the prior record is kept with `superseded_at` and is never admissible again.
 * *Route on `admissible`, Never on Boolean `authorized`*: The barrier checks `grant.isAdmissibleFor(currentHeadSha, activeGapClass)`. A grant minted for an earlier commit $H_1$ or for `RED_CI_GATE` is inadmissible if `HEAD` advances to $H_2$ (e.g., after rebase) or if the active gap is `REVIEW_BARRIER_GAP`.
 
 === Cross-Plan Merge Mutex, FIFO Admission Queue & Epic Plan Emission
@@ -1192,20 +1359,22 @@ Plan A (branch-cleanup) ──► [Enqueue FIFO] ──► [Acquire Holder Slot]
                                             [Release Mutex & Pop]
 ----
 
-1. *FIFO Admission Queue*: Plans requesting the merge mutex enter an ordered per-repository FIFO `waiting[]` (aliased as `admission_queue[]`) keyed by `plan_id`, `owner_pid`, and `enqueued_at`. A plan may acquire the active `holder` slot only when it is at the head of the FIFO queue and `holder == null`.
+1. *FIFO Admission Queue*: Plans requesting the merge mutex enter an ordered per-repository FIFO `waiting[]` keyed by `plan_id`, `owner_pid`, and `enqueued_at`. A plan may acquire the active `holder` slot only when it is at the head of the FIFO queue and `holder == null`. Enqueueing is idempotent per `plan_id` (a waiter already in `waiting[]` keeps its position), and a holder re-requesting the mutex is granted reentrantly without re-queueing.
 2. *Widened Hold across Rebase-to-Merge*: Unlike a narrow lock around `gh pr merge`, the merge mutex is acquired **before** `branch-cleanup` rebases the feature branch onto `main` and held through the merge execution so a sibling plan cannot land a conflicting commit on `main` between rebase and merge.
 3. *Mandatory Release on Every Wait & Abort*: A plan must **never** hold the merge mutex while blocked in an asynchronous wait (`wait:finalize.concurrent-wait` for post-rebase CI, review-bot rate-window wait, merge-queue landing wait, or operator elicitation/escalation) or on abort. Entering any `wait` or `escalate` state inside `branch-cleanup` atomically releases `holder = null` while preserving the plan's FIFO queue position, allowing ready sibling plans to merge without head-of-line blocking.
 4. *Atomic Stale-Holder & Budget Reclaim*: Reaping runs inside the same short transaction as admission. An active `holder` is forcibly reclaimed if and only if it is provably stale — either the runtime instance recorded as owner is no longer alive (PID plus start instant) and no active git/CI job for that plan is running, the holding `plan_id` is in a terminal state (`completed`, `aborted`), or the holder's lease budget (`lease_expires_at`, default 15 minutes without a heartbeat transition) has expired.
-5. *Closed Merge Dispatch Set*: `branch-cleanup` executes merges exclusively through one of two closed mechanisms: direct `safe-merge` (squash/merge via enrolled CI provider when branch is up-to-date and green) or `merge-queue` enqueue (when repository merge queue is enabled, transitioning to `finalize.merge-queue-wait` after releasing the mutex).
+5. *Closed Merge Dispatch Set*: `branch-cleanup` executes merges exclusively through one of two closed mechanisms: direct `safe-merge` (squash/merge via enrolled CI provider when branch is up-to-date and green) or `merge-queue` enqueue (selected only when the provider reports a merge queue configured for the base branch, checked immediately before enqueueing; transitions to `finalize.merge-queue-wait` after releasing the mutex).
++
+The enqueue counts only after a post-condition read of this PR's own queue membership (GitHub: repository `mergeQueue.entries` containing the PR); neither the CLI exit code, nor the existence of a queue rule, nor `mergeStateStatus` (which reads `CLEAN` while queued) is membership evidence, and an unobservable membership records `enqueued: indeterminate`. After either mechanism, the merge is confirmed only by the provider's observed pull-request state (`merged`, with the merge commit on the base branch), never by the merge command's return value or exit code. `finalize.merge-queue-wait` waits for a terminal outcome — `merged`, `ejected`, `closed`, or `timed_out` — because an entry can be ejected on rebase after its checks turned green; a PR that leaves the queue unmerged routes to `escalate`.
 
 ==== Epic Plan Emission (`emit:<plan_id>`)
 
 Orchestrator epics (`scope: epic`) manage multi-plan workstreams stored in `.plan/orchestrator/<epic_id>/` (`status.json` header and per-plan `.plan/orchestrator/<epic_id>/queue/<plan_id>.json` files).
 
 * *Never Dispatch a Plan as a Sub-Agent*: Because sub-agents are single-level leaf workers (`PM-WF-5`) and every plan dispatches its own leaf sub-agents during Phases 2–6, an epic **never** offers a `dispatch` link to launch a plan and **never** executes a plan inline.
-* *Surface Disjointness Gate*: When building the epic representation, the server evaluates expected file-surface disjointness across all currently `launched` and `running` sibling plans. An `indeterminate` surface is treated fail-closed as **not disjoint** (never eligible for parallel emission).
+* *Surface Disjointness Gate*: When building the epic representation, the server evaluates expected file-surface disjointness across all currently `launched` and `running` sibling plans. An `indeterminate` surface is treated fail-closed as **not disjoint** (never eligible for parallel emission). The gate publishes per-state tallies over the whole candidate population in `facts` — `disjoint`, `overlapping`, `indeterminate`, `absent`, `unlistable`, `unreadable` — each with a stated zero. An empty overlap list beside a non-zero `indeterminate` count is reported as `unchecked`, never as a pass, and underivable surfaces are never folded into the disjoint count.
 * *`emit:<plan_id>` Transition (`rel: emit`)*: For each staged plan whose dependencies are `completed` and whose surface is disjoint from active plans, the epic state offers `emit:<plan_id>`. Following `emit:<plan_id>`:
 ** Updates `.plan/orchestrator/<epic_id>/queue/<plan_id>.json` atomically (`status = "launched"`) under the epic lock.
-** Returns the exact operator bootstrap command (`pm-mcp enter --client <client> plan <plan_id> --from-epic <epic_id>`) in `facts.launch_command`. Note that `auto_emit` only pre-selects the emission candidate; it never spawns a background plan session automatically.
+** Returns the exact operator bootstrap command (`pm-mcp enter --client <client> plan <plan_id> --from-epic <epic_id>`) in `facts.emitted_command`. Note that `auto_emit` only pre-selects the emission candidate; it never spawns a background plan session automatically.
 ** Transitions the epic's view of `<plan_id>` from `launched` to `running` on the next call on the epic scope after `pm-mcp enter` has written `.plan/local/plans/<plan_id>/mcp/entry.json`.
 
