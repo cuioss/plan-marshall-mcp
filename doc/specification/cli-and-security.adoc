@@ -1,0 +1,192 @@
+= CLI, Coordination & Security Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » CLI, Coordination & Security (link:../Specification.adoc[Back to Main Specification])
+
+== Overview
+
+This document specifies the operator-facing command line of the *plan-marshall-mcp* (`PM-MCP`) native binary (`pm-mcp`) and the machine-level security mechanisms around the runtime: cross-process `FileChannel.lock()` coordination, the embedded client bundle installer (`pm-mcp client`), the entry identity recorder (`pm-mcp enter`), token-lane credential resolution, operator channel isolation (`pm-mcp operator`), and the security audit log.
+
+The process topology (always-on runtime, `pm-mcp serve` STDIO relay), the local transport, `stdout` hygiene, runtime start/stop/drain, crash recovery, and logical plan sessions are specified exclusively in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-ARCH-1[PM-ARCH-1: Process Ownership & Always-On Runtime]_
+* _See Requirement link:../Requirements.adoc#PM-ARCH-2[PM-ARCH-2: Local-by-Design & Zero External Cloud Dependency]_
+* _See Requirement link:../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain]_
+* _See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+* _See Requirement link:../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream MCP Proxy & Provenance Tagging]_
+* _See Requirement link:../Requirements.adoc#PM-CRED-1[PM-CRED-1: Dual-Lane Credential Separation (System vs Token Lane)]_
+* _See Requirement link:../Requirements.adoc#PM-CRED-2[PM-CRED-2: OS Credential Store Priority & Native Access]_
+* _See Requirement link:../Requirements.adoc#PM-CRED-4[PM-CRED-4: Operator-Only Secret Entry & Zero Model Exposure]_
+* _See Requirement link:../Requirements.adoc#PM-CRED-5[PM-CRED-5: Outbound Domain Scoping & Output Secret Redaction]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-6[PM-SEC-6: Security Audit Trail & Tamper-Evident Logging]_
+* _See Requirement link:../Requirements.adoc#PM-TECH-1[PM-TECH-1: Java 25+ & Quarkus MCP Runtime Foundation]_
+* _See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
+* _See Requirement link:../Requirements.adoc#PM-TECH-3[PM-TECH-3: GraalVM Native Executable & Startup/Memory Bounds]_
+* _See Requirement link:../Requirements.adoc#PM-TECH-4[PM-TECH-4: Operating System Platform Integration (macOS & Linux)]_
+* _See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
+* _See Requirement link:../Requirements.adoc#PM-DIST-2[PM-DIST-2: Embedded Bundle Extraction & Interactive Client Installer]_
+* _See Requirement link:../Requirements.adoc#PM-DIST-3[PM-DIST-3: Uniform Host MCP STDIO Connection Configuration]_
+* _See Requirement link:../Requirements.adoc#PM-DIST-4[PM-DIST-4: Bundle Upgrade Detection & Atomic Reconciliation]_
+* _See Requirement link:../Requirements.adoc#PM-TEST-5[PM-TEST-5: Security Boundary & Confinement Adversarial Testing]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit]_
+
+== Status: PLANNED
+
+== Process Coordination
+_See Requirement link:../Requirements.adoc#PM-ARCH-1[PM-ARCH-1: Process Ownership & Always-On Runtime]_
+
+_See Requirement link:../Requirements.adoc#PM-ARCH-2[PM-ARCH-2: Local-by-Design & Zero External Cloud Dependency]_
+
+_See Requirement link:../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain]_
+
+_See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
+
+The runtime, the `pm-mcp serve` relays, the operator CLI, and (during migration) legacy scripts share the machine-level state under `~/.plan-marshall/mcp/` (layout and permissions in link:filesystem-layout.adoc[Filesystem Layout Specification]). Every read-modify-write of a shared store is performed under the store's `FileChannel.lock()` and completed with an atomic write-and-rename. The operator CLI acts directly on these stores and never calls the runtime's MCP endpoint; the runtime revalidates state from disk inside every locked transition (link:runtime-model.adoc#_operator_cli_interaction[Runtime & Interaction Model Specification]).
+
+Runtime process lifecycle, singleton discovery (`locks/runtime.lock`, `state/runtime.json`), the Unix domain socket endpoint, relay `stdout` hygiene, startup permission verification, crash recovery, and drain are specified in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
+
+== Direct Binary Bundle Extraction & Client Installer (`pm-mcp client`)
+_See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
+
+_See Requirement link:../Requirements.adoc#PM-DIST-2[PM-DIST-2: Embedded Bundle Extraction & Interactive Client Installer]_
+
+_See Requirement link:../Requirements.adoc#PM-DIST-3[PM-DIST-3: Uniform Host MCP STDIO Connection Configuration]_
+
+_See Requirement link:../Requirements.adoc#PM-DIST-4[PM-DIST-4: Bundle Upgrade Detection & Atomic Reconciliation]_
+
+The `pm-mcp` binary is the single version authority for all client integration bundles. All bundle manifests and templates are compiled directly into the native image under `classpath:/bundles/<client>/` (`claude`, `opencode`, `antigravity`, `codex`).
+
+=== Embedded Classpath Bundle Layout
+
+[cols="2,2,3"]
+|===
+|Classpath Resource Path |Client IDs |Normative Contract
+
+|`classpath:/bundles/{client}/bundle-manifest.json`
+|`claude`, `opencode`, `antigravity`, `codex`
+|Contains the normative `ClientBundleManifest` (see link:client-profiles.adoc[Client Profiles Specification]) declaring `bundle_version`, `daemon_version`, `manifest_sha256`, `files[]`, and `shared_configs[]` for `scope=user` and `scope=project`.
+
+|`classpath:/bundles/{client}/files/{bundle_path}`
+|`claude`, `opencode`, `antigravity`, `codex`
+|Immutable UTF-8 template bytes for every command (`/plan-marshall`, `/plan-orchestrator`, `/marshall-steward` or `$plan-marshall` skills), sub-agent definition (`execution-context-l1..l7`, `inherit`, `reader`), and optional hook referenced in `bundle-manifest.json`.
+|===
+
+=== Path Traversal & Integrity Guards During Bundle Extraction
+
+1. Every `bundle_path` and `target_path` in `bundle-manifest.json` is validated against `^(?!/)(?!.*\.\.)[A-Za-z0-9_./-]+$` before touching the filesystem.
+2. Target installation paths are resolved against the canonical scope root (`user` home directory or `project` repository root) via `Path.resolve(targetPath).normalize()` and verified with `startsWith(canonicalScopeRoot)` (`PM-SEC-2`).
+3. Before writing any extracted file, `pm-mcp client` computes the SHA-256 digest of the classpath resource bytes and verifies that it matches the `sha256` declared in `bundle-manifest.json`.
+
+=== `pm-mcp client` CLI Subcommands (`install`, `update`, `remove`, `status`)
+
+* `pm-mcp client install <claude|opencode|antigravity|codex> [--scope user|project]`:
+** Reads `classpath:/bundles/<client>/bundle-manifest.json` directly in-process.
+** Computes the diff between the target filesystem and the manifest (`files[]` additions/modifications and surgical `shared_configs[]` key merges for `.mcp.json`, `opencode.json`, `mcp_config.json`, or `.codex/config.toml`).
+** Displays the complete planned file and configuration changes on the terminal and requires interactive operator confirmation (unless `--yes` is passed for non-interactive CI/automation).
+** Writes each file atomically (`*.tmp` + `fsync` + `Files.move(..., ATOMIC_MOVE)`) and records the installed `bundle_version`, `daemon_version`, `scope`, and per-file SHA-256 digests in `~/.plan-marshall/mcp/state/install-records.json` under `FileChannel.lock()`.
+* `pm-mcp client update [<client>] [--scope user|project]`:
+** Compares the running binary's embedded `bundle-manifest.json` against `install-records.json`, detects any user-modified files via SHA-256 comparison (refusing to overwrite modified files without interactive confirmation), removes retired files from prior bundle versions, and atomically applies updates.
+* `pm-mcp client remove <client> [--scope user|project]`:
+** Removes only the unmodified files and `owned_keys` recorded in `install-records.json`, leaving all user-owned configuration keys and sibling host installations intact.
+* `pm-mcp client status`:
+** Reports installed bundle versions, binary version parity, and any local file modifications across all scopes.
+
+== Entry Identity Recording (`pm-mcp enter`)
+_See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
+
+_See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit]_
+
+When a user invokes `/plan-marshall`, `/plan-orchestrator`, or `/marshall-steward` (or the corresponding Codex skill), the host's entry command executes:
+
+[source,bash]
+----
+pm-mcp enter --client <claude|opencode|antigravity|codex|neutral> <plan|epic|steward> [<plan_id>|<epic_id>] [--from-epic <epic_id>]
+----
+
+1. *Workspace & Enrolment Resolution*: Resolves the canonical git repository root (`workspace_root`) from the current working directory and verifies that the project is enrolled in `~/.plan-marshall/mcp/enrolments.json`.
+2. *Three-Tier Environment Detection*: Evaluates the inherited process environment (`CLAUDECODE`, `OPENCODE`, `ANTIGRAVITY_AGENT`, `CODEX_SANDBOX` / `CODEX_CI`) against `--client` (`PM-CLIENT-3`), logging the comparison to `~/.plan-marshall/mcp/logs/audit.jsonl`.
+3. *Atomic `entry.json` Persistence*: Acquires the scope's `FileChannel.lock()` and writes `<scope_dir>/mcp/entry.json` (or `.plan/local/mcp/entry.json` prior to `pm_start`) with `format_version: 1`, `entry`, `scope_type`, `scope_id`, `client_id`, `client_version`, `client_session_id`, `from_epic`, `workspace_root`, `environment_match_tier`, and `entered_at` (schema in link:store-schemas.adoc[Store Schemas Specification]); the detected environment signature and OS principal are recorded in `audit.jsonl` only.
+4. *Bundle Drift Notice (`PM-DIST-4`)*: Compares the `bundle_version` recorded in `~/.plan-marshall/mcp/state/install-records.json` against the binary's `daemon_version`; if skewed, emits a `bundle_outdated` warning so the initial `pm_start` / `pm_state` representation prompts `pm-mcp client update <client_id>`.
+
+== Token-Lane Credential Architecture & OS Keyring Integration
+_See Requirement link:../Requirements.adoc#PM-CRED-1[PM-CRED-1: Dual-Lane Credential Separation (System vs Token Lane)]_
+
+_See Requirement link:../Requirements.adoc#PM-CRED-2[PM-CRED-2: OS Credential Store Priority & Native Access]_
+
+_See Requirement link:../Requirements.adoc#PM-CRED-4[PM-CRED-4: Operator-Only Secret Entry & Zero Model Exposure]_
+
+_See Requirement link:../Requirements.adoc#PM-CRED-5[PM-CRED-5: Outbound Domain Scoping & Output Secret Redaction]_
+
+=== Two-Lane Provider Architecture
+
+External provider integrations are strictly partitioned into two authentication lanes:
+
+1. *System Lane (`git`, `gh`, `glab`)*: Executed as verified subprocess jobs (`PM-EXEC-5`) that inherit the developer's existing CLI authentication (`~/.gitconfig`, SSH agent, `gh auth`). `pm-mcp` never reads, extracts, or stores CLI-lane tokens.
+2. *Token Lane (SonarQube/SonarCloud, Jira, and authenticated upstream MCP servers)*: Executed directly by `pm-mcp`'s in-process HTTP client (`de.cuioss:cui-http`). Tokens are resolved per request from the credential store hierarchy: `<project>/<provider>` (project-scoped override) -> `<provider>` (global fallback).
+
+=== OS Keyring Backends & Fallback File Store
+
+The `CredentialStore` service resolves secrets using a three-tier backend chain:
+
+* *macOS Keychain (Primary on macOS)*: Invokes macOS Security framework APIs (`SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, `SecItemDelete`) directly via Java 25's Foreign Function & Memory (FFM) API (`java.lang.foreign.Linker`). Items are stored under the configurable service name (default `plan-marshall-mcp`) with account `<provider>` or `<project>/<provider>` and a trusted-application ACL restricting unprompted read access to the signed `pm-mcp` binary.
+* *Linux Secret Service (Primary on Linux)*: Communicates with `org.freedesktop.secrets` over the user session D-Bus (`gnome-keyring` / `KWallet`) storing attributes `application=pm-mcp`, `provider=<provider>`, and optional `project=<project>`.
+* *Permission-Guarded Fallback File Store*: When no OS keyring is available (headless Linux or WSL2), secrets are stored in `~/.plan-marshall/credentials/<provider>.json` and `~/.plan-marshall/credentials/<project>/<provider>.json` (directory mode `0700`, file mode `0600`, see link:filesystem-layout.adoc[Filesystem Layout Specification] and link:store-schemas.adoc[Store Schemas Specification]). If ownership or permission checks fail, `pm-mcp` refuses to read the file and transitions the calling step to a `credentials_file_insecure` state.
+
+=== Operator-Only Credential CLI & Runtime Secret Redaction
+
+* *Operator CLI Verbs*: Credential mutations and verifications are restricted exclusively to interactive TTY invocations of `pm-mcp operator credentials set|status|check|verify|remove|migrate|rotate <provider> [--project]`. When targeting the OS credential store, `set` reads the secret from the terminal with echo disabled (`System.console().readPassword()`); when targeting the file store it writes a `0600` placeholder file (`REPLACE_WITH_YOUR_TOKEN`, …) for direct operator editing. Secrets are never accepted from command-line arguments or environment variables.
+* *Zero Model Exposure & Redaction*: No MCP tool, resource, or state representation exposes credential values (`status` and `check` report only metadata: provider name, scope, backend type, and configured status). All resolved secret values are registered in an in-memory `SecretRedactor` filter that scrubs matching byte/character sequences to `[REDACTED]` across all log records, `audit.jsonl` entries, and error messages, and never exports them into subprocess environments (`PM-CRED-5`).
+
+== Operator Channel Isolation & Privileged CLI (`pm-mcp operator`)
+_See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
+
+_See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+
+Privileged actions—project enrolment (`enrol`, `unenrol`), credential management (`credentials`), gate overrides (`force-gate`), merge-barrier overrides (`authorize-merge`), cross-project access grants (`grant-access`), and plan deletion (`delete-plan`)—are unreachable from every MCP tool.
+
+1. *Dual Operator Channels*: Authorizing decisions require either (a) native MCP Elicitation (`elicitation/create`) on hosts where `client_profile.connection.elicitation_supported == true`, or (b) the interactive `pm-mcp operator <action>` CLI executing directly against the local state stores under `FileChannel.lock()`.
+2. *Interactive TTY & Keyring / Passphrase Verification*: `pm-mcp operator` verifies that it is attached to an interactive terminal (`System.console() != null && System.console().isTerminal()`), detects and rejects known coding-agent subshell environment markers (`CLAUDECODE=1`, `OPENCODE=1`, `ANTIGRAVITY_AGENT=1`, `CODEX_SANDBOX`, `CODEX_CI`) unless interactive operator authentication succeeds, and verifies the operator credential stored in the OS keyring (configured service name, default `plan-marshall-mcp`, account `operator`). On platforms without binary-bound Keychain ACLs (Linux Secret Service or fallback file store), `pm-mcp operator` additionally prompts interactively (no echo) for the operator passphrase, verified against a salted PBKDF2-HMAC-SHA256 hash (`>= 600,000` iterations) with exponential backoff rate-limiting (`2^failures` seconds, max 300s) and audit logging on every attempt.
+3. *Blocked Workflow State*: When a workflow requires operator authorization and MCP Elicitation is unavailable, the engine transitions the scope to `*.blocked`, populates `facts.operator_command` with the exact `pm-mcp operator ...` invocation, and offers only a `wait` link until the operator completes the action on the terminal.
+
+== Security Audit Trail & Three-Tier Identity Verification
+_See Requirement link:../Requirements.adoc#PM-SEC-6[PM-SEC-6: Security Audit Trail & Tamper-Evident Logging]_
+
+_See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier Environment Mismatch Detection & Audit]_
+
+_See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+
+Every MCP tool call, state transition, job execution, credential lookup, and operator command appends a structured JSONL record to `~/.plan-marshall/mcp/logs/audit.jsonl` (mode `0600`, coordinated under `FileChannel.lock()`, schema defined in link:store-schemas.adoc[Store Schemas Specification]):
+
+* *Three-Tier Identity Tuple*: Every audit record captures (1) `declared_client` (from `mcp/entry.json`), (2) `detected_env` (from environment signatures at `enter` or MCP `clientInfo`), and (3) `os_principal` (`System.getProperty("user.name")` / `geteuid()`). Any disagreement between Tier 1 and Tier 2 sets `identity_mismatch: true` in both `audit.jsonl` and the returned TOON representation's `facts`.
+* *Error Sanitization*: Unhandled exceptions or protocol errors return only a closed-enum error code and `audit_id` (UUIDv7) to the MCP caller; stack traces and host filesystem paths are written exclusively to `~/.plan-marshall/mcp/logs/daemon.log`.
+
+== Outbound HTTPS Security (`cui-http`) & Native Runtime Stack
+_See Requirement link:../Requirements.adoc#PM-TECH-1[PM-TECH-1: Java 25+ & Quarkus MCP Runtime Foundation]_
+
+_See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
+
+_See Requirement link:../Requirements.adoc#PM-TECH-3[PM-TECH-3: GraalVM Native Executable & Startup/Memory Bounds]_
+
+_See Requirement link:../Requirements.adoc#PM-TECH-4[PM-TECH-4: Operating System Platform Integration (macOS & Linux)]_
+
+_See Requirement link:../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream MCP Proxy & Provenance Tagging]_
+
+_See Requirement link:../Requirements.adoc#PM-TEST-5[PM-TEST-5: Security Boundary & Confinement Adversarial Testing]_
+
+* *Outbound HTTPS Hardening (`de.cuioss:cui-http`)*: All outbound REST calls (SonarQube/SonarCloud, Jira) and remote upstream MCP calls use `de.cuioss:cui-http`'s `HttpHandler` and `ResilientHttpAdapter` with TLS 1.3+, mandatory certificate/hostname verification, HTTPS-only redirect following, and origin-pinned bearer token transmission (stripping `Authorization` headers on any cross-origin redirect). All URL/path/header parameters composed into outbound requests are validated through `de.cuioss.http.security` pipelines.
+* *GraalVM Native Image & Resource Bounds*: Compiled as a standalone native executable (`Java 25+`, Quarkus `quarkus-mcp-server-http`, Virtual Threads); startup and memory bounds for the runtime and the relay are defined in `PM-TECH-3` and verified as described in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
+* *STDIO & Confinement Adversarial Verification (`PM-TEST-5`)*: Integration tests (`*IT`) using `McpAssured` (`McpStdioTestClient`) verify the transport isolation properties listed in the link:runtime-model.adoc#_verification[Runtime & Interaction Model Specification], that insecure permissions (`0644`) on `enrolments.json` or fallback credential files trigger immediate fail-closed termination, and that path-traversal or command-injection payloads are deterministically rejected and logged to `audit.jsonl`.
+

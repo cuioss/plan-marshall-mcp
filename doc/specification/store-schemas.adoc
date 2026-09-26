@@ -21,10 +21,10 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
 * _See Requirement link:../Requirements.adoc#PM-CRED-3[PM-CRED-3: Permission-Guarded Fallback File Credential Store]_
-* _See Requirement link:../Requirements.adoc#PM-SEC-6[PM-SEC-6: Structured Security & Transition Audit Trail]_
-* _See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Staged Migration Order & Executor Shadow Routing]_
-* _See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Mutual Coexistence Guard Between Legacy Scripts and PM-MCP]_
-* _See Requirement link:../Requirements.adoc#PM-MIG-3[PM-MIG-3: Cross-Runtime File Lock & Shared Store Interoperability]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-6[PM-SEC-6: Security Audit Trail & Tamper-Evident Logging]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Six-Stage Incremental Seam Migration]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Exclusive Runtime per Machine & Routed Legacy Script Execution]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-3[PM-MIG-3: Shared Store Format Interoperability During Staged Porting]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Legacy Surface Retirement]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-5[PM-MIG-5: Quantitative Rollback Triggers & Safe Reversion]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-1[PM-TEST-1: Script Disposition Classification (Ported, Redesigned, Retired)]_
@@ -40,7 +40,7 @@ _See Requirements:_
 
 1. *Version Envelope*: Every JSON store root object and every JSONL header/record must declare `"format_version": 1` (positive integer). When the daemon opens a store with a lower `format_version`, it upgrades the structure in memory and writes the migrated store atomically. If a store has a `format_version` higher than the binary supports, the daemon refuses to mutate the store and requests a binary upgrade.
 2. *Atomic Write-and-Rename*: All JSON file updates are written to a sibling temporary file (`<filename>.tmp.<uuid>`), flushed to disk (`FileChannel.force(true)`), and atomically renamed over the target file (`StandardCopyOption.ATOMIC_MOVE`, `StandardCopyOption.REPLACE_EXISTING`).
-3. *Cross-Runtime File Locking*: During migration stages where legacy Python scripts and the Java daemon share `.plan/` stores (`PM-MIG-3`), all read-modify-write operations acquire an OS-level advisory lock (`flock` / `fcntl` via companion `.lock` files) with a 10-second acquisition timeout and exponential backoff.
+3. *Single Writer Set*: Legacy scripts never run in parallel with `PM-MCP`; during staged porting they run only as `script` jobs of the runtime under the addressed scope's lock (`PM-MIG-2`, `PM-MIG-3`), so all read-modify-write operations on shared stores are serialized by the runtime's own locks and no cross-runtime lock protocol exists.
 
 == Scope Entry Record (`mcp/entry.json`)
 
@@ -200,7 +200,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     "finalize_iteration": {
       "type": "integer",
       "minimum": 0,
-      "description": "Current loop-back iteration count, bounded by marshal.json phase-6-finalize.max_iterations."
+      "description": "Current loop-back iteration count, bounded by marshal.json plan.phase-6-finalize.max_iterations."
     },
     "qgate_iteration": {
       "type": "integer",
@@ -382,6 +382,11 @@ Each line in `.plan/.../plans/<plan_id>/change-ledger.jsonl` records a `worktree
     },
     "examined_modules": { "type": "array", "items": { "type": "string" } },
     "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "job_id": { "type": ["string", "null"] },
+    "commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+    "changed_paths": { "type": "array", "items": { "type": "string" } },
+    "deliverable_id": { "type": ["string", "null"] },
+    "task_id": { "type": ["string", "null"] },
     "recorded_at": { "type": "string", "format": "date-time" }
   }
 }
@@ -831,7 +836,7 @@ The `references.json` store tracks three distinct file-footprint sets for a plan
 * *Structured-Derived Footprint (`derived_files`)*: Re-derived by set union over the solution outline's structured deliverables and partitioned into two disjoint keys:
 ** `expected_modifications`: Files the plan intends to create, modify, or delete.
 ** `read_only_references`: Files inspected for context that must remain unmodified.
-* *Realized Footprint (`realized_files`)*: Captured from the worktree via a `git` job (`git diff --name-status` + untracked files).
+* *Realized Footprint (`realized_files`)*: Captured from the worktree via `git` jobs as the union of `git diff --name-only <base_ref>...HEAD` and the paths parsed from `git status --porcelain` (parity with `manage-references compute-footprint`).
 
 Pairwise reconciliation computes the **symmetric difference in both directions** ($A \setminus B$ and $B \setminus A$) across all three sets so that two equal-sized but disjoint file sets are reported as 100% disagreeing rather than matching by count.
 
@@ -840,7 +845,7 @@ Pairwise reconciliation computes the **symmetric difference in both directions**
 When the operator invokes plan deletion (`delete-plan` via elicitation or CLI):
 
 1. The server scans the plan directory for any lessons created or carried during the plan's execution.
-2. It executes `restore-from-plan` against the main-anchored global lesson store, producing a 4-state outcome (`restored`, `already_present`, `no_lessons`, `failed`) plus a store-resolution discriminator confirming the main store was resolved and scanned.
+2. It executes `restore-from-plan` against the main-anchored global lesson store, producing a 4-state outcome (`restored`, `restore_incomplete`, `no_lesson_file`, `plan_dir_unresolved`; `not_attempted` when carry-back is explicitly opted out) plus a store-resolution discriminator confirming the main store was resolved and scanned. Only `restored` and `no_lesson_file` permit deletion; `restore_incomplete` and `plan_dir_unresolved` veto it.
 3. If any carried lesson fails to land in the main-anchored store, the deletion is **vetoed fail-closed** and the plan directory is preserved intact.
 
 === Lock-Free Snapshot Reads & Global Lock Acquisition Order
@@ -862,11 +867,11 @@ Every legacy Python script in `plan-marshall` is classified into one of three no
 |Disposition |Target Surface in `PM-MCP` |Verification Strategy
 
 |*Ported (1:1 Data Layer)*
-|Canonical store read/write invariants of `manage_status.py`, `manage_tasks.py`, `manage_findings.py`, `manage_references.py`, `manage_change_ledger.py`, `manage_execution_manifest.py`, and `manage_lessons.py`
+|Canonical store read/write invariants of `manage-status.py`, `manage-tasks.py`, `manage-findings.py`, `manage-references.py`, `manage-change-ledger.py`, `manage-execution-manifest.py`, and `manage-lessons.py`
 |100% differential equivalence testing (`PM-TEST-2`) over shared JSON/JSONL fixture corpuses before cutover. Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion).
 
 |*Redesigned (Hypermedia & Native Services)*
-|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage_config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage_locks.py` (replaced by OS `FileChannel.lock()` + `ProcessHandle.of(pid)`), `manage_personas.py`, `manage_providers.py`, `workflow-integration-{git,github,gitlab,sonar}`
+|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by `ConfigReconciler` and the Command-Pattern `ConfigMigrationCommand` chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by OS `FileChannel.lock()` + `ProcessHandle.of(pid)`), `manage_personas.py`, `manage-providers/credentials.py`, `workflow-integration-{git,github,gitlab,sonar}`
 |Workflow DSL AST verification (`PM-TEST-3`), `ConfigMigrationChainTest` version/idempotency verification, scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
 
 |*Retired (Obsolete Infrastructure)*

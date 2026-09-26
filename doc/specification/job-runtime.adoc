@@ -29,10 +29,10 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-2[PM-SEC-2: Workspace Confinement & Path Traversal Prevention]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-5[PM-SEC-5: Subprocess Environment Sanitization & Linux Filesystem Confinement]_
-* _See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS, LSP & MCP Testing Libraries (cui-http, LSP4J, McpAssured)]_
+* _See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
 * _See Requirement link:../Requirements.adoc#PM-TECH-3[PM-TECH-3: GraalVM Native Executable & Startup/Memory Bounds]_
 * _See Requirement link:../Requirements.adoc#PM-TECH-4[PM-TECH-4: Operating System Platform Integration (macOS & Linux)]_
-* _See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Staged Migration Order & Executor Shadow Routing]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Six-Stage Incremental Seam Migration]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-2[PM-TEST-2: Differential Equivalence Testing for Ported Primitives]_
 * _See Requirement link:../Requirements.adoc#PM-TEST-5[PM-TEST-5: Security Boundary & Confinement Adversarial Testing]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
@@ -78,7 +78,7 @@ Before spawning any subprocess, the runtime validates the job request through a 
 
 == Subprocess Lifecycle & Process-Group Isolation
 
-Every job runs as a direct child of the `pm-mcp` server process inside its own isolated operating system process group (`PM-EXEC-4`, `PM-EXEC-5`, `PM-IMPL-1`).
+Every job runs as a direct child of the always-on `pm-mcp` runtime, independent of any host connection (link:runtime-model.adoc[Runtime & Interaction Model Specification]), inside its own isolated operating system process group (`PM-EXEC-4`, `PM-EXEC-5`, `PM-IMPL-1`).
 
 [source,java]
 ----
@@ -93,7 +93,7 @@ if (stdinPayload.isPresent()) {
 } else {
     pb.redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")));
 }
-// Direct output redirection to job log file (never inherits STDIO server stdout/stdin)
+// Direct output redirection to job log file (never inherits the runtime's stdin/stdout)
 pb.redirectOutput(jobLogPath.toFile());
 pb.redirectErrorStream(true);
 Process process = pb.start();
@@ -125,14 +125,14 @@ When a job exceeds its configured timeout (`PM-EXEC-4`) or when the user/client 
 1. *SIGTERM Escalation*: `pm-mcp` sends `SIGTERM` to the entire process group (using Java `ProcessHandle.descendants()` and native OS `kill(-pgid, SIGTERM)` via Java FFM, `PM-TECH-4`).
 2. *Grace Period*: `pm-mcp` waits up to 5,000 milliseconds for all child processes in the group to exit cleanly.
 3. *SIGKILL Cleanup*: If any process remains alive after the grace period, `pm-mcp` issues `kill(-pgid, SIGKILL)` to immediately terminate the remaining process group.
-4. *Closed-Enum Outcome Assignment*: Cancelled requests return `cancelled`; wall-clock timeout expirations return `timed_out`; jobs interrupted by a process crash are recorded as `killed` upon startup recovery.
+4. *Closed-Enum Outcome Assignment*: Cancelled requests return `cancelled`; wall-clock timeout expirations return `timed_out`; jobs interrupted by a runtime crash or drain are recorded as `killed` (on drain, or by crash recovery at the next runtime start); relay termination never affects a job.
 
 === Bounded Long-Poll & Progress-Reset Waiting Primitives (`PM-WF-8`, `PM-IMPL-4`)
 
 When a workflow transition spawns a long-running `build`, `ci`, or `project_script` job, or when the model invokes `pm_build` (`PM-SVC-1`, `PM-SVC-4`):
 
 * *Bounded Wait Slice*: The server holds the request open for at most `bounded_wait_seconds` (configured per client profile in `15s`–`3600s`, default `240s` / 4 minutes). If the job completes within the window, the server immediately evaluates the completion guard and returns the next workflow state.
-* *Progress Notifications*: When the client profile supports `progress_resets_timeout == true` and supplies a `_meta.progressToken`, the job runner emits periodic `notifications/progress` frames (every 5 seconds with current build stage and elapsed time) over the MCP STDIO session.
+* *Progress Notifications*: When the client profile supports `progress_resets_timeout == true` and supplies a `_meta.progressToken`, the job runner emits periodic `notifications/progress` frames (every 5 seconds with current build stage and elapsed time) over the calling host connection (relayed to the host by `pm-mcp serve`).
 * *Non-Blocking Wait Links*: If the job is still running when `bounded_wait_seconds` elapses, the call returns a valid hypermedia state with `form: wait` (`rel: wait`) and `form: submit` (`rel: abort`) links (`PM-WF-8`), never failing with an MCP transport timeout.
 
 === Warm Language Server Pool & Orthogonal Service Access (`PM-SVC-2`, `PM-SVC-4`, `PM-TOOL-2`)
@@ -140,7 +140,7 @@ When a workflow transition spawns a long-running `build`, `ci`, or `project_scri
 The Job Runtime manages a bounded pool of warm Language Server Protocol (LSP) subprocesses (`max_lsp_instances` in `machine-config.json`, default `3`) spoken via Eclipse `LSP4J` over `stdio` (`PM-TECH-2`, `PM-TECH-3`):
 
 * *Verify-Not-Resolve Launch*: Each language server binary (`jdtls`, `pyright-langserver`, `typescript-language-server`, `rust-analyzer`, or the marketplace corpus language server) is verified against `enrolments.json -> projects.<id>.language_servers` before launch.
-* *Lifecycle & Eviction*: Instances are keyed by `(workspace_root, language_id)`, initialized lazily on the first `pm_lsp` call (`PM-TOOL-2`, `PM-SVC-4`), evicted cleanly (`shutdown` -> `exit` -> `SIGTERM`) after 15 minutes of inactivity or when the `pm-mcp serve` process terminates, and restarted automatically (up to 2 retries) on unexpected exit.
+* *Lifecycle & Eviction*: Instances are keyed by `(workspace_root, language_id)`, initialized lazily on the first `pm_lsp` call (`PM-TOOL-2`, `PM-SVC-4`), evicted cleanly (`shutdown` -> `exit` -> `SIGTERM`) after 15 minutes of inactivity or when the runtime drains or stops, and restarted automatically (up to 2 retries) on unexpected exit.
 
 == Linux Filesystem Confinement (`systemd-run`)
 
@@ -189,16 +189,16 @@ If a build fails (exit code != 0) but the output parser cannot extract any struc
 
 * The job outcome is classified as `failed_unparsed` (never folded into normal `failed`).
 * The full raw log is preserved at `~/.plan-marshall/mcp/logs/jobs/<job_id>.log`.
-* The representation exposes a `link` to view the raw log or escalate to the operator, preventing the model from hallucinating non-existent compiler errors.
+* The representation embeds the bounded raw-log tail (last 50 lines, capped at 4 KB, secrets redacted) and the resource URI `pm://plan/{plan_id}/builds/{job_id}/log`, plus an `escalate` link, preventing the model from hallucinating non-existent compiler errors.
 
 == Adaptive Build Timeouts, Coverage Parsers & Gate Honesty (`PM-EXEC-6`)
 
 === Adaptive Timeout Learning
 
-For every `(project_root, executable, canonical_argv)` tuple, `pm-mcp` persists observed successful execution durations in `~/.plan-marshall/mcp/state/build-timings.json`:
+For every `(project_root, executable, canonical_argv)` tuple, `pm-mcp` persists observed execution durations in `~/.plan-marshall/mcp/state/build-timings.json`:
 
-* *Baseline Update Rule*: Upon each `succeeded` run with duration $d$, the learned baseline $L$ updates via $L_{\text{new}} = 0.8 \times \max(L_{\text{old}}, d) + 0.2 \times \min(L_{\text{old}}, d)$.
-* *Timeout Allocation*: The job timeout is set to $\max(\text{engine\_floor}, \lceil 1.25 \times L \rceil)$, where $\text{engine\_floor}$ defaults to `120s` for Maven/Gradle and `60s` for npm/pytest.
+* *Baseline Update Rule*: Upon each completed run (any exit code; never `killed`/`cancelled`) with duration $d$, the learned baseline $L$ updates via $L_{\text{new}} = \lfloor 0.8 \times \max(L_{\text{old}}, d) + 0.2 \times \min(L_{\text{old}}, d) \rfloor$ (first observation stored raw); a `timed_out` run feeds $d = \min(2 \times \text{timeout}, 1800)$.
+* *Timeout Allocation*: The job timeout is set to $\max(\text{engine\_floor}, \lfloor 1.25 \times L \rfloor)$ (default `300s` when unlearned), where $\text{engine\_floor}$ is `300s` for Maven/Gradle/npm and `330s` for pytest.
 
 === Native Coverage Report Parsers
 

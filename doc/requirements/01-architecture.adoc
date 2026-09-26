@@ -1,17 +1,18 @@
 == Core Architecture (PM-ARCH)
 
 [#PM-ARCH-1]
-=== PM-ARCH-1: Process Ownership & Native STDIO Server Execution
+=== PM-ARCH-1: Process Ownership & Always-On Runtime
 
 The system must strictly divide responsibilities between deterministic process execution and probabilistic model judgment. All state tracking, transition sequencing, gate evaluations, and command assembly belong to the system, while the model is tasked exclusively with judgment-based contributions.
 
-* The system must execute all workflow state machines, state transitions, quality gate evaluations, and command assembly inside the `pm-mcp` native server process, confining model contributions exclusively to judgment artifacts (request clarification, solution outline authoring, code implementation, finding triage, and commit/pull request descriptions).
-* The system must execute as a native STDIO MCP server (`pm-mcp serve`) spawned directly by the host coding agent under the operating system privileges of the local developer user, with zero listening network ports.
+* The system must execute all workflow state machines, state transitions, quality gate evaluations, and command assembly inside the always-on `pm-mcp` runtime process, confining model contributions exclusively to judgment artifacts (request clarification, solution outline authoring, code implementation, finding triage, and commit/pull request descriptions).
+* The system must run as a single always-on runtime process (daemon) per machine and `PM_MCP_BASE`, under the operating system privileges of the local developer user, whose lifetime and jobs are independent of any host conversation or host connection.
+* The system must let host coding agents reach the runtime exclusively through a thin `pm-mcp serve` STDIO relay spawned by the host per connection, with zero listening network ports.
 * The system must enforce mutual exclusion across concurrent sessions, sub-agents, and projects using OS-level `FileChannel.lock()` advisory locks and atomic write-then-rename operations within `.plan/` and `~/.plan-marshall/mcp/locks/`.
 * The system must compile workflow definitions, state stores, tools, client profiles, vocabulary skills, and background services into a single GraalVM native binary, guaranteeing that all components operate on an identical release version without runtime drift.
 * The system must reject any architecture where process ordering, transition permissions, or parameter assembly depend on prose instructions or client-side prompt compliance.
 
-See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] and the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] for implementation details.
 
 [#PM-ARCH-2]
 === PM-ARCH-2: Local-by-Design & Zero External Cloud Dependency
@@ -22,31 +23,33 @@ The system must operate entirely on the developer's workstation, directly intera
 * The system must enforce workspace confinement, restricting all file reads, file modifications, and process executions strictly to the enrolled project root directory and its active linked worktrees.
 * The system must reject any operation attempting to access or modify filesystem paths outside the enrolled project boundary unless explicitly authorized by the human operator through the operator channel.
 
-See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
+See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
 
 [#PM-ARCH-3]
-=== PM-ARCH-3: Native STDIO MCP Transport & Frontier Protocol Compliance
+=== PM-ARCH-3: STDIO Host Transport, Local Relay & Frontier Protocol Compliance
 
-The server must expose its capabilities exclusively via the Model Context Protocol (MCP) `stdio` transport (`io.quarkiverse.mcp:quarkus-mcp-server-stdio`) targeting the frontier MCP `2026-07-28` specification.
+Hosts must connect over the Model Context Protocol (MCP) `stdio` transport, relayed to the always-on runtime over a user-private local channel, targeting the frontier MCP `2026-07-28` specification.
 
-* The system must communicate with host coding agents (`claude`, `opencode`, `antigravity`, `codex`) exclusively over standard input (`stdin`) and standard output (`stdout`) via `pm-mcp serve`, omitting all HTTP, SSE, and WebSocket network listeners.
-* The system must reserve `stdout` strictly for newline-delimited JSON-RPC 2.0 MCP messages (`quarkus.mcp.server.stdio.null-system-out=true`) and route all diagnostic logging to `stderr` and `~/.plan-marshall/mcp/logs/daemon.log`.
+* The system must communicate with host coding agents (`claude`, `opencode`, `antigravity`, `codex`) exclusively over standard input (`stdin`) and standard output (`stdout`) of the `pm-mcp serve` relay.
+* The relay must forward MCP messages in both directions (requests, responses, notifications, and server-to-client requests such as elicitation) between the host and the runtime without interpreting them, preserving JSON-RPC `id` values.
+* The runtime must serve MCP only over a Unix domain socket restricted to the owning OS user, omitting all TCP/UDP listeners.
+* The relay must reserve `stdout` strictly for newline-delimited JSON-RPC 2.0 MCP messages and route all diagnostic logging to `stderr`; the runtime logs to `~/.plan-marshall/mcp/logs/daemon.log`.
 * The system must target the MCP `2026-07-28` protocol version exclusively, omitting legacy protocol versions (`2025-11-25`, `2024-11-05`) and backward-compatibility shims.
 
-See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] for implementation details.
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] for implementation details.
 
 [#PM-ARCH-4]
 === PM-ARCH-4: Stateless Requests & Explicit Scope Addressing
 
 The system must operate without transport-level session state, evaluating every request entirely from explicit scope identifiers and persisted filesystem records.
 
-* The system must process every MCP tool invocation statelessly, maintaining no protocol-level session state across calls in compliance with sessionless MCP standards.
+* The system must process every MCP tool invocation statelessly: MCP transport sessions and host connections may carry only negotiated protocol capabilities and connection metadata, never workflow state.
 * The system must require every stateful workflow invocation to carry an explicit logical scope identifier (`plan_id` or `epic_id`) and, when addressing an entity-specific transition, the entity identifier within the link ID.
-* The system must resolve the client runtime identity (`client_id`) and the target project root (`workspace_root`) exclusively from the scope's persisted entry record (`entry.json`), rejecting client-supplied working directory or client-type overrides.
+* The system must resolve the client identity (`client_id`) and the target project root (`workspace_root`) of scoped calls exclusively from the scope's persisted entry record (`entry.json`), rejecting client-supplied working directory or client-type overrides.
 * The system must answer every workflow query and validate every transition entirely from persisted filesystem state, guaranteeing zero state loss across host restarts, context window compactions (`/clear`), or process restarts.
 * The system must restrict unscoped tool requests strictly to global project discovery and initial plan instantiation (`pm_plans`, `pm_epics`, `pm_start`).
 
-See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification], the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], and the link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
 
 [#PM-ARCH-5]
 === PM-ARCH-5: Worktree-Bound Plan Location & Main-Bound Orchestrator Location
@@ -88,14 +91,29 @@ Directory moves between the main checkout and plan worktrees must occur atomical
 See the link:specification/move-journal.adoc[Move Journal Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
 
 [#PM-ARCH-8]
-=== PM-ARCH-8: STDIO Process Lifecycle, Crash Recovery & Job Drain
+=== PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain
 
-Each `pm-mcp` server process must manage its lifecycle cleanly alongside its parent host session, providing graceful job draining on EOF/signals and deterministic crash recovery on startup.
+The runtime must run continuously and recover deterministically from crashes, while relays come and go with host connections without affecting runtime state or jobs.
 
-* The host coding agent spawns `pm-mcp serve` automatically when starting an MCP session and closes `stdin` when the session ends.
-* The system must provide CLI inspection and lifecycle verbs (`pm-mcp status` to inspect active plans, build slots, and running jobs across the machine, and `pm-mcp drain` to signal active `pm-mcp` processes to drain running jobs before upgrade).
-* When `stdin` reaches `EOF` or the process receives `SIGTERM`/`SIGINT`, `pm-mcp serve` must enter drain mode: stop accepting new tool requests, allow active build/git/CI subprocesses to finish (up to the configured drain timeout) or record interrupted jobs as `killed`, terminate warm LSP child processes, and exit cleanly.
-* The system must verify the binary version on disk during every client entry call (`pm-mcp enter`) and warn or drain active processes if a newer binary version has been installed.
-* The system must recover state upon every `pm-mcp` startup by inspecting persisted state files, releasing stale locks whose owning PID is no longer alive (`ProcessHandle.of(pid)`), completing or rolling back any interrupted `move-journal.json`, and marking orphaned `running` jobs whose child PIDs have terminated as `killed` without blind re-execution.
+* The system must start the runtime on demand when a relay finds none running, detached from the relay's process group and session so that no host action on the relay terminates it, and must optionally support start at login through the per-user OS service manager.
+* The system must ensure that relay termination (`stdin` EOF or signals) closes only that host connection and never cancels, drains, or kills jobs or alters persisted state.
+* The system must provide CLI inspection and lifecycle verbs: `pm-mcp status` to inspect the runtime, active plans, build slots, and running jobs across the machine, and `pm-mcp drain` to stop the runtime gracefully before an upgrade.
+* On `SIGTERM`/`SIGINT` (including via `pm-mcp drain`), the runtime must stop admitting new jobs, allow running build/git/CI jobs to finish up to the configured drain timeout, record the remaining jobs as `killed`, terminate warm LSP child processes, and exit cleanly.
+* The system must detect a version mismatch between an installed binary and the running runtime during `pm-mcp enter`, relay connection, and `pm-mcp status`, and recommend `pm-mcp drain`.
+* The system must recover state on every runtime start before accepting calls: release stale locks and leases whose owning process (PID plus start time) is no longer alive, complete or roll back any interrupted `move-journal.json`, and mark orphaned `running` jobs as `killed` (terminating their process groups if still alive) without blind re-execution.
 
-See the link:specification/daemon-endpoint.adoc[Daemon Endpoint Specification] and link:specification/move-journal.adoc[Move Journal Specification] for implementation details.
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification], the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], and the link:specification/move-journal.adoc[Move Journal Specification] for implementation details.
+
+[#PM-ARCH-9]
+=== PM-ARCH-9: Logical Plan Sessions & Connection-Independent Continuation
+
+A working session with PM-MCP is a logical sequence of calls against one plan or epic, carried by persisted state rather than by any connection or conversation.
+
+* The system must identify a logical session solely by its `plan_id` or `epic_id` and represent it solely by that scope's persisted files.
+* The system must execute every mutating call as exactly one state transition that is fully persisted before the response is returned, so that a lost response never loses or duplicates a transition.
+* The system must allow a logical session to continue either by following a link from the last representation or by calling `pm_state(plan_id | epic_id)` from any host connection, host, sub-agent, or later conversation, with identical results for identical persisted state.
+* The system must allow multiple host connections to address the same logical session concurrently, serializing mutations through the scope lock (`PM-WF-4`).
+* The system must let long-running jobs started in a logical session complete while no host is connected, exposing their outcome to the next call on that scope.
+* The system may vary connection-dependent rendering (bounded vs. progress waits, elicitation vs. `*.blocked` operator fallback) by the capabilities of the calling host connection, never by persisted state differences.
+
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] for implementation details.

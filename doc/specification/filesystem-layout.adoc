@@ -26,8 +26,8 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-SEC-2[PM-SEC-2: Workspace Confinement & Path Traversal Prevention]_
 * _See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
 * _See Requirement link:../Requirements.adoc#PM-DIST-5[PM-DIST-5: Multi-Host Concurrent Coexistence on One Machine]_
-* _See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Mutual Coexistence Guard Between Legacy Scripts and PM-MCP]_
-* _See Requirement link:../Requirements.adoc#PM-MIG-3[PM-MIG-3: Cross-Runtime File Lock & Shared Store Interoperability]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Exclusive Runtime per Machine & Routed Legacy Script Execution]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-3[PM-MIG-3: Shared Store Format Interoperability During Staged Porting]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-5[PM-MIG-5: Quantitative Rollback Triggers & Safe Reversion]_
 * _See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
 
@@ -43,7 +43,6 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 ├── .gitignore
 ├── .plan/
 │   ├── marshal.json                     # Project-level configuration (git-tracked)
-│   ├── co-exist.lock                    # Mutual coexistence lock between legacy Python and PM-MCP
 │   │
 │   ├── orchestrator/                    # Orchestrator epics (git-tracked, worktree-edited)
 │   │   └── <epic_id>/
@@ -60,7 +59,7 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 │   └── local/                           # Git-ignored local execution state
 │       │
 │       ├── plans/                       # Pre-worktree and post-merge plan directories
-│       │   └── <plan_id>/               # Relocated to worktree during execution (Phase 4/5/6)
+│       │   └── <plan_id>/               # Relocated to worktree during execution (Phase 5/6)
 │       │       ├── request.md
 │       │       ├── outline.md
 │       │       ├── execution-manifest.json
@@ -81,7 +80,7 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 │               ├── <repo-source-files>
 │               └── .plan/               # Worktree-local plan tree
 │                   ├── marshal.json     # Pinned branch configuration
-│                   └── plans/
+│                   └── local/plans/
 │                       └── <plan_id>/   # Authoritative plan directory while worktree exists
 │                           ├── request.md
 │                           ├── outline.md
@@ -99,7 +98,7 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 === Worktree Path Resolution & Same-Filesystem Invariant
 
 * *Deterministic Location*: For any plan identified by `<plan_id>`, the server resolves its active working tree deterministically:
-** If `.plan/local/worktrees/<plan_id>/` exists and is a valid git worktree, the plan directory is located at `.plan/local/worktrees/<plan_id>/.plan/plans/<plan_id>/`.
+** If `.plan/local/worktrees/<plan_id>/` exists and is a valid git worktree, the plan directory is located at `.plan/local/worktrees/<plan_id>/.plan/local/plans/<plan_id>/`.
 ** Otherwise, the plan directory is located at `.plan/local/plans/<plan_id>/` within the primary checkout.
 * *Same-Filesystem Invariant*: All worktrees are created within `.plan/local/worktrees/<plan_id>`. This guarantees that moving the `<plan_id>` directory between the primary checkout and the worktree operates on the *same physical filesystem partition*, enabling POSIX atomic renames (`rename(2)` / `Files.move(..., ATOMIC_MOVE)`).
 * *Stateless Client Scope*: Neither the model nor the MCP client ever passes filesystem paths (`PM-ARCH-4`, `PM-SEC-2`). The client passes only `plan_id` or `epic_id`. The daemon dynamically resolves the canonical real path (`Path.toRealPath()`) and verifies workspace confinement before any file I/O.
@@ -131,16 +130,20 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
     │   ├── build-slots.json             # Active PID-keyed build concurrency leases
     │   ├── merge-queue.json             # Per-repo FIFO merge admission queues & active holders
     │   ├── review-bot-windows.json      # Per-bot cross-plan rate-window claims
-    │   └── processes/                   # Active STDIO server process descriptors
-    │       └── <pid>.json
+    │   └── runtime.json                 # Runtime record: pid, start instant, version, socket path
     │
-    ├── locks/                           # Cross-session OS FileChannel.lock() primitives
+    ├── run/                             # Runtime socket directory (mode 0700)
+    │   └── runtime.sock                 # Unix domain socket of the runtime (mode 0600)
+    │
+    ├── locks/                           # Cross-process OS FileChannel.lock() primitives
+    │   ├── runtime.lock                 # Runtime singleton lock (held for the runtime lifetime)
+    │   ├── runtime-start.lock           # Serializes on-demand runtime start by relays
     │   ├── merge.lock                   # Machine-wide merge mutex and FIFO queue
     │   ├── review-bot.lock              # Bot rate-window claim records
     │   └── build-slots.lock             # Concurrency limiter semaphore lock
     │
     └── logs/                            # Diagnostic logs and structured security audit
-        ├── daemon.log                   # Rolling server diagnostic log (mode 0600)
+        ├── daemon.log                   # Rolling runtime diagnostic log (mode 0600)
         ├── audit.jsonl                  # Append-only transition, tool call & security audit (mode 0600)
         └── jobs/                        # Subprocess execution logs by job ID
             └── <job_id>.log
@@ -166,7 +169,11 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 
 |`~/.plan-marshall/mcp/locks/*.lock`
 |`0600` (`-rw-------`)
-|Held via OS kernel `FileChannel.lock()` across concurrent `pm-mcp` STDIO server and CLI processes.
+|Held via OS kernel `FileChannel.lock()` across the runtime, `pm-mcp serve` relays, and CLI processes.
+
+|`~/.plan-marshall/mcp/run/runtime.sock`
+|`0600` (`srw-------`) in a `0700` directory
+|Only listener of the runtime (`PM-SEC-4`, link:runtime-model.adoc[Runtime & Interaction Model Specification]).
 
 |`~/.plan-marshall/mcp/logs/audit.jsonl`
 |`0600` (`-rw-------`)
@@ -179,23 +186,22 @@ When a plan transitions to or from an isolated worktree, the daemon executes ato
 
 * *Outward Relocation (Main Checkout -> Worktree)*:
 ** Git worktree is created at `.plan/local/worktrees/<plan_id>/`.
-** `.plan/local/worktrees/<plan_id>/.plan/plans/` directory is prepared.
+** `.plan/local/worktrees/<plan_id>/.plan/local/plans/` directory is prepared.
 ** Write-ahead journal entry is flushed (`operation: RELOCATE_TO_WORKTREE`, `phase_state: TARGET_PREPARED`).
-** Atomic directory rename moves `.plan/local/plans/<plan_id>/` to `.plan/local/worktrees/<plan_id>/.plan/plans/<plan_id>/`.
-** Journal state is updated to `COMMITTED`, then deleted.
+** Atomic directory rename moves `.plan/local/plans/<plan_id>/` to `.plan/local/worktrees/<plan_id>/.plan/local/plans/<plan_id>/`.
+** `status.json` location is updated and fsynced, then the journal is deleted.
 * *Inward Relocation (Worktree -> Main Checkout)*:
 ** Prior to worktree removal, write-ahead journal entry is flushed (`operation: RELOCATE_TO_MAIN`, `phase_state: TARGET_PREPARED`).
-** Atomic directory rename moves `.plan/local/worktrees/<plan_id>/.plan/plans/<plan_id>/` back to `.plan/local/plans/<plan_id>/`.
-** Journal state is updated to `COMMITTED`, then deleted.
+** Atomic directory rename moves `.plan/local/worktrees/<plan_id>/.plan/local/plans/<plan_id>/` back to `.plan/local/plans/<plan_id>/`.
+** `status.json` location is updated and fsynced, then the journal is deleted.
 ** Git worktree at `.plan/local/worktrees/<plan_id>/` is safely dismantled (`git worktree remove`).
 
 If a power failure or crash occurs during either step, the daemon's startup recovery procedure inspects `move-journal.json` to complete or roll back the move idempotently.
 
-== Legacy Store Coexistence, File Locking & Cutover (`PM-MIG-2`, `PM-MIG-3`, `PM-MIG-5`)
+== Staged Porting, Cutover & Rollback (`PM-MIG-2`, `PM-MIG-3`, `PM-MIG-5`)
 
-During the phased migration from `plan-marshall` Python scripts to `PM-MCP`:
+During the staged porting from `plan-marshall` Python scripts to `PM-MCP`:
 
-1. *Mutual Coexistence Guard (`PM-MIG-2`)*: When a plan or epic is entered via `pm-mcp enter`, the daemon creates `<scope_dir>/mcp/entry.json` and acquires `.plan/co-exist.lock`. Legacy `plan-marshall` workflow entry points (`execute-script.py` phase routers) inspect `<scope_dir>/mcp/entry.json` and refuse to run legacy phase mutations on an MCP-managed scope unless explicitly downgraded via rollback.
-2. *Cross-Runtime Advisory File Locking (`PM-MIG-3`)*: Both the Java daemon and legacy Python scripts acquire OS-level `flock` / `FileChannel.lock()` on companion `.lock` files before mutating shared `.plan/` JSON/JSONL stores (`status.json`, `findings.jsonl`, `references.json`, `TASK-*.json`).
-3. *Quantitative Rollback & Per-Project Reversion (`PM-MIG-5`)*: Because `.plan/` stores preserve structural compatibility with `format_version: 1`, an operator can revert a project or individual plan to legacy `plan-marshall` execution by removing `mcp/entry.json` (via `pm-mcp operator rollback-scope <plan_id>` or `pm-mcp client remove --scope project`), leaving all domain artifacts (`request.md`, `outline.md`, `TASK-*.json`, `findings.jsonl`) intact.
-
+1. *Machine Cutover (`PM-MIG-2`)*: Installing Stage 1 switches the whole machine to `PM-MCP`. The client bundles remove the host allowlist entries for `execute-script.py`, and the legacy executor refuses to run unless launched by the runtime as a `script` job. Legacy and `PM-MCP` never run in parallel on one machine.
+2. *Single Writer Set (`PM-MIG-3`)*: Ported Java primitives and routed legacy `script` jobs both run inside the runtime. A `script` job holds the addressed scope's lock for its whole duration, so shared `.plan/` stores (`status.json`, `findings.jsonl`, `references.json`, `TASK-*.json`) never see concurrent writers from the two implementations and no cross-runtime lock protocol exists.
+3. *Rollback (`PM-MIG-5`)*: `pm-mcp operator rollback` drains the runtime and restores direct legacy execution on the machine. Plan directories and domain artifacts (`request.md`, `outline.md`, `TASK-*.json`, `findings.jsonl`) stay in place.
