@@ -70,7 +70,7 @@ Every workflow state representation is serialized as a top-level TOON object wit
 |`state`
 |Required
 |Dotted enum
-|Closed-enum state name (`<phase>.<step>[.<substate>]`, e.g., `finalize.push-barrier`, `execute.verify.running`). Never a boolean.
+|Closed-enum state name (`<phase>.<step>[.<substate>]`, e.g., `finalize.concurrent-wait`, `execute.verify.running`; while a sub-workflow is active, the active sub-workflow state, e.g., `git.compose-message`). Never a boolean.
 
 |`phase`
 |Required
@@ -115,24 +115,24 @@ Every workflow state representation is serialized as a top-level TOON object wit
 
 === Canonical Representation Example
 
+`finalize.push-barrier` is a `call` state (`call git.commit_and_push`), so it is never a resting state: while the push barrier runs, the representation shows the active `git.*` sub-workflow state with `phase` inherited from the caller. The example shows `git.compose-message`, entered when the barrier (`message_mode=none_assert_clean`) finds unexpected uncommitted files:
+
 [source,toon]
 ----
 scope: plan
 plan_id: PLAN-2026-042
-state: finalize.push-barrier
+state: git.compose-message
 phase: finalize
-summary: "tasks 11/11 done, freshness gate green, branch not pushed"
-skill: "skill://pm/finalize/push-barrier/SKILL.md"
+summary: "push barrier found 2 uncommitted files, commit message required"
+skill: "skill://pm/git/commit-message/SKILL.md"
 facts:
   branch: feature/PLAN-2026-042
-  commits_ahead: 4
-  gate.freshness: green
-  outline_uri: "pm://plan/PLAN-2026-042/outline"
-  worktree_sha: 8f3a1c9e2d4b6a0f1e2d3c4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1
-links[3]{rel,link,form,free}:
-  next,push,noop,""
-  alt,commit,submit,"message:text[1..2000]"
-  escalate,escalate,escalate,"reason:text[1..500]"
+  changed_files: 2
+  module_scope: http
+  suggested_type: fix
+links[2]{rel,link,form,free}:
+  next,commit,submit,"message:text[1..2000]"
+  abort,abort,noop,""
 ----
 
 == The Five Normative Link Forms
@@ -262,9 +262,14 @@ Link identifiers (`link` column) are server-derived, stateless tokens governed b
 
 [source,ebnf]
 ----
-link_id       = action_name , [ ":" , entity_id ] ;
-action_name   = lowercase_alpha , { lowercase_alpha | digit | "_" | "-" } ;
-entity_id     = ( alpha | digit ) , { alpha | digit | "_" | "." | "-" } ;
+link_id         = action_name , [ ":" , entity_id ] ;
+action_name     = lowercase_alpha , { lowercase_alpha | digit | "_" | "-" } ;
+entity_id       = ( alpha | digit ) , { alpha | digit | "_" | "." | "-" } ;
+alpha           = lowercase_alpha | uppercase_alpha ;
+lowercase_alpha = ? ASCII "a".."z" ? ;
+uppercase_alpha = ? ASCII "A".."Z" ? ;
+digit           = "0" | nonzero_digit ;
+nonzero_digit   = ? ASCII "1".."9" ? ;
 ----
 
 1. *Scope-Wide Link (`<action>`)*: Matches pattern `^[a-z][a-z0-9_-]{0,63}$` (for example `push`, `commit`, `refine`, `outline`, `escalate`, `loop_back`) and applies to the entire `plan_id` or `epic_id` scope.
@@ -279,11 +284,17 @@ The `free` column specifies the closed schema for `pm_do(..., args)` in compact 
 free_spec     = "" | param_decl , { "," , param_decl } ;
 param_decl    = param_name , ":" , param_type , [ "?" ] ;
 param_name    = lowercase_alpha , { lowercase_alpha | digit | "_" } ;
-param_type    = "text" , [ "[" , int , ".." , int , "]" ]
-              | "int" , [ "[" , int , ".." , int , "]" ]
-              | "enum[" , enum_val , { "|" , enum_val } , "]"
-              | "list[" , scalar_type , "]" ;
+param_type    = scalar_type
+              | "list<" , scalar_type , ">" ;
+scalar_type   = "text" , [ int_range ]
+              | "int" , [ int_range ]
+              | "enum[" , enum_val , { "|" , enum_val } , "]" ;
+int_range     = "[" , int , ".." , int , "]" ;
+enum_val      = alpha , { alpha | digit | "_" | "-" } ;
+int           = "0" | nonzero_digit , { digit } ;
 ----
+
+The character classes `alpha`, `lowercase_alpha`, `digit`, and `nonzero_digit` are those of the link identifier grammar above. `param_type` mirrors the DSL `type_spec` (link:workflow-dsl.adoc[Workflow DSL Specification]): lists use the single syntax `list<…>` (for example `paths:list<text>?`), enum values may contain upper case (`enum[FIX|SUPPRESS|ACCEPT]`), and there is no object type.
 
 NOTE: Boolean parameters are prohibited in workflow transitions to preserve explicit closed-enum intent (e.g., `decision:enum[approve|reject]` rather than `approved:bool`). A trailing `?` marks an optional parameter (such as `token_usage:int[0..10000000]?`).
 
@@ -324,43 +335,86 @@ links[2]{rel,link,form,free}:
   abort,"cancel:finalize.concurrent-wait",noop,""
 ----
 
+Both links are the implicit links of the `composite_job` state (link:workflow-dsl.adoc#implicit-job-links[Workflow DSL Specification]); they are never declared in DSL source.
+
 === Closed Status Enumerations in `finalize.concurrent-wait`
 
 * `ci_status`: `running` | `passed` | `failed` | `not_triggered` | `cancelled`
-* `bot_status`: `pending` | `completed` | `not_configured` | `rate_limited` | `timed_out` | `cancelled`
+* `bot_status`: `pending` | `running` | `completed` | `not_configured` | `rate_limited` | `timed_out` | `cancelled`
 
 === Deterministic Evaluation & Immediate Short-Circuit Matrix
 
-When the model follows `wait:finalize.concurrent-wait`, the daemon monitors both underlying jobs (`ci_job_id` and `bot_job_id`) concurrently and unblocks according to the following transition rules:
+When the model follows `wait:finalize.concurrent-wait`, the daemon monitors both underlying jobs (`ci_job_id` and `bot_job_id`) concurrently and unblocks according to the following transition rules. Rows are evaluated top to bottom and the first matching row wins; together they cover every combination of `ci_status` and `bot_status`. The composite outcome column names the `finalize.watch-ci-and-bots` outcome declared in the `finalize.pmwf` excerpt (link:workflow-dsl.adoc[Workflow DSL Specification]); _(keep waiting)_ means the composite job has not settled.
 
-[cols="1,1,2,3"]
+[cols="1,1,1,2,3"]
 |===
-|`ci_status` |`bot_status` |Target State |Engine Action
+|`ci_status` |`bot_status` |Composite Outcome |Target State |Engine Action
 
 |`failed`
-|_Any (`pending`, `completed`, etc.)_
+|_Any_
+|`ci_failed`
 |`finalize.ci-failed`
 |*Immediate Short-Circuit*: The daemon immediately unblocks `wait:finalize.concurrent-wait`, cancels any still-pending review-bot wait timer (`bot_job_id`), persists CI failure findings, and returns `finalize.ci-failed` with `fix`, `loop_back`, and `escalate` links.
 
+|`not_triggered`
+|_Any_
+|`ci_failed`
+|`finalize.ci-failed`
+|*Immediate Short-Circuit*: No CI run was triggered for the pushed `HEAD`; handled as a hard CI failure with failure class `not_triggered` recorded in `facts`, cancelling the bot wait as for `failed`.
+
+|`cancelled`
+|_Any_
+|`cancelled`
+|`finalize.wait-cancelled`
+|The CI run was cancelled externally; the bot wait is cancelled and `finalize.wait-cancelled` offers `retry` (restart the composite wait) and `escalate`.
+
+|_Any other_
+|`cancelled`, or `cancel:finalize.concurrent-wait` followed
+|`cancelled`
+|`finalize.wait-cancelled`
+|The review-bot run was cancelled externally, or the model followed the implicit `cancel:finalize.concurrent-wait` link; all constituent jobs are cancelled and `finalize.wait-cancelled` offers `retry` and `escalate`.
+
 |`passed`
-|`completed` (0 open findings)
+|`completed` (0 open findings) / `not_configured`
+|`all_green`
 |`finalize.merge-gate`
-|Both concurrent gates succeeded cleanly; advances directly to the pre-merge barrier.
+|Both concurrent gates succeeded cleanly (or no review bot is configured); advances directly to the pre-merge barrier.
 
 |`passed`
 |`completed` ($\ge 1$ open findings)
+|`findings_open`
 |`finalize.triage`
 |Bot review findings were ingested into `findings.jsonl`; transitions to `finalize.triage` offering `triage:<finding_id>` links.
 
 |`passed`
-|`rate_limited` / `timed_out`
+|`rate_limited`
+|`bot_rate_limited`
 |`finalize.review-escalate`
-|CI passed, but the review bot rate-window or timeout budget expired; offers `retry` and `escalate` links.
+|CI passed, but the review bot's rate window has not reopened within the wait budget; offers `retry` and `escalate` links.
+
+|`passed`
+|`timed_out`
+|`bot_timed_out`
+|`finalize.review-escalate`
+|CI passed, but the review bot exceeded its timeout budget without completing; offers `retry` and `escalate` links.
+
+|`passed`
+|`pending` / `running`
+|_(keep waiting)_
+|`finalize.concurrent-wait`
+|CI is green and the review bot has not finished; the daemon keeps waiting on the bot. When the wait bound expires, returns updated `finalize.concurrent-wait` with `ci_status: passed`, incremented `elapsed_seconds`, and fresh `wait:` / `cancel:` links.
 
 |`running`
-|`pending` / `completed` (within wait bound)
+|`rate_limited`
+|_(keep waiting)_
 |`finalize.concurrent-wait`
-|Wait bound (4m default or 30m with progress) expired while CI is still running; returns updated `finalize.concurrent-wait` with incremented `elapsed_seconds` and fresh `wait:finalize.concurrent-wait` link.
+|The daemon keeps waiting on CI and records the bot's rate window in `facts`; the bot outcome is decided only once CI has passed (then the `passed` rows apply).
+
+|`running`
+|`pending` / `running` / `completed` / `not_configured` / `timed_out`
+|_(keep waiting)_
+|`finalize.concurrent-wait`
+|Wait bound (4m default or 30m with progress) expired while CI is still running; returns updated `finalize.concurrent-wait` with incremented `elapsed_seconds` and fresh `wait:` / `cancel:` links. A settled bot status is retained in `facts` until CI settles.
 |===
 
 == Deterministic Native TOON Encoder Specification
