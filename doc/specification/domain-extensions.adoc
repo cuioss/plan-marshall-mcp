@@ -869,7 +869,7 @@ In the legacy architecture, `.plan/marshal.json` and `.plan/run-configuration.js
 `.plan/marshal.json`
 |Yes (committed to repository)
 |Daemon via validated setup/config hypermedia links; Domain `config_defaults` seeded write-once.
-|Project metadata (`project.default_base_branch`), workflow posture & `*_without_asking` knobs, loop-back caps, effort role overrides (`plan.*.effort.*`, `orchestrator.effort.*`), active domain IDs (`domains.enabled`), `build_map` routes, non-secret provider selection and base URLs/origins (VCS=1, CI<=1, Sonar/other), `{tool}.acceptable_warnings`, coverage thresholds, and architecture module enrichment metadata.
+|Project metadata (`project.default_base_branch`), workflow posture & `*_without_asking` knobs, loop-back caps, effort role overrides (`plan.*.effort.*`, `orchestrator.effort.*`), active skill domains (`skill_domains`), `build_map` routes, non-secret provider selection and base URLs/origins (VCS=1, CI<=1, Sonar/other), `{tool}.acceptable_warnings`, coverage thresholds, and architecture module enrichment metadata.
 
 |*Tier 2: Operator Enrolment & Machine Config* +
 `~/.plan-marshall/mcp/enrolments.json` +
@@ -889,9 +889,9 @@ In the legacy architecture, `.plan/marshal.json` and `.plan/run-configuration.js
 
 === Tier 1: Git-Tracked Project Configuration (`.plan/marshal.json`)
 
-1. *Elimination of Frozen `skill_domains` Snapshots*: During migration from legacy `marshal.json`, frozen hook outputs stored under `skill_domains.{key}` (skill lists, globs, recipes) are treated as derived legacy artifacts and stripped. The compiled-in domain descriptors in `pm-mcp` are authoritative; `.plan/marshal.json` retains only `domains.enabled` (list of active domain IDs) and explicit operator parameter overrides.
+1. *Elimination of Frozen `skill_domains` Snapshots*: During migration from legacy `marshal.json`, frozen hook outputs stored under `skill_domains.{key}` (skill lists, globs, recipes) are treated as derived legacy artifacts and stripped. The compiled-in domain descriptors in `pm-mcp` are authoritative; `.plan/marshal.json` retains under `skill_domains` only the active domain IDs and explicit operator parameter overrides.
 2. *Write-Once Domain Defaults*: When a domain is enabled, its `config_defaults` map is merged into `.plan/marshal.json` using write-once semantics: existing project keys are never overwritten.
-3. *Provider Cardinality & Origin Pinning*: Provider declarations in `.plan/marshal.json` enforce category cardinality: exactly `1` version-control provider (`git`), at most `1` CI provider (`github` or `gitlab`), and `0..N` code-quality/issue providers (such as `sonar`). For token-lane REST providers (`PM-CRED-2`), `.plan/marshal.json` stores the non-secret `base_url` (which must use `https://`), establishing the single issuing origin to which the daemon's REST client restricts authentication headers (forbidding cross-origin or HTTP downgrade redirects).
+3. *Provider Cardinality & Origin Pinning*: Provider declarations in `.plan/marshal.json` enforce category cardinality: exactly `1` version-control provider (`git`), at most `1` CI provider (`github` or `gitlab`), and `0..N` code-quality/issue providers (such as `sonar`). For token-lane REST providers (`PM-CRED-2`), `.plan/marshal.json` stores the non-secret provider `url` (which must use `https://`; the credential entry's own `url` is the origin tokens are sent to, `PM-CRED-5`), establishing the single issuing origin to which the daemon's REST client restricts authentication headers (forbidding cross-origin or HTTP downgrade redirects).
 
 === Tier 2: Enrolled Argument Templates & Slot Cap (`~/.plan-marshall/mcp/`)
 
@@ -933,29 +933,31 @@ In legacy `plan-marshall`, schema and default updates to `.plan/marshal.json` we
 
 Every `.plan/marshal.json` root document carries a `system` tracking block managed exclusively by `ConfigReconciler` (see link:store-schemas.adoc[Store Schemas Specification]):
 
+The `system` block extends the one `plan-marshall` already writes (`retention`, `provisioned_version`, `config_seed_fingerprint`); the first migration command (`M001`) adds the versioning fields. `marshal.json` has no `format_version` of its own.
+
 [source,json]
 ----
 {
-  "format_version": 1,
   "system": {
+    "retention": { "logs_days": 1, "archived_plans_days": 5 },
+    "provisioned_version": "1.0.0",
+    "config_seed_fingerprint": "a94f6e2c81b3d04e7f1298a0b5c6d7e8f90123456789abcdef0123456789abcd",
     "schema_version": 4,
     "baseline_version": 1,
     "applied_migrations": [
       "M002_rename_retired_step_keys",
       "M003_migrate_run_at_all_to_lane",
       "M004_split_enabled_bots_to_participation_lists"
-    ],
-    "provisioned_binary_version": "1.0.0",
-    "config_seed_fingerprint": "a94f6e2c81b3d04e7f1298a0b5c6d7e8f90123456789abcdef0123456789abcd"
+    ]
   }
 }
 ----
 
-* `schema_version`: Monotonically increasing integer (`1..CURRENT_SCHEMA_VERSION`) identifying the highest `ConfigMigrationCommand.targetVersion()` applied to this file.
+* `retention`, `provisioned_version`: Kept from `plan-marshall` unchanged. `provisioned_version` is the version of the binary that last reconciled the file and only advances when a valid version is present (never blanked).
+* `schema_version`: Monotonically increasing integer (`1..CURRENT_SCHEMA_VERSION`) identifying the highest `ConfigMigrationCommand.targetVersion()` applied to this file; its absence identifies an unmigrated `plan-marshall` file, which `M001` handles.
 * `baseline_version`: Integer epoch floor (`MINIMUM_SUPPORTED_SCHEMA_VERSION`). Migration IDs with `targetVersion <= baseline_version` are compacted out of `applied_migrations` at major epoch bumps so `.plan/marshal.json` never accumulates unbounded historical entries.
 * `applied_migrations`: Ordered array of `migrationId` strings for all commands applied above `baseline_version`.
-* `provisioned_binary_version`: Semantic version of the `pm-mcp` binary that last reconciled the file; only advances when a valid binary version is present (never blanked).
-* `config_seed_fingerprint`: Deterministic SHA-256 digest of the compiled-in default configuration tree, active domain `config_defaults` for `domains.enabled`, and `FinalizeStepDescriptor` ordering table.
+* `config_seed_fingerprint`: *Deliberate change vs. `plan-marshall`* (8-hex MD5 over the default config only): a deterministic SHA-256 digest of the compiled-in default configuration tree, the active domains' `config_defaults`, and the `FinalizeStepDescriptor` ordering table.
 
 === 2. Command-Pattern Architecture (`ConfigMigrationCommand`)
 
@@ -1048,7 +1050,7 @@ Raw .plan/marshal.json (ObjectNode)
   │
   └─► Phase 5: Epoch Compaction, Stamp & Conditional Atomic Write
         Compacts applied_migrations <= baseline_version, updates system.schema_version,
-        provisioned_binary_version, and config_seed_fingerprint, and atomically writes
+        provisioned_version, and config_seed_fingerprint, and atomically writes
         .plan/marshal.json ONLY if canonical JSON bytes changed
 ----
 

@@ -38,7 +38,7 @@ _See Requirements:_
 
 == Format Versioning & Atomic Write Discipline
 
-1. *Version Envelope*: Every JSON store root object and every JSONL header/record must declare `"format_version": 1` (positive integer). When the daemon opens a store with a lower `format_version`, it upgrades the structure in memory and writes the migrated store atomically. If a store has a `format_version` higher than the binary supports, the daemon refuses to mutate the store and requests a binary upgrade.
+1. *Version Envelope*: Every server-owned JSON store root object and every JSONL header/record must declare `"format_version": 1` (positive integer). The git-tracked `.plan/marshal.json` (versioned by `system.schema_version`) and the operator-edited credential files (`PM-CRED-3`) are the only exceptions. When the runtime opens a store with a lower `format_version`, it upgrades the structure in memory and writes the migrated store atomically. If a store has a `format_version` higher than the binary supports, the daemon refuses to mutate the store and requests a binary upgrade.
 2. *Atomic Write-and-Rename*: All JSON file updates are written to a sibling temporary file (`<filename>.tmp.<uuid>`), flushed to disk (`FileChannel.force(true)`), and atomically renamed over the target file (`StandardCopyOption.ATOMIC_MOVE`, `StandardCopyOption.REPLACE_EXISTING`).
 3. *Single Writer Set*: Legacy scripts never run in parallel with `PM-MCP`; during staged porting they run only as `script` jobs of the runtime under the addressed scope's lock (`PM-MIG-2`, `PM-MIG-3`), so all read-modify-write operations on shared stores are serialized by the runtime's own locks and no cross-runtime lock protocol exists.
 
@@ -227,14 +227,6 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     "metadata": {
       "type": "object",
       "description": "Plan-level metadata including planning_lane, complexity, domains, and recipe_id."
-    },
-    "store_digests": {
-      "type": "object",
-      "description": "Map of relative store path to expected SHA-256 hex digest for out-of-band edit detection.",
-      "additionalProperties": {
-        "type": "string",
-        "pattern": "^[0-9a-f]{64}$"
-      }
     },
     "freshness_reconcile": {
       "type": ["object", "null"],
@@ -547,7 +539,7 @@ Composed deterministically in-process by `ExecutionManifestResolver` during Phas
 
 == Project Configuration Store (`.plan/marshal.json`, `PM-EXT-6`, `PM-EXT-7`)
 
-Stores git-tracked project configuration and the versioned `system` migration ledger reconciled atomically by `ConfigReconciler` via the Command-Pattern `ConfigMigrationCommand` chain (see link:domain-extensions.adoc[Domain Extensions Specification]).
+Stores git-tracked project configuration and the versioned `system` migration ledger reconciled atomically by `ConfigReconciler` via the Command-Pattern `ConfigMigrationCommand` chain (see link:domain-extensions.adoc[Domain Extensions Specification]). The top-level structure is that of `plan-marshall`'s `marshal.json` (verified at commit `1d4a1da37`; re-verify before implementing). Unlike server-owned stores, `marshal.json` carries **no** `format_version`: `system.schema_version` is its version, and it is migrated only by an explicit reconcile step that produces a commit, never silently at runtime start (`PM-ARCH-6`).
 
 [source,json]
 ----
@@ -556,58 +548,42 @@ Stores git-tracked project configuration and the versioned `system` migration le
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/marshal-config.json",
   "title": "MarshalConfigRecord",
   "type": "object",
-  "required": [
-    "format_version",
-    "system",
-    "project",
-    "domains",
-    "providers",
-    "plan"
-  ],
+  "required": ["system", "project", "skill_domains", "providers", "plan"],
   "additionalProperties": false,
   "properties": {
-    "format_version": {
-      "type": "integer",
-      "const": 1
-    },
     "system": {
       "type": "object",
-      "required": [
-        "schema_version",
-        "baseline_version",
-        "applied_migrations",
-        "provisioned_binary_version",
-        "config_seed_fingerprint"
-      ],
+      "required": ["provisioned_version", "config_seed_fingerprint"],
       "additionalProperties": false,
       "properties": {
+        "retention": {
+          "type": "object",
+          "description": "Retention settings as in plan-marshall (logs_days, archived_plans_days, lessons_superseded_days, temp_on_maintenance, no_plan_body_days, build_results_days, ...)."
+        },
+        "provisioned_version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Version of the binary that last reconciled this file (plan-marshall field name kept)."
+        },
+        "config_seed_fingerprint": {
+          "type": "string",
+          "pattern": "^([a-f0-9]{8}|[a-f0-9]{64})$",
+          "description": "plan-marshall: 8-hex MD5 of the default config. PM-MCP (deliberate change): SHA-256 of compiled defaults, enabled domain config_defaults, and finalize step order; M001 replaces the legacy value."
+        },
         "schema_version": {
           "type": "integer",
           "minimum": 1,
-          "description": "Highest ConfigMigrationCommand.targetVersion() applied to this configuration."
+          "description": "Added by M001. Highest ConfigMigrationCommand.targetVersion() applied; absent means a plan-marshall file awaiting M001."
         },
         "baseline_version": {
           "type": "integer",
           "minimum": 1,
-          "description": "Compaction floor (MINIMUM_SUPPORTED_SCHEMA_VERSION); migrations <= baseline_version are compacted."
+          "description": "Added by M001. Compaction floor (MINIMUM_SUPPORTED_SCHEMA_VERSION)."
         },
         "applied_migrations": {
           "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "^M\\d{3}_[a-z0-9_]+$"
-          },
-          "description": "Ordered list of applied ConfigMigrationCommand IDs above baseline_version."
-        },
-        "provisioned_binary_version": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Semantic version of the pm-mcp binary that last reconciled this file."
-        },
-        "config_seed_fingerprint": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$",
-          "description": "SHA-256 digest of compiled-in default schema, enabled domain config_defaults, and finalize step order."
+          "items": { "type": "string", "pattern": "^M\\d{3}_[a-z0-9_]+$" },
+          "description": "Added by M001. Ordered list of applied ConfigMigrationCommand IDs above baseline_version."
         }
       }
     },
@@ -615,28 +591,27 @@ Stores git-tracked project configuration and the versioned `system` migration le
       "type": "object",
       "required": ["default_base_branch"],
       "properties": {
-        "default_base_branch": { "type": "string", "default": "main" },
-        "working_prefixes": { "type": "array", "items": { "type": "string" } }
+        "default_base_branch": { "type": "string", "default": "main" }
       }
     },
-    "domains": {
+    "skill_domains": {
       "type": "object",
-      "required": ["enabled"],
-      "properties": {
-        "enabled": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Active domain descriptor IDs (replaces legacy frozen skill_domains snapshots)."
-        }
-      }
+      "description": "Enabled skill domains and per-domain settings, as in plan-marshall."
     },
     "providers": {
-      "type": "object",
-      "description": "Non-secret VCS (1), CI (<=1), and code-quality/issue (0..N) provider selections and HTTPS origins."
+      "type": "array",
+      "description": "Non-secret provider declarations: exactly one version-control provider (git), at most one CI provider (github or gitlab), and 0..N other providers, each with its url."
     },
-    "build_map": {
+    "build": {
       "type": "object",
-      "description": "Write-once file-glob to module/whole-tree verification routing rules."
+      "description": "Build settings including the write-once build map (build.map)."
+    },
+    "credentials_config": {
+      "type": "object",
+      "description": "Non-secret credential settings keyed by credential key."
+    },
+    "interaction_mode": {
+      "description": "Interaction posture as in plan-marshall."
     },
     "plan": {
       "type": "object",
@@ -830,8 +805,11 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
 
 Because `.plan/` files reside in the repository working tree where an agent with filesystem write access could modify them directly outside the MCP server:
 
-* On every write to a plan store (`status.json`, `references.json`, `TASK-*.json`, `findings.jsonl`, `outline.md`), the server computes the SHA-256 digest of the written file and records it in `status.json -> store_digests`.
-* On every subsequent read or transition, the engine verifies the current file SHA-256 against `store_digests`. Any mismatch triggers an immediate `store_tampered` transition block requiring operator resolution.
+* Digests live in the sidecar `mcp/digests.json` (`{"format_version": 1, "stores": {"<relative path>": {"size": <int>, "sha256": "<hex>"}}}`), never inside a store they protect.
+* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, the findings and change-ledger JSONL files, `outline.md`, `request.md`), the server records the file's size and SHA-256 in the sidecar under the plan lock.
+* On every subsequent read inside a transition, the engine verifies size and SHA-256 against the sidecar. Any mismatch triggers an immediate `store_tampered` transition block requiring operator resolution.
+* After a legacy `script` job finishes (it runs under the plan lock, `PM-MIG-2`), the runtime re-records the digests of the stores that job may write, so legitimate legacy writes never raise `store_tampered`.
+* An intentional manual edit is accepted with `pm-mcp operator accept-edit <plan_id> <store>`, which re-baselines that store's digest and records the action in `audit.jsonl`.
 
 === Three-Way File Footprint Reconciliation (`references.json`)
 
