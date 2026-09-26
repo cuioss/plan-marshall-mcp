@@ -20,6 +20,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-ARCH-5[PM-ARCH-5: Worktree-Bound Plan Location & Main-Bound Orchestrator Location]_
 * _See Requirement link:../Requirements.adoc#PM-ARCH-6[PM-ARCH-6: Filesystem State Persistence & Cache-Only Process Memory]_
 * _See Requirement link:../Requirements.adoc#PM-ARCH-7[PM-ARCH-7: Atomic Plan State Relocation Across Worktrees]_
+* _See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
 * _See Requirement link:../Requirements.adoc#PM-CRED-1[PM-CRED-1: Dual-Lane Credential Separation (System vs Token Lane)]_
 * _See Requirement link:../Requirements.adoc#PM-CRED-2[PM-CRED-2: OS Credential Store Priority & Native Access]_
 * _See Requirement link:../Requirements.adoc#PM-CRED-3[PM-CRED-3: Permission-Guarded Fallback File Credential Store]_
@@ -50,12 +51,15 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 │   │       ├── spec.md                  # Epic specification (workstream and plan sections)
 │   │       ├── queue/                   # Staged per-plan spec definitions
 │   │       │   └── <plan_id>.json       # Individual queued plan record and spec reference
-│   │       ├── inbox.jsonl              # Append-only structured messages from plans
+│   │       ├── inbox.jsonl              # Append-only event log: messages from plans and epics
 │   │       ├── landings.jsonl           # Verified plan landings and post-merge analysis
 │   │       ├── resume_anchor.md         # Human- and model-readable epic checkpoint summary
 │   │       └── mcp/                     # MCP scope metadata (git-ignored)
 │   │           ├── entry.json           # Advisory client identity and workspace root
 │   │           └── status.json          # FSM orchestrator state
+│   │
+│   ├── archived-orchestrators/          # Terminal epics (git-tracked, moved in the shared epic worktree)
+│   │   └── <epic_id>-<YY-MM-DD>/        # Same per-concern layout; status.json keeps epic_id
 │   │
 │   └── local/                           # Git-ignored local execution state
 │       │
@@ -69,6 +73,9 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 │       │   ├── .tombstones/
 │       │   │   └── <lesson_id>.json     # Tombstone written by every retirement
 │       │   └── .digests.json            # Lesson-store size/SHA-256 sidecar
+│       │
+│       ├── archive/                     # Archived plans (archive-plan, step 1100); never relocated
+│       │   └── <plan_id>/               # Same layout as a plan directory; read-only, resolvable by plan_id
 │       │
 │       ├── mcp/
 │       │   └── pending/                 # Pending entry records of not-yet-created plans
@@ -93,6 +100,7 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 │       │       └── mcp/
 │       │           ├── digests.json     # Store size/SHA-256 sidecar (out-of-band edit detection)
 │       │           ├── entry.json       # Persisted client identity and workspace root
+│       │           ├── mailbox.jsonl    # Append-only event log: messages from the parent epic
 │       │           └── status.json      # Hypermedia FSM state & iteration counters
 │       │
 │       └── worktrees/                   # Dedicated worktree root for active plans
@@ -119,16 +127,30 @@ Every enrolled repository checkout contains a `.plan/` directory structured into
 │                           └── mcp/
 │                               ├── digests.json
 │                               ├── entry.json
+│                               ├── mailbox.jsonl
 │                               └── status.json
 ----
 
-The repository `.gitignore` partitions `.plan/`: `.plan/*` is ignored as a blanket, `!.plan/marshal.json` and `!.plan/orchestrator/` are un-ignored, `.plan/orchestrator/*/mcp/` (and any per-epic log directory) is ignored again after the negations, and `.plan/local/` stays fully ignored. The project setup workflow verifies this partition.
+The repository `.gitignore` partitions `.plan/`: `.plan/*` is ignored as a blanket, `!.plan/marshal.json`, `!.plan/orchestrator/`, and `!.plan/archived-orchestrators/` are un-ignored, `.plan/orchestrator/*/mcp/` and `.plan/archived-orchestrators/*/mcp/` (and any per-epic log directory) are ignored again after the negations, and `.plan/local/` stays fully ignored. The project setup workflow verifies this partition.
+
+[#archives]
+=== Plan & Epic Archives
+
+Archived records keep their identity and stay readable by it (`PM-WF-13`):
+
+* *Plan Archive*: `archive-plan` (step `1100`) moves the plan directory to `.plan/local/archive/<plan_id>/` (git-ignored, same filesystem, never relocated). The path carries no date, so a `plan_id` present in the archive is never allocated again (link:phase-workflows.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]). Archived plans are purged only by the project's retention setting (`system.retention.archived_plans_days`, kept from `plan-marshall`) through an evidence-based removal sweep (link:store-schemas.adoc#evidence-based-removal-sweeps[Store Schemas Specification]).
+* *Epic Archive*: When an epic reaches a terminal state, the epic workflow moves its directory inside the shared epic worktree from `.plan/orchestrator/<epic_id>/` to `.plan/archived-orchestrators/<epic_id>-<YY-MM-DD>/` (UTC archival date), and the move reaches the default branch through the epic landing. The archived `status.json` keeps `epic_id`; the dated suffix is never parsed for identity, and a title is never an identity. The epic archive is git-tracked and has no retention purge.
+* *Enumeration*: Every enumeration of epics (`pm_epics`, sibling-epic enumeration, disjointness and re-grounding reads) covers the active root `.plan/orchestrator/` and, where it reads history, the archived root, and reports per root `root`, `exists`, `listed`, `entries_scanned`, and `unreadable`, so "zero epics" is distinguishable from "root not scanned". Sibling-epic enumeration excludes every archived snapshot whose `epic_id` equals the enumerating epic's own.
+* *Operator Export*: `pm-mcp operator archive export --plan <plan_id>` or `--epic <epic_id>` moves an archived record into the machine-local export `~/.plan-marshall/mcp/archive/<project_key>/plans/<plan_id>/` or `.../epics/<epic_id>-<YY-MM-DD>/`, where `<project_key>` is the project's enrolment key in `enrolments.json`. The export is a move, never a copy, so each record has exactly one authoritative location: a plan is renamed out of `.plan/local/archive/` (a copy-then-delete across filesystems runs under a move journal), and an epic is removed from the archived root in the shared epic worktree, the removal reaching the default branch through the next epic landing. The export is only ever operator-initiated, never automatic, and never leaves the workstation (`PM-ARCH-2`); exported records are outside every retention purge.
+* *Read-Only Access by ID*: An archived or exported record answers read requests by its id; mutating calls are rejected with its terminal representation. A project reads only its own export partition; reading another project's partition requires the operator-approved cross-project escalation (`PM-SEC-2`).
 
 === Worktree Path Resolution & Same-Filesystem Invariant
 
 * *Deterministic Location*: For any plan identified by `<plan_id>`, the server resolves its active working tree deterministically:
 ** If `.plan/local/worktrees/<plan_id>/` exists and is a valid git worktree, the plan directory is located at `.plan/local/worktrees/<plan_id>/.plan/local/plans/<plan_id>/`.
-** Otherwise, the plan directory is located at `.plan/local/plans/<plan_id>/` within the primary checkout.
+** Otherwise, if `.plan/local/plans/<plan_id>/` exists, the plan directory is located there within the primary checkout.
+** Otherwise, if `.plan/local/archive/<plan_id>/` exists, the plan is archived: `pm_state` returns its terminal representation (empty `links`, read-only), `pm://plan/{plan_id}/*` resources and the report and corpus readers serve the archived stores, and every mutating call is rejected.
+** Otherwise, if the project's export partition `~/.plan-marshall/mcp/archive/<project_key>/plans/<plan_id>/` exists, the plan is exported and answered read-only in the same way.
 * *Same-Filesystem Invariant*: All worktrees are created within `.plan/local/worktrees/<plan_id>`. This guarantees that moving the `<plan_id>` directory between the primary checkout and the worktree operates on the *same physical filesystem partition*, enabling POSIX atomic renames (`rename(2)` / `Files.move(..., ATOMIC_MOVE)`).
 * *Stateless Client Scope*: Neither the model nor the MCP client ever passes filesystem paths (`PM-ARCH-4`, `PM-SEC-2`). The client passes only `plan_id` or `epic_id`. The daemon dynamically resolves the canonical real path (`Path.toRealPath()`) and verifies workspace confinement before any file I/O.
 
@@ -184,6 +206,11 @@ Git-tracked orchestrator state (`.plan/orchestrator/**`) is edited only in one s
     │   ├── merge.lock                   # Short transaction lock for merge-queue.json (merge leases)
     │   ├── review-bot.lock              # Short transaction lock for review-bot-windows.json
     │   └── build-slots.lock             # Short transaction lock for build-slots.json
+    │
+    ├── archive/                         # Operator-exported archived records (move only, never automatic)
+    │   └── <project_key>/               # One partition per enrolled project
+    │       ├── plans/<plan_id>/
+    │       └── epics/<epic_id>-<YY-MM-DD>/
     │
     └── logs/                            # Diagnostic logs and structured security audit
         ├── daemon.log                   # Rolling runtime diagnostic log (mode 0600)

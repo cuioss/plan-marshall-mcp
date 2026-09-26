@@ -68,7 +68,7 @@ _See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Ve
 
 === `pm_start` — Initialize a Plan Scope
 
-Creates a new plan directory from one of the four supported initialization sources (`request`, `issue_number`, `lesson_id`, or `recipe_id`) following a plan-mode `pm-mcp enter` invocation, consumes the pending entry record `.plan/local/mcp/pending/<entry_id>.json` whose `entry_id` that invocation printed by relocating it atomically into `.plan/local/plans/<plan_id>/mcp/entry.json`, initializes `mcp/status.json`, and returns the initial TOON hypermedia representation. Concurrent entries for different new plans therefore never share a slot.
+Creates a new plan directory from one of the four supported initialization sources (`request`, `issue_number`, `lesson_id`, or `recipe_id`) following a plan-mode `pm-mcp enter` invocation, consumes the pending entry record `.plan/local/mcp/pending/<entry_id>.json` whose `entry_id` that invocation printed by relocating it atomically into `.plan/local/plans/<plan_id>/mcp/entry.json`, initializes `mcp/status.json`, and returns the initial TOON hypermedia representation. Concurrent entries for different new plans therefore never share a slot. Epic membership has one carrier: the consumed entry record's `from_epic` (written by the emitted `pm-mcp enter … --from-epic <epic_id>` command), which `pm_start` copies into `origin.epic_id`; the tool has no epic parameter. When the new `plan_id` equals a `launched` queue row of an epic and `from_epic` is absent or names another epic, `pm_start` is refused with `epic_pointer_mismatch` (link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Single Epic Pointer). Parameter names follow the entity-noun-first convention of `plan-marshall` ADR-023 within the `<entity>_id` symmetry: `plan_slug`, `epic_id`, `plan_id`.
 
 [source,json]
 ----
@@ -109,16 +109,11 @@ Creates a new plan directory from one of the four supported initialization sourc
       "default": {},
       "description": "Optional recipe scope/thoroughness parameters validated against the recipe's input schema."
     },
-    "slug": {
+    "plan_slug": {
       "type": "string",
       "pattern": "^[a-z0-9]+(-[a-z0-9]+){0,7}$",
       "maxLength": 64,
-      "description": "Optional short kebab-case slug used to derive the plan_id (rejected if shaped like a UUID or lesson_id)."
-    },
-    "epic_id": {
-      "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Optional parent orchestrator epic_id when launching a staged plan."
+      "description": "Optional short kebab-case slug used to derive the plan_id (rejected if shaped like a UUID or lesson_id, or if the derived plan_id is taken by a live, archived, or exported plan)."
     },
     "base_branch": {
       "type": "string",
@@ -185,7 +180,7 @@ Returns the current hypermedia representation (`state`, `summary`, `skill` URI, 
 }
 ----
 
-NOTE: Companion zero-argument discovery tools `pm_plans` and `pm_epics` accept `{"type": "object", "properties": {}, "additionalProperties": false}` and return a tabular TOON listing of active plans or epics in the enrolled workspace. Each listing carries a `last_entered` column that marks the scope whose `mcp/entry.json` was last written by the calling connection's `client_session_id` (`PM-CLIENT-6`); with no session identifier or no match, no row is marked. This is the post-compaction scope pointer on hosts without session lifecycle hooks (link:client-profiles.adoc#session-lifecycle-hook[Client Profiles Specification, Session Lifecycle Hook & Scope Pointer]).
+NOTE: Companion discovery tools `pm_plans` (zero-argument, `{"type": "object", "properties": {}, "additionalProperties": false}`) and `pm_epics` (one optional boolean `include_archived`, default `false`, `additionalProperties: false`) return a tabular TOON listing of active plans or epics in the enrolled workspace; `pm_epics` with `include_archived` also lists archived epics (`.plan/archived-orchestrators/`, link:filesystem-layout.adoc#archives[Filesystem Layout Specification, Plan & Epic Archives]) with their archival date. Both always return a `coverage` table with one row per scanned root (`root`, `exists`, `listed`, `entries_scanned`, `unreadable`), so zero rows are distinguishable from a root that was absent or not scanned. Each listing carries a `last_entered` column that marks the scope whose `mcp/entry.json` was last written by the calling connection's `client_session_id` (`PM-CLIENT-6`); with no session identifier or no match, no row is marked. This is the post-compaction scope pointer on hosts without session lifecycle hooks (link:client-profiles.adoc#session-lifecycle-hook[Client Profiles Specification, Session Lifecycle Hook & Scope Pointer]).
 
 === `pm_do` — Follow a Hypermedia Link
 
@@ -625,10 +620,22 @@ Large artifacts, logs, architecture views, and ledgers are never inlined into hy
 |Epic
 |Tabular TOON projection of workstreams and staged/active plans assembled from the per-file epic layout (`status.json` and `queue/<plan_id>.json`).
 
-|`pm://epic/{epic_id}/inbox`
+|`pm://epic/{epic_id}/inbox` +
+`pm://epic/{epic_id}/inbox/{message_id}`
 |`text/toon`
-|Epic
-|Unread and processed structured messages sent from executing plans (`inbox.jsonl`).
+|Epic / Plan
+|The epic inbox as the fold of its event log (`inbox.jsonl`): every message with its current state (`pending`, `claimed`, `processed`), or one message by its store-assigned `message_id`. The epic scope reads all messages; a plan scope reads only the messages it sent (link:dispatch-and-effort.adoc#plan-scope-outbox-link[Dispatch & Effort Specification, Plan-Scope Outbox Link]). `message_id` must match `^msg-[0-9]{4,}$`; a separator or traversal is refused with `path_traversal_rejected`; reading never changes a message's state.
+
+|`pm://plan/{plan_id}/mailbox` +
+`pm://plan/{plan_id}/mailbox/{message_id}`
+|`text/toon`
+|Plan
+|The plan's own mailbox (`mcp/mailbox.jsonl`, messages from its parent epic) with `mailbox_state`, `delivery_state`, and per-message consumption; readable only by that plan's scope (link:dispatch-and-effort.adoc#plan-mailbox[Dispatch & Effort Specification, Plan Mailbox]).
+
+|`pm://project/owed`
+|`text/toon`
+|Project
+|Undischarged owed items of every active and archived plan of the project, derived from their `owed[]` (link:store-schemas.adoc#owed-item-record[Store Schemas Specification, Owed Item Record]), with per-root coverage.
 
 |`pm://epic/{epic_id}/landings`
 |`text/toon`
@@ -645,10 +652,11 @@ Large artifacts, logs, architecture views, and ledgers are never inlined into hy
 |Project
 |Detailed module descriptor, dependencies, key packages, and enriched responsibility for `{module_id}`.
 
-|`pm://architecture/files?path={rel_path}`
+|`pm://architecture/files` +
+`pm://architecture/files?path={rel_path}`
 |`text/toon`
 |Project
-|Owning module, domain attribution (Axis D), and verification route (Axis B) for `{rel_path}`.
+|Without `path`: the file inventory (file categories with counts) and a coverage block `{files_scanned, excluded{reason: n}, complete}`; a zero count is honest only with `files_scanned > 0` and `complete: true`. With `path`: owning module, domain attribution (Axis D), and verification route (Axis B) for `{rel_path}`. Content search stays with the host's search tool.
 
 |`pm://architecture/graph`
 |`text/toon`
@@ -716,7 +724,7 @@ A foundational invariant of PM-MCP is that *domain failures and transition rejec
 |Host tool modifies files outside the plan's worktree
 |`isError: false`
 |TOON representation in `<phase>.footprint-violation` naming the offending files and offering `fix` and `escalate` links.
-|Revert unauthorized changes and follow `fix`, or `escalate` to operator.
+|Inspect the named files; revert only changes this plan made, never baseline dirt (`facts.baseline_dirty`) or foreign changes, and follow `fix`, or `escalate` to the operator.
 
 |Stale link followed, entity no longer in accepting state, or `args` fails link parameter validation
 |`isError: false`
@@ -803,6 +811,15 @@ links[2]{rel,link,form,free}:
 |`phase_closed`
 |A finding submission is addressed to a phase the plan has already left (for example a `3-outline` Q-Gate finding after the plan entered `phase-4-plan`, link:phase-workflows.adoc[Phase Workflows Specification], Blocking Findings Guard); the finding is not written.
 
+|`epic_pointer_mismatch`
+|`pm_start` would create a plan whose `plan_id` equals a `launched` queue row of an epic while the consumed entry record's `from_epic` is absent or names another epic (link:dispatch-and-effort.adoc[Dispatch & Effort Specification], Single Epic Pointer).
+
+|`plan_id_taken`
+|The `plan_id` derived by `pm_start` already names a live, archived, or exported plan (link:phase-workflows.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); an archived `plan_id` is never reused.
+
+|`target_undeliverable`
+|`mailbox_send:<plan_id>` names a plan that does not exist or is archived (link:dispatch-and-effort.adoc#plan-mailbox[Dispatch & Effort Specification, Plan Mailbox]); the message is not written.
+
 |`path_traversal_rejected`
 |A repository path in `args` escapes the workspace: a `..` segment, an absolute path, or a symlink resolving outside the plan's worktree (`PM-SEC-2`). Job requests carry the same reason with the job outcome `refused` (link:job-runtime.adoc[Job Runtime Specification]).
 |===
@@ -825,7 +842,7 @@ message: "Plan scope 'plan-unknown' does not exist in the enrolled workspace."
 
 Closed `error_code` enumeration for `isError: true`:
 
-* `scope_not_found` — Referenced `plan_id`, `epic_id`, or `entity` does not exist: the plan is in neither the primary checkout, a worktree, nor the plan archive, or the epic or entity is unknown. An archived plan is found and answered read-only with its terminal representation.
+* `scope_not_found` — Referenced `plan_id`, `epic_id`, or `entity` does not exist: the plan is in neither the primary checkout, a worktree, the plan archive, nor the project's export partition, or the epic or entity is unknown. An archived or exported plan is found and answered read-only with its terminal representation.
 * `project_not_enrolled` — The target repository is not enrolled in `~/.plan-marshall/mcp/enrolments.json`.
 * `entry_record_missing` — `pm_start` was called with an `entry_id` for which no pending entry record `.plan/local/mcp/pending/<entry_id>.json` exists (never written by `pm-mcp enter`, or already consumed).
 * `section_not_found` — `pm_skill` or `pm_skill_file` named a `section` that the document's section index does not contain; the message lists the available anchors.
@@ -868,7 +885,7 @@ client.when()
                 "pm_start", "pm_state", "pm_do", "pm_plans", "pm_epics",
                 "pm_build", "pm_lsp", "pm_skills", "pm_skill", "pm_skill_file");
     })
-    .toolsCall("pm_start", Map.of("entry_id", entryId, "request", "Add JSpecify null-safety to service layer", "slug", "null-safety"), response -> {
+    .toolsCall("pm_start", Map.of("entry_id", entryId, "request", "Add JSpecify null-safety to service layer", "plan_slug", "null-safety"), response -> {
         assertThat(response.isError()).isFalse();
         assertThat(response.content().getFirst().asText().text())
             .contains("scope: plan")
