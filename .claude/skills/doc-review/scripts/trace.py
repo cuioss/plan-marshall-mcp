@@ -22,7 +22,12 @@ for dp, _, fns in os.walk(ROOT):
             files[p] = open(os.path.join(dp, fn), encoding='utf-8').read()
 
 def autoid(title):
-    t = title.lower()
+    # Asciidoctor order: special characters become entities first, then inline quotes become tags;
+    # the id generator then strips tags and entities (so `<x>` keeps the text x).
+    t = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    t = re.sub(r'`([^`]+)`', r'<code>\1</code>', t)
+    t = re.sub(r'\*([^*]+)\*', r'<strong>\1</strong>', t)
+    t = t.lower()
     t = re.sub(r'<[^>]+>|&(?:[a-z][a-z]+\d{0,2}|#\d{2,5}|#x[\da-f]{2,4});', '', t)
     t = re.sub(r'[^ \w\-.]+', '', t)
     t = re.sub(r'[ .\-]+', '_', t)
@@ -50,7 +55,7 @@ for p, txt in list(files.items()):
         anchors[p] |= anchors.get(inc, set())
 
 broken = []
-linkre = re.compile(r'(?:link:|xref:)([^\[\s>]*?)(?:#([^\[\s,>]+))?\[|<<([^,>\s]+)(?:,|>>)')
+linkre = re.compile(r'(?:link:|xref:)([^\[\s>]*?)(?:#([^\[\s,>]+))?\[|<<([\w#/.:{][^,>\s]*)(?:,|>>)')
 for p, txt in files.items():
     if p.startswith('discussions/'): continue
     for ln, l in enumerate(txt.split('\n'), 1):
