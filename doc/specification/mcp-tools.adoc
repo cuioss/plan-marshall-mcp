@@ -64,6 +64,7 @@ _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL
 5. *Zero Client-Supplied Filesystem Paths*: No workflow or service tool accepts absolute filesystem paths or worktree locations from the model. Worktrees, branches, and configuration files are resolved server-side from `plan_id` or `epic_id`.
 6. *On-Demand Preloading*: For hosts configured with `schema_residency: "on_demand"` in their client profile, the user entry command preloads `pm_start`, `pm_state`, and `pm_do` so workflow execution incurs zero schema-lookup round trips.
 7. *Canonical Identifiers*: Every identifier property (`plan_id`, `epic_id`, `entry_id`, `entity`, `link`, `dispatch_id`, `job_id`, `lesson_id`, `recipe_id`, `plan_slug`, `module`, skill `uri` and `section`) uses the grammar of the link:identifiers.adoc[Identifier Registry] (`plan_id` and `epic_id`: link:identifiers.adoc#id-plan-id[`plan_id`]; the derivation rules stay in link:phase-workflows.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); every `pattern` below equals the registry grammar, and every example in this specification conforms to it.
+8. *Model-Facing Minimality*: Every tool result and error payload, like every representation, carries only fields with an operational purpose for the model (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]). Implementation variants, derivation sources, internal versions and digests, confinement, timing, and audit identifiers (outside `internal_fault` and `file_unreadable`) are recorded in `audit.jsonl`, the job record, or the metrics store and served by `pm-mcp status` or the operator CLI; `ModelFacingFieldAuditTest` checks every result record against the registry of model-facing fields.
 
 == Core Workflow Tool Schemas (`pm_start`, `pm_state`, `pm_do`)
 _See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_start, pm_state, pm_do)]_
@@ -249,7 +250,7 @@ The sole state transition verb in PM-MCP. Executes the transition identified by 
 
 ==== Two-Stage Schema Validation for `pm_do`
 
-1. *Stage 1 (Tool Argument Validation)*: The server's own argument validator (plain Java over the flat schema and the rules stated in the property descriptions; no JSON Schema library) checks the payload: `additionalProperties: false`, valid `plan_id`/`epic_id`, exactly one scope, syntactic `link` pattern, `args` is a JSON object. A violation is a tool execution error: `isError: true`, `error_code: invalid_arguments`, the offending `parameter`, the violated `rule`, and `audit_id` (<<protocol-errors-vs-domain-workflow-failure-states>>). The Quarkus MCP server runs with `quarkus.mcp.server.tools.input-validation-error=TOOL`, so its own parameter binding reports the same way.
+1. *Stage 1 (Tool Argument Validation)*: The server's own argument validator (plain Java over the flat schema and the rules stated in the property descriptions; no JSON Schema library) checks the payload: `additionalProperties: false`, valid `plan_id`/`epic_id`, exactly one scope, syntactic `link` pattern, `args` is a JSON object. A violation is a tool execution error: `isError: true`, `error_code: invalid_arguments`, the offending `parameter`, and the violated `rule` (<<protocol-errors-vs-domain-workflow-failure-states>>). The Quarkus MCP server runs with `quarkus.mcp.server.tools.input-validation-error=TOOL`, so its own parameter binding reports the same way.
 2. *Stage 2 (Workflow Engine Link Schema)*: Under the scope's exclusive lock, the engine resolves the active `LinkSpec` for `link` in the current state and validates `args` against the link's dynamically derived closed JSON Schema (`additionalProperties: false`, exact required free parameter keys, closed enum values, string length bounds, and integer ranges). If `args` fails Stage 2 validation or `link` is not offered in the current state, the engine returns `isError: false` with a structured `rejected` block and the fresh representation (see <<protocol-errors-vs-domain-workflow-failure-states>>).
 
 == Orthogonal Service Capability Tool Schemas (`pm_build`, `pm_lsp`)
@@ -321,10 +322,11 @@ Submits or awaits a build job in the plan's worktree (or the primary repository 
 
 * `job_id`: unique build job identifier in the `b-` form of the link:identifiers.adoc#id-job-id[`job_id` grammar] (e.g., `b-2291`)
 * `status`: the closed job outcome enum (`succeeded`, `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`; `PM-EXEC-4`, derived by link:job-runtime.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]) plus the non-terminal `running`
-* `worktree_sha`: 64-character SHA-256 freshness digest of `HEAD` + staged + unstaged + untracked files with its `worktree_sha_version`, or `unavailable` when a git invocation failed (never fresh; link:job-runtime.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash]), simultaneously appended to `change-ledger.jsonl` (`kind: "build"`)
 * `summary`: counts of total/passed/failed/skipped tests and compiler/linter errors
 * `failures`: tabular TOON array of located compiler errors or test failures (`file`, `line`, `column`, `rule_or_test`, `message`)
 * `log_uri`: `pm://plan/{plan_id}/builds/{job_id}/log` (or `pm://workspace/builds/{job_id}/log` when `plan_id` is omitted; accompanied by the last 50 lines / 4 KB tail when `status == "failed_unparsed"`, `PM-IMPL-6`)
+
+*Recorded, never returned*: The working-tree digest the build ran against (`worktree_sha` with its `worktree_sha_version`, or `unavailable` with its `worktree_sha_failure`; link:job-runtime.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash]) is stamped on the job's `change-ledger.jsonl` row (`kind: "build"`) and in its job record, where the freshness gates read it; the model makes no decision on it. The allocated budget with its `budget_derivation`, the build template source, the job's `confinement`, the build-slot cap and its source, and the job timing are likewise job-record data, shown by `pm-mcp status` (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 
 *Expected-red runs*: A failing run with `expect: red` is recorded as `expected_red` in the change ledger and files no finding; a passing run with `expect: red` is surfaced as `expected_red_went_green`. An `expect: red` run never satisfies a freshness gate.
 
@@ -431,7 +433,7 @@ _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL
 
 * *Pure Vocabulary Contract (`PM-SKILL-1`)*: All procedural sequencing, CLI invocations, file path templates, and phase transition rules live exclusively in the compiled workflow engine. Vocabulary skills (`skill://pm/<path>/SKILL.md`) contain strictly domain standards, quality rubrics, architectural principles, and judgment criteria.
 * *Server-Generated & Client-Cached Catalogue (`PM-SKILL-2`)*: Vocabulary skills are compiled into the `pm-mcp` binary, filtered by the project's enabled domains (derived, with the overrides of `.marshall/config/domains.json`), and translated on the fly for the active client profile (`PM-CLIENT-2`). Every rendered skill includes a deterministic `_meta.sha256` content digest (`_meta["de.cuioss.pm-mcp/sha256"]`: the SHA-256 of exactly the rendered bytes the client receives, after profile translation and domain filtering, so it changes exactly when those bytes change) enabling client-side caching and invalidation: the runtime is sessionless (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata), so it offers no resource subscriptions and sends no `notifications/resources/updated` or `list_changed`; a client detects a changed skill by its digest, which every catalogue listing and every representation that names the skill carries.
-* *Dynamic State Context Injection (`PM-SKILL-4`)*: Live plan facts (`plan_id`, `worktree_sha`, active task summary, findings count, and valid `links`) are injected into the turn's TOON hypermedia representation (`skill` + `facts` + `links`), never baked into static `SKILL.md` files.
+* *Dynamic State Context Injection (`PM-SKILL-4`)*: Live plan facts (`plan_id`, active task summary, open findings count, and valid `links`) are injected into the turn's TOON hypermedia representation (`skill` + `facts` + `links`), never baked into static `SKILL.md` files.
 * *Core Conduct Vocabulary (`skill://pm/core`)*: The always-loaded core skill states at minimum: (1) a fix covers the whole co-reference population of the defect (derived with `pm_lsp references` or a search before editing), never only the named site; (2) every "only", "all", "none", or "the set is N" claim carries its enumeration and the scope it was derived over; (3) a case outside a closed vocabulary is reported with the vocabulary's out-of-set member, never mapped onto a stand-in member; (4) a re-derived count or coverage figure is checked against its population before it is reported; (5) plan state is read only through `pm_state` and `pm://` resources, never from `.marshall/` files; (6) the correction a rejection names is applied before the call is retried, and a rejected call shape is never resubmitted unchanged; (7) an action taken outside the offered links (a bypass of a sanctioned path, a direct `.marshall/` read or write) is reported with the `report_bypass` link (link:hypermedia-format.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]).
 
 [#vocabulary-skill-rule-classification]
@@ -668,7 +670,7 @@ _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WA
 |Client-profile-rendered vocabulary skill Markdown with the `_meta["de.cuioss.pm-mcp/sha256"]` digest of the rendered bytes.
 |===
 
-*Resource Contract*: Every resource template documents its arguments, its payload, and its zero-result and error semantics (the `pm://architecture/*` details are in link:domain-extensions.adoc[Domain Extensions Specification]). A resource that returns no rows states what it examined, so an empty result is distinguishable from a result that could not be computed; an unknown scope or entity is answered with the JSON-RPC resource error `-32002` (resource not found) whose `data` carries `error_code: scope_not_found` and an `audit_id` (sanitized as in <<protocol-errors-vs-domain-workflow-failure-states>>), never with an empty payload; a resource path resolving outside its permitted root is answered the same way with `error_code: path_traversal_rejected`. `ReadResourceResult` has no `isError`, so resource errors are always JSON-RPC errors.
+*Resource Contract*: Every resource template documents its arguments, its payload, and its zero-result and error semantics (the `pm://architecture/*` details are in link:domain-extensions.adoc[Domain Extensions Specification]). A resource that returns no rows states what it examined, so an empty result is distinguishable from a result that could not be computed; an unknown scope or entity is answered with the JSON-RPC resource error `-32002` (resource not found) whose `data` carries `error_code: scope_not_found` (sanitized as in <<protocol-errors-vs-domain-workflow-failure-states>>; the refusal is audited, its `audit_id` is not returned), never with an empty payload; a resource path resolving outside its permitted root is answered the same way with `error_code: path_traversal_rejected`. `ReadResourceResult` has no `isError`, so resource errors are always JSON-RPC errors.
 
 *Epic Read Access*: An epic scope may read `pm://plan/{plan_id}/findings` and `pm://plan/{plan_id}/status` of the plans in its queue that are `launched`, `running`, or `blocked`, read-only.
 
@@ -724,27 +726,27 @@ A foundational invariant of PM-MCP is that *domain failures and transition rejec
 
 |Malformed JSON-RPC or unknown tool name
 |JSON-RPC error
-|JSON-RPC `error` object (`-32700`, `-32600`, or `-32602`) whose `data` carries `audit_id`; no `CallToolResult`.
+|JSON-RPC `error` object (`-32700`, `-32600`, or `-32602`) with its fixed message; no `CallToolResult`.
 |Fix the tool invocation.
 
 |Tool arguments violate the input schema or a server-enforced argument rule (type, pattern, unknown property, mutually exclusive scope parameters, alternative plan sources, per-operation required parameters)
 |`isError: true`
-|MCP `CallToolResult` with `isError: true`, `error_code: invalid_arguments`, `parameter`, `rule`, and `audit_id`.
+|MCP `CallToolResult` with `isError: true`, `error_code: invalid_arguments`, `parameter`, and `rule`.
 |Correct the named parameter and call again.
 
 |Unknown `plan_id` / `epic_id`, unenrolled workspace, missing pending entry record, or internal server exception
 |`isError: true`
-|MCP `CallToolResult` with `isError: true`, closed `error_code` (`scope_not_found`, `project_not_enrolled`, `entry_record_missing`, `internal_fault`), and `audit_id`.
-|Halt or invoke discovery (`pm_plans` / `pm_epics`) or notify operator with `audit_id`.
+|MCP `CallToolResult` with `isError: true` and closed `error_code` (`scope_not_found`, `project_not_enrolled`, `entry_record_missing`, `internal_fault`); only `internal_fault` adds `audit_id`.
+|Halt or invoke discovery (`pm_plans` / `pm_epics`), or notify the operator (with `audit_id` for `internal_fault`).
 
 |The addressed project's recovery after a runtime start has not finished within the project recovery wait
 |`isError: true`
-|MCP `CallToolResult` with `isError: true`, `error_code: runtime_recovering`, and `audit_id`; nothing of the call was executed.
+|MCP `CallToolResult` with `isError: true` and `error_code: runtime_recovering`; nothing of the call was executed.
 |Retryable: repeat the same call.
 
 |`pm_skill` / `pm_skill_file` names a section the document does not contain, or a document that cannot be read or rendered
 |`isError: true`
-|MCP `CallToolResult` with `isError: true`, closed `error_code` (`section_not_found` with the available anchors, or `file_unreadable`), and `audit_id`.
+|MCP `CallToolResult` with `isError: true` and closed `error_code` (`section_not_found` with the available anchors, or `file_unreadable` with `audit_id`).
 |Read the section index and request an existing anchor, or notify the operator with `audit_id`.
 |===
 
@@ -766,7 +768,6 @@ rejected:
   reason: invalid_link_args
   detail: "parameter 'message' length 0 is below minimum 1"
 facts:
-  branch: feature/plan-x
   changed_files: 2
   continuation_policy: stop_at_phase_boundary
   module_scope: http
@@ -846,7 +847,7 @@ _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL
 
 A content validator that refuses a payload answers `invalid_link_args` and names its specific cause in `detail` (for example `non_resolving_package_key`, link:domain-extensions.adoc[Domain Extensions Specification]); such causes are `detail` codes, not reasons. Outcome, state, condition, and finding tokens (a job's `refused`, the `store_tampered` condition, finding types such as `unknown_config_key`) are never `rejected.reason` values.
 
-A job that exceeds its budget is a job outcome (`timed_out`), never a rejection. Every rejection belongs to the failure class `caller_drift` (the call did not match the offered contract); a tool execution error (`isError: true`, carrying an `audit_id`) belongs to the class `server_fault`. The two classes are counted separately per plan (link:phase-workflows.adoc[Phase Workflows Specification], `record-metrics`), each with its population.
+A job that exceeds its budget is a job outcome (`timed_out`), never a rejection. Every rejection belongs to the failure class `caller_drift` (the call did not match the offered contract); a tool execution error (`isError: true`) belongs to the class `server_fault`. The two classes are counted separately per plan (link:phase-workflows.adoc[Phase Workflows Specification], `record-metrics`), each with its population.
 
 === Sanitized Tool Execution Error Envelope (`isError: true`)
 
@@ -856,9 +857,10 @@ When a tool call cannot be executed (`isError: true`), the `TextContent` payload
 ----
 error: true
 error_code: scope_not_found
-audit_id: 01926f3a-8c4e-7b21-9d3f-5a6b7c8d9e0f
 message: "Plan scope 'plan-unknown' does not exist in the enrolled workspace."
 ----
+
+Every tool execution error is written to `audit.jsonl`, but the payload carries `audit_id` only for the codes whose recovery path is an operator look-up, `internal_fault` and `file_unreadable`; for every other code the model corrects the call, retries, or uses discovery, and the identifier would have no operational value for it (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 
 Closed `error_code` enumeration for `isError: true`:
 
@@ -872,7 +874,7 @@ Closed `error_code` enumeration for `isError: true`:
 * `upstream_timeout` — An upstream pass-through tool call (`up_*`) exceeded its connect or read timeout (link:timeouts.adoc[Timeouts & Budgets Specification]); the call can be retried.
 * `internal_fault` — Unexpected server exception, including a lock acquisition the lock manager refuses as out of order (`lock_order_violation`, link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification]); full diagnostics are written exclusively to `audit.jsonl` under `audit_id`.
 
-JSON-RPC protocol errors are sanitized the same way: the `error.message` is a fixed text per code and `error.data` carries only the `audit_id`, plus the closed `error_code` for resource read errors (`-32002`: `scope_not_found`, `path_traversal_rejected`).
+JSON-RPC protocol errors are sanitized the same way: the `error.message` is a fixed text per code, and `error.data` is present only for resource read errors, carrying the closed `error_code` (`-32002`: `scope_not_found`, `path_traversal_rejected`); the audit record is written, its `audit_id` is not returned.
 
 == Automated MCP Protocol & STDIO Testing with `McpAssured` (`quarkus-mcp-server-test`)
 _See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
@@ -920,6 +922,6 @@ client.when()
 === Normative `McpAssured` Verification Requirements
 
 1. *Tool & Resource Schema Conformance*: Every `@Tool` and `@ResourceTemplate` is asserted via `client.when().toolsList(...)` and `client.when().resourcesTemplatesList(...)` to verify closed JSON Schema Draft 2020-12 `inputSchema` definitions (`additionalProperties: false`) and exact URI template registrations. The example asserts the complete, fixed core tool set at every migration stage with an empty upstream allowlist; no legacy script tool is ever registered. A second test with a configured allowlist asserts exactly the core set plus the allowlisted `up_*` tools, and that an upstream tool not on the allowlist, or one added only in a team configuration file under `.marshall/config/`, never appears.
-2. *Domain Failure vs Protocol Error Assertions*: Every `pm_do` rejection and domain failure state is asserted with `assertThat(response.isError()).isFalse()`, unknown scope queries are asserted with `assertThat(response.isError()).isTrue()` and sanitized `error_code` + `audit_id` payloads, argument violations (schema and server-enforced rules) are asserted with `assertThat(response.isError()).isTrue()` and `error_code: invalid_arguments`, unknown tools are asserted as JSON-RPC error responses (`-32602`) without a `CallToolResult`, and unknown-scope resource reads as JSON-RPC `-32002` with `scope_not_found` in `data`.
+2. *Domain Failure vs Protocol Error Assertions*: Every `pm_do` rejection and domain failure state is asserted with `assertThat(response.isError()).isFalse()`, unknown scope queries are asserted with `assertThat(response.isError()).isTrue()` and a sanitized `error_code` payload without `audit_id` (present only for `internal_fault` and `file_unreadable`), argument violations (schema and server-enforced rules) are asserted with `assertThat(response.isError()).isTrue()` and `error_code: invalid_arguments`, unknown tools are asserted as JSON-RPC error responses (`-32602`) without a `CallToolResult`, and unknown-scope resource reads as JSON-RPC `-32002` with `scope_not_found` in `data`.
 3. *`stdout` Stream Hygiene & `stderr` Separation*: `setStderrHandler(...)` captures all diagnostic output on `stderr` while `McpStdioTestClient` parses every `stdout` line as a strict JSON-RPC 2.0 frame, proving zero `stdout` pollution across concurrent `pm_build` and `pm_lsp` executions (`PM-SEC-4`, `PM-TEST-5`).
 
