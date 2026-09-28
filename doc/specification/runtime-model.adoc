@@ -48,7 +48,7 @@ _See Requirements:_
 |The process a host spawns over `stdio`. Copies JSON-RPC messages between the host's `stdin`/`stdout` and the runtime's socket. Contains no MCP, workflow, or store logic.
 
 |Host connection
-|One relay instance and its connection to the runtime, from the host's `initialize` until the relay exits. Carries only negotiated protocol capabilities and connection metadata.
+|One relay instance and its connection to the runtime, from the host's `initialize` until the relay exits. The runtime keeps no state for it: every forwarded request carries the host's `initialize` data and the connection metadata as headers (<<Connection Metadata>>).
 
 |Host session
 |One conversation in a host (Claude Code, OpenCode, Antigravity, Codex). Spawns at most one relay per configured MCP server. Irrelevant to workflow state.
@@ -88,7 +88,7 @@ _See Requirements:_
                    └───────────────┬──────────────────────────────────┘
                                    │ atomic stores, FileChannel.lock(), child jobs
                    ┌───────────────▼──────────────────────────────────┐
-                   │ .plan/ · ~/.plan-marshall/mcp/ · worktrees       │
+                   │ .marshall/ · <PM_MCP_BASE> · worktrees           │
                    │ builds, git, gh/glab, scripts, language servers  │
                    └──────────────────────────────────────────────────┘
  Operator CLI (pm-mcp enter|client|operator|status|drain) ──► filesystem stores directly
@@ -102,9 +102,11 @@ The runtime is the only process that executes workflow transitions, runs jobs, h
 
 === Singleton & Discovery
 
-* *Singleton lock*: On start the runtime acquires `~/.plan-marshall/mcp/locks/runtime.lock` (`FileChannel.lock()`, held for the process lifetime). A second runtime for the same `PM_MCP_BASE` fails to acquire it and exits with code `0` after confirming the holder answers on the socket.
-* *Runtime record*: `~/.plan-marshall/mcp/state/runtime.json` (mode `0600`) records `pid`, `start_instant` (`ProcessHandle.info().startInstant()`), `version`, `socket_path`, and `started_at`. Liveness checks compare both `pid` and `start_instant` to rule out PID reuse.
-* *Socket*: `~/.plan-marshall/mcp/run/runtime.sock`, created with mode `0600` inside the `0700` directory `run/`. Unix domain socket paths are limited to 103 bytes (macOS); if the resolved path exceeds the limit the runtime refuses to start with a diagnostic naming the path.
+* *Singleton lock*: On start the runtime acquires `<PM_MCP_BASE>/locks/runtime.lock` (`FileChannel.tryLock()`, held for the process lifetime) before anything else (<<Startup Sequence>>, step 1). A second runtime for the same `PM_MCP_BASE` fails to acquire it and exits with code `0` after confirming the holder answers on the socket; the losing runtime writes nothing: no audit record, no runtime record, no socket or stale-file removal, no store access.
+* *Runtime record*: `<PM_MCP_BASE>/state/runtime.json` (mode `0600`) records `pid`, `start_instant` (`ProcessHandle.info().startInstant()`), `version`, `socket_path` (the effective socket path, default or fallback, see *Socket*), and `started_at`. It is written when the socket is bound (<<Startup Sequence>>, step 5). Liveness checks compare both `pid` and `start_instant` to rule out PID reuse.
+* *Socket*: `<PM_MCP_BASE>/run/runtime.sock` (default `~/.plan-marshall-mcp/run/runtime.sock`), created with mode `0600` inside the `0700` directory `run/`.
+** *Fallback path*: If the default path would exceed the platform's `sun_path` limit (104 bytes including the terminating NUL on macOS, 108 on Linux), the runtime binds `$TMPDIR/pm-mcp-<hash>/runtime.sock` instead, where `<hash>` is the first 16 hex characters of the SHA-256 of the canonical `PM_MCP_BASE` path (UTF-8), and `$TMPDIR` is `/tmp` when unset. The directory `pm-mcp-<hash>/` is created with mode `0700` or, if it exists, owner-checked: the runtime refuses to start with a diagnostic naming the directory when it is not owned by the effective UID, is not a directory (a symlink included), or has a mode other than `0700`. If the fallback path also exceeds the limit, the runtime refuses to start with a diagnostic naming both paths.
+** *Discovery*: The effective socket path is recorded as `socket_path` in `state/runtime.json`. The relay reads the path from `runtime.json` and falls back to the default path when the record is absent or unreadable; `pm-mcp status` reports the effective path.
 
 === Transport Endpoint
 
@@ -116,7 +118,7 @@ The runtime is the only process that executes workflow transitions, runs jobs, h
 === Start Modes
 _Implementation watch: link:../implementation-watch/runtime-model.adoc#PM-WATCH-RUN-1[PM-WATCH-RUN-1]_
 
-. *On demand (default)*: When a relay finds no live runtime, it acquires `~/.plan-marshall/mcp/locks/runtime-start.lock`, re-checks liveness, and starts `pm-mcp runtime` detached into a new OS session (`setsid` semantics via `posix_spawn` with `POSIX_SPAWN_SETSID` through Java FFM), with `stdin` from `/dev/null` and `stdout`/`stderr` appended to `logs/daemon.log`. It then waits (bounded, default 5 s) for the socket to accept connections. Detaching guarantees that a host terminating its relay or the relay's process group never terminates the runtime.
+. *On demand (default)*: When a relay finds no live runtime, it acquires `<PM_MCP_BASE>/locks/runtime-start.lock`, re-checks liveness, and starts `pm-mcp runtime` detached into a new OS session (`setsid` semantics via `posix_spawn` with `POSIX_SPAWN_SETSID` through Java FFM), with `stdin` from `/dev/null` and `stdout`/`stderr` appended to `logs/daemon.log`. It then waits, bounded by the runtime start timeout (link:timeouts.adoc#runtime-start-timeout[Timeouts & Budgets Specification]), for the socket to accept connections. Detaching guarantees that a host terminating its relay or the relay's process group never terminates the runtime.
 . *Service-managed (optional)*: `pm-mcp runtime install` registers a per-user service (`launchd` LaunchAgent on macOS, `systemd --user` unit on Linux) that starts the runtime at login and restarts it on failure. Filesystem confinement of jobs is independent of the start mode (link:job-runtime.adoc[Job Runtime Specification]).
 
 The runtime never exits because it is idle. It stops only on `pm-mcp drain`, `SIGTERM`/`SIGINT`, OS shutdown, or a crash.
@@ -127,8 +129,8 @@ The runtime serves many calls concurrently on virtual threads. `FileChannel.lock
 
 * One in-process lock (`ReentrantLock`) per canonical lock key; threads of the runtime queue on it.
 * At most one open `FileChannel` and one OS lock per lock file, taken by the first holder and released by the last, never closed while any holder remains. The OS lock only excludes CLI processes (`pm-mcp enter`, `pm-mcp operator`) that write the same stores.
-* Transaction locks are acquired in the fixed order plan -> epic -> machine and held only for one transaction. Long-lived claims are lease records, never held locks (link:store-schemas.adoc[Store Schemas Specification]).
-* Plan and epic lock files live at `<main>/.plan/local/locks/`, outside the directories they protect (link:filesystem-layout.adoc[Filesystem Layout Specification]).
+* Transaction locks are acquired in one total order and held only for one transaction: workspace -> plan locks (lexicographic by `plan_id`) -> epic locks (lexicographic by `epic_id`) -> `epics-worktree` -> lesson store (`lessons.lock`) -> local configuration (`local-config.lock`) -> build timings (`build-timings.lock`) -> machine store locks (alphabetical by lock path, the per-project enrolment locks `enrolments/<project_id>.lock` lexicographic by `project_id`) -> leaf locks (audit log, digest sidecars; nothing is acquired after a leaf lock). The `LockManager` asserts this order on every acquisition against the locks the transaction already holds; an out-of-order acquisition is refused as `internal_fault` with a `lock_order_violation` audit record, and a unit test covers it. Long-lived claims are lease records, never held locks (link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification]).
+* Workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings lock files live at `<PM_MCP_BASE>/projects/<project_id>/locks/` of the per-project machine store, outside the directories they protect; every machine store replaced by atomic rename is guarded by its sibling lock file in `<PM_MCP_BASE>/locks/`, never by a lock on the store file itself (link:filesystem-layout.adoc[Filesystem Layout Specification]).
 
 === Environment
 
@@ -136,22 +138,39 @@ The runtime's own environment is that of whichever process started it and is the
 
 === Startup Sequence
 
-. *Directory & permission verification (`PM-SEC-4`)*: `~/.plan-marshall/mcp/` must be owned by the effective UID with mode `0700`; `enrolments.json` and `state/*` must be `0600`. Violations are written to `stderr` and `audit.jsonl` and the runtime exits with code `77` (`EX_NOPERM`). Credential files under `~/.plan-marshall/credentials/` are not part of this check: an insecure credential file blocks only the step that needs it (`PM-CRED-4`, link:cli-and-security.adoc[CLI, Coordination & Security Specification]).
-. *Audit chain verification (`PM-SEC-6`)*: Verify the `prev_hash` chain of `logs/audit.jsonl`. A broken chain is reported on `stderr` and in `pm-mcp status` and recorded as an `audit_chain_broken` record; it is never repaired and does not stop the start.
-. *Singleton lock and runtime record* (above).
-. *Crash recovery (`PM-ARCH-7`, `PM-ARCH-8`)*:
-.. Mark every job record left `running` by a previous runtime instance as `killed`; if the job's process group is still alive, terminate it first (`SIGTERM`, then `SIGKILL` after the grace period). Jobs are never re-executed blindly.
-.. Release build slots, merge-queue holders, and review-bot claims whose owner (PID plus start instant) is no longer alive.
-.. Complete or roll back interrupted `move-journal.json` files (link:move-journal.adoc[Move Journal Specification]); per-plan journals are additionally checked lazily on the first call addressing that plan.
-.. *Sweep rule*: Every sweep (leases, jobs, pending entry records, archived plans, job logs) selects candidates only from positive evidence of abandonment (a dead owner identified by PID plus start instant, a terminal state, or an expired lease or retention period), never from a name that fails to parse as an identifier. Each swept directory declares its reserved entries (for example the shared epic worktree `_epics` under `.plan/local/worktrees/`), which are excluded by construction. Pending entry records (`.plan/local/mcp/pending/<entry_id>.json`) older than a configurable age with no live relay of their `client_session_id` are removed and audited.
-. *Store format migration and workflow validation*: Forward-migrate store formats (`PM-ARCH-6`) and validate all workflow definitions (`PM-IMPL-5`), failing closed.
-. *Bind the socket* and begin accepting connections.
+The steps run in this order; each later step runs only while the runtime holds the singleton lock.
+
+. *Singleton lock*: Acquire `<PM_MCP_BASE>/locks/runtime.lock` (<<Singleton & Discovery>>). A runtime that loses exits without writing anything, audit records included.
+. *Stale-socket cleanup*: While holding the singleton lock, and never before, remove a stale `run/runtime.sock`, the stale fallback socket named by a stale `state/runtime.json` (only inside a `pm-mcp-<hash>/` directory owned by the effective UID), and the stale `state/runtime.json` itself. Holding the lock proves that no live runtime owns them; a runtime that removed them without the lock could unlink the live holder's socket.
+. *Directory & permission verification (`PM-SEC-4`)*: `<PM_MCP_BASE>` and `<PM_MCP_BASE>/enrolments/` must be owned by the effective UID with mode `0700`, and `state/*` must be `0600`. Violations are written to `stderr` and `audit.jsonl` and the runtime exits with code `77` (`EX_NOPERM`). A single enrolment file is not part of this check: its permissions and integrity are verified per project (<<Per-Project Recovery>>), and a failure blocks only that project. Credential files under `<PM_MCP_BASE>/credentials/` are not part of this check: an insecure credential file blocks only the step that needs it (`PM-CRED-4`, link:cli-and-security.adoc[CLI, Coordination & Security Specification]).
+. *Bounded verification*: Work whose cost does not grow with the number of projects, plans, or jobs:
+.. *Audit chain verification (`PM-SEC-6`)*: Verify the HMAC-anchored head `logs/audit.head`, the rotation index, and the `prev_hash` chain of `logs/audit.jsonl` from its last checkpoint (incremental; a full verification is the operator command `pm-mcp operator audit verify`). A broken chain is reported on `stderr` and in `pm-mcp status` and recorded as an `audit_chain_broken` record; it is never repaired and does not stop the start.
+.. *Machine store format migration and workflow validation*: Forward-migrate the machine-global store formats (`PM-ARCH-6`) and validate all workflow definitions (`PM-IMPL-5`), failing closed. Per-project stores are migrated in their project's recovery (<<Per-Project Recovery>>).
+. *Bind the socket*: Bind the effective socket path (<<Singleton & Discovery>>, Socket) and write `state/runtime.json` with it.
+. *Ready*: Begin accepting connections and start the background recovery pass over all enrolled projects (<<Per-Project Recovery>>).
+
+The cold-start target of `PM-TECH-3` (≤ 50 ms) covers steps 1 to 6 on a clean state: socket bound and ready, without any per-project recovery.
+
+[#per-project-recovery]
+==== Per-Project Recovery
+
+Crash recovery (`PM-ARCH-8`) runs per project, never before the socket is bound: lazily on the first call addressing the project, and for every enrolled project in a background pass after bind. Each project is recovered once per runtime instance; whichever trigger comes first runs it, and the other waits for its result. A call addressing a project whose recovery has not finished waits for it, bounded by the project recovery wait (link:timeouts.adoc#project-recovery-wait[Timeouts & Budgets Specification]); on expiry the call returns the retryable error `runtime_recovering` (link:mcp-tools.adoc[MCP Tools Specification], closed error codes) while recovery continues, and a repeated call is served once it has finished. Calls addressing other, recovered projects are served meanwhile. The project's recovery comprises:
+
+. Forward-migrate the project's store formats (`PM-ARCH-6`), failing closed for that project.
+. *Enrolment integrity verification (`PM-SEC-5`)*: Verify the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json`: mode `0600` and owner, schema and exact `format_version`, its HMAC-SHA-256 sidecar `<project_id>.json.hmac` (link:cli-and-security.adoc#enrolment-integrity[CLI, Coordination & Security Specification]), and the uniqueness of its `project_root` among the enrolment files. On a failure the runtime records the audit record (`enrolment_tampered`, `enrolment_insecure`, `enrolment_invalid`, or `enrolment_root_conflict`), reports it on `stderr` and in `pm-mcp status`, and refuses every enrolment-dependent operation of this project with that reason until the operator repairs or re-baselines the file through the operator CLI; the other projects and the runtime are unaffected.
+. Mark every job record (`jobs/<job_id>.json`, link:store-schemas.adoc#job-record[Store Schemas Specification, Job Record]) of the project left `running` by a previous runtime instance as `killed`; if the job's process group is still alive (probed with `kill(-pgid, 0)`, also when its leader has exited), terminate it first (`SIGTERM`, then `SIGKILL` after the grace period; link:job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime Specification, Process Termination]). Jobs are never re-executed blindly.
+. Mark the project's leases (merge-queue holders, review-bot claims, build slots) whose `holder_instance` (PID plus start instant) is no longer alive as orphaned; release a build slot at once (its job is recorded as `killed`), and release any other orphaned lease only on positive evidence of abandonment (owning scope terminal, archived, or gone, or lease expiry passed without adoption); the owning scope adopts its orphaned leases on its next call (link:store-schemas.adoc#machine-lease-stores[Store Schemas Specification, Machine Lease Stores]).
+. Roll forward every interrupted `mcp/transaction-journal.json` of the project's plan, epic, and workspace scopes and of its lesson store (link:store-schemas.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]). Store digests are compared only after this step.
+. Reconcile the recorded worktree presence of every plan whose `worktree_path` is set, lazily on the first call addressing that plan: a recorded worktree that no longer exists is cleared (`worktree_path: null`) with an audit record and never followed (link:filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). Plan directories never move, so there is no directory move to complete or roll back.
+. *Pending-record sweep*: Pending entry records (`<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json`) older than the compiled maximum age (`86400` seconds, fixed, link:timeouts.adoc#pending-entry-max-age[Timeouts & Budgets Specification]) are removed and audited; the runtime keeps no connections, so age is the only evidence.
+
+*Sweep rule*: Every sweep (leases, jobs, pending entry records, archived plans, job logs) selects candidates only from positive evidence of abandonment (a dead owner identified by PID plus start instant, a terminal state, or an expired lease or retention period), never from a name that fails to parse as an identifier. Each swept directory declares its reserved entries (for example the shared epic worktree `_epics` under `.marshall/local/worktrees/`), which are excluded by construction.
 
 === Drain, Stop & Upgrade
 
-* On `SIGTERM`/`SIGINT` (sent by `pm-mcp drain`, the service manager, or the OS), the runtime stops admitting new jobs and new transitions that would start jobs, lets running jobs finish up to the drain timeout (`drain_timeout_seconds` in `machine-config.json`, default `600`), then terminates remaining job process groups and records them as `killed`. It shuts down warm LSP servers, releases leases, removes `runtime.json` and the socket, and exits with code `0`.
+* On `SIGTERM`/`SIGINT` (sent by `pm-mcp drain`, the service manager, or the OS), the runtime stops admitting new jobs and new transitions that would start jobs, lets running jobs finish up to the drain timeout (`drain_timeout_seconds` in `machine-config.json`, link:timeouts.adoc#drain-timeout[Timeouts & Budgets Specification]), then terminates remaining job process groups and records them as `killed`. It shuts down warm LSP servers, releases leases, removes `runtime.json` and the socket, and exits with code `0`.
 * Calls arriving during drain receive a normal representation with `facts.runtime: draining` and no job-starting links.
-* *Upgrade*: After installing a new binary, `pm-mcp drain` stops the old runtime; the next relay starts the new one. A relay whose own version differs from `runtime.json -> version` forwards normally but adds `facts.runtime_version_mismatch` (with both versions) to the next representation and recommends `pm-mcp drain` (`PM-DIST-4`).
+* *Upgrade*: After installing a new binary, `pm-mcp drain` stops the old runtime; the next relay starts the new one. A relay whose own version differs from `runtime.json -> version` forwards normally; the runtime, which compares the relay's `PM-MCP-Relay-Version` header with its own version, adds `facts.runtime_version_mismatch` (with both versions) to the next representation on that connection and recommends `pm-mcp drain` (`PM-DIST-4`).
 
 == Relay (`pm-mcp serve`)
 
@@ -164,7 +183,7 @@ The runtime's own environment is that of whichever process started it and is the
 
 === Connection Metadata
 
-On connecting, the relay sends the following as HTTP headers of the `initialize` request. The runtime records them for the lifetime of the host connection:
+The runtime runs Streamable HTTP without MCP sessions: it issues no `Mcp-Session-Id` and keeps nothing per connection (`PM-ARCH-4`). The relay keeps the host's `initialize` request and sends the following HTTP headers on every request it forwards; the runtime evaluates them per request:
 
 [cols="1,3"]
 |===
@@ -173,26 +192,32 @@ On connecting, the relay sends the following as HTTP headers of the `initialize`
 |`PM-MCP-Relay-Version`
 |The relay binary's version (for mismatch detection).
 
+|`PM-MCP-Protocol-Version`, `PM-MCP-Client-Info`, `PM-MCP-Client-Capabilities`
+|The protocol version, `clientInfo`, and capabilities (for example elicitation and progress support) from the host's `initialize` request, as the relay recorded them; the runtime derives the operator channel and every capability-dependent behaviour from these headers on each request.
+
 |`PM-MCP-Env-Signature`
 |The client detection signature computed by the relay from its own inherited environment using the detection rules of the client profiles (link:client-profiles.adoc[Client Profiles Specification]); Tier 2 of `PM-CLIENT-3`.
 
 |`PM-MCP-Workspace`
-|The canonical git top-level of the relay's working directory. Used only to resolve unscoped calls (`pm_plans`, `pm_epics`, `pm_start`); scoped calls resolve the workspace exclusively from `entry.json` (`PM-ARCH-4`).
+|The canonical git top-level of the relay's working directory. Resolves every workspace-addressed request (`PM-ARCH-4`): `pm_plans`, `pm_epics`, `pm_start`, `pm_build` without `plan_id`, `pm_skills` / `pm_skill` / `pm_skill_file` without a scope, `pm_state` / `pm_do` with `scope=workspace`, and the upstream pass-through tools `up_*`. The runtime resolves the header on every such request by the project resolution rule (link:filesystem-layout.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]), the same rule `pm-mcp enter` applies; a directory that does not resolve to an enrolled project fails with `project_not_enrolled`. For scope-addressed calls (`plan_id`, `epic_id`) the header only selects the per-project machine store in which the scope is looked up (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]); the main checkout is the enrolled `project_root`, and the client profile comes from the last row of the scope's session log.
+
+|`PM-MCP-Client-Session`
+|The host session identifier, which the relay reads from the session ID variable listed for the host in the Host Integration Table (link:client-profiles.adoc#host-integration-table[Client Profiles Specification]); empty when the host provides none. Recorded as `client_session_id` in the scope's session log: a scope-addressed call whose header value differs from the `client_session_id` of the scope's last row appends a row for that session (link:store-schemas.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]). Used for `last_entered` (`PM-CLIENT-6`).
 |===
 
-The MCP `initialize` exchange itself (protocol version, `clientInfo`, host capabilities such as elicitation and progress support) passes through unchanged and is answered by the runtime.
+The MCP `initialize` exchange itself passes through unchanged and is answered by the runtime, which records nothing from it; the relay records the host's request to derive the headers above. Milestone 1 verifies that the pinned MCP version and the Quarkus MCP server support sessionless Streamable HTTP. If they do not, the documented fallback is a session-holding runtime whose relay replays the recorded `initialize` and `notifications/initialized` when the runtime answers an unknown session or reports a new instance, suppresses the duplicate response to the host, and fails the old session's open server requests.
 
 == Logical Plan Sessions
 
 === Definition
 
-A logical plan session is identified by its `plan_id` (or `epic_id`) and consists of the scope's persisted files (`entry.json`, `status.json`, and the stores in link:store-schemas.adoc[Store Schemas Specification]). Nothing else carries workflow state: not the host conversation, not the relay, not the MCP transport session (`Mcp-Session-Id`), and not runtime memory, which is a cache that is revalidated against the files (`PM-ARCH-6`).
+A logical plan session is identified by its `plan_id` (or `epic_id`, or the project's workspace scope, `scope=workspace`) and consists of the scope's persisted files (`sessions.jsonl`, `status.json`, and the stores in link:store-schemas.adoc[Store Schemas Specification]). Nothing else carries workflow state: not the host conversation, not the relay, not the MCP transport session (`Mcp-Session-Id`), and not runtime memory, which is a cache that is revalidated against the files (`PM-ARCH-6`).
 
 === Call Cycle
 
 Every scoped call (`pm_state`, `pm_do`, `pm_build`, `pm_lsp`) executes as:
 
-. Resolve the scope from the `plan_id`/`epic_id` argument and its `entry.json` (client profile, workspace root) (`PM-ARCH-4`, `PM-CLIENT-1`).
+. Resolve the scope from the `plan_id`/`epic_id` argument and the last row of its session log (client profile; the main checkout is the enrolled `project_root`), appending a session row when the `PM-MCP-Client-Session` header names a new session (<<Connection Metadata>>), or, for `scope=workspace` and a `pm_build` without `plan_id`, from the verified `PM-MCP-Workspace` header and the workspace home `<PM_MCP_BASE>/projects/<project_id>/workspace/` (link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification]) (`PM-ARCH-4`, `PM-CLIENT-1`).
 . For mutating calls, acquire the scope lock (`PM-WF-4`) and load the current state from disk, discarding stale cache entries.
 . Validate the link and arguments against the persisted state (`PM-WF-6`).
 . Execute exactly one transition, including any auto-steps it chains, and persist all resulting state atomically before releasing the lock.
@@ -215,7 +240,7 @@ Both paths operate on the same files, so any number of host connections may addr
 Some rendering decisions depend on the host connection, not on the plan:
 
 * *Waiting*: Progress waits are used only when the current connection declared progress support and supplied a `progressToken`; otherwise bounded waits are used (`PM-IMPL-4`).
-* *Operator decisions*: MCP elicitation is used only when the current connection declared elicitation support; otherwise the scope enters `*.blocked` with the operator CLI command (`PM-SEC-3`).
+* *Operator decisions*: MCP elicitation is used only when the current connection declared elicitation support; otherwise the engine raises the `blocked` condition on the current state with the operator CLI command (`PM-SEC-3`).
 
 The same plan may therefore render differently for two connections at the same moment without any difference in persisted state.
 
@@ -227,7 +252,7 @@ The same plan may therefore render differently for two connections at the same m
 ----
 Host               pm-mcp serve (relay)             pm-mcp runtime
  │ stdin: request id=7    │                                │
- ├───────────────────────▶│ POST /mcp (Mcp-Session-Id)     │
+ ├───────────────────────▶│ POST /mcp (PM-MCP-* headers)   │
  │                        ├───────────────────────────────▶│ lock, validate, transition,
  │                        │                                │ persist, render
  │                        │◀───────────────────────────────┤ response id=7 (JSON or SSE event)
@@ -241,7 +266,7 @@ The relay preserves JSON-RPC `id` values unchanged, so each host request receive
 
 * *Progress notifications* (`notifications/progress`) and *server requests* related to a pending call (such as `elicitation/create`) arrive on that call's SSE response stream. The relay writes them to `stdout` in arrival order.
 * The host's answer to a server request arrives on `stdin`. The relay posts it to the runtime, which routes it to the waiting call.
-* Messages not related to a pending call (such as `notifications/resources/updated`) arrive on the connection's standalone SSE stream (`GET /mcp`), which the relay keeps open while connected.
+* There are no messages unrelated to a pending call: without sessions the runtime opens no standalone SSE stream (`GET /mcp`) and offers no resource subscriptions or `list_changed` notifications. Clients detect changed skills through their content digest (link:mcp-tools.adoc[MCP Tools Specification]).
 
 === Cancellation
 
@@ -258,19 +283,19 @@ Jobs run in the runtime, independent of any call. A `wait:<job_id>` call returns
 |Event |Behaviour
 
 |Host closes the conversation or kills the relay (`stdin` EOF, `SIGTERM`, `SIGKILL`)
-|The relay closes its runtime connection and exits. The runtime discards the connection's transport state. Running jobs, locks held by in-flight transitions (released at transition end), and persisted state are unaffected.
+|The relay closes its runtime connection and exits. The runtime holds no state for the connection. Running jobs, locks held by in-flight transitions (released at transition end), and persisted state are unaffected.
 
 |Relay dies while a call is in flight
 |The runtime completes and persists the transition; only the response is lost. The next `pm_state(plan_id)` from any connection returns the resulting state.
 
 |Runtime not running when a relay starts or reconnects
-|The relay starts it on demand (<<Start Modes>>). If the socket does not accept connections within the start timeout, the relay answers pending requests with a JSON-RPC error carrying the closed code `runtime_unavailable` and keeps retrying on subsequent requests.
+|The relay starts it on demand (<<Start Modes>>). If the socket does not accept connections within the start timeout, the relay answers pending requests with a JSON-RPC error carrying the closed code `runtime_unavailable` and keeps retrying on subsequent requests. Because the runtime keeps no session, a request after a runtime restart is served normally; only requests in flight during the restart are lost.
 
 |Runtime crashes during a transition
-|Atomic write-and-rename guarantees each store is either fully updated or unchanged. The relay answers the in-flight request with `runtime_unavailable`; after restart, crash recovery runs and `pm_state` shows the persisted state.
+|Atomic write-and-rename guarantees each store is either fully updated or unchanged, and the scope's transaction journal makes a multi-store transaction complete by roll-forward. The relay answers the in-flight request with `runtime_unavailable`; after restart, the project's recovery completes before its first call is served (<<Per-Project Recovery>>), and `pm_state` shows the persisted state.
 
 |Runtime crashes while jobs run
-|On the next start, the orphaned jobs are terminated if still alive and recorded as `killed` (<<Startup Sequence>>).
+|After the next start, the project's recovery terminates the orphaned jobs if still alive and records them as `killed` (<<Per-Project Recovery>>).
 
 |Runtime draining
 |New calls receive representations with `facts.runtime: draining`; after exit, the next relay start brings up a new runtime.
@@ -278,13 +303,16 @@ Jobs run in the runtime, independent of any call. A `wait:<job_id>` call returns
 
 == Operator CLI Interaction
 
-The operator CLI never calls the runtime's MCP endpoint. It reads and writes the filesystem stores directly under the same `FileChannel.lock()` protocol. Because the runtime revalidates state from disk inside every locked transition, CLI changes (enrolment, `entry.json` from `pm-mcp enter`, operator decisions) take effect on the next call without notification. Details of each CLI verb are in link:cli-and-security.adoc[CLI, Coordination & Security Specification].
+The operator CLI never calls the runtime's MCP endpoint. It reads and writes the filesystem stores directly under the same `FileChannel.lock()` protocol. Because the runtime revalidates state from disk inside every locked transition, CLI changes (enrolment files, session rows appended by `pm-mcp enter`, operator decisions) take effect on the next call without notification. Details of each CLI verb are in link:cli-and-security.adoc[CLI, Coordination & Security Specification].
 
 == Verification
 _Implementation watch: link:../implementation-watch/runtime-model.adoc#PM-WATCH-RUN-3[PM-WATCH-RUN-3]_
 
 * *Relay integration tests (`*IT`)*: `McpAssured.newStdioClient()` spawns `pm-mcp serve` with an isolated `PM_MCP_BASE`, which starts a private runtime on demand. Tests cover `id` preservation, elicitation round trips, progress forwarding, cancellation, relay kill during a pending call, and continuation from a second client via `pm_state`.
 * *Runtime restart tests*: Kill the runtime during an active job and a pending transition; verify the job is recorded `killed`, stores are consistent, and a new relay resumes the logical session.
+* *Startup order tests*: A second runtime started against a live one exits `0` and leaves `<PM_MCP_BASE>` byte-identical (no audit record, `runtime.json` and the socket unchanged); a stale socket and `runtime.json` left by a killed runtime are removed only after the lock is acquired; a call addressing a project whose recovery exceeds the project recovery wait returns `runtime_recovering`, and the repeated call after recovery is served.
+* *Socket path fallback tests*: A `PM_MCP_BASE` long enough to push `run/runtime.sock` over the platform `sun_path` limit binds `$TMPDIR/pm-mcp-<hash>/runtime.sock`, records it in `runtime.json`, and the relay connects through it; a fallback directory owned by another UID, or with a mode other than `0700`, makes the start refuse.
+* *Cold-start measurement (`PM-TECH-3`)*: The ≤ 50 ms target is measured from process start to the socket accepting connections (step 6 of <<Startup Sequence>>) on a clean state (empty `PM_MCP_BASE` apart from a valid enrolment, no stale files, no projects to recover), excluding every per-project recovery.
 * *Isolation tests (`PM-TEST-5`)*: Verify that the runtime opens no TCP/UDP listener, that the socket and its directory have modes `0600`/`0700`, and that every line the relay writes to `stdout` is a valid JSON-RPC 2.0 message.
 * *Technical verification (Milestone 1)*:
 ** `quarkus-mcp-server-http` bound to a Unix domain socket under GraalVM native image on macOS and Linux, using the Netty native transport (`kqueue`/`epoll`). If that is not viable in native image, the fallback is a runtime-side listener on the JDK's `UnixDomainSocketAddress` channels speaking the same Streamable HTTP subset.

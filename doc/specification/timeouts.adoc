@@ -1,0 +1,582 @@
+= Timeouts & Budgets Specification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../Specification.adoc[Specification] » Timeouts & Budgets
+
+== Overview
+
+This document is the single normative source of every timeout, time window, wait window, budget, deadline, expiry, idle limit, heartbeat, back-off, interval, and age-based retention of *plan-marshall-mcp* (`PM-MCP`) (operator decisions D70 and D74). Every other requirement and specification names *what* is timed and links the anchor here for the value, its derivation, its configuration key, its floor or cap, and the behaviour on expiry; none of them restates a number or a derivation rule.
+
+JSON Schemas of configuration stores (`machine-config.json` and the per-project enrolment files `enrolments/<project_id>.json` in link:store-schemas.adoc[Store Schemas Specification], the client profile schema in link:client-profiles.adoc[Client Profiles Specification]) keep their `default`, `minimum`, and `maximum` values because a schema must be self-contained; each of those values equals the value registered here, and a divergence is a defect of the schema.
+
+Every duration is stated in seconds unless the table says otherwise. Deadlines are measured on the monotonic clock of the process that enforces them; persisted instants (`lease_expires_at`, `reset_at`, next-allowed timestamps) follow the one wire shape of link:store-schemas.adoc[Store Schemas Specification] (RFC 3339 UTC).
+
+Not in scope: the startup and memory bounds of `PM-TECH-3` (performance bounds, not timeouts, defined there), the token and wall-minute spend anchors of link:dispatch-and-effort.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification, Spend Accounting] (spend warnings, never a deadline), and the review-bot rate windows (see <<waits>>).
+
+== Traceability
+_See Requirements:_
+
+* _See Requirement link:../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain]_
+* _See Requirement link:../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job Links & Wait Transitions]_
+* _See Requirement link:../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+* _See Requirement link:../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Plan Emission & Cross-Plan Merge Mutex]_
+* _See Requirement link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2: Orthogonal Service Capability Tools (pm_build, pm_lsp)]_
+* _See Requirement link:../Requirements.adoc#PM-SVC-2[PM-SVC-2: Warm Language Server Pool & Semantic Code Navigation]_
+* _See Requirement link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4: Direct Host Subprocess Management & Process-Group Isolation]_
+* _See Requirement link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6: Adaptive Build Timeouts, Coverage Parsing & Gate Honesty]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
+* _See Requirement link:../Requirements.adoc#PM-TECH-4[PM-TECH-4: Operating System Platform Integration (macOS & Linux)]_
+* _See Requirement link:../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy]_
+* _See Requirement link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
+* _See Requirement link:../Requirements.adoc#PM-MIG-5[PM-MIG-5: Quantitative Triggers & Project Release]_
+
+== Status: PLANNED
+
+== Table Conventions
+
+Every group below is one normative table with the columns:
+
+* *Name*: what is timed.
+* *Value / derivation*: the compiled default or the rule that computes the value.
+* *Configurable?*: the configuration key and its store, or `fixed` (compiled into the binary; changed only by a release).
+* *Floor / cap*: the bounds a configured or derived value is clamped to; `—` when none applies.
+* *Applies to*: the jobs, calls, or records the value governs.
+* *Behaviour on expiry*: what happens when the time runs out.
+* *Defined for*: the sections that use the value (they link here and restate nothing).
+
+A value marked _open_ is not yet defined; it belongs to the named open design topic, and nothing may assume a value for it until that topic defines it here.
+
+[#job-budgets]
+== Job Budgets & Escalation
+_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-15[PM-WATCH-JOB-15], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-16[PM-WATCH-JOB-16]_
+
+Every job runs under a wall-clock budget $t$ allocated at job start and recorded, with its `budget_derivation`, in the job record and the job representation (`PM-EXEC-4`, `PM-EXEC-6`). The budget is keyed per project by the *budget key*:
+
+* build jobs: the canonical command `<build_system>:<verb>[@<module_id>][+<profile>…]` (canonical verb from the link:job-runtime.adoc#canonical-build-verbs[Canonical Build Verb Set], module omitted for a whole-tree run, profiles sorted), for example `maven:verify+pre-commit` or `maven:module-tests@plan-marshall-mcp`;
+* `git` and `ci` jobs: `<kind>:<operation>`, where `<operation>` is the closed operation name of the composing primitive (`PM-EXEC-5`), for example `git:worktree-remove` or `ci:pr-checks`;
+* `project_script` jobs: `project_script:<project_script_id>`.
+
+Learned values live in the project's `<PM_MCP_BASE>/projects/<project_id>/build-timings.json` (link:store-schemas.adoc#build-timings-store[Store Schemas, Build Timings Store]) under this key (link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning], which defines which runs feed the learned baseline).
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[engine-floor]]Engine floor $F$
+|Maven, Gradle, npm: `300`; pyproject (`pw`, every command): `330` (plan-marshall's per-tool outer floors `MAVEN_OUTER_FLOOR_SECONDS`, `GRADLE_OUTER_FLOOR_SECONDS`, `NPM_OUTER_FLOOR_SECONDS`, `PYTEST_OUTER_FLOOR_SECONDS`, verified at plan-marshall commit `88fcfc9ef`). `git`, `ci`: the floor of the operation class (rows below).
+|fixed
+|Is itself the lower bound of every budget of its key; no derivation and no configuration ever undercuts it.
+|build, `git`, `ci` jobs
+|—
+|link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]; link:domain-extensions.adoc#_tier_3_adaptive_build_timeouts_crash_replay_state[Domain Extensions, Tier 3]
+
+|[[learned-baseline]]Learned baseline $L$
+|Max-biased blend over finished runs of the key: $L_{\text{new}} = \lfloor 0.8 \times \max(L_{\text{old}}, d) + 0.2 \times \min(L_{\text{old}}, d) \rfloor$ for a finished run of duration $d$; the first observation is stored raw.
+|not configured (server-managed per-project store `build-timings.json`)
+|—
+|build, `git`, `ci` jobs
+|—
+|link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]
+
+|[[budget-allocation]]Allocated budget $t$
+|First match: (1) an escalation budget $E$ is set for the key → $t = E$ (`escalated`); (2) an operator budget $O$ is enrolled for the key → $t = \max(F, O)$ (`operator`); (3) the key has a learned value → $t = \max(F, \lfloor 1.25 \times L \rfloor)$ (`learned` with its observation count); (4) otherwise $t = F$ (`floor_default`).
+|via the operator budget $O$ (next row)
+|$t \ge F$ always. The escalation cap $C$ bounds only the escalation step, never an operator budget.
+|build, `git`, `ci` jobs
+|The runtime terminates the job's process group (<<grace-period>>) and records `timed_out` (<<no-verdict-rule>>).
+|link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]; link:job-runtime.adoc#outcome-derivation[Job Runtime, Outcome Derivation]
+
+|[[operator-budget]]Operator budget $O$
+|Seconds per budget key, set by the operator.
+|`command_budgets` of the project's enrolment file `enrolments/<project_id>.json` (link:store-schemas.adoc#enrolment-store[Store Schemas, Project Enrolment Store]), written only through the operator CLI
+|Clamped up to $F$; may exceed the escalation cap $C$.
+|build, `git`, `ci` jobs
+|As allocated budget.
+|link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning] (Seeded Wait Budgets)
+
+|[[escalation-budget]]Escalation budget $E$
+|Set by a `timed_out` run with budget $t$ for the next run of the same key: $E = \max(t, \min(2 \times t, C))$. One-shot: the next finished run of the key clears it. A timed-out run never feeds $L$.
+|the cap $C$ (next row)
+|$E \ge t$ (an escalation never lowers a budget, also when $t > C$); $E \le \max(t, C)$.
+|build, `git`, `ci` jobs
+|As allocated budget.
+|link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]
+
+|[[escalation-cap]]Escalation cap $C$
+|`1800` (plan-marshall's `MAX_TIMEOUT`)
+|`escalation_cap_seconds` in `machine-config.json` (link:store-schemas.adoc#machine-config[Store Schemas, Machine Configuration Store])
+|minimum `330` (the highest engine floor)
+|the escalation step
+|—
+|this table
+
+|[[git-local-budget]]`git` local operation class
+|Floor `120`; allocation as above. Operations that read or change only the local repository without running hooks: `status`, `diff`, `log`, `rev-parse`, `ls-files`, `merge-base`, `branch`, `worktree add`, `worktree list`, `worktree remove`, `worktree prune`.
+|via $O$ per operation key
+|$F = 120$
+|`git` jobs
+|`timed_out`; never answered with `--force` or any other widening flag; a timed-out `worktree remove` runs the <<worktree-remove-recheck>>.
+|link:job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]; link:filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout, Worktree Lifecycle]
+
+|[[git-hook-budget]]`git` hook-running operation class
+|Floor `300`; allocation as above. Operations that run repository hooks: `commit`, `merge`, `rebase`, `cherry-pick`.
+|via $O$ per operation key
+|$F = 300$
+|`git` jobs
+|`timed_out`; a partial rebase or merge is reported from the worktree state, never aborted or forced by the runtime.
+|link:workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`)
+
+|[[git-network-budget]]`git` network operation class
+|Floor `300`; allocation as above. Operations that contact a remote: `fetch`, `push` (including its `pre-push` hook), `pull`, `ls-remote`.
+|via $O$ per operation key
+|$F = 300$
+|`git` jobs
+|`timed_out`; a push is re-verified from the remote ref state before any retry.
+|link:workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`)
+
+|[[ci-query-budget]]`ci` query operation class
+|Floor `60`; allocation as above. Read-only provider CLI calls (`gh`, `glab`): pull-request and check inspection, run lookup, review and comment retrieval, merge-queue membership reads, and the single poll of a `bot_poll` job.
+|via $O$ per operation key
+|$F = 60$
+|`ci` and `bot_poll` jobs
+|`timed_out`; the enclosing wait re-polls (<<waits>>).
+|link:job-runtime.adoc[Job Runtime]; link:phase-workflows.adoc[Phase Workflows], Phase 6
+
+|[[ci-mutation-budget]]`ci` mutation operation class
+|Floor `120`; allocation as above. Provider CLI calls that change provider state: pull-request create and edit, comments, review triggers, merge, merge-queue enqueue.
+|via $O$ per operation key
+|$F = 120$
+|`ci` jobs
+|`timed_out`; the effect is confirmed only from the provider's observed state before any retry (never from the exit status).
+|link:phase-workflows.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]
+
+|[[project-script-budget]]`project_script` budget
+|The enrolled maximum timeout of the script, used as $t$ for every run; no learning and no escalation.
+|`max_timeout_seconds` of the entry in `enrolments/<project_id>.json -> project_scripts` (operator CLI, link:store-schemas.adoc#enrolment-store[Store Schemas, Project Enrolment Store])
+|minimum `10`; no cap beyond the operator's value
+|`project_script` jobs
+|`timed_out`; the retry is offered at the same budget beside `escalate` (the operator raises the maximum by re-enrolment).
+|link:domain-extensions.adoc[Domain Extensions] (Project Script Jobs); link:job-runtime.adoc[Job Runtime]
+
+|[[grace-period]]Termination grace period
+|`5` between `SIGTERM` and `SIGKILL` to the job's process group.
+|fixed
+|—
+|every termination of a job group (budget expiry, cancel, drain, orphan termination) and the final `SIGTERM` of an evicted language server
+|`SIGKILL` to the whole group, also when its leader is gone.
+|link:job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]
+
+|[[cancel-group-retry]]Cancel-before-group retry
+|When `kill(-pgid, SIGTERM)` answers `ESRCH` because the `job-exec` shim has not yet called `setpgid`, the runtime signals the PID directly and retries against the group every `0.1` for at most `10` attempts (`1` in total).
+|fixed
+|—
+|`cancel:<job_id>`, budget expiry, drain
+|After the last attempt the job is settled from its exit status; `cancel_before_group` is recorded in the job record either way.
+|link:job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]
+|===
+
+[#no-verdict-rule]
+=== Timed-Out Outcomes Are No-Verdict (D70)
+
+* *Every `timed_out` is `no_verdict`*: A job settled `timed_out` counts as `no_verdict` in every roll-up (landing facts, metrics, gate facts, CI taxonomy, finding counts), never as `failed` and never as `succeeded`, whatever its `budget_derivation`. It never fails a gate, and it emits zero located code errors or findings (`PM-EXEC-4`).
+* *The derivation selects only the retry offer*: A `timed_out` job auto-offers `retry` with the escalation budget $E$ when $E > t$ (derivations `floor_default`, `learned`, `operator`, and `escalated` below the cap). When $E = t$ (the budget already reached $\max(t, C)$) or for a `project_script`, `retry` is offered at $t$ together with `escalate`, so the operator can enrol an operator budget above the cap.
+* *Budget statistic*: A budget always names the statistic it came from (the blend $L$ with its observation count, never a median or percentile); a p50 or p95 duration quoted in facts is labelled as such and is never used as a budget.
+
+[#worktree-remove-recheck]
+=== Partial-Removal Re-Check after a Timed-Out `git worktree remove` (D74)
+
+A `timed_out` `git worktree remove` can leave a partially deleted tree. Before any retry and before the removal is recorded:
+
+1. The runtime runs `git worktree list --porcelain` in the main checkout (budget class <<git-local-budget>>) and checks whether the worktree directory still exists.
+2. *Unregistered and absent*: the removal is complete; it is recorded (`worktree_path: null`) with `removal_evidence: recheck`.
+3. *Registered but the directory is absent*: the runtime runs `git worktree prune` and repeats step 1 once; it records the removal only on the re-checked positive evidence.
+4. *Directory present (registered or not)*: `worktree_path` stays set, the step reports `worktree_removal: partial` with the remaining path, and `retry` is offered with the escalation budget; the retry never adds `--force`.
+5. *Re-check itself fails or times out*: the removal is `indeterminate`; nothing is recorded as removed (link:store-schemas.adoc#evidence-based-removal-sweeps[Store Schemas, Evidence-Based Removal Sweeps]).
+
+[#waits]
+== Waits & Long-Polls
+_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-5[PM-WATCH-JOB-5]_
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[bounded-wait]]Bounded wait window
+|Compiled default `240` per client profile.
+|`connection.bounded_wait_seconds` of the client profile; operator override in `<PM_MCP_BASE>/conf/profiles/<client_id>.json`
+|`15`..`3600`; profile validation also rejects a value above `connection.idle_timeout_seconds − 30`
+|`wait:<job_id>`, `wait:<composite_id>`, `wait:decision:<decision_id>`, a `pm_build` call and its `job_id` continuation, when the connection does not qualify for a progress wait
+|The call returns the running representation (or the unchanged `blocked` representation) with fresh `wait:` and `cancel:` links and reports whether the job state changed during the window; never an MCP transport timeout.
+|link:job-runtime.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]; link:hypermedia-format.adoc[Hypermedia Format] (`wait` form, Short-Circuit Matrix); link:mcp-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools, `pm_build`]
+
+|[[progress-wait]]Progress wait upper bound
+|`1800`
+|`progress_wait_max_seconds` in `machine-config.json`
+|`60`..`7200`
+|the same waits, when the client profile declares `progress_resets_timeout: true` and the request carries a `progressToken`
+|As bounded wait.
+|link:job-runtime.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]; link:runtime-model.adoc#_connection_scoped_rendering[Runtime Model, Connection-Scoped Rendering]
+
+|[[progress-interval]]Progress notification interval
+|`5` between `notifications/progress` frames (stage and elapsed time).
+|fixed
+|never more than `60` between two frames of one progress wait
+|progress waits
+|—
+|link:job-runtime.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]
+
+|[[decision-wait]]Operator decision wait
+|One bounded or progress wait window per `wait:decision:<decision_id>` call; the pending decision itself never expires.
+|as bounded / progress wait
+|as bounded / progress wait
+|`blocked` condition, `execute.awaiting-infeasible-decision`
+|Returns the unchanged representation with its `blocked` condition; the decision stays pending until the operator resolves it or the scope terminates.
+|link:workflow-dsl.adoc#escalation-decision-wait[Workflow DSL, Escalation Without Elicitation]; link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI & Security, Operator Channel Isolation]
+
+|[[elicitation-wait]]Elicitation request
+|Held within the window (bounded or progress) of the call that issued `elicitation/create`.
+|as bounded / progress wait
+|as bounded / progress wait
+|operator-authorizing and routine elicitations
+|The server withdraws the request, records the decision as pending, and raises the `blocked` condition with `wait:decision:<decision_id>`; a declined or cancelled elicitation is an answer, not an expiry.
+|link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI & Security, Operator Channel Isolation]
+
+|[[ci-wait]]CI wait
+|No deadline: a CI wait is re-polled window by window and never lapses. When no learned figure exists, the operator budget of the CI key seeds the expected-duration fact.
+|seed via $O$
+|—
+|CI constituents of `wait:<job_id>` and composite waits
+|Window expiry only (as bounded wait).
+|link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning] (Seeded Wait Budgets)
+
+|CI re-poll cadence inside a window
+|_open_: git/GitHub/GitLab design topic.
+|—
+|—
+|CI waits
+|—
+|link:phase-workflows.adoc[Phase Workflows], Phase 6
+
+|[[review-bot-windows]]Review-bot rate windows, re-review timeout, bot wait budgets
+|_open_: not defined here. The window derivation (`rate_interval_seconds × attempt_ceiling`, bot-stated reset ETA, the compiled rate-window floor `5400` applied only when no ETA is published, fixed) and the re-review timeout that derives from it belong to the open git/GitHub/GitLab design topic.
+|see link:phase-workflows.adoc#_refusals_rate_windows[Phase Workflows, Refusals & Rate Windows]
+|—
+|`finalize.review-window-wait`, `rereview_timeout` gap class
+|—
+|link:phase-workflows.adoc#_refusals_rate_windows[Phase Workflows, Refusals & Rate Windows]
+
+|[[merge-queue-wait]]Merge-queue landing wait
+|_open_: the budget after which `finalize.merge-queue-wait` and the epic landing settle `timed_out` belongs to the git/GitHub/GitLab design topic.
+|—
+|—
+|`finalize.merge-queue-wait`, epic landing
+|`timed_out` routes to `escalate`; a `timed_out` landing is `no_verdict` (<<no-verdict-rule>>).
+|link:phase-workflows.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]; link:dispatch-and-effort.adoc[Dispatch & Effort] (Epic Landing)
+
+|Host cancellation of a wait
+|Immediate: a host `notifications/cancelled` ends the pending wait or call only.
+|fixed
+|—
+|every wait
+|The job keeps running; only `cancel:<job_id>` cancels a job.
+|link:runtime-model.adoc#_cancellation[Runtime Model, Cancellation]
+|===
+
+[#runtime-lifecycle]
+== Runtime Lifecycle
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[runtime-start-timeout]]Runtime start timeout
+|`5` for the socket of a runtime started on demand to accept connections.
+|fixed
+|—
+|`pm-mcp serve` relay; a second runtime confirming that the singleton holder answers
+|The relay answers pending requests with the JSON-RPC error `runtime_unavailable` and retries on the next request.
+|link:runtime-model.adoc#_start_modes[Runtime Model, Start Modes]; link:runtime-model.adoc#_failure_semantics[Runtime Model, Failure Semantics]
+
+|[[project-recovery-wait]]Project recovery wait
+|`10` for a call addressing a project whose per-project recovery (lazy or background pass) has not finished.
+|fixed
+|—
+|every MCP call addressing a project (by scope or `PM-MCP-Workspace`) after a runtime start
+|The call returns the retryable error `runtime_recovering` (`isError: true`); the recovery continues, and a repeated call is served once it has finished. Nothing of the call is executed.
+|link:runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]; link:mcp-tools.adoc[MCP Tools] (closed error codes)
+
+|[[drain-timeout]]Drain timeout
+|`600`
+|`drain_timeout_seconds` in `machine-config.json`
+|minimum `0` (`0` terminates running jobs at once)
+|running jobs at `SIGTERM`/`SIGINT` / `pm-mcp drain`
+|Remaining job groups are terminated (<<grace-period>>) and recorded `killed`; warm language servers are shut down; the runtime exits.
+|link:runtime-model.adoc#_drain_stop_upgrade[Runtime Model, Drain, Stop & Upgrade]
+
+|[[pending-entry-max-age]]Pending entry record maximum age
+|`86400`
+|fixed (compiled constant; no legitimate machine difference)
+|—
+|`<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json`
+|Removed and audited by the project's recovery sweep (age is the only evidence; the runtime keeps no connections).
+|link:runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]
+
+|[[lsp-idle-timeout]]Language server idle timeout
+|`900` without a request to the instance.
+|`lsp_idle_timeout_seconds` in `machine-config.json`
+|minimum `60`
+|warm LSP pool instances
+|Clean eviction (`shutdown` → `exit` → `SIGTERM` after <<grace-period>>); the next request starts a new instance lazily.
+|link:job-runtime.adoc#_warm_language_server_pool_orthogonal_service_access_pm_svc_2_pm_svc_4_pm_tool_2[Job Runtime, Warm Language Server Pool]; link:mcp-tools.adoc[MCP Tools] (Warm LSP Pool Lifecycle)
+
+|[[lsp-start-timeout]]Language server start timeout
+|`120` from spawn to the `initialize` response.
+|`lsp_start_timeout_seconds` in `machine-config.json`
+|minimum `10`
+|warm LSP pool instances
+|The instance is terminated; `pm_lsp` reports the failure and an Axis C resolver reports `NOT_RUN` with `FAILED_TO_START`.
+|link:domain-extensions.adoc[Domain Extensions] (Explicit Non-Run Reporting)
+
+|[[lsp-request-timeout]]Language server request timeout
+|`60` per request.
+|`lsp_request_timeout_seconds` in `machine-config.json`
+|minimum `5`
+|`pm_lsp` operations and Axis C symbol-edge queries
+|The request is cancelled (`$/cancelRequest`); `pm_lsp` reports a timeout, never an empty result, and an Axis C resolver reports `NOT_RUN` with `TIMEOUT`.
+|link:domain-extensions.adoc[Domain Extensions] (Explicit Non-Run Reporting)
+
+|Transaction lock acquisition
+|No timeout: transaction locks are held for one transaction only (link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas, Transaction Locks]); long-lived claims are leases (<<leases>>). A reporting threshold of `30` watches every wait without aborting it.
+|fixed (the threshold feeds a `PM-MIG-5` trigger, which must not vary per machine)
+|—
+|runtime and operator CLI
+|The wait continues; the lock manager appends one `lock_wait_exceeded` audit record (lock, holder, waited time), which counts as a `PM-MIG-5` integrity trigger event.
+|link:runtime-model.adoc#_in_process_lock_manager[Runtime Model, In-Process Lock Manager]
+|===
+
+[#leases]
+== Leases & Heartbeats
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[merge-lease]]Merge holder lease
+|`lease_expires_at = heartbeat_at + 900`; every transition of the holding plan inside the rebase-to-merge critical section is a heartbeat and refreshes `heartbeat_at`.
+|fixed
+|—
+|`holder` of `state/merge-queue.json`
+|The holder is reclaimed in the next admission transaction (stale-holder reclaim); an orphaned holder whose expiry passed without adoption is released.
+|link:phase-workflows.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]; link:store-schemas.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|[[build-slot-lease]]Build slot lease
+|`lease_expires_at = acquired_at + t + 5` (the job's allocated budget plus the termination grace period).
+|derived
+|—
+|`state/build-slots.json`
+|The slot is released once its job has settled; a slot whose job was recorded `killed` at a runtime restart is released at once.
+|link:store-schemas.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|Review-bot window claim
+|`reset_at` of the window (see <<review-bot-windows>>, _open_).
+|—
+|—
+|`state/review-bot-windows.json`
+|—
+|link:store-schemas.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|Orphaned lease release
+|Positive evidence only: owning scope terminal, archived, or gone; or `lease_expires_at` passed without adoption; or (build slot) its job recorded `killed`.
+|—
+|—
+|every lease marked `orphaned_at`
+|Released and audited.
+|link:runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]
+|===
+
+[#operator-decisions]
+== Operator & Decisions
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[operator-auth-backoff]]Operator passphrase back-off
+|$2^{\text{failures}}$ after the last failed verification; the failure counter and the next-allowed instant persist in `state/operator-auth.json`; a successful verification resets the counter.
+|fixed
+|cap `300`
+|`pm-mcp` operator passphrase verification (platforms without binary-bound keyring ACLs)
+|Attempts before the next-allowed instant are refused and audited; a new CLI process does not reset it.
+|link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI & Security, Operator Channel Isolation]
+
+|Pending operator decision
+|No expiry.
+|—
+|—
+|`pending_decision` of a scope
+|—
+|link:workflow-dsl.adoc#escalation-decision-wait[Workflow DSL, Escalation Without Elicitation]
+
+|Merge authorization grant
+|No time expiry: admissibility is bound to `HEAD` and the gap class; a re-grant supersedes.
+|—
+|—
+|`MergeAuthorizationRecord`
+|—
+|link:phase-workflows.adoc[Phase Workflows] (Operator Merge Authorization Record)
+
+|`dispatch_id`
+|No time expiry: a `dispatch_id` becomes stale only when superseded (`redispatch:<entity>`) or returned.
+|—
+|—
+|dispatch claims
+|—
+|link:dispatch-and-effort.adoc#_dispatch_id_generation_lifecycle_states[Dispatch & Effort, Dispatch ID Lifecycle]
+|===
+
+[#retention]
+== Retention & Rotation
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[audit-rotation-age]]Audit log rotation age
+|`30` days since the first record of the current `audit.jsonl` (rotation also on `max_bytes`, whichever comes first).
+|`audit_rotation.max_days` in `machine-config.json`
+|minimum `1` day
+|`<PM_MCP_BASE>/logs/audit.jsonl`
+|Checkpoint record, rename to `audit-<first_event_id>.jsonl`, index entry.
+|link:cli-and-security.adoc[CLI & Security] (Security Audit Trail); link:store-schemas.adoc#audit-log[Store Schemas, Audit Log]
+
+|[[retention-days]]Project retention periods
+|Compiled defaults: `job_logs_days` `5`, `archived_plans_days` `5`, `superseded_lessons_days` `0`, `arch_constraint_quiet_days` `90`. The governed stores are machine-local, so retention is operator posture, never team configuration.
+|`retention.{job_logs_days, archived_plans_days, superseded_lessons_days, arch_constraint_quiet_days}` in `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, machine-wide defaults in `machine-config.json` `project_defaults.retention`
+|minimum `0`
+|job logs and job records (`job_logs_days`), archived plans (`archived_plans_days`), superseded lesson bodies (`superseded_lessons_days`), quiet-window retirement of `arch-constraint` lessons (`arch_constraint_quiet_days`)
+|Evidence-based removal sweep (dry run unless applied by the operator).
+|link:store-schemas.adoc#evidence-based-removal-sweeps[Store Schemas, Evidence-Based Removal Sweeps]; link:store-schemas.adoc[Store Schemas] (Lesson Store); link:store-schemas.adoc#local-config[Store Schemas, Operator Local Configuration]
+
+|Rotated audit files
+|Removed only as whole files by a retention purge; their index entries are never removed.
+|—
+|—
+|`logs/audit-*.jsonl`
+|—
+|link:cli-and-security.adoc[CLI & Security] (Security Audit Trail)
+|===
+
+[#host-integration]
+== Host Integration
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[host-idle-timeout]]Host tool-call idle timeout
+|Per host, compiled into its client profile (_provisional_ until verified in Milestone 1: per-host tool-call timeout thresholds and whether `notifications/progress` resets them, `PM-IMPL-4`).
+|`connection.idle_timeout_seconds` of the client profile; operator override in `<PM_MCP_BASE>/conf/profiles/<client_id>.json`
+|`30`..`7200`
+|every host tool call
+|Host-side: the host abandons the call; the runtime completes and persists the transition anyway (only the response is lost).
+|link:client-profiles.adoc#_normative_client_profile_json_schema[Client Profiles, Normative Schema]; link:runtime-model.adoc#_failure_semantics[Runtime Model, Failure Semantics]
+
+|Progress resets the host timer
+|Capability flag per host, not a duration; selects <<progress-wait>> over <<bounded-wait>>.
+|`connection.progress_resets_timeout` of the client profile
+|—
+|waits
+|—
+|link:client-profiles.adoc#_normative_client_profile_json_schema[Client Profiles, Normative Schema]
+
+|Outbound HTTPS and upstream MCP call timeouts
+|Connect `10`, read `60` for every `cui-http` call (Sonar REST, credential verification, remote upstream MCP servers) and read `60` per request for `stdio` upstream servers.
+|Per upstream server in `<PM_MCP_BASE>/conf/upstream-mcp.json` (`connect_timeout_seconds`, `read_timeout_seconds`); fixed for Sonar and credential verification
+|minimum `1`
+|outbound calls
+|A Sonar step records the call as `indeterminate` (never clean); an upstream tool call returns `isError: true` with `error_code: upstream_timeout`; a credential verification reports `unverified`.
+|link:cli-and-security.adoc[CLI & Security] (Outbound HTTPS Security); link:mcp-tools.adoc[MCP Tools] (Upstream MCP Proxy)
+|===
+
+[#derived-fact-validity]
+== Derived Facts
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|Local derivation currency
+|No time bound: a local derivation (inputs read from the repository or the machine) is recomputed whenever its `input_digest` changes.
+|fixed
+|—
+|`PS/derived-facts.json` entries of local kinds
+|—
+|link:store-schemas.adoc#derived-facts[Store Schemas, Derived Facts Store]
+
+|[[network-derivation-validity]]Network derivation validity period
+|`86400` since `derived_at`; additionally refreshed by the project-setup reconcile and by `pm-mcp enter`. _Provisional_: which provider facts are network derivations (allowed merge methods, enforced merge queue, remote base branch) is part of the open git/GitHub/GitLab design topic.
+|fixed
+|—
+|`PS/derived-facts.json` entries of network kinds
+|The next read that needs the fact refreshes it; a failed refresh keeps the last value with `state: stale`, and every gate that depends on the fact evaluates `indeterminate`, never pass.
+|link:store-schemas.adoc#derived-facts[Store Schemas, Derived Facts Store]
+|===
+
+[#configuration-keys]
+== Configuration Keys
+
+The configurable values above, by store:
+
+* `machine-config.json` (operator CLI, link:store-schemas.adoc#machine-config[Store Schemas, Machine Configuration Store]): `drain_timeout_seconds`, `escalation_cap_seconds`, `progress_wait_max_seconds`, `lsp_idle_timeout_seconds`, `lsp_start_timeout_seconds`, `lsp_request_timeout_seconds`, `audit_rotation.max_days`, and `project_defaults.retention.*` (machine-wide defaults of the per-project retention keys).
+* `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (operator CLI, link:store-schemas.adoc#local-config[Store Schemas, Operator Local Configuration]): `retention.*`.
+* `enrolments/<project_id>.json` (operator CLI, link:store-schemas.adoc#enrolment-store[Store Schemas, Project Enrolment Store]): `command_budgets` (operator budgets per budget key), `project_scripts.<project_script_id>.max_timeout_seconds`.
+* Client profile (compiled, operator override in `<PM_MCP_BASE>/conf/profiles/`): `connection.bounded_wait_seconds`, `connection.idle_timeout_seconds`, `connection.progress_resets_timeout`.
+
+No team configuration file (`.marshall/config/*.json`) holds a timeout, wait, threshold, or retention value. Tuning values that calibrate server algorithms are compiled constants (`fixed` above, and in the owning specification: the recipe auto-route threshold `0.6`, the lane prune thresholds, the refine confidence threshold `95`, the iteration caps, the step wait timeouts, the preference recurrence threshold, the untrusted raw-input byte cap, the review rate-window floor `5400`); per-project tuning would make metrics incomparable across projects (`PM-MIG-5` triggers).
+
+A value outside its floor or cap is never used: the runtime clamps it to the bound and reports the configured value, the used value, and the source (`machine_config`, `local_config`, `enrolment`, `profile_override`, `compiled_default`, `invalid`, or `unreadable`) in `pm-mcp status` and in the facts of the affected job or wait.
+
+[#resolved-divergences]
+== Resolved Divergences
+
+The definitions that existed before this document, and how they were resolved:
+
+[cols="2,4"]
+|===
+|Item |Divergence and resolution
+
+|No-verdict rule
+|`PM-EXEC-6` and Adaptive Timeout Learning made only a `timed_out` job with a `floor_default` or `escalated` budget no-verdict, while Process Termination counted every `timed_out` as `no_verdict`. Every `timed_out` is now `no_verdict`; the derivation selects only the retry offer (<<no-verdict-rule>>).
+
+|Escalation
+|$E = \min(2 \times t, 1800)$ lowered the budget when $t > 1800$ (for example after an operator budget above the cap). Now $E = \max(t, \min(2 \times t, C))$ with the configurable cap $C$.
+
+|Operator budget vs floors
+|Job Runtime let an operator per-command budget "win over every derivation", while Domain Extensions said floors are "never violated, even if an explicit bound is configured". An operator budget may exceed the cap but is clamped up to the engine floor ($\max(F, O)$), as `plan-marshall`'s explicit bound is.
+
+|Python floor
+|Job Runtime and `PM-EXEC-6` put the `330` floor on "pytest", Domain Extensions on "pyproject". `plan-marshall` applies `PYTEST_OUTER_FLOOR_SECONDS` to every pyproject command; the floor is keyed by build system (`pyproject`).
+
+|Progress notification interval
+|Job Runtime emitted frames every 5 s, `PM-IMPL-4` required "at least every 60 seconds", and the Hypermedia Format described "60s MCP progress notifications". The interval is `5`; `60` is the ceiling between two frames.
+
+|LSP idle key
+|MCP Tools named the eviction key `idle_timeout_seconds`, which is the client profile's host idle timeout; the key is `lsp_idle_timeout_seconds` in `machine-config.json`.
+
+|Drain timeout key
+|Runtime Model referenced `drain_timeout_seconds` in `machine-config.json`, which the schema did not define; the key is now in the schema.
+
+|Git, CI and script budgets
+|Undefined (D74); a watch fixture recorded a 60 s git budget firing twice. Defined per operation class with floors (<<job-budgets>>); `project_script` uses the enrolled maximum, which the enrolment schema did not carry.
+
+|Bounded wait vs host idle timeout
+|"Safely below the host's idle timeout" had no rule; profile validation now rejects `bounded_wait_seconds` above `idle_timeout_seconds − 30`.
+
+|`dispatch_id` expiry
+|MCP Tools and the Workflow DSL rejected a `dispatch_id` that is "superseded or expired", but the dispatch lifecycle defines no expiry; a `dispatch_id` is stale only when superseded.
+|===

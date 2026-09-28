@@ -12,10 +12,10 @@ The security architecture of `PM-MCP` enforces a strict dual-boundary security m
 * The system must tag all external content—including repository code, build definitions, pull request comments, review-bot outputs, and responses from upstream MCP servers—with provenance metadata (for proxied upstream content, the `_meta` key `de.cuioss.pm-mcp/source`, `PM-SVC-3`) and treat it as untrusted.
 * The system must prohibit state machine transitions derived solely from untrusted external content; external review-bot comments or CI statuses may create findings or trigger verification checks, but must never directly mark a quality gate green or bypass a merge barrier.
 * The system must process untrusted external text through a restricted extraction parser whose output is strictly validated by a deterministic validator against a closed JSON schema (rejecting undeclared keys, clamping lengths, and rejecting URLs whose host fails the WebFetch domain allowlist) prior to incorporation into plan stores, and must restrict reader fetches to that allowlist.
-* The system must record the repository state of the main checkout and active worktrees at task start, and verify realized changes at task submit and before commit; any change detected outside the assigned worktree must transition the plan into a `*.footprint-violation` state with an explanatory finding and restrict offered links to `fix` and `escalate`.
-* The system must offer the model a self-report link that records an action taken outside the server (including a bypass of a sanctioned path) as an audited event and a finding, and must document as an accepted residual risk that host-side reads of `.plan/` and unreported host actions are not observable.
+* The system must record the repository state of the main checkout and active worktrees at task start, and verify realized changes at task submit and inside the commit operation itself, before every commit of every caller (plan, epic, and workspace scope), whichever link or state leads to it; any change detected outside the assigned worktree or outside the commit's staging set, any change inside it to a wrapper's pinned build files (`PM-EXEC-1`), and any main-checkout change since the plan's entry baseline must raise a footprint-violation condition on the scope's current state (`PM-WF-3`) with an explanatory finding, make no commit, and restrict offered links to `fix` and `escalate`.
+* The system must offer the model a self-report link that records an action taken outside the server (including a bypass of a sanctioned path) as an audited event and a finding, and must document as an accepted residual risk that host-side reads of `.marshall/` and unreported host actions are not observable.
 
-See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], link:specification/job-runtime.adoc[Job Runtime & Execution Specification], link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification], link:specification/hypermedia-format.adoc[Hypermedia Format Specification], and link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
+See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], link:specification/job-runtime.adoc[Job Runtime Specification], link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification], and link:specification/hypermedia-format.adoc[Hypermedia Format Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/store-schemas.adoc#PM-WATCH-STORE-33[PM-WATCH-STORE-33]
 
@@ -24,14 +24,14 @@ Implementation watch: link:implementation-watch/store-schemas.adoc#PM-WATCH-STOR
 
 To prevent unauthorized file modifications or cross-project data leakage, all PM-MCP file and repository operations must be strictly confined to the enrolled repository root and its active worktrees.
 
-* The system must resolve the canonical repository root at session entry (`pm-mcp enter`) and persist it in the scope's entry record (`mcp/entry.json`).
-* The system must cross-check client-declared MCP roots with the process working directory at entry, report any discrepancy in the audit log, and apply the narrower root set.
+* The system must resolve the project at session entry (`pm-mcp enter`) and for every `PM-MCP-Workspace` header by one rule (git top-level and common git directory mapped to an enrolled project root; a worktree only under `.marshall/local/worktrees/`) and record the resolved `project_id` and entry origin, never a path, in the scope's session log.
+* The system must derive workspace confinement exclusively from server-verified data: the `PM-MCP-Workspace` header resolved against the enrolment for workspace-addressed requests and the enrolled project root of the scope's per-project machine store for scope-addressed requests (`PM-ARCH-4`); client-declared MCP roots are advisory and never widen or narrow the confinement.
 * The system must canonicalize all paths (resolving all symbolic links) for every filesystem, git, and build operation, asserting that the target path resides within the enrolled workspace root or a live linked git worktree whose git common directory resolves to that root.
 * The system must reject any path traversal attempt (including directory traversal sequences `..`, absolute paths outside the workspace, or symlinks pointing outside the root) with an explicit `path_traversal_rejected` error outcome.
 * The system must forbid AI models from specifying raw filesystem paths for state manipulation; all target scopes (`plan_id`, `epic_id`) must be resolved server-side from persisted state.
 * The system must require explicit operator approval for cross-project access (such as multi-repo epic landing or dependency verification); such access must be requested via an `escalate` link, approved exclusively by the operator via elicitation or operator CLI, limited to enrolled projects, scoped to a specific access level (read or read-write) and execution lifetime, and recorded in the audit log.
 
-See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], link:specification/job-runtime.adoc[Job Runtime & Execution Specification], and link:specification/mcp-tools.adoc[MCP Tools Specification] for implementation details.
+See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], link:specification/job-runtime.adoc[Job Runtime Specification], and link:specification/mcp-tools.adoc[MCP Tools Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-2[PM-WATCH-CLI-2], link:implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-42[PM-WATCH-PHASE-42], link:implementation-watch/store-schemas.adoc#PM-WATCH-STORE-24[PM-WATCH-STORE-24], link:implementation-watch/store-schemas.adoc#PM-WATCH-STORE-33[PM-WATCH-STORE-33]
 
@@ -45,12 +45,12 @@ Privileged operations that alter machine configuration, security posture, or pro
 * The system must provide exactly two isolated channels for operator decisions, neither of which routes through the AI model:
 ** MCP Elicitation: Direct interactive user prompts supported by compliant host runtimes that return answers straight to PM-MCP without model interception.
 ** Operator CLI (`pm-mcp operator <action>`): An interactive command-line interface operating directly against the local state and credential stores under `FileChannel.lock()`, verifying the privileged operator credential and requiring terminal confirmation (`isatty(STDIN_FILENO)`).
-* The system must transition a plan or epic into a `*.blocked` state whenever an operator decision is required, persisting the pending operator decision record, displaying the pending request and matching CLI command, and offering only the link `wait:decision:<decision_id>` (rel `wait`), a bounded wait on that decision record, until it is resolved.
+* The system must raise the `blocked` condition on the current state of a plan or epic (`PM-WF-3`) whenever an operator decision is required and cannot be elicited, persisting the pending operator decision record, displaying the pending request and matching CLI command, and offering only the link `wait:decision:<decision_id>` (rel `wait`), a bounded wait on that decision record, until it is resolved.
 * The system must protect the operator token using the OS credential store (macOS Keychain access control list restricted to `pm-mcp`); when operating on platforms lacking application-level access control (Linux Secret Service or file store), the system must require a salted PBKDF2 operator passphrase entered interactively without terminal echo.
-* The system must enforce exponential rate-limiting on operator passphrase verification failures, persisting the failure counter and the next-allowed timestamp in `~/.plan-marshall/mcp/state/operator-auth.json` (mode `0600`) so that starting a new CLI process does not reset the back-off, and log all privileged authentication attempts to the audit log.
+* The system must enforce exponential rate-limiting on operator passphrase verification failures, persisting the failure counter and the next-allowed timestamp in `<PM_MCP_BASE>/state/operator-auth.json` (mode `0600`) so that starting a new CLI process does not reset the back-off, and log all privileged authentication attempts to the audit log.
 * The system must document as an accepted residual risk that on macOS, where the Keychain releases the operator token to the `pm-mcp` binary without a passphrase, a model-driven shell that runs `pm-mcp operator` inside a pseudo-terminal with the agent environment markers removed passes the operator checks.
 
-See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] and link:specification/mcp-tools.adoc[MCP Tools & Resources Specification] for implementation details.
+See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], link:specification/mcp-tools.adoc[MCP Tools & Resources Specification], link:specification/workflow-dsl.adoc[Workflow DSL Specification], and link:specification/timeouts.adoc#operator-decisions[Timeouts & Budgets Specification] (back-off, decision waits) for implementation details.
 
 [#PM-SEC-4]
 === PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene
@@ -58,27 +58,29 @@ See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Sp
 By connecting hosts over `stdio` and relaying to the runtime over a user-private Unix domain socket, `pm-mcp` eliminates network-borne attack vectors (DNS rebinding, cross-origin browser requests, unauthorized local TCP port access, and SSH port-forwarding leaks) and enforces strict OS-level process and stream isolation.
 
 * The system must open zero TCP or UDP listeners in any production execution mode; the runtime's only listener must be a Unix domain socket with mode `0600` inside a `0700` directory owned by the active OS user, rejecting peers with a different UID where the platform exposes peer credentials.
-* The system must enforce strict `stdout` stream hygiene in the `pm-mcp serve` relay: `stdout` is reserved exclusively for newline-delimited JSON-RPC 2.0 MCP messages, while all diagnostics are routed strictly to `stderr`; the runtime writes its diagnostics to `~/.plan-marshall/mcp/logs/daemon.log`.
-* The system must redirect `stdout` and `stderr` of all spawned child subprocesses (`build`, `git`, `ci`, `script`, and warm LSP servers) to dedicated capture pipes or log files, never allowing a child process to inherit a descriptor connected to a host.
-* The system must enforce POSIX directory permissions of `0700` on `~/.plan-marshall/mcp/` and `0600` on all state, lock, enrolment, and audit files, refusing startup if directory or file ownership does not match the active OS user UID.
+* The system must enforce strict `stdout` stream hygiene in the `pm-mcp serve` relay: `stdout` is reserved exclusively for newline-delimited JSON-RPC 2.0 MCP messages, while all diagnostics are routed strictly to `stderr`; the runtime writes its diagnostics to `<PM_MCP_BASE>/logs/daemon.log`.
+* The system must redirect `stdout` and `stderr` of all spawned child subprocesses (`build`, `git`, `ci`, `project_script`, and warm LSP servers) to dedicated capture pipes or log files, never allowing a child process to inherit a descriptor connected to a host.
+* The system must enforce POSIX directory permissions of `0700` on `<PM_MCP_BASE>` and `0600` on all state, lock, enrolment, and audit files, refusing startup if directory or file ownership does not match the active OS user UID.
 
 See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] and the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] for implementation details.
 
 [#PM-SEC-5]
 === PM-SEC-5: Subprocess Environment Sanitization & Linux Filesystem Confinement
 
-Subprocesses spawned by PM-MCP for builds, git operations, CI queries, and legacy scripts must be executed with sanitized environments and OS-level confinement.
+Subprocesses spawned by PM-MCP for builds, git operations, CI queries, and enrolled project scripts must be executed with sanitized environments and OS-level confinement.
 
-* The system must spawn all subprocesses directly via operating system process creation APIs without invoking intermediate system shells (`/bin/sh` or `/bin/bash`), and place each job in its own distinct process group.
-* The system must filter subprocess environments against a strict allowlist of necessary variables (`PATH`, `HOME`, toolchain paths); operator tokens and credential secrets must never be exported to child environments.
+* The system must spawn all subprocesses directly via operating system process creation APIs without invoking intermediate system shells (`/bin/sh` or `/bin/bash`), and place each job in its own distinct process group; the only shell that runs is the interpreter of a committed, enrolled `#!/bin/sh` wrapper (`mvnw`, `gradlew`), which receives the validated argument vector as positional arguments.
+* The system must build every subprocess environment from scratch against a strict, specified allowlist (per variable: permitted job types and provenance, enrolment snapshot or runtime-computed), never inheriting the runtime's own environment; operator tokens, credential secrets, and flag-injecting variables (`JAVA_TOOL_OPTIONS`, `MAVEN_OPTS`, `GRADLE_OPTS`) must never be exported to child environments.
 * The system must pass free-text parameters (such as commit messages, PR descriptions, and outline text) exclusively in memory via standard input (`stdin`) (`PM-EXEC-5`), never via temporary files and never interpolated into command-line arguments.
 * The system must confine every subprocess on Linux before execution, in the `job-exec` shim:
 ** `PR_SET_NO_NEW_PRIVS`, so that no job or descendant can gain privileges.
-** A Landlock filesystem ruleset granting write access only to enrolled project roots (including their worktrees), declared build toolchain caches, `~/.plan-marshall/`, the system temporary directory, and device nodes, with read-only access everywhere else.
+** A Landlock filesystem ruleset (ABI >= 2; a kernel offering only ABI 1 is recorded as `confinement: partial(abi=1)`, never as confined) granting write access only to enrolled project roots (including their worktrees), declared build toolchain caches, the system temporary directory, and device nodes, with read-only access everywhere else; the writable set never contains `<PM_MCP_BASE>` or `~/.plan-marshall/`, which an adversarial test proves with a job whose write to `<PM_MCP_BASE>/enrolments.json` fails (`PM-TEST-5`).
 * The system must compute the writable set from the current enrolments at every job start, so that enrolment changes take effect for the next job.
+* The system must protect every enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` with its own HMAC-SHA-256 over its canonical content, written by the operator CLI on every write with a key held in the OS keyring under the PM-MCP namespace (operator lane) or, on hosts without a keyring, in `<PM_MCP_BASE>/state/` (mode `0600`); the runtime must verify it before first serving the project after a start and before every verify-not-resolve check (`PM-EXEC-2`), refuse with `enrolment_tampered` and an audit record on mismatch for that project only, and accept a re-baseline only through the operator CLI.
+* The system must document as accepted residual risks that the enrolment HMAC does not stop a deliberate forgery on hosts without a keyring, where the key file is readable by every process of the same user, nor on macOS, where the Keychain releases the key to the `pm-mcp` binary without a passphrase so that a model-driven shell passing the operator checks (`PM-SEC-3`) can re-baseline a tampered file.
 * The system must document as accepted residual platform risks the absence of equivalent unprivileged sandboxing on macOS, and on Linux kernels without Landlock, where jobs run with `PR_SET_NO_NEW_PRIVS` only and the job record states `confinement: unavailable`.
 
-See the link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-2[PM-WATCH-JOB-2]
 
@@ -87,16 +89,17 @@ Implementation watch: link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-2[
 
 The system must maintain an append-only, tamper-evident audit record of all security-relevant operations, authentication events, and identity assertions.
 
-* The system must record every tool invocation, state machine transition, job submission, credential access, operator action, and model self-report of an action taken outside the server (`PM-SEC-1`) to an append-only JSONL audit log (`~/.plan-marshall/mcp/logs/audit.jsonl`).
-* The system must chain the audit records: every record must carry `prev_hash`, the SHA-256 of the previous record's canonical line (a defined genesis value for the first record); the runtime must verify the chain at start, and a broken chain must be reported to the operator and recorded in the audit log, never silently repaired.
+* The system must record every tool invocation, state machine transition, job submission, credential access, operator action, and model self-report of an action taken outside the server (`PM-SEC-1`) to an append-only JSONL audit log (`<PM_MCP_BASE>/logs/audit.jsonl`).
+* The system must chain the audit records: every record must carry `prev_hash`, the SHA-256 of the previous record's canonical line (a defined genesis value for the first record); the runtime must anchor the chain head (record count and head hash) in an HMAC-protected sidecar under the enrolment integrity key, rotate the log only through checkpoint records listed in a hash-chained index, verify incrementally from the last checkpoint at start (full verification on operator demand), and report a broken chain (including a deleted, reset, or truncated log) to the operator and record it in the audit log, never silently repaired; the anchoring is tamper-evident, not tamper-proof, against a process holding the integrity key.
 * The system must record three distinct identity layers for every audited operation:
 ** The declared client identity (`--client` parameter from entry point).
 ** The detected environment signature (host detection signals per the link:specification/client-profiles.adoc#host-integration-table[Host Integration Table], or MCP `clientInfo`).
 ** The authenticated operating system user principal running the process.
 * The system must explicitly flag any discrepancy between declared client identity and detected environment signature (`identity_mismatch=true`) in the audit log and return a warning in the state representation.
+* The system must never rewrite a recorded measurement or audit fact: a correction is appended as its own record that names the record it corrects, and every measurement record carries the `head_sha` and round it was taken at.
 * The system must redact all sensitive credentials, passwords, and tokens before writing entries to diagnostic logs or the audit log.
 * The system must sanitize error responses returned to AI models, suppressing internal exception traces, stack traces, and local system paths, returning only closed-enum error codes and the unique audit record identifier for operator diagnostics.
 
-See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] and link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] for implementation details.
+See the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-13[PM-WATCH-GEN-13], link:implementation-watch/runtime-model.adoc#PM-WATCH-RUN-2[PM-WATCH-RUN-2]

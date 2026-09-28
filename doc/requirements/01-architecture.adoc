@@ -8,7 +8,7 @@ The system must strictly divide responsibilities between deterministic process e
 * The system must execute all workflow state machines, state transitions, quality gate evaluations, and command assembly inside the always-on `pm-mcp` runtime process, confining model contributions exclusively to judgment artifacts (request clarification, solution outline authoring, code implementation, finding triage, and commit/pull request descriptions).
 * The system must run as a single always-on runtime process (daemon) per machine and `PM_MCP_BASE`, under the operating system privileges of the local developer user, whose lifetime and jobs are independent of any host conversation or host connection.
 * The system must let host coding agents reach the runtime exclusively through a thin `pm-mcp serve` STDIO relay spawned by the host per connection, with zero listening network ports.
-* The system must enforce mutual exclusion across concurrent sessions, sub-agents, and projects using OS-level `FileChannel.lock()` advisory locks and atomic write-then-rename operations within `.plan/` and `~/.plan-marshall/mcp/locks/`.
+* The system must enforce mutual exclusion across concurrent sessions, sub-agents, and projects using OS-level `FileChannel.lock()` advisory locks and atomic write-then-rename operations within `.marshall/` and `<PM_MCP_BASE>/locks/`.
 * The system must compile workflow definitions, state stores, tools, client profiles, vocabulary skills, and background services into a single GraalVM native binary, guaranteeing that all components operate on an identical release version without runtime drift.
 * The system must reject any architecture where process ordering, transition permissions, or parameter assembly depend on prose instructions or client-side prompt compliance.
 
@@ -38,7 +38,7 @@ Hosts must connect over the Model Context Protocol (MCP) `stdio` transport, rela
 * The system must communicate with host coding agents (`claude`, `opencode`, `antigravity`, `codex`) exclusively over standard input (`stdin`) and standard output (`stdout`) of the `pm-mcp serve` relay.
 * The relay must forward MCP messages in both directions (requests, responses, notifications, and server-to-client requests such as elicitation) between the host and the runtime without interpreting them, preserving JSON-RPC `id` values.
 * The runtime must serve MCP only over a Unix domain socket restricted to the owning OS user, omitting all TCP/UDP listeners.
-* The relay must reserve `stdout` strictly for newline-delimited JSON-RPC 2.0 MCP messages and route all diagnostic logging to `stderr`; the runtime logs to `~/.plan-marshall/mcp/logs/daemon.log`.
+* The relay must reserve `stdout` strictly for newline-delimited JSON-RPC 2.0 MCP messages and route all diagnostic logging to `stderr`; the runtime logs to `<PM_MCP_BASE>/logs/daemon.log`.
 * The system must target the MCP `2026-07-28` protocol version exclusively, omitting legacy protocol versions (`2025-11-25`, `2024-11-05`) and backward-compatibility shims.
 
 See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] for implementation details.
@@ -48,31 +48,34 @@ See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specif
 
 The system must operate without transport-level session state, evaluating every request entirely from explicit scope identifiers and persisted filesystem records.
 
-* The system must process every MCP tool invocation statelessly: MCP transport sessions and host connections may carry only negotiated protocol capabilities and connection metadata, never workflow state.
-* The system must require every stateful workflow invocation to carry an explicit logical scope identifier (`plan_id` or `epic_id`) and, when addressing an entity-specific transition, the entity identifier within the link ID.
-* The system must resolve the client identity (`client_id`) and the target project root (`workspace_root`) of scoped calls exclusively from the scope's persisted entry record (`entry.json`), rejecting client-supplied working directory or client-type overrides.
+* The system must process every MCP request statelessly, including at the transport: the runtime keeps no MCP transport session and no per-connection state. The relay attaches the host's `initialize` data (protocol version, capabilities, `clientInfo`) and its connection metadata to every forwarded request, so each request is self-describing and a runtime restart loses only the requests in flight.
+* The system must require every stateful workflow invocation to carry an explicit logical scope identifier (`plan_id`, `epic_id`, or `scope=workspace` for the project's one workspace scope) and, when addressing an entity-specific transition, the entity identifier within the link ID.
+* The system must resolve the client identity of scope-addressed calls exclusively from the last row of the scope's persisted session log (`sessions.jsonl`) and the target project root exclusively from the project's enrolment (the enrolled `project_root` of the per-project machine store the scope lives in), rejecting client-supplied working directory or client-type overrides.
 * The system must answer every workflow query and validate every transition entirely from persisted filesystem state, guaranteeing zero state loss across host restarts, context window compactions (`/clear`), or process restarts.
-* The system must restrict unscoped tool requests strictly to global project discovery and initial plan instantiation (`pm_plans`, `pm_epics`, `pm_start`).
+* The system must distinguish exactly two request classes: *scope-addressed* requests carry `plan_id` or `epic_id` (and the entity where applicable); *workspace-addressed* requests take their project from the relay's `PM-MCP-Workspace` header: `pm_plans`, `pm_epics`, `pm_start`, `pm_build` without `plan_id`, `pm_skills` / `pm_skill` / `pm_skill_file` without a scope, `pm_state` / `pm_do` with `scope=workspace`, and the upstream pass-through tools `up_*`. There are no other requests without a scope.
+* The system must verify, for every workspace-addressed request, that the `PM-MCP-Workspace` header names an enrolled project root, refusing the request with `project_not_enrolled` otherwise.
 
-See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification], the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], and the link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification], the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], the link:specification/store-schemas.adoc[Store Schemas Specification], and the link:specification/identifiers.adoc[Identifier Registry] for implementation details.
 
 Implementation watch: link:implementation-watch/store-schemas.adoc#PM-WATCH-STORE-1[PM-WATCH-STORE-1]
 
 [#PM-ARCH-5]
-=== PM-ARCH-5: Worktree-Bound Plan Location & Main-Bound Orchestrator Location
+=== PM-ARCH-5: Worktree-Bound Plan Execution & Main-Bound Orchestrator Location
 
-Plan execution state must be isolated inside worktrees to protect the main checkout; git-tracked orchestrator state belongs to the repository's main branch, is edited only in the one shared epic worktree, and reaches the main branch only through a branch merge.
+Plan state must live outside the repository and plan execution must be isolated inside worktrees to protect the main checkout; git-tracked orchestrator state belongs to the repository's main branch, is edited only in the one shared epic worktree, and reaches the main branch only through a branch merge.
 
-* The system must locate a plan's state directory within the main checkout's `.plan/local/plans/<plan_id>/` prior to worktree allocation, and relocate it into the worktree's `.plan/local/worktrees/<plan_id>/.plan/` during active execution.
+* The system must keep a plan's state directory in the per-project machine store `<PM_MCP_BASE>/projects/<project_id>/plans/<plan_id>/` for the plan's whole life and never move it; a plan worktree (`.marshall/local/worktrees/<plan_id>/`) is only a git checkout created for execution and finalize and removed afterwards, and the plan's `status.json` records its `worktree_path` (or `null` while none exists).
+* The system must clear `worktree_path` in the same transaction that records a worktree's removal, so that no store keeps pointing at a removed worktree.
+* The system must keep no state in the repository's git-ignored `.marshall/local/`, which holds only worktrees and temporary files, so that deleting it loses no plan data.
 * The system must ensure that the repository's main checkout working tree remains clean and unaffected by uncommitted plan execution artifacts at all times.
 * The system must isolate all mutations to git-tracked orchestrator state (epic ledgers, inbox messages, landing records, and epic specifications) within one shared, long-lived epic worktree on one fixed branch, incorporating changes into the main branch strictly through a monitored branch landing that never removes that worktree.
 * The system must resolve every read and write of git-tracked orchestrator state, including those made on behalf of child plans, to the shared epic worktree copy, and must never treat the primary checkout's copy as authoritative while the epic worktree exists.
-* The system must automatically resolve the current filesystem location of any plan directory from its `plan_id` without requiring the client or model to provide filesystem paths.
-* The system must start every job in the working directory that matches the plan's location, derived from the plan's persisted `location` at job start (the main checkout while `location == MAIN_CHECKOUT` and for plan-less jobs, the worktree root while `location == WORKTREE`), so that legacy scripts resolve their runtime-state root by plan-marshall's working-directory rule (ADR-002); the system must never run a job that removes a worktree with a working directory inside that worktree, must never set the legacy test override `PLAN_BASE_DIR` for production jobs, and scripts receive the plan identity only through their own arguments.
+* The system must resolve any plan directory and its worktree from its `plan_id` without requiring the client or model to provide filesystem paths.
+* The system must start every job in the working directory that matches the plan's worktree presence at job start (the worktree root while the plan's persisted `worktree_path` is set; the main checkout while it is `null` and for plan-less jobs); the system must never run a job that removes a worktree with a working directory inside that worktree, and scripts receive the plan identity only through their own arguments.
 
-See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], link:specification/job-runtime.adoc[Job Runtime Specification], link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification], and link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
+See the link:specification/filesystem-layout.adoc[Filesystem Layout Specification], link:specification/job-runtime.adoc[Job Runtime Specification], and link:specification/dispatch-and-effort.adoc[Dispatch & Effort Specification] for implementation details.
 
-Implementation watch: link:implementation-watch/filesystem-layout.adoc#PM-WATCH-FS-3[PM-WATCH-FS-3], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-4[PM-WATCH-JOB-4]
+Implementation watch: link:implementation-watch/filesystem-layout.adoc#PM-WATCH-FS-3[PM-WATCH-FS-3], link:implementation-watch/filesystem-layout.adoc#PM-WATCH-FS-4[PM-WATCH-FS-4], link:implementation-watch/filesystem-layout.adoc#PM-WATCH-FS-5[PM-WATCH-FS-5], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-4[PM-WATCH-JOB-4]
 
 [#PM-ARCH-6]
 === PM-ARCH-6: Filesystem State Persistence & Cache-Only Process Memory
@@ -81,28 +84,13 @@ All durable workflow and coordinator data must reside in structured filesystem s
 
 * The system must persist all authoritative workflow states, tasks, findings, references, locks, build jobs, and audit events directly in filesystem files formatted as JSON or JSONL.
 * The system must treat all in-memory process data structures as disposable caches, ensuring that any process exit, crash, or restart leaves persistent state intact and uncorrupted.
-* The system must store credentials exclusively within the operating system credential store or its permission-guarded fallback file store (`~/.plan-marshall/credentials/`), keeping secrets in process memory only for the duration of the active request.
-* The system must include a mandatory `format_version` integer property in every persisted JSON and JSONL state file, except the operator-edited credential files kept in `plan-marshall` format (`PM-CRED-3`).
-* The system must automatically validate and migrate forward server-owned store file formats upon runtime start before accepting incoming workflow requests; the git-tracked `.plan/marshal.json` is migrated only by an explicit, committed reconcile step (`PM-EXT-7`).
+* The system must store credentials exclusively within the operating system credential store or its permission-guarded fallback file store (`<PM_MCP_BASE>/credentials/`), keeping secrets in process memory only for the duration of the active request.
+* The system must include a mandatory `format_version` integer property in every persisted JSON and JSONL state file, including the operator files (enrolment files and the credential files of `PM-CRED-3`).
+* The system must validate the `format_version` of every store it reads and accept exactly the binary's current version, refusing any other with a named reason (`format_outdated`, `format_newer`) and never migrating a store on runtime start; the git-tracked team configuration and workflow units are never rewritten by the runtime, and a new binary's default changes reach them only through the project setup workflow (`PM-EXT-7`).
 
 See the link:specification/store-schemas.adoc[Store Schemas Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-56[PM-WATCH-GEN-56], link:implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-39[PM-WATCH-PHASE-39]
-
-[#PM-ARCH-7]
-=== PM-ARCH-7: Atomic Plan State Relocation Across Worktrees
-
-Directory moves between the main checkout and plan worktrees must occur atomically under mutual exclusion to prevent data loss or inconsistency during transitions.
-
-* The system must create all plan worktrees within the repository's `.plan/local/worktrees/` directory, guaranteeing that worktree directories and main repository plan directories reside on the same filesystem volume to allow atomic renames.
-* The system must acquire the plan-specific lock file prior to initiating any directory move between `.plan/local/plans/<plan_id>/` and `.plan/local/worktrees/<plan_id>/.plan/`.
-* The system must record every directory relocation in a write-ahead journal (`move-journal.json`) before modifying filesystem paths.
-* The system must relocate the plan's entry record (`entry.json`) atomically alongside the plan directory during all worktree creation, worktree destruction, and plan finalization operations.
-* The system must inspect `move-journal.json` during server startup and automatically roll back or complete any interrupted directory move before processing new requests.
-
-See the link:specification/move-journal.adoc[Move Journal Specification] and link:specification/filesystem-layout.adoc[Filesystem Layout Specification] for implementation details.
-
-Implementation watch: link:implementation-watch/filesystem-layout.adoc#PM-WATCH-FS-4[PM-WATCH-FS-4]
 
 [#PM-ARCH-8]
 === PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain
@@ -114,9 +102,10 @@ The runtime must run continuously and recover deterministically from crashes, wh
 * The system must provide CLI inspection and lifecycle verbs: `pm-mcp status` to inspect the runtime, active plans, build slots, and running jobs across the machine, and `pm-mcp drain` to stop the runtime gracefully before an upgrade.
 * On `SIGTERM`/`SIGINT` (including via `pm-mcp drain`), the runtime must stop admitting new jobs, allow running build/git/CI jobs to finish up to the configured drain timeout, record the remaining jobs as `killed`, terminate warm LSP child processes, and exit cleanly.
 * The system must detect a version mismatch between an installed binary and the running runtime during `pm-mcp enter`, relay connection, and `pm-mcp status`, and recommend `pm-mcp drain`.
-* The system must recover state on every runtime start before accepting calls: release stale locks and leases whose owning process (PID plus start time) is no longer alive, complete or roll back any interrupted `move-journal.json`, and mark orphaned `running` jobs as `killed` (terminating their process groups if still alive) without blind re-execution.
+* The system must start the runtime in a fixed order: acquire the singleton lock first (a runtime that loses it exits without writing anything, audit records included), remove a stale socket and stale runtime record only while holding that lock, verify directories and permissions, run only bounded verification (audit chain head and incremental chain, enrolment integrity), bind the socket, and become ready.
+* The system must recover each project's state after bind, lazily on the first call addressing the project and in a background pass, and must never serve a call addressing a project before its recovery has finished: such a call waits for it, bounded, and on expiry returns the retryable error `runtime_recovering`. Recovery must release stale locks whose owning process (PID plus start time) is no longer alive, mark leases served by a dead runtime instance as orphaned so that their owning scope (plan, epic, or workspace) adopts them on its next call, releasing a lease only on positive evidence of abandonment, roll forward any interrupted per-scope transaction journal, and mark orphaned `running` jobs as `killed` (terminating their process groups if still alive) without blind re-execution; a workflow state bound to such a job settles with the outcome `killed`, which its workflow routes explicitly, and no job is started again except through a declared transition.
 
-See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification], the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], and the link:specification/move-journal.adoc[Move Journal Specification] for implementation details.
+See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification], the link:specification/cli-and-security.adoc[CLI, Coordination & Security Specification], the link:specification/workflow-dsl.adoc#job-state-binding[Workflow DSL Specification, Job State Entry & Binding], and the link:specification/timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification] (drain timeout, start timeout, project recovery wait, lease expiry) for implementation details.
 
 Implementation watch: link:implementation-watch/runtime-model.adoc#PM-WATCH-RUN-1[PM-WATCH-RUN-1], link:implementation-watch/runtime-model.adoc#PM-WATCH-RUN-2[PM-WATCH-RUN-2]
 
@@ -130,7 +119,7 @@ A working session with PM-MCP is a logical sequence of calls against one plan or
 * The system must allow a logical session to continue either by following a link from the last representation or by calling `pm_state(plan_id | epic_id)` from any host connection, host, sub-agent, or later conversation, with identical results for identical persisted state.
 * The system must allow multiple host connections to address the same logical session concurrently, serializing mutations through the scope lock (`PM-WF-4`).
 * The system must let long-running jobs started in a logical session complete while no host is connected, exposing their outcome to the next call on that scope.
-* The system may vary connection-dependent rendering (bounded vs. progress waits, elicitation vs. `*.blocked` operator fallback) by the capabilities of the calling host connection, never by persisted state differences.
+* The system may vary connection-dependent rendering (bounded vs. progress waits, elicitation vs. the `blocked` condition's operator fallback) by the capabilities of the calling host connection, never by persisted state differences.
 
 See the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] for implementation details.
 

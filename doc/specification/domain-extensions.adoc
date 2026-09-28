@@ -12,7 +12,7 @@ link:../Specification.adoc[Specification] » Domain Extensions, Build Map & Conf
 
 This document specifies the four-axis domain extension architecture (Axes A–D), provenance-preserving dependency edge and path-attribution merge algorithms, server-owned module discovery and `derive-verification` build map, architecture query resources and enrichment workflow, declarative recipe engine with Tier-1 init scoring, out-of-process `project_script` execution contract, and the normative three-way configuration split for *plan-marshall-mcp* (`PM-MCP`).
 
-In the legacy script-and-prose architecture, domain extensions were implemented as in-process Python classes (`extension.py`) discovered via `importlib` even though roughly 80% of their surface returned constant metadata, while `marshal.json` mixed git-tracked project preferences, frozen hook snapshots, and executable command overrides. `PM-MCP` replaces dynamic code loading with a closed-world native design: declarative domain descriptors paired with sealed Java axis interfaces in `pm-mcp-core`, permanent out-of-process `project_script` jobs for project-local and custom domain code, and a strict security boundary separating git-tracked project settings from operator enrolment and server-managed runtime state.
+In the legacy script-and-prose architecture, domain extensions were implemented as in-process Python classes (`extension.py`) discovered via `importlib` even though roughly 80% of their surface returned constant metadata, while `marshal.json` mixed git-tracked project preferences, frozen hook snapshots, and executable command overrides. `PM-MCP` replaces dynamic code loading with a closed-world native design: declarative domain descriptors paired with sealed Java axis interfaces in `pm-mcp-core`, permanent out-of-process `project_script` jobs for project-local and custom domain code, and a strict security boundary separating the sparse git-tracked team configuration (`.marshall/config/`) from operator files, enrolment, and server-managed runtime state.
 
 == Traceability
 
@@ -24,8 +24,8 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-EXT-3[PM-EXT-3: Module Discovery, Build Map & Architecture Enrichment]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
 * _See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
-* _See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
-* _See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
+* _See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Configuration Split by Owner Class (Team, Operator, Server State)]_
+* _See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Configuration Versioning, Validation & Zero-CoT Upgrades]_
 
 == Status: PLANNED
 
@@ -44,7 +44,7 @@ _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WA
 1. *Fail-Closed Descriptor Loading (ADR-017)*: A validator derives its contract from the target's own declaration and fails closed when it cannot. Unlike the legacy catch-all that silently ignored broken `extension.py` modules, `PM-MCP` validates every compiled and project-local descriptor against its closed JSON Schema at startup. Any schema violation or unresolvable skill/resolver reference causes an immediate, explicit diagnostic failure rather than silent degradation.
 2. *Null-on-Absent Never Fabricates a Positive (ADR-010)*: When a domain is inactive or does not declare an optional capability (such as an architecture fitness gate or a domain verb like `marker-detect` or `rewrite-log-parse`), that capability is omitted from representations (`null` / absent). Conversely, if an active domain promises a mandatory gate that cannot execute, the engine halts with a diagnosable refusal (`refused`) and **never** records a synthetic pass.
 3. *Security Profile Resolution Constraint*: The `security` profile in `skills_by_profile` resolves focused security vocabulary skills (`skill://pm/domain/<domain>/security`) for implementation, review, and audit states; it **never** generates standalone implementation tasks of its own.
-4. *Technique Preconditions*: A prescriptive section of a domain vocabulary skill may declare a precondition in the descriptor's `technique_preconditions`, using the Axis A `applies_to_module` predicate grammar (build system, dependency coordinates, path and file globs). The server evaluates it against the project's discovered modules at render time; when no module satisfies it, the renderer emits that section marked "available technique, not adopted in this project" instead of as binding guidance (link:client-profiles.adoc#_rendering_invariants[Client Profiles Specification, Rendering Invariants]), and the rendered digest (`PM-SKILL-2`) reflects the result. Every section that prescribes the same `technique` declares the same precondition, so the technique's status is identical in every skill that carries it; the descriptor loader refuses a technique with diverging preconditions.
+4. *Technique Preconditions*: A prescriptive section of a domain vocabulary skill may declare a precondition in the descriptor's `technique_preconditions`, using the Axis A `applies_to_module` predicate grammar (build system, packaging, dependency coordinates, module path glob, file existence). The server evaluates it against the project's discovered modules at render time; when no module satisfies it, the renderer emits that section marked "available technique, not adopted in this project" instead of as binding guidance (link:client-profiles.adoc#_rendering_invariants[Client Profiles Specification, Rendering Invariants]), and the rendered digest (`PM-SKILL-2`) reflects the result. Every section that prescribes the same `technique` declares the same precondition, so the technique's status is identical in every skill that carries it; the descriptor loader refuses a technique with diverging preconditions.
 
 === Sealed Java Interfaces for Axes A–D
 _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-3[PM-WATCH-EXT-3], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-4[PM-WATCH-EXT-4]_
@@ -70,11 +70,14 @@ public sealed interface SkillLoadingAxis permits DeclarativeDomainAxisA {
     /** Detection globs (domain-detection glob dialect, distinct from build-map fnmatch). */
     List<String> providesFileGlobs();
 
-    /** Write-once default configuration entries seeded into .plan/marshal.json. */
-    Map<String, Object> configDefaults();
+    /** Maps execution profile (core, implementation, module_testing, integration_testing, quality, documentation, security; `core` is merged into every other profile) to its {defaults, optionals} skill:// URIs. */
+    Map<String, ProfileSkills> skillsByProfile();
 
-    /** Maps execution profile (core, implementation, module_testing, integration_testing, quality, documentation, security; `core` is merged into every other profile) to skill:// URIs. */
-    Map<String, List<String>> skillsByProfile();
+    /** Parent domain of an additive domain (java-cui -> java, javascript-cui -> javascript); empty for a standalone domain. */
+    Optional<String> additiveTo();
+
+    /** Descriptor default of the always_on inclusion leg. */
+    boolean alwaysOn();
 
     /**
      * Evaluates the domain's declarative applicability rules (applies_to_module) against a
@@ -149,8 +152,13 @@ public sealed interface EdgeDerivationAxis
     /** Stable, unique resolver ID ("maven", "gradle", "npm", "pyproject", "python", "markdown", "documentation", "lsp"). */
     String resolverId();
 
-    /** Derives directed inter-module dependency edges; never activated by file pattern, only by explicit resolverId. */
-    ResolverExecutionResult deriveEdges(WorkspaceDiscoveryContext context);
+    /**
+     * Derives directed inter-module dependency edges; never activated by file pattern, only by explicit resolverId.
+     *
+     * @throws ResolverException when the derivation fails; DerivationMerge.invoke reports it as
+     *         status ERROR and continues with the sibling resolvers
+     */
+    ResolverExecutionResult deriveEdges(WorkspaceDiscoveryContext context) throws ResolverException;
 }
 
 /**
@@ -174,12 +182,12 @@ public sealed interface PathOwnershipAxis permits DeclarativeDomainAxisD {
 
 The Axis C resolver IDs mirror `plan-marshall` (`derivation_resolver_id()` of `build-maven`, `build-npm`, `build-pyproject`, `pm-dev-python`, `pm-plugin-development`, `pm-documents`, and `plan-marshall-plugin`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. `pyproject` (declared-dependency join) and `python` (import join) stay distinct IDs so an edge's provenance tells the two derivations apart; `markdown` and `documentation` read overlapping file types over different module corpora, and an edge both find carries both IDs. *Deliberate addition vs. `plan-marshall`*: the `gradle` resolver (`GradleEdgeResolver`) has no `plan-marshall` counterpart (`build-gradle` ships no derivation resolver).
 
-*Machine-local resolver enablement*: Which discovered resolvers run is a machine-local binding, because a resolver's availability and cost depend on locally installed tooling (the `lsp` resolver needs an enrolled language server). The binding `derivation_resolvers.<resolver_id>.enabled` lives per project in `~/.plan-marshall/mcp/machine-config.json` (Tier 2, written via `pm-mcp operator config`), mirroring `plan-marshall`'s `derivation_resolvers` section of `.plan/local/run-configuration.json`. An absent section, absent entry, or malformed entry means *enabled*; only an explicit `false` disables a resolver. A disabled resolver is still discovered and reported (status `NOT_DISPATCHED`, reason `DISABLED`, zero edges), never pruned from the report, and is not counted as having run.
+*Machine-local resolver enablement*: Which discovered resolvers run is a machine-local binding, because a resolver's availability and cost depend on locally installed tooling (the `lsp` resolver needs an enrolled language server). The binding `derivation_resolvers.<resolver_id>.enabled` lives in the project's operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (Tier 2, written via `pm-mcp operator config --project <project_id>`, machine-wide default in `machine-config.json` `project_defaults`; link:store-schemas.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), keyed by `project_id`, never by a project root path, and mirroring `plan-marshall`'s `derivation_resolvers` section of its `.plan/local/run-configuration.json`. An absent section or absent entry means *enabled*; only an explicit `false` disables a resolver (a malformed entry fails the closed schema of `local-config.json` and is reported, never read as a setting). A disabled resolver is still discovered and reported (status `NOT_DISPATCHED`, reason `DISABLED`, zero edges), never pruned from the report, and is not counted as having run.
 
 === Declarative Domain Descriptor Schema (`<domain_id>.json`)
 _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-2[PM-WATCH-EXT-2]_
 
-All constant domain metadata—including the Axis-A `applies_to_module` applicability predicates (`build_system`, `dependency_contains`, `path_matches`, `file_exists`, `packaging_equals`, and `promote_optional_to_default`)—is expressed in the domain descriptor JSON Schema:
+All constant domain metadata—the profile skill lists (`defaults` and `optionals` per profile, including `core`), the parent domain of an additive domain (`additive_to`), the `always_on` inclusion flag, and the Axis-A `applies_to_module` applicability rules with their `when` predicates (`build_system`, `packaging_equals`, `packaging_not_equals`, `dependency_contains`, `path_matches`, `file_exists`) and `promote_optional_skills_to_default`—is expressed in the domain descriptor JSON Schema:
 
 [source,json]
 ----
@@ -197,13 +205,53 @@ All constant domain metadata—including the Axis-A `applies_to_module` applicab
     "applicability_rules"
   ],
   "additionalProperties": false,
+  "$defs": {
+    "skillRef": { "type": "string", "pattern": "^skill://pm/domain/[a-z][a-z0-9-]{1,31}/[a-z0-9][a-z0-9-]*$" },
+    "profileSkills": {
+      "type": "object",
+      "required": ["defaults", "optionals"],
+      "additionalProperties": false,
+      "properties": {
+        "defaults": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillRef" } },
+        "optionals": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillRef" } }
+      }
+    },
+    "activatableProfile": {
+      "type": "string",
+      "enum": ["implementation", "module_testing", "integration_testing", "quality", "security", "documentation"]
+    },
+    "when": {
+      "type": "object",
+      "description": "AND of every present predicate; an empty object matches every module.",
+      "additionalProperties": false,
+      "properties": {
+        "build_system": { "type": "string", "enum": ["maven", "gradle", "npm", "pyproject", "documentation", "marshall-plugin", "none"] },
+        "packaging_equals": { "type": "string", "minLength": 1 },
+        "packaging_not_equals": { "type": "string", "minLength": 1 },
+        "dependency_contains": { "type": "string", "minLength": 1, "description": "Substring of at least one declared dependency coordinate of the module." },
+        "path_matches": { "type": "string", "minLength": 1, "description": "Domain-detection glob against the module path." },
+        "file_exists": { "type": "string", "minLength": 1, "description": "Module-relative path that must exist." }
+      }
+    }
+  },
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "domain_id": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9-]{1,31}$"
+      "pattern": "^[a-z][a-z0-9-]{1,31}$",
+      "description": "identifiers.adoc, domain_id"
     },
     "display_name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "additive_to": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z][a-z0-9-]{1,31}$",
+      "description": "domain_id of the parent domain this additive domain extends (java-cui -> java, javascript-cui -> javascript); null for a standalone domain."
+    },
+    "always_on": {
+      "type": "boolean",
+      "default": false,
+      "description": "Descriptor default of the always_on inclusion leg: the domain joins every plan's domain set and is exempt from narrowing."
+    },
     "build_system": {
       "type": ["string", "null"],
       "enum": ["maven", "gradle", "npm", "pyproject", null]
@@ -213,32 +261,29 @@ All constant domain metadata—including the Axis-A `applies_to_module` applicab
       "items": { "type": "string" },
       "description": "Domain-detection globs (distinct from build-map fnmatch globs)."
     },
-    "config_defaults": {
-      "type": "object",
-      "description": "Write-once default keys seeded into .plan/marshal.json when the domain is activated."
-    },
     "skills_by_profile": {
       "type": "object",
-      "description": "Every listed profile names at least one skill (minItems 1). A profile without skills is absent here and declared in minimal_profiles; the completeness check requires implementation and module_testing to be either listed here or declared minimal.",
+      "description": "Per profile a {defaults, optionals} pair. core is merged into every profile (its defaults into each profile's defaults, its optionals into each profile's optionals) and is never activated on its own. Every listed profile other than core names at least one skill in defaults or optionals; a profile without skills is absent here and declared in minimal_profiles; the completeness check requires implementation and module_testing to be either listed here or declared minimal.",
       "additionalProperties": false,
       "properties": {
-        "implementation": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
-        "module_testing": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
-        "integration_testing": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
-        "quality": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
-        "security": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } },
-        "documentation": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" } }
+        "core": { "$ref": "#/$defs/profileSkills" },
+        "implementation": { "$ref": "#/$defs/profileSkills" },
+        "module_testing": { "$ref": "#/$defs/profileSkills" },
+        "integration_testing": { "$ref": "#/$defs/profileSkills" },
+        "quality": { "$ref": "#/$defs/profileSkills" },
+        "security": { "$ref": "#/$defs/profileSkills" },
+        "documentation": { "$ref": "#/$defs/profileSkills" }
       }
     },
     "minimal_profiles": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "enum": ["implementation", "module_testing", "integration_testing", "quality", "security", "documentation"] },
+      "items": { "$ref": "#/$defs/activatableProfile" },
       "description": "Profiles the domain deliberately ships without skills. A profile listed here must be absent from skills_by_profile; readers (task skill resolution, posture preview, pm_skills) render it as minimal, never as an empty or missing profile."
     },
     "triage_skill": {
       "type": ["string", "null"],
-      "pattern": "^skill://pm/triage/[a-z0-9-]+$"
+      "pattern": "^skill://pm/triage/[a-z0-9][a-z0-9-]*$"
     },
     "arch_gate": {
       "type": ["object", "null"],
@@ -252,31 +297,24 @@ All constant domain metadata—including the Axis-A `applies_to_module` applicab
     },
     "applicability_rules": {
       "type": "array",
-      "description": "Axis-A applicability rules (applies_to_module) evaluated against each discovered module; they decide profile activation and gate which build.map routes filed under this domain are seeded.",
+      "description": "Axis-A applicability rules (applies_to_module) evaluated against each discovered module; they decide profile activation and gate which build.map routes filed under this domain are seeded. A module matches the domain when at least one rule matches (OR across rules).",
       "items": {
         "type": "object",
         "required": ["rule_id", "when", "activate_profiles"],
         "additionalProperties": false,
         "properties": {
-          "rule_id": { "type": "string" },
-          "when": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "build_system": { "type": "string", "enum": ["maven", "gradle", "npm", "pyproject", "documentation", "marshall-plugin", "none"] },
-              "packaging_not_equals": { "type": "string" },
-              "dependency_contains_any": { "type": "array", "items": { "type": "string" } },
-              "path_matches_any": { "type": "array", "items": { "type": "string" } },
-              "file_exists_any": { "type": "array", "items": { "type": "string" } }
-            }
-          },
+          "rule_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+          "when": { "$ref": "#/$defs/when" },
           "activate_profiles": {
             "type": "array",
-            "items": { "type": "string" }
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/activatableProfile" }
           },
           "promote_optional_skills_to_default": {
             "type": "array",
-            "items": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" }
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/skillRef" }
           }
         }
       }
@@ -289,10 +327,10 @@ All constant domain metadata—including the Axis-A `applies_to_module` applicab
         "required": ["skill", "section", "technique", "when"],
         "additionalProperties": false,
         "properties": {
-          "skill": { "type": "string", "pattern": "^skill://pm/domain/[a-z0-9-]+/[a-z0-9-]+$" },
+          "skill": { "$ref": "#/$defs/skillRef" },
           "section": { "type": "string", "description": "Section anchor of the skill's section index (mcp-tools.adoc, pm_skill section parameter)." },
-          "technique": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Technique identifier shared by every skill section that prescribes the same technique." },
-          "when": { "$ref": "#/properties/applicability_rules/items/properties/when" }
+          "technique": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$", "description": "Technique identifier shared by every skill section that prescribes the same technique." },
+          "when": { "$ref": "#/$defs/when" }
         }
       }
     },
@@ -326,6 +364,14 @@ All constant domain metadata—including the Axis-A `applies_to_module` applicab
 
 The `when.build_system` values are the module `build_systems` facts that `plan-marshall`'s discovery emits (`maven`, `gradle`, `npm`, `documentation` from `pm-documents`, `marshall-plugin` from `pm-plugin-development`), and the domain verb IDs are those `pm-dev-java-cui` declares in `provides_domain_verb()` (`marker-detect` → `search-markers`, `rewrite-log-parse` → `parse-rewrite-log`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. `PM-MCP` names the Python build system `pyproject` throughout, where `plan-marshall`'s discovery records `python`.
 
+*Profile and applicability semantics*:
+
+* *`core` merge*: `core` is not an activatable profile. When the server resolves a profile's skills, it prepends the domain's `core.defaults` to that profile's `defaults` and its `core.optionals` to that profile's `optionals` (duplicates removed, first occurrence kept), mirroring `plan-marshall`'s `core` profile (for example `pm-dev-java-cui` declares `cui-logging` under `core`). A profile that the domain neither lists nor declares minimal still receives `core`.
+* *`when` predicates*: all predicates present in one rule must hold (AND within a rule); a module matches the domain when any rule matches (OR across rules); an empty `when` (`{}`) matches every module. `packaging_equals` and `packaging_not_equals` compare the module's discovered packaging exactly (a module without a packaging fact satisfies only `packaging_not_equals`), `dependency_contains` is a substring test over the module's declared dependency coordinates, and `file_exists` tests a module-relative path. Disjunction inside one predicate is expressed by a second rule, never by a list value.
+* *`activate_profiles`*: a closed enum of the activatable profiles; a matching rule activates exactly the listed profiles for that module, and `promote_optional_skills_to_default` moves the named skills of those profiles from `optionals` to `defaults` for that module.
+* *`additive_to`*: an additive domain (`java-cui` extends `java`, `javascript-cui` extends `javascript`) applies to a module only where its parent domain applies, and its resolved skills are appended after the parent's for the same profile; a descriptor whose `additive_to` names an unknown domain or forms a cycle fails descriptor loading.
+* *`always_on`*: the descriptor declares the default of the `always_on` inclusion leg (`domain-detect`, phase-workflows.adoc § Widen-Only Domain Re-Merge). The project's override of `always_on` and of `file_globs` (plan-marshall's `skill_domains.<domain>.always_on` / `file_globs` in `marshal.json`) belongs to the team file `.marshall/config/domains.json`, not to the descriptor (link:store-schemas.adoc#config-domains-json[Store Schemas Specification, `domains.json`]). *Deliberate change vs. `plan-marshall`*: a descriptor carries no `config_defaults` map; nothing is seeded into a configuration file when a domain is activated, and a domain's defaults are compiled defaults of the effective configuration.
+
 == Provenance-Preserving Merge Algorithms (ADR-014)
 _See Requirement link:../Requirements.adoc#PM-EXT-2[PM-EXT-2: Provenance-Preserving Edge Derivation & Path Attribution Merges]_
 
@@ -338,15 +384,22 @@ The edge derivation merge combines directed inter-module edges $(u \to v)$ from 
 
 1. *Activation by Explicit Resolver ID*: Resolvers are invoked strictly by their `resolverId` (never implicitly by file extension). A resolver disabled by the machine-local `derivation_resolvers` binding is not invoked; the caller folds in a `ResolverExecutionResult` with status `NOT_DISPATCHED` and reason `DISABLED`, which is reported with zero edges and excluded from the count of resolvers that ran.
 2. *Idempotent Union with Provenance*: Multiple resolvers discovering the same directed edge $(u, v)$ are merged into a single `MergedDependencyEdge` record whose `resolverIds` set is the sorted union of all contributing resolver IDs. A resolver's `contributedEdgeCount` counts its distinct accepted pairs.
-3. *Reported Drops*: Self-edges $(u, u)$ and edges naming a module outside the discovered module set are dropped, each with a `merge: ` note on the producing resolver's report.
+3. *Reported Drops*: Malformed candidates (a missing edge or endpoint), self-edges $(u, u)$, and edges naming a module outside the discovered module set are dropped, each with a `merge: ` note on the producing resolver's report.
 4. *Explicit Non-Run Reporting for LSP & External Resolvers*: An `LspSymbolEdgeResolver` (or `ProjectScriptEdgeResolver`) that could not execute **never returns an empty edge list masquerading as a clean scan**. Instead, it returns a `ResolverExecutionResult` with status `NOT_RUN` and an explicit `NonRunReason` (`ABSENT`, `FAILED_TO_START`, `TIMEOUT`, `UNSUPPORTED`).
+5. *Failing Resolver Isolation*: A resolver whose `deriveEdges` throws `ResolverException` is folded in by `DerivationMerge.invoke` as status `ERROR` with zero edges and a `merge: ` note carrying the sanitized exception (simple class name and message, line breaks collapsed to spaces, truncated to 200 characters; never a stack trace). It contributes no edges, counts as dispatched, and never aborts the merge; its siblings still contribute.
+6. *Duplicate Resolver IDs*: When two results carry the same `resolverId`, the first registration wins; the second is dropped entirely (no edges, no report of its own) and the surviving report receives a `merge: ` note naming the dropped duplicate.
+7. *Ordered Output*: Every map in the result is an ordered, unmodifiable view (`TreeMap` by key), never `Map.copyOf`, whose iteration order is unspecified; merged edges are sorted by `(from, to)` and reports by `resolverId`, so two runs over the same input serialize byte-identically.
 
 [source,java]
 ----
 package de.cuioss.pm.mcp.core.architecture;
 
+import de.cuioss.pm.mcp.core.domain.EdgeDerivationAxis;
+import de.cuioss.pm.mcp.core.domain.ResolverException;
+import de.cuioss.pm.mcp.core.domain.WorkspaceDiscoveryContext;
+
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -357,7 +410,9 @@ public final class DerivationMerge {
 
     private static final String MERGE_NOTE = "merge: ";
 
-    public enum ResolverStatus { RAN, NOT_RUN, NOT_DISPATCHED }
+    private static final int MAX_ERROR_TEXT = 200;
+
+    public enum ResolverStatus { RAN, NOT_RUN, NOT_DISPATCHED, ERROR }
 
     public enum NonRunReason { NONE, ABSENT, FAILED_TO_START, TIMEOUT, UNSUPPORTED, DISABLED }
 
@@ -394,6 +449,23 @@ public final class DerivationMerge {
             int dispatchedResolverCount // excludes NOT_DISPATCHED reports
     ) {}
 
+    /** Invokes one resolver; a thrown ResolverException becomes an ERROR result, never an abort. */
+    public static ResolverExecutionResult invoke(EdgeDerivationAxis resolver, WorkspaceDiscoveryContext context) {
+        try {
+            return resolver.deriveEdges(context);
+        } catch (ResolverException e) {
+            return new ResolverExecutionResult(resolver.resolverId(), ResolverStatus.ERROR, NonRunReason.NONE,
+                    null, List.of(), List.of(MERGE_NOTE + "deriveEdges() failed: " + sanitize(e)));
+        }
+    }
+
+    /** Simple class name and message, single line, bounded; never a stack trace. */
+    static String sanitize(ResolverException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage().replaceAll("[\\r\\n\\t]+", " ").strip();
+        String text = e.getClass().getSimpleName() + (message.isEmpty() ? "" : ": " + message);
+        return text.length() <= MAX_ERROR_TEXT ? text : text.substring(0, MAX_ERROR_TEXT) + "...";
+    }
+
     public DerivationMergeResult merge(
             Set<String> knownModules,
             List<ResolverExecutionResult> results) {
@@ -410,9 +482,19 @@ public final class DerivationMerge {
         Map<EdgeKey, Map<String, TreeSet<String>>> details = new TreeMap<>();
         Map<String, ResolverStatusReport> reports = new TreeMap<>();
 
+        Map<String, List<String>> duplicateNotes = new TreeMap<>();
+
         for (ResolverExecutionResult res : results) {
+            if (reports.containsKey(res.resolverId())) {
+                // First registration wins; the duplicate is dropped and named on the surviving report
+                duplicateNotes.computeIfAbsent(res.resolverId(), k -> new ArrayList<>())
+                        .add(MERGE_NOTE + "dropped duplicate registration of resolver id '" + res.resolverId()
+                                + "' (status " + res.status() + ") - the first registration wins");
+                continue;
+            }
             List<String> notes = new ArrayList<>(res.notes());
             if (res.status() != ResolverStatus.RAN) {
+                // NOT_RUN, NOT_DISPATCHED and ERROR contribute no edges
                 reports.put(res.resolverId(), new ResolverStatusReport(
                         res.resolverId(), res.status(), res.nonRunReason(),
                         res.diagnosticMessage(), 0, List.copyOf(notes)));
@@ -420,6 +502,11 @@ public final class DerivationMerge {
             }
             Set<EdgeKey> contributed = new TreeSet<>();
             for (RawEdge edge : res.edges()) {
+                if (edge == null || edge.fromModule() == null || edge.toModule() == null) {
+                    notes.add(MERGE_NOTE + "dropped malformed candidate " + edge
+                            + " - not a (from, to) pair of module names");
+                    continue;
+                }
                 if (edge.fromModule().equals(edge.toModule())) {
                     notes.add(MERGE_NOTE + "dropped self-edge (" + edge.fromModule() + " -> "
                             + edge.toModule() + ") - a module does not depend on itself");
@@ -451,14 +538,22 @@ public final class DerivationMerge {
                     res.diagnosticMessage(), contributed.size(), List.copyOf(notes)));
         }
 
+        duplicateNotes.forEach((id, extra) -> reports.computeIfPresent(id, (k, r) -> {
+            List<String> notes = new ArrayList<>(r.notes());
+            notes.addAll(extra);
+            return new ResolverStatusReport(r.resolverId(), r.status(), r.nonRunReason(),
+                    r.diagnosticMessage(), r.contributedEdgeCount(), List.copyOf(notes));
+        }));
+
         List<MergedDependencyEdge> mergedEdges = provenance.entrySet().stream()
                 .map(entry -> {
                     EdgeKey k = entry.getKey();
-                    Map<String, List<String>> detMap = new LinkedHashMap<>();
+                    TreeMap<String, List<String>> detMap = new TreeMap<>();
                     details.getOrDefault(k, Map.of())
                             .forEach((r, s) -> detMap.put(r, List.copyOf(s)));
-                    return new MergedDependencyEdge(
-                            k.from(), k.to(), List.copyOf(entry.getValue()), Map.copyOf(detMap));
+                    // ordered view, never Map.copyOf (unspecified iteration order)
+                    return new MergedDependencyEdge(k.from(), k.to(), List.copyOf(entry.getValue()),
+                            Collections.unmodifiableSortedMap(detMap));
                 })
                 .toList();
 
@@ -476,11 +571,11 @@ public final class DerivationMerge {
 The path attribution merge combines Axis-D `claim_paths` claims across active attributors and resolves repository-relative file paths to their owning module via longest-prefix matching:
 
 1. *Single Shared Spelling Normalizer (`normalizeSpelling`)*: Claim registration and file lookup pass through the exact same normalizer. Normalization is spelling-only: it trims surrounding whitespace, folds backslashes to `/`, strips leading `./` runs, and strips trailing slashes. It resolves no symlink, touches no filesystem, does not collapse `..` segments, does not strip a leading `/`, and does not collapse `//`; whether a path is admissible is a policy decision of each side, not a spelling decision.
-2. *Claim Validity Filters (Drop and Report, Never Throw)*: A claim survives only if it is well-formed (non-null prefix and module), its normalized prefix bounds a subtree inside the repository, and its `target_module` is a known module (a discovered module or a registered synthetic domain module such as the one owning `.plan`). A blank or root-level prefix (`""`, `.`, `..`, or a bare `/`) and a prefix whose first normalized segment is `..` are dropped; a merely dot-relative prefix (`./doc`) is normalized to `doc`, not dropped. Every dropped claim appends a `merge: ` note naming the claim and the reason to the claiming attributor's report.
-3. *Failing Attributor Isolation*: An attributor whose `claimPaths()` throws `AttributorException` is reported with status `ERROR`, `claimCount` `0`, and a note carrying the failure; it contributes no claims, and its siblings still contribute. A failing attributor never aborts the merge.
-4. *Collision Without Winner Invariant*: If two attributors claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` yields no claim, is recorded as a `PathClaimCollision` diagnostic, and every contending attributor receives a `merge: ` note naming all contending modules. Identical claims `(same prefix, same target_module)` merge idempotently into one claim carrying the sorted union of producer IDs. Differently-scoped prefixes (`.plan` and `.plan/local`) are not a collision.
+2. *Claim Validity Filters (Drop and Report, Never Throw)*: A claim survives only if it is well-formed (non-null prefix and module), its normalized prefix bounds a subtree inside the repository, and its `target_module` is a known module (a discovered module or a registered synthetic domain module such as the one owning `.marshall`). A blank or root-level prefix (`""`, `.`, `..`, or a bare `/`), an absolute prefix (a leading `/` or a drive letter such as `C:/`), and a repository-escaping prefix (any normalized segment equal to `..`, not only the first) are dropped; a merely dot-relative prefix (`./doc`) is normalized to `doc`, not dropped. Every dropped claim appends a `merge: ` note naming the claim and the reason to the claiming attributor's report. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `_normalize_prefix` drops only a leading `..` segment and admits `/etc` or `doc/../../x`; `PM-MCP` drops both, because such a prefix can never bound a subtree inside the repository.
+3. *Failing Attributor Isolation*: An attributor whose `claimPaths()` throws `AttributorException` is reported with status `ERROR`, `claimCount` `0`, and a `merge: ` note carrying the sanitized failure (simple class name and message, as in `DerivationMerge.sanitize`); it contributes no claims, and its siblings still contribute. A failing attributor never aborts the merge. *Duplicate attributor IDs*: when two attributors share an `attributorId`, the first registration wins; the second is not invoked, and the surviving report receives a `merge: ` note naming the dropped duplicate. All internal maps are ordered (`TreeMap` / `LinkedHashMap` in registration order), never `HashMap` or `Map.copyOf`.
+4. *Collision Without Winner Invariant*: If two attributors claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` yields no claim, is recorded as a `PathClaimCollision` diagnostic, and every contending attributor receives a `merge: ` note naming all contending modules. Identical claims `(same prefix, same target_module)` merge idempotently into one claim carrying the sorted union of producer IDs. Differently-scoped prefixes (`.marshall` and `.marshall/local`) are not a collision.
 5. *Per-Attributor Report*: Every attributor yields exactly one `AttributorReport(attributorId, status, claimCount, notes)`, where `claimCount` counts the surviving (non-collided) claims it produced. Zero attributors is a first-class outcome (empty claims, empty reports, never an exception); the report count distinguishes "no attributor ran" from "attributors ran and none claimed the path".
-6. *Segment-Boundary Longest-Prefix Lookup*: A spelling-normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`, so `.plans/x` never resolves through a `.plan` claim. Among all matching claims, the longest prefix wins; this is resolution order, not a collision tie-break.
+6. *Segment-Boundary Longest-Prefix Lookup*: A spelling-normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`, so `.marshalls/x` never resolves through a `.marshall` claim. Among all matching claims, the longest prefix wins; this is resolution order, not a collision tie-break.
 
 [source,java]
 ----
@@ -494,7 +589,6 @@ import de.cuioss.pm.mcp.core.domain.PathOwnershipClaim;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -547,10 +641,23 @@ public final class PathAttributionMerge {
         return p.substring(0, end);
     }
 
-    /** Identity key of a claimed prefix; empty when the prefix bounds no subtree inside the repository. */
+    /** Simple class name and single-line message, bounded to 200 characters; never a stack trace. */
+    static String sanitize(AttributorException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage().replaceAll("[\\r\\n\\t]+", " ").strip();
+        String text = e.getClass().getSimpleName() + (message.isEmpty() ? "" : ": " + message);
+        return text.length() <= 200 ? text : text.substring(0, 200) + "...";
+    }
+
+    /**
+     * Identity key of a claimed prefix; empty when the prefix bounds no subtree inside the repository:
+     * root-level, absolute (leading '/' or drive letter), or repository-escaping (any '..' segment).
+     * Deliberate hardening vs. plan-marshall, which rejects only a leading '..' segment.
+     */
     static Optional<String> normalizePrefix(String raw) {
         String p = normalizeSpelling(raw);
-        if (ROOT_LEVEL_PREFIXES.contains(p) || "..".equals(p.split("/", 2)[0])) {
+        boolean absolute = p.startsWith("/") || p.matches("^[A-Za-z]:(/.*)?$");
+        boolean escaping = List.of(p.split("/")).contains("..");
+        if (ROOT_LEVEL_PREFIXES.contains(p) || absolute || escaping) {
             return Optional.empty();
         }
         return Optional.of(p);
@@ -566,17 +673,23 @@ public final class PathAttributionMerge {
         }
 
         Map<ClaimKey, TreeSet<String>> producers = new TreeMap<>();
-        Map<String, AttributorStatus> statusById = new LinkedHashMap<>();
-        Map<String, List<String>> notesById = new HashMap<>();
+        Map<String, AttributorStatus> statusById = new LinkedHashMap<>();   // registration order
+        Map<String, List<String>> notesById = new TreeMap<>();
 
         for (PathOwnershipAxis attributor : attributors) {
             String id = attributor.attributorId();
+            if (statusById.containsKey(id)) {
+                // First registration wins; the duplicate is not invoked and is named on the surviving report
+                notesById.computeIfAbsent(id, k -> new ArrayList<>()).add(MERGE_NOTE
+                        + "dropped duplicate registration of attributor id '" + id + "' - the first registration wins");
+                continue;
+            }
             PathClaimSet declared;
             try {
                 declared = attributor.claimPaths();
             } catch (AttributorException e) {
                 statusById.put(id, AttributorStatus.ERROR);
-                notesById.put(id, new ArrayList<>(List.of("claimPaths() failed: " + e.getMessage())));
+                notesById.put(id, new ArrayList<>(List.of(MERGE_NOTE + "claimPaths() failed: " + sanitize(e))));
                 continue;
             }
             statusById.put(id, AttributorStatus.OK);
@@ -590,7 +703,7 @@ public final class PathAttributionMerge {
                 Optional<String> prefix = normalizePrefix(claim.pathPrefix());
                 if (prefix.isEmpty()) {
                     notes.add(MERGE_NOTE + "dropped claim ('" + claim.pathPrefix() + "' -> " + claim.targetModule()
-                            + ") - blank, root-level, or repo-escaping prefix does not bound a subtree"
+                            + ") - blank, root-level, absolute, or repo-escaping prefix does not bound a subtree"
                             + " inside the repository");
                     continue;
                 }
@@ -602,7 +715,7 @@ public final class PathAttributionMerge {
                 producers.computeIfAbsent(new ClaimKey(prefix.get(), claim.targetModule()), k -> new TreeSet<>())
                         .add(id);
             }
-            notesById.put(id, notes);
+            notesById.put(id, notes);   // a later duplicate appends its note after these
         }
 
         Map<String, TreeMap<String, TreeSet<String>>> byPrefix = new TreeMap<>();
@@ -611,7 +724,7 @@ public final class PathAttributionMerge {
 
         List<ActivePathClaim> active = new ArrayList<>();
         List<PathClaimCollision> collisions = new ArrayList<>();
-        Map<String, Integer> claimCountById = new HashMap<>();
+        Map<String, Integer> claimCountById = new TreeMap<>();
 
         byPrefix.forEach((prefix, targets) -> {
             if (targets.size() == 1) {
@@ -656,9 +769,9 @@ _See Requirement link:../Requirements.adoc#PM-EXT-3[PM-EXT-3: Module Discovery, 
 `PM-MCP` moves deterministic module discovery, dependency graph construction, verification routing (`derive-verification`), and architecture queries into the daemon while keeping semantic module enrichment (`responsibility`, `purpose`, `key_packages`) as model judgment.
 
 === Server-Owned Module Discovery & Enrolled Discovery Jobs
-_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-6[PM-WATCH-EXT-6], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-7[PM-WATCH-EXT-7], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-8[PM-WATCH-EXT-8]_
+_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-6[PM-WATCH-EXT-6], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-7[PM-WATCH-EXT-7]_
 
-Module discovery combines compiled-in descriptor parsers with optional enrolled build-tool discovery jobs, caching the resulting structural snapshot in server state keyed by the repository's descriptor tree hash:
+Module discovery combines compiled-in descriptor parsers with optional enrolled build-tool discovery jobs, caching the resulting structural snapshot in server state keyed by the repository's descriptor tree hash (the derived fact `module_discovery` of the project's `derived-facts.json`, link:store-schemas.adoc#derived-fact-kinds-discovery-calibration[Store Schemas Specification, Derived fact kinds]); the enrolled discovery job templates below are compiled defaults that the project's enrolment may override (`build.discovery_templates`):
 
 [cols="1,2,2,3"]
 |===
@@ -681,23 +794,37 @@ Module discovery combines compiled-in descriptor parsers with optional enrolled 
 
 |Python (`pyproject`)
 |`pyproject.toml` (TOML parser in `pm-mcp-core`)
-|*(Pure descriptor parse + AST import scan)*
+|*(Pure descriptor parse + line-oriented import scan)*
 |Project metadata, `[project.dependencies]`, `[tool.pytest]`, `[tool.mypy]`, `[tool.ruff]`, top-level package directories and test roots.
+
+|Documentation (`documentation`)
+|`doc/` or `docs/` directory holding `.adoc` or `.md` files at any depth, or a root `README.adoc` (mirrors `pm-documents` `discover_modules`)
+|*(Pure file-tree scan; no subprocess required)*
+|One `documentation` module (build system `documentation`) with its documentation root and its outbound `component_refs` (cross-document references, materialized at discovery time for the `documentation` resolver).
+
+|Plugin bundles (`marshall-plugin`)
+|`marketplace/.claude-plugin/marketplace.json` plus one `.claude-plugin/plugin.json` per bundle (mirrors `pm-plugin-development` `plugin_discover.py`, active only when the marketplace is named `plan-marshall`)
+|*(Pure descriptor parse; no subprocess required)*
+|One module per bundle (build system `marshall-plugin`): skills, agents, and commands as packages with their frontmatter descriptions, and outbound `component_refs` to other bundles.
 |===
 
+* **Python Import Scan (Deliberate Simplification)**: The Python import scan is a line-oriented scanner in Java: it reads only `import x[.y]` and `from x[.y] import ...` lines (leading whitespace allowed, continuation lines and parenthesized import lists joined), and builds no full Python AST. *Deliberate simplification vs. `plan-marshall`*, which parses with Python's `ast` module: imports produced dynamically (`importlib`, `__import__`) or hidden in string literals are not seen, and an `import` line inside a multi-line string may be read as an import; both errors are accepted because the scan only derives module edges, never a gate verdict.
+
 * **Live Crawl, Snapshot as Cache**: Discovery always crawls the live worktree, including uncommitted descriptors. The descriptor tree hash covers the live descriptor content, not `HEAD`. The persisted snapshot is a denormalized cache, never the gatekeeper: a module directory present on disk but absent from the snapshot is still discovered.
+* **In-Process Crawl vs. Lazy Discovery Jobs**: The in-process crawl (compiled-in descriptor parsers and file-tree scans) issues no child process except `git rev-parse --git-common-dir`. Enrolled discovery jobs (the job templates above) run lazily, only when a fact that only they provide is requested, and always as enrolled jobs of the job runtime, never as ad-hoc subprocesses of the crawl.
 * **Per-Descriptor Failure Isolation**: A malformed descriptor (the root descriptor or one workspace member) is reported for its module with the parse diagnostic and does not abort discovery of the remaining modules.
+* **Build-File Dependency Parser**: Each build domain (Maven, Gradle, npm, `pyproject`) provides, next to its descriptor parser, a build-file dependency parser: it claims its build files (`pom.xml`, `build.gradle(.kts)` and `settings.gradle(.kts)`, `package.json`, `pyproject.toml`) and returns the ecosystem-qualified third-party coordinates a file declares at a given revision (`maven:<groupId>:<artifactId>`, `npm:<name>`, `pypi:<name>`) with their scope, or a parse diagnostic. The pre-merge Dependency Delta Check consumes it (link:phase-workflows.adoc#dependency-delta[Phase Workflows Specification, Dependency Delta Check]); a changed build file that no parser claims, or that fails to parse, makes that check `indeterminate`.
 
 === Build Map & Deterministic `derive-verification` (ADR-004)
 _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-9[PM-WATCH-EXT-9]_
 
-The file-to-build contract lives at `build.map` in `.plan/marshal.json` (peer of `build.queue`): a domain-keyed inventory `{"<domain>": [{"glob", "role", "build_class"}]}` with roles `production`, `test`, and `config` and the closed build classes `compile`, `module-tests`, `verify`, and `none`. Phase 4 (`plan`) calls `derive-verification` with each task's changed-artifact list and stamps the returned canonical command set into the task's `verification.commands`; Phase 5 (`execute`) runs the stamped commands. The seeding, editing, and reseeding rules mirror `plan-marshall` (`manage-config/scripts/_cmd_build_map.py`, `manage-config/standards/data-model.md` § build.map, `marshall-steward/references/build-map-setup.md`, `phase-4-plan/SKILL.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+The file-to-build contract lives in the team file `.marshall/config/build-map.json` (`routes`, link:store-schemas.adoc#config-build-map-json[Store Schemas Specification, `build-map.json`]; called the build map, `build.map` in `plan-marshall`): a domain-keyed inventory `{"<domain>": [{"glob", "role", "build_class"}]}` with roles `production`, `test`, and `config` and the closed build classes `compile`, `module-tests`, `verify`, and `none`. Phase 4 (`plan`) calls `derive-verification` with each task's changed-artifact list and stamps the returned canonical command set into the task's `verification.commands`; Phase 5 (`execute`) runs the stamped commands. The seeding, editing, and reseeding rules mirror `plan-marshall` (`manage-config/scripts/_cmd_build_map.py`, `manage-config/standards/data-model.md` § build.map, `marshall-steward/references/build-map-setup.md`, `phase-4-plan/SKILL.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
 
-* **Seeding from Axis B**: The seed collects every build-system descriptor's `classifyGlobs()` routes under its served domain key, keeps a domain's routes only when that domain's Axis-A applicability matches at least one discovered module, prunes routes that match no git-tracked file, and stamps each route with `classifyBuildClass()`. Because applicability needs discovered modules, seeding happens only in `setup.seed-build-map` after `setup.discover-modules`; `config.reconcile` default seeding never creates `build.map`.
-* **Write-Once Seed, Direct Edits**: A seed never overwrites an existing `build.map` block. Corrections are made directly to the seeded entries — through the `customize_routes` link of `setup.seed-build-map`, or by a committed edit of `.plan/marshal.json` — and there is no separate override layer. `customize_routes` therefore edits the seeded block itself and is not an exception to write-once: write-once constrains the seeder, not the user.
-* **Explicit Reseed Only**: The seeded block is re-derived only through `setup.reseed-build-map`, which the setup workflow enters on every reconcile run when a `build.map` block exists. The state compares the persisted block with the live derivation (per domain, added and removed globs). When they agree it passes silently; on drift it offers `reseed_build_map` (replace the whole block with the live derivation, discarding hand edits) and `keep_build_map` (preserve the persisted block). The state always waits for this answer, even when other setup decisions are pre-answered, so a hand edit is never discarded without consent (`plan-marshall`: `build-map drift`, `build-map seed --force`, upgrade nested gate `build-map-reseed`).
+* **Seeding from Axis B**: The seed collects every build-system descriptor's `classifyGlobs()` routes under its served domain key, keeps a domain's routes only when that domain's Axis-A applicability matches at least one discovered module, prunes routes that match no git-tracked file, and stamps each route with `classifyBuildClass()`. Because applicability needs discovered modules, seeding happens only in `setup.seed-build-map` after `setup.discover-modules`; nothing else creates `build-map.json`.
+* **Write-Once Seed, Direct Edits**: A seed never overwrites an existing `build-map.json`. Corrections are made directly to the seeded entries — through the `customize_routes` link of `setup.seed-build-map`, or by a committed edit of `.marshall/config/build-map.json` — and there is no separate override layer. `customize_routes` therefore edits the seeded block itself and is not an exception to write-once: write-once constrains the seeder, not the user.
+* **Explicit Reseed Only**: The seeded block is re-derived only through `setup.reseed-build-map`, which the setup workflow enters on every reconcile run when `build-map.json` exists. The state compares the persisted block with the live derivation (per domain, added and removed globs). When they agree it passes silently; on drift it offers `reseed_build_map` (replace the whole block with the live derivation, discarding hand edits) and `keep_build_map` (preserve the persisted block). The state always waits for this answer, even when other setup decisions are pre-answered, so a hand edit is never discarded without consent (`plan-marshall`: `build-map drift`, `build-map seed --force`, upgrade nested gate `build-map-reseed`).
 * **Separate Glob Dialect**: Build-map routes use the **`fnmatch` glob dialect**, which is kept strictly separate from the Axis-A `provides_file_globs` domain-detection dialect. A path-bearing route matches the whole repository-relative path (a single `*` spans `/`; routes never use `**`), and a bare-basename route (no `/`, e.g. `pom.xml`) matches that file name at any depth.
-* **Fail-Closed Read Invariant**: `derive-verification` reads `build.map` fail-closed. If `build.map` is absent, malformed, or holds an entry with an unknown `role` or `build_class`, the engine refuses verification derivation with an explicit diagnostic (`build_map_invalid` or `build_map_unseeded`) rather than returning an empty verification set. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `build-map read` also fails closed, but its deriver and build-decision readers degrade an absent `build.map` to an empty map instead of refusing.
+* **Fail-Closed Read Invariant**: `derive-verification` reads `build-map.json` fail-closed. If it is absent, malformed, at another `format_version`, or holds an entry with an unknown `role` or `build_class`, the engine refuses verification derivation with an explicit diagnostic (`build_map_invalid` or `build_map_unseeded`) rather than returning an empty verification set. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `build-map read` also fails closed, but its deriver and build-decision readers degrade an absent `build.map` to an empty map instead of refusing.
 * **Canonical Command Resolution Rules**:
   - Production paths (`role == "production"`, `build_class == "compile"`) resolve `compile` on the owning module.
   - Test paths (`build_class == "module-tests"`) resolve `test-compile` + `module-tests` on the owning module (Maven Failsafe `*IT`/`IT*`/`*ITCase` test paths route to `verify`).
@@ -707,7 +834,7 @@ The file-to-build contract lives at `build.map` in `.plan/marshal.json` (peer of
 === Architecture Query Resources (`pm://architecture/...`)
 _See Requirement link:../Requirements.adoc#PM-TOOL-3[PM-TOOL-3: Read-Only MCP Resource URI Surface]_
 
-_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-5[PM-WATCH-EXT-5], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-10[PM-WATCH-EXT-10], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-11[PM-WATCH-EXT-11], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-25[PM-WATCH-EXT-25]_
+_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-5[PM-WATCH-EXT-5], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-8[PM-WATCH-EXT-8], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-10[PM-WATCH-EXT-10], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-25[PM-WATCH-EXT-25]_
 
 Instead of invoking Python CLI scripts via Bash to inspect repository structure, the model reads server-computed MCP resources under `pm://architecture/`:
 
@@ -727,6 +854,9 @@ Instead of invoking Python CLI scripts via Bash to inspect repository structure,
 |`pm://architecture/files?path={rel_path}`
 |Owning module (`which-module`) resolved via module roots and Axis-D `PathAttributionMerge`, plus matching `build.map` route.
 
+|`pm://architecture/files/{path}/neighbours`
+|File-level neighbours of one repository-relative file: the files it imports (resolved by the same scanners as the Axis-C resolvers, unresolvable imports listed as `unresolved[]`), its paired test or production file (by the owning build system's source-set convention, `none` when there is none), and its owning module. The light gate `init.light-gate` counts `|neighbours|` from this resource (link:phase-workflows.adoc#light-gate[Phase Workflows Specification, Light Gate]).
+
 |`pm://architecture/graph`
 |Merged Axis-C dependency graph (`MergedDependencyEdge[]` with `resolverIds` provenance) and topological layers.
 
@@ -734,77 +864,83 @@ Instead of invoking Python CLI scripts via Bash to inspect repository structure,
 |Direct upstream dependencies and direct downstream consumers of `<module_id>`, annotated with resolver provenance.
 
 |`pm://architecture/impact?modules={csv}`
-|Transitive downstream blast radius and derived verification set (`derive-verification`) for the specified modules or active plan footprint.
+|Transitive downstream blast radius and derived verification set (`derive-verification`) for the specified modules or active plan footprint. The impact closure is the specified modules, their transitive reverse dependents, and every repository-wide test module (a module whose tests check the whole tree, such as a naming or architecture test), whether or not it depends on the specified modules.
 
 |`pm://architecture/drift`
-|Descriptor regression and module-diff report comparing the current working tree against the cached architecture snapshot: `changed[]` for modules whose comparison is certified as different, and `indeterminate[]{module, reason}` for modules the hash surface cannot certify. An uncertifiable comparison is `indeterminate`, never `changed`.
+|Descriptor regression and module-diff report comparing the current working tree against the project architecture snapshot `.marshall/project-architecture/_project.json` (same file name as `plan-marshall`'s `.plan/project-architecture/_project.json`, with the per-module `{module}/derived.json`): `changed[]` for modules whose comparison is certified as different, and `indeterminate[]{module, reason}` for modules the hash surface cannot certify. An uncertifiable comparison is `indeterminate`, never `changed`.
 |===
 
 * **Resource Contracts**: Every `pm://architecture/*` resource documents its arguments, its payload, and its zero-result and error semantics. An empty result is returned only for a population that was actually examined; a resource that could not examine its population returns an explicit error or `indeterminate` entry, never an empty list.
+* **Empty Graph Is Not Clean**: When the project has at least 2 modules and the merged graph holds 0 edges, `pm://architecture/graph`, `pm://architecture/neighbours/{module_id}`, and `pm://architecture/impact` answer `indeterminate` (with the resolver status reports), never an empty edge set, and every gate reading the graph treats that answer as `indeterminate`.
 * **Two Capability Vocabularies**: Capability status uses two distinct vocabularies that are never mixed: `derivable` / `not_derivable` for derivation capabilities (a discovery tier or resolver can produce the fact) and `available` / `unavailable` for content capabilities (the content can be read or searched).
 
 === Architecture Enrichment Judgment Links & Project Setup State Machine
 
-Only semantic module enrichment (`responsibility`, `purpose`, and `key_packages` with their reasoning) requires model judgment. `PM-MCP` replaces the legacy `marshall-steward` first-run wizard (Steps 1–16) and its `upgrade` verb with one dedicated **`project-setup`** state machine (`classpath:/workflows/project-setup.pmwf`). On first entry (no `.plan/marshal.json`) the workflow starts at `setup.prepare-workspace`; on every later entry it runs the reconcile path starting at `setup.reconcile-config`.
+Only semantic module enrichment (`responsibility`, `purpose`, and `key_packages` with their reasoning) requires model judgment. `PM-MCP` replaces the legacy `marshall-steward` first-run wizard (Steps 1–16) and its `upgrade` verb with one dedicated **`project-setup`** state machine (`classpath:/workflows/project-setup.pmwf`), hosted by the project's workspace scope (`scope workspace`; entered with `pm-mcp enter --client <client> workspace` and driven through `pm_state` / `pm_do` with `scope=workspace`, `PM-ARCH-4`; its state lives in `workspace/mcp/status.json` of the per-project machine store `<PM_MCP_BASE>/projects/<project_id>/`, link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]). The workspace scope exists once the project is enrolled: `pm-mcp operator enrol` creates the project's machine store for every project, and the first run of the setup workflow creates `.marshall/`. Enrolment (`pm-mcp operator enrol`, host tools) therefore precedes the workspace scope and is never a state of the setup workflow; missing secrets are handled by the credential check (`pm-mcp operator credentials`, `PM-CRED-3`) where a credential is used. The workflow has one start state, `setup.entry`, an `auto` state that routes by server facts: without `.marshall/config/` (first run) to `setup.prepare-workspace`, which creates `.marshall/config/` with the copies of the binary's default workflow units (the JSON team files stay absent until a deviation is configured, since they are sparse), otherwise to the reconcile path starting at `setup.reconcile-config`. The workflow unit `project-setup.pmwf` itself is compiled into the binary and is never project-owned: the setup workflow must be able to repair a project whose units fail verification. The workflow has no terminal state: the workspace scope lives as long as the project's enrolment, and every run ends in the resting `link` state `setup.completed`, whose `reconcile` link returns to `setup.entry` for the next run. A project that also runs on legacy `plan-marshall` starts from a clean slate like any other: `PM-MCP` imports nothing from its `.plan/` (`PM-MIG-2`), so its first setup run takes the first-run path; setup never reads or writes `.plan/`. Its states are catalogued in the link:state-catalogue.adoc#state-catalogue-setup[State Catalogue, Project Setup: `setup`].
 
 [source,text]
 ----
-First run                                           Reconcile run (configured project)
-
-setup.prepare-workspace                             setup.reconcile-config
-  (auto: .gitignore entries; config.reconcile         (auto: config.reconcile, five-phase
-   creates .plan/marshal.json)                         ConfigReconciler pipeline)
-         │                                                   │
-         ▼                                                   ▼
-setup.effort-ladder                                 setup.discover-modules
-  (auto: validates .plan/local/effort-ladder.json)    (job: rediscovery; descriptor regression
-         │                                             via pm://architecture/drift)
-         ▼                                                   │
-setup.project-settings                                       ▼
-  (link: configure_project — base branch,           setup.reseed-build-map
-   interaction mode, phase settings, review gates)    (auto when in sync; on drift link:
-         │                                             reseed_build_map / keep_build_map)
-         ▼                                                   │
-setup.detect-domains                                         ▼
-  (auto: scans provides_file_globs & descriptors,   setup.commit-changes
-   seeds config_defaults write-once)                  (sub-workflow: git.commit_and_push;
-         │                                             links: land / leave)
-         ▼                                                   │
-setup.discover-modules                                       ▼
-  (job: runs descriptor parsers & enrolled          setup.completed (terminal)
-   discovery templates)
+                               setup.entry
+                (auto: routes by server facts — first run or configured)
+         │ first_run                                   │ configured
+         ▼                                             ▼
+setup.prepare-workspace                        setup.reconcile-config
+  (auto: .gitignore entries; creates              (auto: config.validate — team files,
+   .marshall/config/ with the default units)       local-config.json, project units;
+         │                                         format refusals offer a rewrite)
+         ▼                                             │
+setup.effort-ladder                                    │
+  (auto: validates the operator file                   │
+   local-config.json incl. effort ladder)              │
+         │                                             │
+         ▼                                             │
+setup.project-settings                                 │
+  (link: configure_project — sparse team keys;         │
+   operator posture only via elicitation)              │
+         │                                             │
+         ▼                                             ▼
+setup.detect-domains  (auto: scans provides_file_globs & descriptors,
+                       derives domain activation; overrides from domains.json)
          │
          ▼
-setup.seed-build-map
-  (link: confirm_build_map / customize_routes)
-         │
-         ▼
-setup.select-providers
-  (link: configure_providers — VCS=1, CI<=1, Sonar/other)
-         │
-         ▼
-setup.configure-finalize
-  (link: configure_finalize — verification steps, finalize steps;
-   every lane:ask element must be answered)
-         │
-         ▼
-setup.merge-queue
-  (link: enable_merge_queue / skip_merge_queue; skipped when not eligible)
-         │
-         ▼
-setup.awaiting-enrolment
-  (escalate: operator runs `pm-mcp operator enrol` & `pm-mcp operator credentials`)
-         │
-         ▼
-setup.enrich-architecture
-  (parallel dispatch: enrich:<module_id> per unenriched module)
+setup.discover-modules  (job: descriptor parsers & enrolled discovery templates;
+                         reconcile run: rediscovery + pm://architecture/drift)
+         │ first run                                   │ reconcile run
+         ▼                                             ▼
+setup.seed-build-map                            setup.reseed-build-map
+  (link: confirm_build_map /                      (passes when in sync; on drift link:
+   customize_routes)                               reseed_build_map / keep_build_map)
+         │                                             │
+         ▼                                             ▼
+setup.select-providers                          setup.offer-new-steps
+  (link: configure_providers — CI derived,        (awaiting_user: adopt or decline each
+   ci_provider override, Sonar, review bots)       changed default unit, three-way diff)
+         │                                             │
+         ▼                                             │
+setup.configure-finalize                               │
+  (link: configure_finalize; optional step             │
+   lanes, every lane:ask element answered)             │
+         │                                             │
+         ▼                                             │
+setup.merge-queue                                      │
+  (link: enable_merge_queue /                          │
+   skip_merge_queue; skipped when not eligible)        │
+         │                                             │
+         ▼                                             ▼
+setup.enrich-architecture  (dispatch:enrich-<module_id>; first run: every unenriched
+                            module, reconcile run: modules in drift changed[] only)
          │  [Guard: every_module_enriched]
          ▼
-setup.commit-changes
-  (sub-workflow: git.commit_and_push; links: land / leave)
-         │
+setup.commit-changes  (link: land / leave; re-entered on aborted)
+         │ land                                          │ leave
+         ▼                                               │
+setup.land-changes  (call git.commit_and_push)           │
+         │ committed_* / pushed_clean / clean            │
+         ▼                                               ▼
+setup.completed  (link: reconcile — resting state of the workspace scope)
+         │ reconcile
          ▼
-setup.completed (terminal)
+setup.entry
 ----
 
 In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `dispatch:enrich-<module_id>` links (or direct `enrich:<module_id>` submission links for single-module repositories). The submission parameters mirror `plan-marshall`'s `architecture enrich module` and `architecture enrich package` commands (`manage-architecture/scripts/architecture.py`, purpose values from `manage-architecture/standards/architecture-persistence.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing:
@@ -838,7 +974,9 @@ In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `disp
 |List of `{package, description, components}`: `package` is a repository-relative path that must resolve to an existing location (the path is the identity key), `description` is 1–2 sentences and required, and `components` optionally names the package's key types. A dotted package identifier is rejected with `invalid_link_args` whose `detail` names `non_resolving_package_key` (link:mcp-tools.adoc#rejection-reasons[closed rejection reasons]); only the server-derived `packages` facts of `pm://architecture/modules/{module_id}` may carry dotted names.
 |===
 
-The reasoning fields carry the enrichment rationale required by `PM-EXT-3` and are persisted next to the values they justify. *Deliberate hardening vs. `plan-marshall`*: `purpose` is validated against the closed enum; `plan-marshall` documents the same eight values but its CLI accepts any string. The state cannot transition to `setup.commit-changes` until the **`every_module_enriched`** guard evaluates to `true` (every discovered module has a `responsibility`).
+The reasoning fields carry the enrichment rationale required by `PM-EXT-3` and are persisted next to the values they justify. *Deliberate hardening vs. `plan-marshall`*: `purpose` is validated against the closed enum; `plan-marshall` documents the same eight values but its CLI accepts any string. The state cannot transition to `setup.commit-changes` until the **`every_module_enriched`** guard evaluates to `true` (every discovered module has a `responsibility`). On the reconcile path the state is scoped to the modules listed in `changed[]` of `pm://architecture/drift`: only those are offered for enrichment, and the state passes without a dispatch when the list is empty; a module listed in `indeterminate[]` is never treated as changed.
+
+*Landing*: `setup.commit-changes` is a `link` state offering the routine decision `land` or `leave`; `land` enters the `call` state `setup.land-changes`, which runs `call git.commit_and_push (message_mode=step_or_fallback, push_mode=if_configured)` on the primary checkout with the setup staging set `.marshall/config/**` (team files and workflow units), `.gitignore`, and `.marshall/project-architecture/**` (link:workflow-dsl.adoc#_call_site_reuse_matrix_across_workflows[Workflow DSL Specification, Call-Site Reuse Matrix]). Every outcome except `aborted` enters `setup.completed`; `aborted` returns to the decision. `leave` enters `setup.completed` with the changes uncommitted.
 
 ==== Steward Wizard Step Mapping
 
@@ -852,7 +990,7 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Step 1: Gitignore Setup
 |Writes the `.plan/` entries with tracked-file exceptions into `.gitignore` (`gitignore_setup.py`).
-|`setup.prepare-workspace`.
+|`setup.prepare-workspace` (writes the `.marshall/` partition into `.gitignore`).
 
 |Step 2: Update Project Documentation
 |Appends executor and temp-file conventions to the project's agent documentation (`determine_mode fix-docs`).
@@ -868,19 +1006,19 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Step 5: Initialize Marshal.json
 |Creates `.plan/marshal.json` with defaults (`manage-config init`).
-|`setup.prepare-workspace` (`config.reconcile` creates the file from compiled defaults).
+|`setup.prepare-workspace` (creates `.marshall/config/` with the default workflow units; no JSON defaults are written, the team files are sparse; an existing `.plan/marshal.json` is never read, `PM-MIG-2`).
 
 |Step 5b: Effort Ladder & Pin Setup
 |Seeds and validates the machine-local effort ladder and materializes model pins (`effort_pins`).
-|`setup.effort-ladder` validates `.plan/local/effort-ladder.json` and fails closed on a malformed ladder; model pins are applied when `pm-mcp client install` / `update` renders the agent variants.
+|`setup.effort-ladder` validates the operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (including its `effort_ladder`) and fails closed on a malformed file; nothing is seeded, absent entries resolve to the client profile's compiled ladder; model pins are applied when `pm-mcp client install` / `update` renders the agent variants.
 
 |Step 6: Project Default Base Branch
 |Seeds `project.default_base_branch` from `origin/HEAD` (fallback `main`).
-|`setup.project-settings`.
+|Derived (fact `base_branch_default`); `setup.project-settings` writes `project.json` `base_branch` only when the team chooses another branch.
 
 |Step 6b: Interaction Mode
 |Persists `interaction_mode` (`basic` \| `advanced` \| `expert`).
-|`setup.project-settings`.
+|Operator posture in `local-config.json`, set through the operator channel (elicitation in `setup.project-settings`, or `pm-mcp operator config`); never a team key.
 
 |Step 7: Discover and Activate Providers
 |Detects and activates VCS, CI, and other providers.
@@ -888,7 +1026,7 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Step 8: Project Architecture
 |Applies extension `config_defaults`, discovers modules, runs the LLM architectural analysis.
-|`setup.detect-domains` (`config_defaults`), `setup.discover-modules` (discovery), `setup.enrich-architecture` (analysis).
+|`setup.detect-domains` (domain activation; no `config_defaults` are written, domain defaults are compiled defaults), `setup.discover-modules` (discovery), `setup.enrich-architecture` (analysis).
 
 |Step 8b: Seed the Build Map
 |Seeds `build.map` after architecture discovery (write-once).
@@ -900,11 +1038,11 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Step 10: Plan Phase Settings
 |Sets `branch_strategy`, `compatibility`, `commit_and_push`.
-|`setup.project-settings`.
+|`setup.project-settings` (`compatibility`, `simplicity`, `minimum_lane` in `workflow.json`). `branch_strategy` and `commit_and_push` are *retired*: plans always use a feature branch, a worktree, and a pull request, and a local-only outcome is derived from the absence of a push remote (derived fact `push_remote`).
 
 |Step 11: Quality Pipeline Configuration
 |Selects `verification_steps` and finalize steps.
-|`setup.configure-finalize`.
+|`setup.configure-finalize` (optional step lanes and parameters in `workflow.json`; which steps exist is the project's `finalize.pmwf` unit, whose mandatory steps cannot be removed).
 
 |Step 11b: Resolve Adversarial Infra Elements (`lane: ask`)
 |Mandatory, non-skippable answer for every `lane: ask` finalize element.
@@ -912,15 +1050,15 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Step 12: Review Gates
 |Sets the `*_without_asking` transition flags.
-|`setup.project-settings`.
+|*Retired*: the five flags are replaced by the per-plan `continuation_policy`, whose default is the operator's `continuation.default_policy` in `local-config.json` (operator channel); outline approval and the other operator-authorizing decisions are never automatic.
 
 |Step 13: Detect CI Provider and Configure Credentials
 |Detects the CI provider, verifies its CLI, optionally configures credentials.
-|`setup.select-providers` (CI detection) and `setup.awaiting-enrolment` (host tools via `pm-mcp operator enrol`, secrets via `pm-mcp operator credentials`).
+|`setup.select-providers` (CI detection). Host tools are enrolled by `pm-mcp operator enrol`, which precedes the workspace scope; secrets are configured through `pm-mcp operator credentials` when the credential check of their first use raises the `blocked` condition (`PM-CRED-3`).
 
 |Step 13.5: Merge-Queue Provisioning
 |Probes the platform merge queue and persists the `use_merge_queue` opt-in.
-|`setup.merge-queue`.
+|`setup.merge-queue` provisions the platform queue on request; no opt-in is persisted, because whether a queue is enforced is derived from the provider (fact `merge_queue_enforced`, open git/GitHub/GitLab design topic) and an enforced queue is never bypassed.
 
 |Step 14: Permission Setup
 |Grants standing host permissions for routine commands.
@@ -932,17 +1070,17 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Step 15: Summary
 |Prints the wizard summary.
-|`setup.completed` (the terminal representation's facts).
+|`setup.completed` (the facts of the resting state's representation).
 
 |Step 16: Step-Ordering + End-of-Run Landing Cycle
-|Runs `sync-defaults` and `steps-sort`, then lands the steward-created artifacts.
-|Ordering: `config.reconcile` phases 2–3 inside `setup.prepare-workspace` and `setup.reconcile-config`. Landing: `setup.commit-changes`.
+|Runs `sync-defaults` and `steps-sort`, then lands the wizard-created artifacts.
+|Ordering: *retired* (sparse files hold no step maps to sync or sort; the step order is a descriptor property and the project's `finalize.pmwf` unit). Landing: `setup.commit-changes` (`land` / `leave`) and `setup.land-changes`.
 
 3+|*`upgrade` verb (`upgrade.py`, `upgrade-flow.md`)*
 
 |Stage top-level gates (suppressed by `--integrate true`)
 |Prompts before each of the four stages.
-|*Retired*: each reconcile-path state is its own gate; there is no stage grouping to confirm.
+|*Retired*: each reconcile-path state is its own gate; there is no stage grouping to confirm. Changes of the binary's default workflow units (including newly shipped finalize steps) are offered as a three-way diff in `setup.offer-new-steps` (§ Configuration Validation & Upgrades Before 1.0).
 
 |Stage 1 `regenerate-target-tree` (meta project)
 |Regenerates the generated target tree.
@@ -962,15 +1100,15 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Stage 2 `reconcile-marshal-json`
 |Reconciles `marshal.json` (`sync-defaults`, `steps-sort`, key normalization).
-|`setup.reconcile-config`.
+|`setup.reconcile-config` validates the team files, the operator file, and the project units and offers a rewrite of a file the binary refuses by format; default sync, step sorting, and key normalization are *retired* (sparse files).
 
 |Stage 2 `migrate-bot-lists`
 |Maps the retired `enabled_bots` knob onto `required_bots` / `optional_bots`.
-|`setup.reconcile-config` (migration command `M004_split_enabled_bots_to_participation_lists`).
+|*Retired*: no legacy configuration is imported (`PM-MIG-2`), so the `enabled_bots` knob never exists in `.marshall/config/project.json`; `review.required_bots` / `review.optional_bots` are answered in `setup.select-providers`.
 
 |Stage 2 `validate-bot-lists`
 |Reports bot tokens that match no registered reviewer.
-|`setup.reconcile-config` (`ConfigReconciler` phase 4, registry validation).
+|`setup.reconcile-config` (validation on read: every bot token resolves in the review-bot registry, `unregistered_kind`).
 
 |Stage 2 `migrate-architecture-descriptors`
 |Rewrites architecture descriptors (`discover --force --apply migration`) and checks for regression (`descriptor-regression-check`).
@@ -990,7 +1128,7 @@ Every step of the `plan-marshall` first-run wizard and every stage sub-step and 
 
 |Stage 4 `run-landing-cycle` and nested gates `land-leave`, `branch-reuse`
 |Lands the reconciled artifacts, asking whether to land or leave them and whether to reuse an existing branch.
-|`setup.commit-changes` (`land` / `leave` links; branch handling by `git.commit_and_push`).
+|`setup.commit-changes` (`land` / `leave` links) and `setup.land-changes` (branch handling by `git.commit_and_push`).
 |===
 
 == Declarative Recipe Engine & Tier-1 Init Routing
@@ -1001,7 +1139,9 @@ Recipes define repeatable, structured plan templates for recurring engineering c
 === Declarative Recipe Descriptor Schema
 _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-12[PM-WATCH-EXT-12]_
 
-Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local recipes (`.plan/recipes/<recipe_id>.json` + `.plan/recipes/<recipe_id>.md`) are defined as declarative data structures:
+Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local recipes (`.marshall/recipes/<recipe_id>.json` + `.marshall/recipes/<recipe_id>.md`) are defined as declarative data structures.
+
+*Domain recipes (`provides_recipes`)*: `plan-marshall`'s `provides_recipes()` hook becomes packaging: a domain recipe (such as `pm-dev-java-cui`'s `cui-logging-enforce`) is part of its domain bundle, compiled into the classpath next to the domain descriptor, and registered under the bundle's `domain_id` (its descriptor's `domain` field equals that `domain_id`). The recipe registry is assembled at build time; two recipes with the same `recipe_key` (built-in or domain) fail the build, so a collision never reaches a runtime registry and no registration order decides a winner.
 
 [source,json]
 ----
@@ -1024,7 +1164,7 @@ Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local 
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "recipe_key": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Registry key as in plan-marshall (e.g. code-review)." },
+    "recipe_key": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", "maxLength": 37, "description": "Registry key as in plan-marshall (e.g. code-review); at most 37 characters so the recipe plan ID fits the plan_id grammar (identifiers.adoc, recipe_key)." },
     "display_name": { "type": "string", "minLength": 3, "maxLength": 100 },
     "description": { "type": "string", "description": "Scored by keyword overlap together with display_name." },
     "domain": { "type": "string", "description": "Optional domain; matches the plan's domain for the domain score." },
@@ -1039,21 +1179,14 @@ Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local 
     "lane": { "type": "object", "description": "Optional execution-profile seed (posture and per-step overrides), lowest precedence." },
     "skill_uri": {
       "type": "string",
-      "pattern": "^skill://pm/recipe/[a-z0-9-]+$"
+      "pattern": "^skill://pm/recipe/[a-z][a-z0-9]*(-[a-z0-9]+)*$"
     },
-    "parameters": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["name", "type", "required"],
-        "additionalProperties": false,
-        "properties": {
-          "name": { "type": "string" },
-          "type": { "type": "string", "enum": ["text", "int", "enum", "module_list", "glob"] },
-          "enum_values": { "type": "array", "items": { "type": "string" } },
-          "required": { "type": "boolean" },
-          "default_value": { "type": ["string", "integer", "null"] }
-        }
+    "parameters_schema": {
+      "type": "object",
+      "description": "Free per-recipe input schema (a JSON Schema 2020-12 object schema) for recipe_params; there is no fixed parameter vocabulary (no global scope x thoroughness matrix). The server validates recipe_params against it at pm_start and refuses a violation; defaults declared in it are applied by the server. Absent means the recipe takes no parameters and any non-empty recipe_params is refused.",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "object" }
       }
     },
     "target_harvester": {
@@ -1070,12 +1203,15 @@ Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local 
             "ascii_diagram_blocks",
             "stalled_lessons",
             "footprint_diff",
-            "project_script"
-          ]
+            "project_script",
+            "request_scoped"
+          ],
+          "description": "request_scoped: no harvest runs; the deliverables come from the pre-diagnosed request (named files, root cause, exact change), as for surgical-fix."
         },
-        "script_job_id": {
+        "project_script_id": {
           "type": ["string", "null"],
-          "description": "Required when kind == 'project_script'."
+          "pattern": "^[a-z][a-z0-9-]{0,63}$",
+          "description": "Key of the enrolled project script (project_scripts of enrolments/<project_id>.json, whose binding must be worker_kind recipe_harvester with this recipe as target); required when kind == 'project_script'."
         }
       }
     },
@@ -1106,26 +1242,53 @@ _Implementation watch: link:../implementation-watch/phase-workflows.adoc#PM-WATC
 The scoring and routing rules mirror `plan-marshall` (`script-shared/scripts/recipe_scoring.py`, `phase-1-init/SKILL.md`, verified at commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing).
 
 1. *Explicit Choice Beats Heuristic Match*: A plan started from a recipe (`pm_start` with `recipe_id`, i.e. source `recipe`) bypasses scoring and routes directly to `init.recipe-selected`.
-2. *Registry-Wide Deterministic Scoring*: For every other source, during `phase-1-init` (ahead of light/deep planning-lane routing), the server scores **every** registered recipe (no domain pre-filter): $\text{confidence} = 0.6 \cdot \text{keyword} + 0.25 \cdot \text{domain} + 0.15 \cdot \text{scope}$, rounded to three decimals, where `keyword` is the share of the recipe's `display_name` + `description` tokens (stop-words removed) found in the request, `domain` is `1` when the recipe's `domain` equals the plan's domain, and `scope` is `1` when the plan's scope estimate matches the recipe's `scope` (`module` for surgical/narrow plans, `codebase_wide` for broad ones). For the surgical-fix recipe only, a pre-diagnosed-change shape score of the request may raise the confidence (`max`). Recipes below `0.35` are dropped.
-3. *Auto-Route or Ask*: When `plan.phase-1-init.auto_route_recipe` is `true` (default) and the top confidence is at least `plan.phase-1-init.auto_route_recipe_threshold` (default `0.6`), the engine selects that recipe without asking. Otherwise, if candidates remain, it enters `init.recipe-candidate` (an `*.awaiting_user` state) offering `use_recipe:<recipe_key>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for the others) and `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
-4. [[recipe-plan-id]]*Recipe Plan ID*: A recipe plan's `plan_id` is `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC), so every run gets a fresh branch name. *Deliberate change vs. `plan-marshall`*: `plan-marshall` uses hour precision (`{yyyy-mm-dd-hh}`), which collides when the same recipe runs twice within an hour.
-5. *Server-Side Target Harvesting & Deliverable Generation*: When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`) and verifying coverage at completion.
-6. *Auditable, Idempotent Harvest Runs*: A recipe run records one disposition per harvested target; for `recipe-lesson-cleanup` over `stalled_lessons` the dispositions are `routed`, `reclassified`, and `retired` (through a lesson tombstone with its mandatory `reason` and `coverage_verdict`, link:store-schemas.adoc#lesson-record[Store Schemas Specification, Lesson Record, Retirement]). Re-running on unchanged input is a no-op keyed on the target's duplicate key (for lessons: link:store-schemas.adoc#lesson-record[Store Schemas Specification, Lesson Record, Upstream Release, Duplicates]). If the population differs between harvesting and action, the run reports the delta (added and removed target ids) and never adopts it silently.
+2. *Registry-Wide Deterministic Scoring*: For every source other than `recipe` (`request`, `issue`, `lesson`; a `local_changes` plan goes to the land lane and is not scored), during `phase-1-init` (ahead of light/deep planning-lane routing), the server scores **every** registered recipe (no domain pre-filter): $\text{confidence} = 0.6 \cdot \text{keyword} + 0.25 \cdot \text{domain} + 0.15 \cdot \text{scope}$, rounded to three decimals, where `keyword` is the share of the recipe's `display_name` + `description` tokens (stop-words removed) found in the request, `domain` is `1` when the recipe's `domain` equals the plan's domain, and `scope` is `1` when the plan's scope estimate matches the recipe's `scope` (`module` for surgical/narrow plans, `codebase_wide` for broad ones). For the surgical-fix recipe only, a pre-diagnosed-change shape score of the request may raise the confidence (`max`). Recipes below `0.35` are dropped.
+3. *Auto-Route or Ask*: Scoring always runs (item 2); `recipes.auto_route` never switches it off, it only chooses between auto-routing and asking. When the operator's `recipes.auto_route` (`local-config.json`, default `true`) holds and the top confidence is at least the compiled auto-route threshold `0.6` (a calibration of the scorer, not configurable), the engine selects that recipe without asking. Otherwise (auto-routing disabled, or the top confidence below the threshold), if candidates remain, it enters `init.recipe-candidate` (the single state of the recipe selection dialogue, kind `awaiting_user`; recipe selection never uses another `init` question state) offering `use_recipe:<recipe_key>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for the others) and `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
+4. [[recipe-plan-id]]*Recipe Plan ID*: A recipe plan's `plan_id` is `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC), so every run gets a fresh branch name; its grammar and the 37-character bound of `recipe_key` that keeps it within the `plan_id` grammar are in the link:identifiers.adoc#id-recipe-plan-id[Identifier Registry]. *Deliberate change vs. `plan-marshall`*: `plan-marshall` uses hour precision (`{yyyy-mm-dd-hh}`), which collides when the same recipe runs twice within an hour.
+5. *Server-Side Target Harvesting & Deliverable Generation*: When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. A recipe whose harvester kind is `request_scoped` (`surgical-fix`) runs no harvest: its deliverables come from the pre-diagnosed request (the named files, root cause, and exact change; one deliverable per affected file or one for the whole cohesive edit), and a request that names no file or crosses a module boundary is refused by the recipe's fit gate rather than widened. The deliverables are derived in the Phase 3 entry state of the recipe shortcut, `outline.recipe-entry` (link:state-catalogue.adoc#state-outline.recipe-entry[State Catalogue]). The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`, offered by `outline.recipe-confirm` before `outline.review`) and verifying coverage at completion.
+6. *Auditable, Idempotent Harvest Runs*: A recipe run records one disposition per harvested target; for `recipe-lesson-cleanup` over `stalled_lessons` the dispositions are `routed`, `reclassified`, and `retired` (through the lesson's in-file retirement with its mandatory `reason` and `verdict`, link:store-schemas.adoc#lesson-record[Store Schemas Specification, Lesson Record, Retirement]); the `stalled_lessons` population is the lessons with a stale claim (link:store-schemas.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]). Re-running on unchanged input is a no-op keyed on the target's duplicate key (for lessons: link:store-schemas.adoc#lesson-record[Store Schemas Specification, Lesson Record, Upstream Release, Duplicates]). If the population differs between harvesting and action, the run reports the delta (added and removed target ids) and never adopts it silently.
+7. *Empty Harvest Is a No-Op, Never an Empty PR*: When the harvester (after `confirm_recipe_targets` pruning) yields zero targets, the plan creates no deliverables, no commit, and no pull request: it ends as `completed` with `merge_outcome: no_pr` (link:store-schemas.adoc[Store Schemas Specification, `merge_outcome`]) and the fact `empty_harvest` (harvester kind and the population it scanned) in its landing envelope. An empty pull request is never created for a recipe plan.
+8. *Recipe Parameters*: `recipe_params` (link:mcp-tools.adoc[MCP Tools Specification, `pm_start`]) is validated by the server against the recipe's own `parameters_schema`; there is no global parameter vocabulary such as a fixed scope × thoroughness matrix. A violation refuses `pm_start` before any plan directory is created, and a recipe without `parameters_schema` refuses non-empty `recipe_params`.
+9. *Doc-Shaped Lesson Route*: For source `lesson`, the server additionally evaluates `plan-marshall`'s doc-shaped predicate over the lesson body (`phase-1-init` Step 5c-lesson): the body has at least one `## Directive` or `## Actions` section, contains no fenced code block tagged `python`, `py`, `java`, `js`, `javascript`, `ts`, or `typescript`, and the first non-empty line of no directive section begins (case-insensitively) with `test`, `refactor`, `implement`, `add code`, `write code`, or `migrate`. When all three hold, the plan is routed to the `lesson-cleanup` recipe (`init.recipe-selected`, recorded with `route_reason: doc_shaped_lesson`) ahead of the registry scoring; otherwise the lesson is scored like any other source.
+10. *Request-Aspect Classification*: For every source other than `recipe`, the server classifies the request aspect (`analysis`, `planning`, `implementation`) by keyword-table token overlap (`plan-marshall`'s `aspect-classify`): the higher of `analysis` and `planning` is accepted only when its overlap confidence is at least `0.7` (independent of the recipe thresholds) and beats the `implementation` overlap; otherwise the aspect is `implementation`. The result is persisted as `status.metadata.request_aspect` with its confidence, silently (no question), and records intent only; it never decides whether a build is needed.
 
-=== Pre-Submission Self-Review Surfacer Contract (`ext-self-review-*`)
-_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-13[PM-WATCH-EXT-13], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-14[PM-WATCH-EXT-14], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-15[PM-WATCH-EXT-15], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-16[PM-WATCH-EXT-16], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-17[PM-WATCH-EXT-17], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-18[PM-WATCH-EXT-18], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-19[PM-WATCH-EXT-19], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-20[PM-WATCH-EXT-20], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-24[PM-WATCH-EXT-24], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-26[PM-WATCH-EXT-26], link:../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-40[PM-WATCH-GEN-40], link:../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-45[PM-WATCH-GEN-45]_
+Items 9 and 10 are Tier-1 routing computed by the server in `init.classify` with zero model calls. *Deliberate change vs. `plan-marshall`*: `plan-marshall` lets the orchestrating model apply the doc-shaped predicate and offers a bounded model fallback for an ambiguous aspect; `PM-MCP` computes both deterministically and has no model fallback.
 
-During `phase-6-finalize`, the pre-submission structural self-review step runs deterministic candidate detectors over the plan's realized diff to surface high-risk patterns (unvalidated boundary inputs, asymmetric function pairs, description-vs-body mismatches, stale ordinal prose, unguarded flags) as structured facts for model review:
+[[self-review-surfacer]]
+== Pre-Submission Self-Review Surfacer Extension Point (`ext-self-review-*`)
+_See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+
+_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-13[PM-WATCH-EXT-13], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-14[PM-WATCH-EXT-14], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-15[PM-WATCH-EXT-15], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-16[PM-WATCH-EXT-16], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-17[PM-WATCH-EXT-17], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-18[PM-WATCH-EXT-18], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-19[PM-WATCH-EXT-19], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-20[PM-WATCH-EXT-20], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-24[PM-WATCH-EXT-24], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-26[PM-WATCH-EXT-26], link:../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-45[PM-WATCH-GEN-45]_
+
+The self-review surfacer is a domain extension point, not a recipe: a domain bundle registers at most one compiled surfacer `ext-self-review-<domain_id>` (in `plan-marshall`: `pm-plugin-development:ext-self-review-plan-marshall`), declaring the content classes it covers and its detectors. During `phase-6-finalize`, the pre-submission structural self-review step (link:phase-workflows.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, catalogue row `8`, `pre-submission-self-review`]) runs the surfacers registered for the plan's domains as deterministic candidate detectors over the plan's realized diff to surface high-risk patterns (unvalidated boundary inputs, asymmetric function pairs, description-vs-body mismatches, stale ordinal prose, unguarded flags) as structured facts for model review.
+
+*Outcomes*: every round records exactly one of three outcomes, carried into the landing facts as `self_review` (link:phase-workflows.adoc#_landing_envelope_emit_landing[Phase Workflows Specification § Landing Envelope]):
+
+* `reviewed`: at least one applicable surfacer ran and the model submitted its verdict over the surfaced candidates.
+* `not_covered`: a surfacer is registered for the plan's domains but does not apply to the footprint; the surfacer names the reason (`no_covered_content_class` with the uncovered content classes, or `zero_detectors`).
+* `not_run`: no surfacer is registered for any of the plan's domains; the reason is `no_domain_surfacer`.
+
+Neither `not_covered` nor `not_run` is ever recorded or rendered as `clean` or `passed`. The contract rules:
 
 * **AsciiDoc Content Class**: `*.adoc` paths form their own content class `asciidoc` (never `other`), covered at least by the stale-count and ordinal-prose detector: a count or ordinal stated in prose ("the five bands", "the third item", "13-state vocabulary") that no longer matches the enumeration, table, or list it describes, including one in a file the plan did not edit, is a candidate. PM-MCP's own documentation is AsciiDoc, so its changes are reviewed rather than reported `not_covered`.
-* **Applicability by Content Class**: A surfacer is applicable when its declared content classes cover at least one content class of the realized footprint; a footprint whose paths all fall in content class `other` has no applicable surfacer. An inapplicable surfacer is never run: the step records `not_covered` with the uncovered content classes and completes non-blocking, never as `clean`. The refusal reasons `no_domain_surfacer`, `no_covered_content_class`, and `zero_detectors` are round-invariant at an unchanged `HEAD`.
-* **Not Run Is Not Clean Invariant**: When no self-review surfacer is applicable, the server records `"status": "not_run: no_surfacer_resolved"` in the finalize ledger—never `"clean"` or `"passed"`. Every active surfacer records its `scope_statement`, `structural_limit`, and `delta_coverage`; a detector class with zero matching files in the diff is recorded as `unapplicable`, never counted toward measured clean coverage.
+* **Applicability by Content Class**: A surfacer is applicable when its declared content classes cover at least one content class of the realized footprint; a footprint whose paths all fall in content class `other` has no applicable surfacer. An inapplicable surfacer is never run: the step records `not_covered` with the surfacer's reason and the uncovered content classes and completes non-blocking, never as `clean`. The reasons `no_domain_surfacer`, `no_covered_content_class`, and `zero_detectors` are round-invariant at an unchanged `HEAD`.
+* **Not Run Is Not Clean Invariant**: When no self-review surfacer is registered for the plan's domains, the server records `"status": "not_run"` with `"reason": "no_domain_surfacer"` in the finalize ledger—never `"clean"` or `"passed"`. Every active surfacer records its `scope_statement`, `structural_limit`, and `delta_coverage`; a detector class with zero matching files in the diff is recorded as `unapplicable`, never counted toward measured clean coverage.
 * **Which Zero Coverage**: Per content class the surfacer records `files`, `files_with_candidates`, and `detectors`; a class with `files > 0` and `detectors == 0` is recorded as `gap`, never as clean. The reach map is derived from the registered detectors. Every realized path with no applicable detector is listed as `not_scanned` in the step facts and the landing facts, and a round over only `not_scanned` paths is `not_covered`. Per-file candidate counts distinguish `examined_zero` (an applicable detector ran on the file and found nothing) from `not_scanned`.
 * **Run-Emitted Diagnostics**: Diagnostics emitted by the plan's own run (build, validator, or gate output) whose subject overlaps the plan footprint are surfaced as candidates alongside the detector findings.
 * **Target-Class Seeding**: When the plan's approved outline names the defect class the plan exists to remove (its target defect class), the surfacer also seeds candidates of that class over the plan footprint in every round, because a fix for a class is the likeliest place to re-commit it; the seeded candidates are counted in the round's `cohort_size` like any other.
 * **Out-of-Surface Findings**: Findings identified outside the surface go into a non-blocking `observed_out_of_surface` list whose count reaches the step summary, so `clean`, `nothing_found`, and `suppressed` stay distinct outcomes.
 * **Round Accounting**: `cohort_size` is published per round and cumulatively. A finding at a file and line of a prior round's finding is marked `repeat_site` with its repeat count. A finding classified `self_seeded` (introduced by the previous round's fix) records that classification at WARNING level; its remedy is the deletion of the added clause, gated on that recorded classification. Each round records `findings_total` and `findings_self_seeded`; from round 2 the step's facts state the self-seeded share, the vocabulary skill prescribes deleting the added text or replacing it with a pointer as the default remediation, and the share of every round is rendered in `finalize.loop-limit-reached` (link:workflow-dsl.adoc#loop-back-bounds[Workflow DSL Specification]). The share is a signal only: `max_iterations` remains the loop's only automatic bound.
-* **Delta Round Narrowing Invariant**: On subsequent finalize iterations after a fix, delta self-review rounds narrow only the candidate file set to files modified since the previous reviewed `worktree_sha`, never narrowing the hunk basis against the plan's base commit. The plan's base commit is the footprint `base_ref` defined in link:store-schemas.adoc[Store Schemas Specification] (§ Three-Way File Footprint Reconciliation). Before computing candidates the step fetches `origin/<base_branch>` itself; the fail-closed refusal applies only when the base commit or the previous `worktree_sha` is still unresolvable after that fetch, and then the step fails with an explicit error rather than silently widening or skipping. The delta candidate set also includes the reference closure: every file of the plan footprint that references a path or a declared symbol changed since the previous reviewed `worktree_sha` (a document line made stale by an edit in another file is therefore a candidate in the next delta round, not only in the closing full round). When the previous round's `worktree_sha` is not an ancestor of `HEAD` (the branch was rebased), delta resolution is skipped, open findings stay pending, and a full round is required: an endpoint diff across an upstream advance never marks a finding fixed. A delta round can never close the step: a clean delta round is followed by exactly one full-surface round over the whole plan diff, and only a clean full-surface round records `done` (`may_close = true`). A delta round that surfaces findings loops back without a confirmation round.
+* **Delta Round Narrowing Invariant**: On subsequent finalize iterations after a fix, delta self-review rounds narrow only the candidate file set to files modified since the previous reviewed `worktree_sha`, never narrowing the hunk basis against the plan's base commit. Every fix hunk is reviewed together with its full enclosing passage (the enclosing section, list, table, or code block), never as the bare hunk. The plan's base commit is the footprint `base_ref` defined in link:store-schemas.adoc[Store Schemas Specification] (§ Three-Way File Footprint Reconciliation). Before computing candidates the step fetches `origin/<base_branch>` itself; the fail-closed refusal applies only when the base commit or the previous `worktree_sha` is still unresolvable after that fetch, and then the step fails with an explicit error rather than silently widening or skipping. The delta candidate set also includes the reference closure: every file of the plan footprint that references a path or a declared symbol changed since the previous reviewed `worktree_sha` (a document line made stale by an edit in another file is therefore a candidate in the next delta round, not only in the closing full round). When the previous round's `worktree_sha` is not an ancestor of `HEAD` (the branch was rebased), delta resolution is skipped, open findings stay pending, and a full round is required: an endpoint diff across an upstream advance never marks a finding fixed. A delta round can never close the step: a clean delta round is followed by exactly one full-surface round over the whole plan diff, and only a clean full-surface round records `done` (`may_close = true`). A delta round that surfaces findings loops back without a confirmation round.
+
+[[retrospective-aspects]]
+== Retrospective Aspect Extension Point (`provides_retrospective_aspects`)
+_See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+
+`plan-marshall`'s `provides_retrospective_aspects()` hook lets a domain bundle attach deterministic, script-backed analysis fragments to `plan-retrospective` for plans of its domain (`pm-plugin-development` is the only bundle declaring one). In `PM-MCP` it becomes an extension point of the post-run quality report (link:phase-workflows.adoc#post-run-quality-report[Phase Workflows Specification § Post-Run Quality Report]):
+
+* *Registration*: A domain bundle registers each aspect as a compiled instrument keyed `(domain_id, aspect)`; the report engine runs it only when the plan's domains include that `domain_id`. There is no script path and no model dispatch: the aspect is part of the in-process report engine.
+* *Instrument Contract*: A domain aspect is an instrument like any built-in one and obeys the report's Instrument Contract (populations, declared `proves` / `falsifiable_preconditions` / `self_included`, `zero_reason`, clean rendered). An aspect that cannot read its inputs renders `unmeasured`, never `0`.
+* *Observability Only*: Every domain aspect declares `gates_merge: false`; its verdicts are INFO decisions in `quality-report.json` and never enter the pre-merge barrier.
 
 == Out-of-Process Project Script Jobs (`project_script`) & Domain Workers
 _See Requirement link:../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
@@ -1142,20 +1305,20 @@ To support repository-specific automation (`finalize-step-*` skills that ship ex
 │  • Verifies script path, interpreter hash, and SHA-256 against enrolment│
 │  • Serializes closed JSON input payload; spawns isolated process group  │
 │  • Validates stdout against strict output JSON Schema                   │
-│  • Persists findings/facts into .plan/ stores atomically                │
+│  • Persists findings/facts into .marshall/ stores atomically            │
 └───────────────────┬─────────────────────────────────▲───────────────────┘
                     │ stdin: ProjectScriptInput JSON  │ stdout: ProjectScriptOutput JSON
                     ▼                                 │
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ Out-of-Process `project_script` Subprocess (Stateless Fact Producer)    │
 │  • Runs in sanitized environment (no provider credentials)              │
-│  • Reads worktree files read-only; NEVER writes to .plan/ stores        │
+│  • Reads worktree files read-only; NEVER writes to .marshall/ stores    │
 │  • Returns structured facts, candidate findings, or parsed log records  │
 └─────────────────────────────────────────────────────────────────────────┘
 ----
 
-1. *No Direct Store Mutation*: A `project_script` subprocess is a stateless fact producer. It **must never** write directly to `.plan/local/plans/`, `.plan/orchestrator/`, or `marshal.json`. All persistence is performed by the daemon after validating the script's JSON output.
-2. *Operator Enrolment Precondition*: Every `project_script` (and its runtime interpreter, such as a pinned `python3` binary) must be enrolled by the operator in `~/.plan-marshall/mcp/enrolments.json` with its repository-relative script path, expected SHA-256 content hash, maximum timeout, and allowed step/worker binding (`finalize_step`, `recipe_harvester`, `log_parser`, `module_discovery`, `edge_resolver`). If a script file is modified in the working tree without re-enrolment, the verify-not-resolve digest check rejects execution with job outcome `refused`.
+1. *No Direct Store Mutation*: A `project_script` subprocess is a stateless fact producer. It **must never** write directly to the per-project machine store (`<PM_MCP_BASE>/projects/<project_id>/`, outside its Landlock write set anyway), `.marshall/orchestrator/`, or `.marshall/config/`. All persistence is performed by the daemon after validating the script's JSON output.
+2. *Operator Enrolment Precondition*: Every `project_script` (and its runtime interpreter, such as a pinned `python3` binary) must be enrolled by the operator in the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (`project_scripts.<project_script_id>`, link:store-schemas.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]) with its repository-relative script path, expected SHA-256 content hash, interpreter, maximum timeout (`max_timeout_seconds`, the budget of every run, link:timeouts.adoc#project-script-budget[Timeouts & Budgets Specification]), its binding (`worker_kind` ∈ `finalize_step`, `recipe_harvester`, `log_parser`, `module_discovery`, `edge_resolver`, and `target`, the step id, recipe key, or build system it serves), and its `argument_schema` (an inline JSON Schema, validated as a schema at enrolment, against which the runtime validates the arguments of every run, `PM-EXT-5`). A job that uses a script for another worker kind or target than its binding is refused. If a script file is modified in the working tree without re-enrolment, the verify-not-resolve digest check rejects execution with job outcome `refused`.
 
 === Normative Input & Output JSON Schemas for `project_script`
 
@@ -1181,8 +1344,8 @@ To support repository-specific automation (`finalize-step-*` skills that ship ex
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "job_id": { "type": "string" },
-    "plan_id": { "type": ["string", "null"] },
+    "job_id": { "type": "string", "pattern": "^[bcgrpl]-[0-9a-f]{4,16}$" },
+    "plan_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
     "worker_kind": {
       "type": "string",
       "enum": ["finalize_step", "recipe_harvester", "log_parser", "module_discovery", "edge_resolver"]
@@ -1259,12 +1422,13 @@ _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JO
 }
 ----
 
-== Three-Way Configuration Split (`marshal.json`, Enrolment, Server State)
-_See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Three-Way Configuration Split (Project, Enrolment, Server State)]_
+[#config-split]
+== Configuration Split (Team Files, Operator Files & Enrolment, Server State)
+_See Requirement link:../Requirements.adoc#PM-EXT-6[PM-EXT-6: Configuration Split by Owner Class (Team, Operator, Server State)]_
 
-In the legacy architecture, `.plan/marshal.json` and `.plan/local/run-configuration.json` mixed declarative project settings, frozen extension hook snapshots (`skill_domains`), overridable shell commands (`verify_command`), language-server argument vectors, and learned runtime timeouts inside workspace files that the model's file/shell tools could modify.
+In the legacy architecture, `.plan/marshal.json` and `.plan/local/run-configuration.json` mixed declarative project settings, operator posture, frozen extension hook snapshots (`skill_domains`), overridable shell commands (`verify_command`), language-server argument vectors, server bookkeeping, and learned runtime timeouts inside workspace files that the model's file/shell tools could modify.
 
-`PM-MCP` enforces a fundamental security invariant: **Nothing that decides what binary or argument vector executes on the host may be read from a file the model can write.** Configuration and operational state are partitioned across three strictly separated stores.
+`PM-MCP` keeps none of these files and imports nothing from them: it never reads or writes `.plan/` (`PM-MIG-2`) and enforces a fundamental security invariant: **Nothing that decides what binary or argument vector executes on the host may be read from a file the model can write.** Configuration and operational state are partitioned by owner class across strictly separated stores, and every file has exactly one owner class: *team* (git-tracked, shared through the repository), *operator* (machine-local, written only through the operator channel), or *server* (machine-local state and caches). A value the server can observe or derive is never configured (link:store-schemas.adoc#derived-facts[Store Schemas Specification, Derived Facts Store]); a tuning value that calibrates a server algorithm is a compiled constant (link:timeouts.adoc#configuration-keys[Timeouts & Budgets Specification, Configuration Keys]); an option whose only effect is to weaken a guarantee does not exist.
 
 === Configuration Partition Matrix
 
@@ -1272,216 +1436,116 @@ In the legacy architecture, `.plan/marshal.json` and `.plan/local/run-configurat
 |===
 |Tier & Store Location |Git-Tracked? |Writer Authority |Permitted Contents
 
-|*Tier 1: Project Configuration* +
-`.plan/marshal.json`
+|*Tier 1: Team Configuration* +
+`.marshall/config/{project,workflow,domains,build-map}.json` +
+`.marshall/config/*.pmwf`
 |Yes (committed to repository)
-|Daemon via validated setup/config hypermedia links; Domain `config_defaults` seeded write-once.
-|Project metadata (`project.default_base_branch`), workflow posture & `*_without_asking` knobs, loop-back caps, effort role overrides (`plan.*.effort.*`, `orchestrator.effort.*`), active skill domains (`skill_domains`), `build.map` routes, non-secret provider selection and base URLs/origins (VCS=1, CI<=1, Sonar/other), `{tool}.acceptable_warnings`, and coverage thresholds. Architecture module enrichment is stored separately in `.plan/project-architecture/<module>/enriched.json`, as in `plan-marshall`.
+|Daemon via validated setup/config hypermedia links, and committed edits; sparse (only deviations), never seeded with defaults except the build map.
+|Repository policy (base branch, branch prefix, `merge_method` and `ci_provider` overrides, Sonar coordinates and credential-key references, review bots and review currency), workflow policy (minimum planning lane, refine policy, verification verbs, optional finalize step lanes and parameters, project finalize step descriptors, target-neutral effort levels), domain detection overrides, `build-map.json` routes, and the project-owned workflow units (link:workflow-dsl.adoc#project-owned-units[Workflow DSL Specification, Project-Owned Workflow Units & Compiled Invariants]). Schemas: link:store-schemas.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]. Architecture module enrichment is stored separately in `.marshall/project-architecture/<module>/enriched.json`, in the layout `plan-marshall` uses under `.plan/`.
 
-|*Tier 2: Operator Enrolment & Machine Config* +
-`~/.plan-marshall/mcp/enrolments.json` +
-`~/.plan-marshall/mcp/machine-config.json`
+|*Tier 2: Operator Files & Enrolment* +
+`<PM_MCP_BASE>/enrolments/<project_id>.json` +
+`<PM_MCP_BASE>/machine-config.json` +
+`<PM_MCP_BASE>/projects/<project_id>/local-config.json`
 |No (machine-local, outside workspace)
-|Human operator exclusively via `pm-mcp operator enrol` / `pm-mcp operator config` CLI (`0600` permissions; unreachable from any MCP tool or plan link).
-|Enrolled project root paths, pinned build wrappers (`./mvnw`, `./gradlew`, `./pw`) and SHA-256 digests, enrolled host tools (`npm`, `git`, `gh`, `glab`, `python3`, language server binaries) with absolute paths and SHA-256 digests, canonical & discovery argument template allowlists, `project_script` digests and schemas, CLI provider `verify_command` overrides, machine-local Axis-C resolver enablement (`derivation_resolvers`), and the machine-global build slot cap.
+|Human operator exclusively via `pm-mcp operator enrol` / `pm-mcp operator config` CLI or operator-channel elicitation (`0600` permissions; unreachable from any MCP tool or plan link).
+|Per project one enrolment file with its own HMAC and lock (link:store-schemas.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]): the enrolled project root, pinned build wrappers (`./mvnw`, `./gradlew`, `./pw`) with their SHA-256 digests, `pinned_files`, and interpreter, enrolled host tools (`npm`, `git`, `gh`, `glab`, `python3`) and language server binaries with absolute paths and SHA-256 digests, the canonical command templates per build verb and the discovery command templates, CLI provider `verify_argv` overrides, `project_script` digests, bindings, argument schemas, and maximum timeouts, operator command budgets, Landlock `write_paths`, and the captured build environment; the machine-global build slot cap and machine bounds; per project the operator posture of `local-config.json` (continuation default, merge consent, recipe auto-route, interaction mode, language, commit trailer, effort ladder, envelope budget override, Axis-C resolver enablement, retention), with machine-wide defaults in `machine-config.json` `project_defaults` (link:store-schemas.adoc#local-config[Store Schemas Specification, Operator Local Configuration]).
 
 |*Tier 3: Server-Managed State* +
-`~/.plan-marshall/mcp/state/` +
-`.plan/local/plans/<id>/mcp/`
-|No (git-ignored daemon runtime state)
+`<PM_MCP_BASE>/state/` +
+`<PM_MCP_BASE>/projects/<project_id>/`
+|No (machine-local daemon state, outside the repository)
 |Daemon exclusively (internal state stores and journals).
-|Adaptive build timeouts (`~/.plan-marshall/mcp/state/build-timings.json`, keyed by project and canonical command), historical CI durations, commit-keyed module discovery cache (`discovery-cache.json`), verification timestamps, active/completed job records and logs, crash-replay journals, and interaction audit logs.
+|Per project: learned job budgets (`build-timings.json`, keyed by canonical budget key), the job records of the write-ahead job journal (`jobs/<job_id>.json`), and the derived facts (`derived-facts.json`), among them the module discovery snapshot keyed by descriptor tree hash (fact kind `module_discovery`) and the cost calibration (fact kind `cost_calibration`; link:store-schemas.adoc#derived-fact-kinds-discovery-calibration[Store Schemas Specification, Derived fact kinds]); machine-wide: leases, install records, and the runtime record in `state/`, job logs, and the audit log.
 |===
 
-=== Tier 1: Git-Tracked Project Configuration (`.plan/marshal.json`)
+=== Tier 1: Git-Tracked Team Configuration (`.marshall/config/`)
 
-1. *Elimination of Frozen `skill_domains` Snapshots*: During migration from legacy `marshal.json`, frozen hook outputs stored under `skill_domains.{key}` (skill lists, globs, recipes) are treated as derived legacy artifacts and stripped. The compiled-in domain descriptors in `pm-mcp` are authoritative; `.plan/marshal.json` retains under `skill_domains` only the active domain IDs and explicit operator parameter overrides.
-2. *Write-Once Domain Defaults*: When a domain is enabled, its `config_defaults` map is merged into `.plan/marshal.json` using write-once semantics: existing project keys are never overwritten.
-3. *Provider Cardinality & Origin Pinning*: Provider declarations in `.plan/marshal.json` enforce category cardinality: exactly `1` version-control provider (`git`), at most `1` CI provider (`github` or `gitlab`), and `0..N` code-quality/issue providers (such as `sonar`). For token-lane REST providers (`PM-CRED-2`), `.plan/marshal.json` stores the non-secret provider `url` (which must use `https://`; the credential entry's own `url` is the origin tokens are sent to, `PM-CRED-5`), establishing the single issuing origin to which the daemon's REST client restricts authentication headers (forbidding cross-origin or HTTP downgrade redirects).
+1. *No Frozen Hook Snapshots*: Unlike `plan-marshall`'s `.plan/marshal.json`, no team file stores frozen hook outputs (skill lists, globs, recipes, `bundle`, `outline_skill`, `workflow_skill_extensions`). The compiled-in domain descriptors in `pm-mcp` are authoritative; domain activation and active profiles are derived (`setup.detect-domains`, per-module Axis-A applicability), and `domains.json` holds only overrides where the derivation is wrong for the repository (`enabled`, `always_on`, `file_globs`, `disabled_profiles`).
+2. *No Default Seeding*: Team files are sparse: no compiled default and no domain default is ever written into them. A domain descriptor contributes no `config_defaults` map; its defaults are compiled defaults of the effective configuration (link:store-schemas.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]). `plan-marshall`'s per-domain `project_skills` key does not exist: `PM-MCP` serves only compiled skills, and project automation enters as project-local recipes or enrolled `project_script` steps (whether project-local vocabulary skills become a feature is an open question of the client and CLI topic).
+3. *Derived Providers & Origin Pinning*: The version-control provider is always `git`; the CI provider is derived from the remote host and the enrolled host tools (derived fact `ci_provider`), overridable only by `project.json` `ci_provider` for self-hosted remotes; code-quality integrations (Sonar) are configured under `project.json` `integrations`, because their coordinates are project facts the server cannot observe. For token-lane REST providers (`PM-CRED-2`), a team file only references the credential key; it never decides where a token is sent. The single issuing origin to which the daemon's REST client restricts authentication headers is the origin of the operator-owned credential entry's `url` (`https://`, `PM-CRED-5`), never a value from a model-writable team file (forbidding cross-origin or HTTP downgrade redirects). A provider `verify_command` is never read from a team file; an override is an enrolment `verify_argv` (Tier 2).
+4. *One Owner per Key*: Operator posture (continuation default, merge consent, interaction mode, language, commit trailer, effort ladder, retention) never appears in a team file; a team file that carries it fails validation with `unknown_config_key`.
 
-=== Tier 2: Enrolled Argument Templates & Slot Cap (`~/.plan-marshall/mcp/`)
+[#enrolled-argument-templates]
+=== Tier 2: Enrolled Argument Templates & Slot Cap (`<PM_MCP_BASE>`)
 
-To prevent argument injection without requiring the operator to re-enrol the project every time a new module is added, build enrolment binds wrappers and host tools to **typed argument templates** defined by domain support:
+To prevent argument injection without requiring the operator to re-enrol the project every time a new module is added, build enrolment binds wrappers and host tools to **typed argument templates** defined by domain support. The templates live in the project's enrolment file (`build.canonical_templates.<build_system>.<verb>` and `build.discovery_templates.<build_system>.<name>`, link:store-schemas.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]); they decide what a build job runs, and no separate goal allowlist exists:
 
 [source,json]
 ----
 {
-  "canonical_templates": {
-    "maven": {
-      "module-tests": ["test", "-pl", "{module}"],
-      "quality-gate": ["verify", "-DskipTests", "-pl", "{module}"],
-      "verify": ["verify", "-P{profile}", "-pl", "{module}"]
-    }
+  "build": {
+    "canonical_templates": {
+      "maven": {
+        "module-tests": ["test", "-pl", "{module}"],
+        "quality-gate": ["verify", "-DskipTests", "-pl", "{module}"],
+        "verify": ["verify", "-P{profile}", "-pl", "{module}"]
+      }
+    },
+    "discovery_templates": {}
   }
 }
 ----
 
 * **Typed Placeholder Validation at Job Time**: When the daemon constructs a build job, it substitutes `{module}` and `{profile}` and validates them against its own cached module discovery snapshot (`{module}` must be a discovered module path/coordinate in the repository; `{profile}` must be a profile declared in that module's build descriptor).
-* **Enrolled Template Precedence**: An enrolled template for a canonical verb replaces the compiled default template for that project; every build representation names the template source (`enrolled` or `compiled_default`). Templates are never read from `.plan/marshal.json` (`PM-EXT-6`).
-* **Forbidden Free Flags**: Arbitrary user- or model-supplied flags—specifically `-D`, `-f`, `--file`, `-s`, `--settings`, `--init-script`, or shell metacharacters—are never accepted in canonical build jobs.
-* **Machine-Wide Slot Cap & Source Discrimination**: `machine-config.json` holds `max_concurrent_builds`. On every build submission, the scheduler resolves the cap and reports both the value and its resolution `source` (`machine_config`, `default`, `invalid`, or `unreadable`); `invalid` and `unreadable` configuration files are surfaced explicitly in diagnostics and never silently folded into `"default"`.
+* **Enrolled Template Precedence**: An enrolled template for a canonical verb replaces the compiled default template for that project; every build representation names the template source (`enrolled` or `compiled_default`). Templates are never read from a team configuration file (`PM-EXT-6`).
+* **Forbidden Free Flags**: Arbitrary user- or model-supplied flags—specifically `-D`, `-f`, `--file`, `-s`, `--settings`, `--init-script`, or shell metacharacters—are never accepted in canonical build jobs. Flags that repository files inject (`.mvn/maven.config`, `.mvn/jvm.config`, `gradle.properties`) are not filtered here; those files are pinned by the wrapper enrolment and refuse the build when changed (link:job-runtime.adoc[Job Runtime Specification], Verify-Not-Resolve).
+* **Machine-Wide Slot Cap & Source Discrimination**: `machine-config.json` holds `max_build_slots`. On every build submission, the scheduler resolves the cap and reports both the value and its resolution `source` (`machine_config`, `default`, `invalid`, or `unreadable`); `invalid` and `unreadable` configuration files are surfaced explicitly in diagnostics and never silently folded into `"default"`.
 
 === Tier 3: Adaptive Build Timeouts & Crash-Replay State
 
 The daemon maintains learned operational metrics and job journals in Tier 3 server state:
 
-1. *Adaptive Timeout Learning (`build-timings.json`)*: One machine-level store, `~/.plan-marshall/mcp/state/build-timings.json`, keyed by project (the enrolled project root) and canonical command (the normalized canonical argument vector `(build_system, canonical_verb, module_id, sorted_profiles)`); no project-local timeout store exists. Given observed run durations, the server maintains a max-biased baseline $T_{\text{learned}} = \lfloor 0.8 \times \max(T_{\text{learned}}, d) + 0.2 \times \min(T_{\text{learned}}, d) \rfloor$ and sets the execution timeout to $T_{\text{limit}} = \max\left(T_{\text{engine\_floor}},\; \lfloor 1.25 \times T_{\text{learned}} \rfloor\right)$. Per-engine minimum floors (Maven/Gradle/npm: `300s`, pyproject: `330s`) are never violated, even if an explicit bound is configured, every finished run (any exit code) feeds $T_{\text{learned}}$, a `timed_out` run never feeds it but sets a one-shot escalation budget $\min(2 \times \text{timeout}, 1800\,s)$ for the next run, residue-poisoned runs are not blended while clean observations exist, every allocation records its `budget_derivation`, and durations from `killed` or `cancelled` runs are **never** incorporated (link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning]).
-2. *One-Time Import of Learned Timeouts*: At machine cutover (`PM-MIG-2`), and when a project is first enrolled after cutover, the runtime imports that project's learned values once from `.plan/local/run-configuration.json` (`commands["<tool>:<key>"].timeout_seconds`, in seconds, e.g. `commands["maven:verify"]`) as the initial $T_{\text{learned}}$ of the canonical command the key maps to. Existing `build-timings.json` entries are never overwritten, keys that map to no canonical command are skipped and listed in the cutover receipt, and the legacy file is left unchanged. As a store conversion under `PM-MIG-3`, the import has a reverse converter that writes the learned values back to their originating keys on rollback (`PM-MIG-5`). The legacy source mirrors `plan-marshall` (`manage-run-config/scripts/run_config.py`, `script-shared/scripts/build/_build_execute.py`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+1. *Adaptive Timeout Learning (`build-timings.json`)*: One store per project, `<PM_MCP_BASE>/projects/<project_id>/build-timings.json` (link:store-schemas.adoc#build-timings-store[Store Schemas Specification, Build Timings Store]), keyed by canonical budget key (for build jobs the normalized canonical command `(build_system, canonical_verb, module_id, sorted_profiles)`); no repository-local and no machine-level timeout store exists, so a moved checkout keeps its budgets. The server maintains a max-biased learned baseline from observed run durations and allocates each job budget from it; the per-engine floors are never violated, also not by an operator budget, which may exceed the escalation cap but is clamped up to the floor. Which runs feed the baseline is defined in link:job-runtime.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning]; the blend, the floors, the allocation, the escalation budget and its cap, operator budgets, and `budget_derivation` are defined only in link:timeouts.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets].
+2. *No Inherited Timeouts*: Every learned value starts from the project's own finished runs under `PM-MCP`; learned timeouts of legacy `plan-marshall` (`.plan/local/run-configuration.json`) are never read or imported (`PM-MIG-2`). Until a key has a learned value, its budget is the floor default (link:timeouts.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]).
 3. *Gate Honesty & Examined Population Tracking*: Before a green build or quality gate clears open findings in `findings.jsonl`, the server's compiled log and report parsers verify that for Maven and Gradle the build log explicitly contains the engine's terminal success marker (e.g., `BUILD SUCCESS` / `BUILD SUCCESSFUL`) in addition to exit code `0`, and that the tool examined a non-empty file/test population capable of reaching the finding's file and category (e.g., `mypy` gates run with `--no-incremental` / cache disabled so untouched files with broken cross-module types are not skipped).
-4. *Crash Replay & Atomic Fate Recording*: Every spawned job is recorded in the daemon's write-ahead job journal prior to `ProcessBuilder.start()`. Request status (`running`) is never treated as terminal fate; terminal fate (`succeeded`, `failed`, `timed_out`, `cancelled`, `killed`, `indeterminate`) is written atomically at process termination. If the daemon restarts while a job record is still `running`, journal replay marks the orphaned job `killed` ("do not retry blindly") and attaches no synthetic error findings.
+4. *Crash Replay & Atomic Fate Recording*: Every spawned job is recorded in the daemon's write-ahead job journal, one job record `<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.json` per job (link:store-schemas.adoc#job-record[Store Schemas Specification, Job Record]), prior to `ProcessBuilder.start()`. Request status (`running`) is never treated as terminal fate; terminal fate (`succeeded`, `failed`, `failed_unparsed`, `timed_out`, `cancelled`, `killed`, `indeterminate`), derived by link:job-runtime.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation], is written atomically at process termination; `refused` is written atomically when the job is refused before spawn, so no journal entry of a refused job ever reaches `ProcessBuilder.start()`. If the daemon restarts while a job record is still `running`, journal replay marks the orphaned job `killed` ("do not retry blindly") and attaches no synthetic error findings.
 
-== Systematized `marshal.json` Upgrades: Command-Pattern Migration Chain & Zero-CoT Reconciliation (`PM-EXT-7`)
-_See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Versioned Command-Pattern Configuration Upgrades & Zero-CoT Reconciliation]_
+[#config-upgrades]
+== Configuration Validation & Upgrades Before 1.0 (`PM-EXT-7`)
+_See Requirement link:../Requirements.adoc#PM-EXT-7[PM-EXT-7: Configuration Versioning, Validation & Zero-CoT Upgrades]_
 
-In legacy `plan-marshall`, schema and default updates to `.plan/marshal.json` were split across ad-hoc hooks inside `manage_config.py -> sync-defaults` (`RETIRED_STEP_KEY_RENAMES`, `run_at_all -> lane`, lane materialization), separate CLI canonicalizers (`steps-sort`, `normalize-keys`), and one-shot subcommands in `marshall-steward/scripts/upgrade.py` (`migrate-bot-lists`, `validate-bot-lists`). Every new migration required adding prose instructions to `upgrade-flow.md` that the LLM had to read into its context window and execute via separate `Bash` calls—polluting the model's Chain of Thought (CoT) with historical schema trivia even on already-current repositories.
+In legacy `plan-marshall`, schema and default updates to `.plan/marshal.json` were split across ad-hoc hooks inside `manage-config.py -> sync-defaults` (`RETIRED_STEP_KEY_RENAMES`, `run_at_all -> lane`, lane materialization), separate CLI canonicalizers (`steps-sort`, `normalize-keys`), and one-shot subcommands in `marshall-steward/scripts/upgrade.py` (`migrate-bot-lists`, `validate-bot-lists`). Every new migration required adding prose instructions to `upgrade-flow.md` that the LLM had to read into its context window and execute via separate `Bash` calls—polluting the model's Chain of Thought (CoT) with historical schema trivia even on already-current repositories. The seeding, sorting, and offered-step bookkeeping existed only to keep a materialised copy of compiled defaults consistent.
 
-`PM-MCP` replaces ad-hoc config updates with a self-contained, version-tracked **Command-Pattern** subsystem (`de.cuioss.pm.mcp.core.config.migration`) executed atomically inside the server.
+`PM-MCP` has none of this machinery. Team files are sparse and hold no defaults, so there is nothing to seed, sync, sort, normalize, or offer through a ledger; there is no `system` block, no seed fingerprint, no migration chain (`ConfigMigrationCommand`, `ConfigReconciler`), and no startup migration. It never reads, converts, or upgrades a legacy `.plan/marshal.json` (`PM-MIG-2`).
 
-=== 1. Version Tracking & Migration Ledger in `.plan/marshal.json`
+=== 1. One Version Rule for Every File Kind
+_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-21[PM-WATCH-EXT-21]_
 
-Every `.plan/marshal.json` root document carries a `system` tracking block managed exclusively by `ConfigReconciler` (see link:store-schemas.adoc[Store Schemas Specification]):
+Every team configuration file, the operator's `local-config.json`, every enrolment and credential file, every server store, and every workflow unit declares its format version (`format_version`, or the `format` of a unit header). Before 1.0 a binary accepts exactly the current version of each kind and refuses any other with `format_outdated` or `format_newer` naming the file (link:store-schemas.adoc#format-versioning[Store Schemas Specification, Format Versioning]); a reader never rewrites a file. The migration mechanism for 1.0 and later (one mechanism for every file kind) is decided at 1.0 with the knowledge of the actual format churn.
 
-The `system` block extends the one `plan-marshall` already writes (`retention`, `provisioned_version`, `config_seed_fingerprint`); the first migration command (`M001`) adds the versioning fields. `marshal.json` has no `format_version` of its own.
+=== 2. Validation on Every Read & the Effective Configuration
 
-[source,json]
-----
-{
-  "system": {
-    "retention": { "logs_days": 1, "archived_plans_days": 5 },
-    "provisioned_version": "1.0.0",
-    "config_seed_fingerprint": "a94f6e2c81b3d04e7f1298a0b5c6d7e8f90123456789abcdef0123456789abcd",
-    "schema_version": 4,
-    "baseline_version": 1,
-    "applied_migrations": [
-      "M002_rename_retired_step_keys",
-      "M003_migrate_run_at_all_to_lane",
-      "M004_split_enabled_bots_to_participation_lists"
-    ]
-  }
-}
-----
+Every computation of the effective configuration (at `pm_start`, phase handshakes, `pm-mcp enter`, and `setup.reconcile-config`) parses the team files and the operator file against their closed schemas, applies the server-side rules of each key, loads and verifies the project's workflow units (link:workflow-dsl.adoc#project-owned-units[Workflow DSL Specification, Project-Owned Workflow Units & Compiled Invariants]), resolves every value along its chain (team or operator file, derived fact, compiled default), and publishes the result with per-key sources as `pm://project/config` (link:store-schemas.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]). A non-object root fails before any field access. Unknown keys are `unknown_config_key` findings naming the key path, never silently kept as unread settings; a setup or config link that would write an undeclared key is refused (`invalid_link_args`). Review-bot tokens are checked against the registered bot kinds (`unregistered_kind`) and effort keys against the role registry (`PM_MCP-100`).
 
-* `retention`, `provisioned_version`: Kept from `plan-marshall` unchanged. `provisioned_version` is the version of the binary that last reconciled the file and only advances when a valid version is present (never blanked).
-* `schema_version`: Monotonically increasing integer (`1..CURRENT_SCHEMA_VERSION`) identifying the highest `ConfigMigrationCommand.targetVersion()` applied to this file; its absence identifies an unmigrated `plan-marshall` file, which `M001` handles.
-* `baseline_version`: Integer epoch floor (`MINIMUM_SUPPORTED_SCHEMA_VERSION`). Migration IDs with `targetVersion <= baseline_version` are compacted out of `applied_migrations` at major epoch bumps so `.plan/marshal.json` never accumulates unbounded historical entries.
-* `applied_migrations`: Ordered array of `migrationId` strings for all commands applied above `baseline_version`.
-* `offered_steps`: Step ids ever seeded into or offered for the operator-prunable step maps (§ 3); written only by `ConfigReconciler` and by the answer to a new-step offer.
-* `config_seed_fingerprint`: *Deliberate change vs. `plan-marshall`* (8-hex MD5 over the default config only): a deterministic SHA-256 digest of the compiled-in default configuration tree, the active domains' `config_defaults`, and the `FinalizeStepDescriptor` ordering table.
+=== 3. Upgrade Path: Drain, Release Notes, Offered Default Changes
+_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-22[PM-WATCH-EXT-22]_
 
-=== 2. Command-Pattern Architecture (`ConfigMigrationCommand`)
+A new binary reaches a project in three ways, none of which rewrites a file silently:
 
-Each version-specific structural or value migration ($v-1 \to v$) is implemented as a standalone, immutable Java class implementing the sealed `ConfigMigrationCommand` interface:
+. *New compiled defaults* take effect at once for every key a team or operator file does not set, because the files are sparse. In-flight plans stay on their bound snapshot (§ 5).
+. *A `format_version` bump* of a file kind is listed in the release notes with the changed keys. Scope stores of in-flight plans follow the drain rule: `pm-mcp drain` reports the live scopes, and the operator finishes them before upgrading. For a team JSON file the binary refuses (`format_outdated`), `setup.reconcile-config` offers a server-rendered rewrite at the current format: every key still valid is carried over, every key the new schema no longer admits is listed by name as dropped, and the rewrite is shown as a diff and lands only through `setup.commit-changes`. An operator file is refused by the CLI naming the file and the changed keys, and the operator sets the keys again through `pm-mcp operator config`.
+. *Changed default workflow units* are offered in `setup.offer-new-steps` as a three-way diff: from the default revision the project unit was derived from (`derived_from` in the unit header) to the binary's current default revision, applied to the project's unit. `adopt` applies the hunks and advances `derived_from`; `decline` advances `derived_from` without applying them, so a declined change is never offered again, and a step the team removed from its unit is never restored (only hunks between two default revisions are ever offered). The resulting unit is verified like every project unit before it can land.
 
-[source,java]
-----
-package de.cuioss.pm.mcp.core.config.migration;
-
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.util.List;
-import java.util.Set;
-
-public record MigrationContext(
-    Set<String> enabledDomains,
-    Set<String> registeredBotKinds,
-    List<String> orderedFinalizeStepIds
-) {}
-
-public record MigrationMutation(
-    String kind,        // "renamed" | "migrated" | "stripped" | "seeded"
-    String jsonPointer,
-    String detail
-) {}
-
-public record MigrationWarning(
-    String code,        // e.g., "unknown_bot_tokens", "unrecognized_top_level_key"
-    String jsonPointer,
-    String message,
-    List<String> offendingValues,
-    List<String> allowedValues
-) {}
-
-public record MigrationStepResult(
-    int targetVersion,
-    String migrationId,
-    boolean mutated,
-    List<MigrationMutation> mutations,
-    List<MigrationWarning> warnings
-) {}
-
-public sealed interface ConfigMigrationCommand
-    permits M001_StripLegacySkillDomainsAndExecBindings,
-            M002_RenameRetiredStepKeys,
-            M003_MigrateRunAtAllToLane,
-            M004_SplitEnabledBotsToParticipationLists {
-
-    /** Strictly monotonic target schema version (e.g., 1, 2, 3, 4). */
-    int targetVersion();
-
-    /** Stable unique identifier (e.g., "M004_split_enabled_bots_to_participation_lists"). */
-    String migrationId();
-
-    /** Concise human-readable summary for audit.jsonl and operator receipts. */
-    String description();
-
-    /**
-     * Applies an idempotent structural/value transformation to the raw Jackson ObjectNode AST.
-     * Must preserve operator overrides (Rule 3) and never throw on already-migrated trees.
-     */
-    MigrationStepResult execute(ObjectNode root, MigrationContext context);
-}
-----
-
-* *AST-Before-Binding Isolation*: `ConfigMigrationCommand.execute(...)` transforms the raw Jackson `ObjectNode` tree **before** the tree is deserialized into the strongly typed `MarshalConfigRecord`. Consequently, `MarshalConfigRecord` and runtime readers (`ConfigService`) represent **only** the current canonical schema and never carry `@JsonAlias` annotations, deprecated record components, or fallback branches for retired keys.
-* *Lossless Override Preservation*: Every command must move or transform existing operator values in place rather than resetting to defaults (e.g., renaming `default:automated-review` $\to$ `plan-marshall:automatic-review` carries the step's nested parameter block verbatim, or drops the retired key if the canonical key already exists; migrating `enabled_bots` $\to$ `required_bots` / `optional_bots` never overwrites an existing operator-answered `bot_lists_provenance`).
-
-=== 3. Five-Phase Atomic Reconciliation Pipeline (`ConfigReconciler`)
-_Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-21[PM-WATCH-EXT-21], link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-22[PM-WATCH-EXT-22]_
-
-All updates to `.plan/marshal.json` (whether triggered during `steward` setup/upgrade, `pm-mcp operator upgrade-config`, or automatic forward migration) pass through a single deterministic in-process method `ConfigReconciler.reconcile(Path marshalJsonPath)`:
-
-[source,text]
-----
-Raw .plan/marshal.json (ObjectNode)
-  │
-  ├─► Phase 1: Pending Command Chain (v_cur + 1 .. CURRENT_SCHEMA_VERSION)
-  │     Executes each unapplied ConfigMigrationCommand in ascending targetVersion order
-  │
-  ├─► Phase 2: Non-Destructive Default Seeding (syncDefaults)
-  │     Deep-merges missing keys from DefaultMarshalConfig + enabled domain config_defaults
-  │     (key-exists preservation: existing operator values and lists are never overwritten;
-  │     operator-prunable step maps are excluded, new steps are offered once via offered_steps)
-  │
-  ├─► Phase 3: Deterministic Canonicalization (stepsSort + normalizeKeys)
-  │     Re-orders plan.phase-6-finalize.steps by FinalizeStepDescriptor.order() ascending
-  │     and orders all top-level/nested object keys into canonical schema order
-  │
-  ├─► Phase 4: Registry & Post-Condition Validation
-  │     Validates every key at every level against the MarshalConfigRecord schema and checks
-  │     required_bots/optional_bots against registered bot kinds; unknown keys are reported
-  │
-  └─► Phase 5: Epoch Compaction, Stamp & Conditional Atomic Write
-        Compacts applied_migrations <= baseline_version, updates system.schema_version,
-        provisioned_version, and config_seed_fingerprint, and atomically writes
-        .plan/marshal.json ONLY if canonical JSON bytes changed
-----
-
-*Operator-Prunable Step Maps*: `plan.phase-5-execute.verification_steps` and `plan.phase-6-finalize.steps` are keyed maps the operator prunes by deleting keys, so a missing key there means "removed", never "not yet seeded". Phase 2 therefore never deep-merges into them. `system.offered_steps[]` records every step id ever seeded into or offered for these maps; a shipped step id absent from it is offered once through a setup `*.awaiting_user` question (`add` / `decline`), and either answer is recorded in `offered_steps`, so a declined or removed step is never offered or added again. The initial seeding of a new project (no `system.schema_version`) writes the default maps and records their ids. *Deliberate change vs. `plan-marshall`*: `plan-marshall`'s `syncDefaults` deep-merges these maps and restores removed steps (TokenSheriff#745).
-
-*Undeclared Keys Are Refused, Never Kept Unread*: A setup or config link that would write a key not declared in `MarshalConfigRecord` is refused (`invalid_link_args`). Unknown keys found in a hand-edited `.plan/marshal.json` are reported as `unknown_config_key` findings naming the key path; they are never silently kept as unread settings.
-
-=== 4. Anti-CoT-Clutter & Lifecycle Compaction Guarantees
+=== 4. Anti-CoT-Clutter Guarantees
 
 To ensure configuration upgrades never degrade model reasoning or bloat context windows:
 
 1. *Zero Migration Prose in Skills (`PM-SKILL-1`, `PM-EXT-7`)*: No vocabulary skill (`skill://pm/...`) or workflow state prompt ever instructs the model to run `sync-defaults`, `steps-sort`, `normalize-keys`, or `migrate-*` commands, nor mentions retired configuration keys (`enabled_bots`, `run_at_all`, `default:automated-review`, `skill_domains`).
-2. *Silent $O(1)$ Fast-Path When Current*: At `pm_start`, phase handshakes, and `pm-mcp enter`, the server compares `(system.schema_version, system.config_seed_fingerprint)` against `(CURRENT_SCHEMA_VERSION, CURRENT_SEED_FINGERPRINT)`. When they match, verification completes in memory in $<1\text{ ms}$ and emits **zero** facts, links, or warnings into the state representation.
-3. *Single Server-Side Reconcile Transition*: When `schema_version < CURRENT_SCHEMA_VERSION` or `config_seed_fingerprint` differs, `steward` (or `pm-mcp operator upgrade-config`) runs the entire 5-phase `ConfigReconciler` pipeline in one atomic step (`config.reconcile`) and emits a compact receipt containing only non-empty deltas (`from_schema_version`, `to_schema_version`, `applied_migrations[]`, `added_defaults_count`, `new_step_offers[]`, `warnings[]`); `added_defaults_count` never counts a key of an operator-prunable step map, and `new_step_offers[]` lists the newly shipped steps offered, so a new default is never confused with re-adding a removed one.
-4. *Epoch Compaction (`MINIMUM_SUPPORTED_SCHEMA_VERSION`)*: At major releases, `MINIMUM_SUPPORTED_SCHEMA_VERSION` advances. `ConfigMigrationCommand` classes with `targetVersion <= MINIMUM_SUPPORTED_SCHEMA_VERSION` are deleted from the active command chain, and `ConfigReconciler` compacts their IDs out of `system.applied_migrations` into `system.baseline_version`. If a repository presents a `schema_version < MINIMUM_SUPPORTED_SCHEMA_VERSION`, `ConfigReconciler` fails closed with an explicit `unsupported_legacy_config_epoch` error naming the required bridge version.
-5. *Three-Surface Synchronization (In-Flight `execution-manifest.json` Snapshot & Adoption)*: An in-flight plan (Phases 4–6) executes against the configuration snapshot bound at composition. Whenever `ConfigReconciler` or an edit changes `.plan/marshal.json`, the next phase handshake (`phase-workflows.adoc`, Outside-World Invariants) detects that the plan's recorded `config_hash` / `schema_version` differs and runs `ExecutionManifestResolver` in-process to compose a candidate: an identical candidate is adopted silently; a differing one enters `<phase>.config-drift` (`adopt` / `keep`, audited). The manifest records its `composed_inputs` (`config_hash`, `realized_footprint_digest`, `change_type`, `providers_digest`); at Phase 6 entry the resolver re-computes every recorded input: a difference in the plan's own inputs (`realized_footprint_digest`, `change_type`, `providers_digest`) re-composes the manifest and records the changed inputs in `facts`, a difference in `config_hash` follows the adoption rule above, and an input the resolver cannot re-derive is listed as `unchecked` in those facts, never omitted. `config_hash` is computed over the `.plan/marshal.json` of the plan's current location (the worktree copy from Phase 5 on), so a deliverable that edits a configuration knob re-composes the manifest at the next handshake.
-6. *Build-Time Chain Integrity Verification (`ConfigMigrationChainTest`)*: JUnit 5 build tests in `pm-mcp-core` enforce:
-** Contiguous gap-free `targetVersion()` numbering from `MINIMUM_SUPPORTED_SCHEMA_VERSION + 1` to `CURRENT_SCHEMA_VERSION`.
-** Globally unique `migrationId()` strings matching `^M\d{3}_[a-z0-9_]+$`.
-** Strict idempotency: running `ConfigReconciler.reconcile(...)` a second time on any migrated fixture yields `mutated == false` and zero byte diff.
-** Lossless override preservation across per-version fixture pairs (`v1 -> v2 -> ... -> vN`).
+2. *Silent Fast-Path When Current*: At `pm_start`, phase handshakes, and `pm-mcp enter`, the server compares the digests of the team files, the operator file, the project's workflow units, the derived facts, and the compiled defaults with those of the last validated effective configuration; when they match, verification completes in memory and emits **zero** facts, links, or warnings into the state representation.
+3. *Upgrades Only in the Setup Workflow*: Offered default changes and format rewrites happen only in `project-setup` (`setup.reconcile-config`, `setup.offer-new-steps`), whose receipt lists only non-empty deltas (`format_refusals[]`, `rewrites[]`, `unit_changes_offered[]`, `findings[]`).
+
+[#config-snapshot]
+=== 5. Three-Surface Synchronization (In-Flight `execution-manifest.json` Snapshot & Adoption)
+
+An in-flight plan (Phases 4–6) executes against the configuration snapshot bound at composition. `config_hash` is computed over the effective configuration: every effective value with its source, the compiled defaults, the derived facts the values rest on, the team files, the operator file, and the process DSL units the plan's lifecycle loads (link:store-schemas.adoc#project-configuration-store[Store Schemas Specification, Project Configuration] item 6), never over raw file bytes alone, so a binary upgrade that changes a default would otherwise silently change in-flight plans. Whenever an edit, a changed derived fact, a changed workflow unit, or a new binary changes it, the next phase handshake (`phase-workflows.adoc`, Outside-World Invariants) detects that the plan's recorded `config_hash` differs and runs `ExecutionManifestResolver` in-process to compose a candidate: an identical candidate is adopted silently; a differing one raises the `config_drift` condition on the phase entry state (`adopt` / `keep`, audited; link:state-catalogue.adoc#condition-config_drift[State Catalogue, Conditions]). A candidate whose workflow units no longer contain the plan's current state or an entry of its `call_stack` offers only `keep`. The manifest records its `composed_inputs` (`config_hash`, `realized_footprint_digest`, `change_type`, `providers_digest`); at Phase 6 entry the resolver re-computes every recorded input: a difference in the plan's own inputs (`realized_footprint_digest`, `change_type`, `providers_digest`) re-composes the manifest and records the changed inputs in `facts`, a difference in `config_hash` follows the adoption rule above, and an input the resolver cannot re-derive is listed as `unchecked` in those facts, never omitted. `config_hash` reads the configuration of the plan's current location (the worktree copy of `.marshall/config/` from Phase 5 on), so a deliverable that edits a configuration file or workflow unit re-composes the manifest at the next handshake.
+
+=== 6. Build-Time Verification
+
+JUnit 5 build tests in `pm-mcp-core` enforce:
+
+** Every configuration schema is closed at every level and valid JSON Schema (draft 2020-12); the compiled default table satisfies it.
+** Every default workflow unit passes Rules 1–12 and the compiled invariants (link:workflow-dsl.adoc#project-owned-units[Workflow DSL Specification]), and the invariant checker refuses a fixture set of weakened units (a mandatory step removed, the push barrier bypassed, the Q-Gate removed from a phase that requires it).
+** A three-way default-unit offer never re-adds a hunk the fixture project removed, and a declined offer is not repeated.
 
 

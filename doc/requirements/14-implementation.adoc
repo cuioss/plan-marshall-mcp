@@ -5,27 +5,29 @@
 
 To guarantee fast unit test execution, clean architectural boundaries, and framework independence, the repository must separate domain logic from the Quarkus runtime assembly.
 
-* The codebase must transition from the initial single-module bootstrap (`plan-marshall-mcp`) into three primary build modules:
+* The codebase must transition from the initial single-module bootstrap (`plan-marshall-mcp`) into three primary build modules and one out-of-band module. New modules must be added with their first code, never as empty shells.
 ** `pm-mcp-core` (*Plain Java*): Contains all workflow primitives, the workflow DSL parser/validator/diagram generator, the hypermedia state engine, JSON/JSONL state stores, the TOON encoder, and client profile translation logic. It must depend only on Jackson and `cui-java-tools`, with zero dependencies on Quarkus, CDI, or MCP libraries.
-** `pm-mcp-server` (*Quarkus Runtime Assembly*): Wires `pm-mcp-core` into the always-on runtime via CDI producers (`quarkus-mcp-server-http` on a Unix domain socket), exposing MCP tools and resources, the `pm-mcp serve` STDIO relay, CLI subcommands (`runtime`, `serve`, `enter`, `client`, `operator`, `status`, `drain`, and the internal `job-exec` process-group shim), native-image reflection registrations (`@RegisterForReflection`), and `McpAssured` integration tests (`*IT`).
-** `pm-mcp-dist` (*Packaging*): Produces platform release archives, installation layouts, embedded client bundles, and CycloneDX SBOMs.
+** `pm-mcp-server` (*Quarkus Runtime Assembly*): Wires `pm-mcp-core` into the always-on runtime via CDI producers (`quarkus-mcp-server-http` on a Unix domain socket), exposing MCP tools and resources, the `pm-mcp serve` STDIO relay, CLI subcommands (`runtime`, `serve`, `enter`, `client`, `operator`, `status`, `drain`, `hook`, and the internal `job-exec` process-group shim), native-image reflection registrations (`@RegisterForReflection`), and `McpAssured` integration tests (`*IT`).
+** `pm-mcp-dist` (*Packaging*): Produces the release layout: the native `pm-mcp` binaries per supported platform (client bundles embedded), their SHA-256 digests, a CycloneDX SBOM, and the release notes.
+** `pm-mcp-conformance` (*Out-of-band*): Hosts the behavioural conformance harness (`PM-TEST-6`) as its own module outside the regular build: it is built and run only through its own Maven profile and is never part of `verify` or a required CI check.
+* The deterministic scenario replay harness (`pm-mcp-scenario`, `PM-TEST-4`) must be a test-scope part of `pm-mcp-core` (JUnit, in-process), not a module of its own.
 * Dependency direction must flow strictly from `pm-mcp-server` to `pm-mcp-core`; `pm-mcp-core` must define service interfaces (e.g., job execution, plan locking) implemented by `pm-mcp-server`.
 * Unit tests in `pm-mcp-core` (`test -pl pm-mcp-core`) must execute directly on the JVM without Quarkus augmentation, and an automated build test in `pm-mcp-server` must verify that every persisted Java record in `pm-mcp-core` is registered for GraalVM native reflection.
 * Both modules must share a unified `LogRecord` numbering registry defined in `pm-mcp-core` and independently satisfy project test coverage minimums.
 
-See the link:specification/workflow-dsl.adoc[Workflow DSL & State Machine Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+See the link:specification/workflow-dsl.adoc[Workflow DSL & Engine Specification] and link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details.
 
 [#PM-IMPL-2]
 === PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output
 
 The system must separate internal persistence formats from model-facing wire representations, optimizing disk storage for schema evolution and wire output for token efficiency.
 
-* All server-owned machine state must be persisted as canonical JSON documents (one file per entity, such as `status.json`, `entry.json`, `references.json`, `TASK-NNN.json`) or append-only JSONL logs (`findings.jsonl`, `change-ledger.jsonl`, `audit.jsonl`) serialized via Jackson 2 over Java records.
-* Every persisted JSON document and JSONL record, except the operator-edited credential files kept in `plan-marshall` format (`PM-CRED-3`) and the git-tracked `.plan/marshal.json` (versioned by `system.schema_version`, `PM-EXT-7`), must carry a mandatory integer `format_version` attribute; the daemon must automatically migrate older store versions forward on startup before serving requests.
-* Narrative documents authored for human and model consumption (`request.md`, `outline.md`, `spec.md`, lessons) must remain in standard Markdown format; the narrative of an epic landing is a Markdown field of its structured landing record, which is written as one atomic unit together with its server-derived facts, so no narrative-only landing can exist.
+* All server-owned machine state must be persisted as canonical JSON documents (one file per entity, such as `status.json`, `references.json`, `TASK-NNN.json`, `jobs/<job_id>.json`) or append-only JSONL logs (`findings.jsonl`, `change-ledger.jsonl`, `sessions.jsonl`, `audit.jsonl`) serialized via Jackson 2 over Java records.
+* Every persisted JSON document and JSONL record, including the git-tracked team configuration files (`.marshall/config/*.json`) and the operator-owned `local-config.json`, `machine-config.json`, enrolment, and credential files (`PM-CRED-3`), must carry a mandatory integer `format_version` attribute. Before 1.0 the daemon must accept exactly the current version of each file kind and refuse any other with `format_outdated` or `format_newer` naming the file; it must never migrate a store on startup, and a format bump is handled by the drain rule, the release notes, and the project setup workflow (`PM-EXT-7`); the migration mechanism for 1.0 and later is decided at 1.0.
+* Narratives authored for human and model consumption (`request.md`, `outline.md`, `spec.md`, lesson bodies) must stay Markdown text; structured metadata of a narrative lives beside it (a lesson's YAML front matter, validated against a closed schema with `format_version`); the narrative of an epic landing is a Markdown field of its structured landing record, which is written as one atomic unit together with its server-derived facts, so no narrative-only landing can exist.
 * Model-facing tool results and state representations must be rendered into TOON format strictly at the MCP wire boundary from the underlying Java records.
 
-See the link:specification/store-schemas.adoc[Store Schemas & Data Model Specification] and link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Representation Specification] for implementation details.
+See the link:specification/store-schemas.adoc[Store Schemas Specification], link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Encoding Specification], and the link:specification/identifiers.adoc[Identifier Registry] for implementation details.
 
 Implementation watch: link:implementation-watch/client-profiles.adoc#PM-WATCH-CLIENT-1[PM-WATCH-CLIENT-1]
 
@@ -36,9 +38,9 @@ Implementation watch: link:implementation-watch/client-profiles.adoc#PM-WATCH-CL
 
 * The system must implement a native, reflection-free TOON encoder in `pm-mcp-core` conforming to the official TOON specification (version pinned after verification in Milestone 1) for the subset emitted by `PM-MCP`: objects, tabular object arrays, length-prefixed inline primitive arrays, and minimal string quoting with the official escapes (no block literals).
 * The TOON encoder must be verified against the conformance test fixtures of the pinned official TOON specification version.
-* A reader for `plan-marshall`'s legacy TOON dialect (supporting tab-sniffed rows, embedded JSON cells, and block scalars) must be restricted strictly to test and migration utilities for differential test comparison and one-time store conversion, and must never be exposed in production request handling.
+* A reader for `plan-marshall`'s legacy TOON dialect (supporting tab-sniffed rows, embedded JSON cells, and block scalars) must be restricted strictly to test utilities for differential test comparison (`PM-TEST-2`) and must never be part of the production code.
 
-See the link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Representation Specification] for implementation details.
+See the link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Encoding Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-1[PM-WATCH-HYP-1], link:implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-4[PM-WATCH-HYP-4]
 
@@ -48,31 +50,35 @@ Implementation watch: link:implementation-watch/hypermedia-format.adoc#PM-WATCH-
 Because builds, CI runs, and review-bot windows exceed typical MCP tool call timeouts across hosts, the system must provide resilient hypermedia waiting primitives backed by persistent daemon jobs.
 
 * Every background job must execute inside the always-on runtime, independently of any host connection, and persist its state so that it survives relay termination, context loss, and host restarts (`PM-ARCH-9`), exposing four hypermedia link primitives:
-** *Bounded Wait (`wait:<job_id>`)*: Blocks up to a configurable duration safely below the host's idle timeout (default 4 minutes) and returns either the completed job transition or the running state representation with updated progress and a fresh `wait` link.
-** *Progress Wait (`wait:<job_id>`)*: Activated automatically when *both* the active client profile declares that MCP progress notifications reset the host's idle timer *and* the incoming MCP request supplies a `progressToken`; emits progress notifications at least every 60 seconds and blocks until job completion or an extended upper bound (default 30 minutes).
+** *Bounded Wait (`wait:<job_id>`)*: Blocks up to a configurable duration safely below the host's idle timeout and returns either the completed job transition or the running state representation with updated progress and a fresh `wait` link.
+** *Progress Wait (`wait:<job_id>`)*: Activated automatically when *both* the active client profile declares that MCP progress notifications reset the host's idle timer *and* the incoming MCP request supplies a `progressToken`; emits progress notifications periodically, never with a gap the host could read as idle, and blocks until job completion or an extended upper bound.
 ** *Composite Wait (`wait:<composite_id>`)*: Monitors a concurrent region of parallel jobs (such as `finalize.concurrent-wait` across CI runs and review-bot rate windows), unblocking when all member jobs settle or immediately short-circuiting to a failure state if any required job fails.
 ** *Cancel (`cancel:<job_id>`)*: Terminates the target job process group and transitions the representation to the cancelled state.
 * The server must select between bounded wait and progress wait automatically without model involvement, and must omit separate polling tools in favor of bounded `wait` links; the only exception is `pm_build`, which serves plan-less builds that have no scope for a `wait:` link and therefore continues a running build via its own `job_id` argument with the same bounded window (`PM-TOOL-2`).
 
-See the link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Representation Specification] and link:specification/job-runtime.adoc[Job Runtime & Execution Specification] for implementation details.
+The window values, their bounds, and the progress interval are defined in the link:specification/timeouts.adoc#waits[Timeouts & Budgets Specification]; the per-host tool-call timeout thresholds and whether `notifications/progress` resets them are verified per host in Milestone 1.
+
+See the link:specification/hypermedia-format.adoc[Hypermedia Format & TOON Encoding Specification], link:specification/job-runtime.adoc[Job Runtime Specification], and link:specification/timeouts.adoc[Timeouts & Budgets Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-5[PM-WATCH-JOB-5]
 
 [#PM-IMPL-5]
 === PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation
 
-All plan phase lifecycles, finalize sequences, and epic workflows must be defined in a declarative domain-specific language (DSL) validated at build time and at daemon startup.
+All plan phase lifecycles, finalize sequences, and epic workflows must be defined in a declarative domain-specific language (DSL) validated at build time and on every load. The phase and sub-workflow units are project-owned (`.marshall/config/*.pmwf`, copied from the binary's default units by the project setup workflow) so the team sees and reviews the process it runs; the process stays server-enforced because every project unit is verified against rules and invariants compiled into the binary.
 
 * Every workflow operation must be encapsulated as a unit-testable Java primitive declaring a canonical name (e.g., `git.commit`, `ci.watch`), a typed parameter record, a sealed outcome enumeration (`ok`, `nothing_to_commit`, `hook_failed`), and explicit store/job side effects.
 * Workflow state machines must be authored in `PM-MCP`'s line-based workflow DSL supporting `state`, `skill`, `link <rel> <id> (<params>)`, `do <primitive>`, `auto <primitive>`, `job <primitive>`, `guard <primitive>`, `dispatch <envelope>`, `escalate <decision>`, `call <workflow>`, `<outcome> -> <state>`, and state migration rules (`migrate <old> -> <new>`).
-* Build-time unit tests and daemon startup initialization must validate every workflow DSL definition, failing closed if any check fails:
+* Build-time unit tests (for the default units) and every load of a project's units must validate every workflow DSL definition, failing closed if any check fails (a failing project unit refuses the project's plan lifecycle with its file and line and is never replaced by a default unit):
 ** Every referenced primitive and vocabulary skill exists, and link free parameters match the primitive's parameter record.
 ** Every sealed outcome of every invoked primitive is explicitly handled (compile-grade exhaustiveness).
 ** Every state is reachable from the `start` state, every non-terminal state has at least one outbound transition, and all link identifiers are unique within a state.
-** Every state name present in a committed registry of previously released versions is either preserved or mapped via an explicit `migrate <old> -> <new>` rule.
+** Every state name present in a committed registry of previously released versions is either preserved or mapped via an explicit `migrate <old> -> <new>` rule (default units).
+** Every project unit satisfies the compiled invariants of its phase: the mandatory steps and states are present, outline approval stays an operator decision, the Q-Gate, footprint checks, push barrier, and pre-merge barrier lie on every required path, the finalize ordering bands hold, every step completes exactly once, every decision kind is registered, condition overlays are unchanged, and no path weakens a guarantee; project steps bind only to enrolled project scripts.
 * A build-time generator must render every DSL workflow definition into Mermaid state diagrams and AsciiDoc state/link/outcome tables under `doc/` (plus an ASCII state/transition table for terminal output), and a CI test must fail if committed documentation drifts from the DSL definitions.
+* The link:specification/state-catalogue.adoc[State Catalogue] must be normatively equal to the state table the DSL diagram generator produces: the catalogue documents the default units, and a build-time drift test must fail when a state defined in any default `*.pmwf` unit is missing from the catalogue or vice versa, or when a catalogue row's phase value, kind, or exits differ from the definitions.
 
-See the link:specification/workflow-dsl.adoc[Workflow DSL & State Machine Specification] for implementation details.
+See the link:specification/workflow-dsl.adoc[Workflow DSL & Engine Specification] and the link:specification/state-catalogue.adoc[State Catalogue] for implementation details.
 
 Implementation watch: link:implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-1[PM-WATCH-DSL-1], link:implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-9[PM-WATCH-DSL-9], link:implementation-watch/filesystem-layout.adoc#PM-WATCH-FS-1[PM-WATCH-FS-1], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-11[PM-WATCH-GEN-11], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-12[PM-WATCH-GEN-12], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-15[PM-WATCH-GEN-15], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-20[PM-WATCH-GEN-20], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-22[PM-WATCH-GEN-22], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-23[PM-WATCH-GEN-23], link:implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-6[PM-WATCH-TOOL-6]
 
@@ -86,7 +92,7 @@ To keep raw compiler and test logs out of model context while ensuring no build 
 ** Record the build outcome with the distinct status `failed_unparsed` (never reporting an empty error list as a clean failure).
 ** Attach the bounded tail of the raw build log (last 50 lines / 4 KB) and the `pm://plan/{plan_id}/builds/{job_id}/log` resource URI directly in the representation so the model or operator can diagnose the root cause.
 
-See the link:specification/job-runtime.adoc[Job Runtime & Execution Specification] and link:specification/mcp-tools.adoc[MCP Tools & Resources Specification] for implementation details.
+See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/mcp-tools.adoc[MCP Tool & Resource Surface Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-4[PM-WATCH-GEN-4], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-7[PM-WATCH-JOB-7], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-14[PM-WATCH-JOB-14]
 
@@ -95,13 +101,15 @@ Implementation watch: link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-
 
 Persisted stores must preserve defect-driven data integrity invariants, detect out-of-band working-tree edits, and prevent deadlocks across concurrent scopes.
 
-* The system must record a content digest (size and SHA-256) on every server write to `.plan/` plan store files in a sidecar outside the protected stores, verify it on read so any out-of-band modification by the model or external tools is detected immediately, re-record digests after legacy `script` jobs, and let the operator accept an intentional edit through the operator CLI.
-* The system must implement three-way file footprint reconciliation in `references.json` comparing (1) declared files, (2) structured deliverable-derived files (partitioned into expected modifications vs read-only references), and (3) git-realized modified files pairwise by symmetric difference in both directions.
-* The system must enforce the fail-closed lesson carry-back veto on plan deletion (`delete-plan`): restoring carried lessons to the main-anchored lesson store and refusing deletion if any carried lesson fails to land.
+* The system must record a content digest (size and SHA-256) on every server write to `.marshall/` plan store files in a sidecar outside the protected stores, verify it on read so any out-of-band modification by the model or external tools is detected immediately, and let the operator accept an intentional edit through the operator CLI. Tampering must be decided only under the store's lock; a lock-free reader that sees a mismatch must report it as unverified.
+* The system must make every multi-store write of a plan, epic, or workspace scope crash-consistent through a per-scope transaction journal that is written and synced before the stores and rolled forward on recovery, record digests only through it, and repair a torn last line of an append-only JSONL store only at the tail, under the store's lock, with an audit record.
+* The system must implement three-way file footprint reconciliation in `references.json` comparing (1) declared files, (2) structured deliverable-derived files (partitioned into expected modifications vs read-only references), and (3) git-realized modified files pairwise by symmetric difference in both directions; a realized footprint whose recorded state is not `measured` must be reported as indeterminate, never as clean.
+* The system must apply a lesson to a plan by claiming it in the lesson store, never by moving the lesson file: the claim is released on plan abort or deletion (`delete-plan`) and turned into an in-file retirement when the plan completes, so a plan deletion never needs to carry a lesson back.
 * The system must serve read-only store queries from lock-free atomic file snapshots.
-* The system must hold short transaction locks only for the duration of one transaction and, when a transaction spans several scopes, acquire them in a single strict global order: `plan` -> `epic` -> `machine`.
+* The system must hold short transaction locks only for the duration of one transaction and acquire all locks in one total order: workspace -> plan locks (lexicographic by `plan_id`) -> epic locks (lexicographic by `epic_id`) -> `epics-worktree` -> lesson store (`<PM_MCP_BASE>/projects/<project_id>/locks/lessons.lock`, held for lesson id allocation and every lesson write) -> local configuration (`locks/local-config.lock`) -> build timings (`locks/build-timings.lock`) -> machine store locks (alphabetical by lock path, the per-project enrolment locks lexicographic by `project_id`) -> leaf locks (audit log, digest sidecars; nothing is acquired after a leaf lock). The lock manager must assert this order on every acquisition and refuse an out-of-order acquisition as `internal_fault` with an audit record, covered by a unit test.
+* The system must guard every store that is replaced by atomic rename with a sibling lock file, never with a lock on the store file itself; only the append-only audit log may be locked directly.
 * The system must represent long-lived coordination claims (merge mutex, review-bot rate windows, build slots) as persisted lease records that are claimed and released under a short transaction lock and never held as OS locks while other locks are acquired.
-* The system must place plan and epic locks at fixed, git-ignored, main-anchored paths outside the directories they protect (`.plan/local/locks/`), so that directory relocation and per-worktree copies never split a lock.
+* The system must place workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings locks at fixed paths of the per-project machine store outside the directories they protect (`<PM_MCP_BASE>/projects/<project_id>/locks/`), so that no worktree or per-worktree copy ever splits a lock.
 * The runtime must route every lock acquisition through a single lock manager that combines one in-process lock per lock key with at most one OS `FileChannel.lock()` per lock file, the OS lock serving only exclusion against CLI processes.
 
 See the link:specification/store-schemas.adoc[Store Schemas Specification] and the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] for implementation details.

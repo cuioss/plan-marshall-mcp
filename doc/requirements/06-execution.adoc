@@ -9,7 +9,9 @@ All project builds and external tool invocations must execute through git-tracke
 * The system must require build systems that lack a wrapper concept (such as `npm`) to execute via an explicitly enrolled host tool pinned to its absolute filesystem path and SHA-256 binary digest.
 * The system must never search the `PATH` environment variable at job execution time, preventing writable `PATH` directories from shadowing enrolled binaries.
 * The system must reject any attempt to invoke an unenrolled toolchain executable.
-* The system must validate all build arguments against the enrolled argument schema associated with the wrapper or host tool before spawning the subprocess.
+* The system must validate all build arguments against the enrolled argument schema associated with the wrapper or host tool before spawning the subprocess; this guards against injection through link parameters only.
+* The system must pin, together with each wrapper, every repository file that decides which tool runs and with which flags (wrapper jar and properties, `.mvn/maven.config`, `.mvn/jvm.config`, `gradle.properties`), require `distributionSha256Sum` for downloading wrappers, and refuse a build whose pinned files changed since enrolment until the operator re-enrols them.
+* The system must start an interpreter-based wrapper (such as `pw`) through its enrolled interpreter, never through the wrapper's shebang.
 
 See the link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details.
 
@@ -18,9 +20,10 @@ See the link:specification/job-runtime.adoc[Job Runtime Specification] for imple
 
 Project execution capabilities must be strictly opt-in via operator enrolment, and every job must be verified against enrolment constraints prior to launch.
 
-* The system must enforce a strictly opt-in execution policy, serving a project only after the human operator has enrolled it via the operator CLI (`pm-mcp operator`) into `~/.plan-marshall/mcp/enrolments.json`.
+* The system must enforce a strictly opt-in execution policy, serving a project only after the human operator has enrolled it via the operator CLI (`pm-mcp operator`) into its own enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json`, a closed, versioned record of the project root, pinned wrappers (with the files that decide their flags) and host tools, the canonical and discovery command templates, provider verification overrides, enrolled project scripts (with binding, argument schema, and maximum timeout), operator command budgets, write paths, and the captured build environment.
 * The system must restrict all enrolment creation and modification operations exclusively to the operator channel, ensuring enrolment is never reachable from model tool calls or workflow links.
-* The system must enforce a verify-not-resolve contract before launching any job (`build`, `git`, `ci`, `script`): verify that the target directory is the enrolled project root or a live linked worktree thereof, verify the executable's absolute path and SHA-256 digest against the enrolment record, and validate the argument vector against the enrolled schema.
+* The system must protect the integrity of every enrolment file: every operator CLI write, under the file's own lock, stores an HMAC-SHA-256 over the canonical file content in the file's own sidecar, keyed with a secret held in the OS keyring (`PM-MCP` namespace, operator lane) or, on hosts without a keyring, in a `0600` file under `<PM_MCP_BASE>/state/`; the runtime verifies a project's HMAC before first serving the project after a start and before every verify-not-resolve check, refuses with `enrolment_tampered` and an `audit.jsonl` record on mismatch, and accepts a re-baselining only through the operator CLI. A tampered, insecure, or invalid enrolment file blocks only its own project.
+* The system must enforce a verify-not-resolve contract before launching any job (`build`, `git`, `ci`, `project_script`): verify that the target directory is the enrolled project root or a live linked worktree thereof, verify the executable's absolute path and SHA-256 digest against the enrolment record, and validate the argument vector against the enrolled schema.
 * The system must immediately refuse any job that fails enrolment verification and report `status: refused` as a distinct outcome state in the workflow representation, never conflating enrolment refusals with build failures (`failed`).
 
 See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/store-schemas.adoc[Store Schemas Specification] for implementation details.
@@ -28,12 +31,12 @@ See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:
 [#PM-EXEC-3]
 === PM-EXEC-3: Python Interpreter Pinning & Hash Verification
 
-Legacy Python script jobs executed during staged porting must be bound to an enrolled Python interpreter and verified script digests.
+Jobs whose executable runs under a host interpreter (project scripts, `PM-EXT-5`, and interpreter-based wrappers such as `pw`) must be bound to an enrolled interpreter and verified script digests. `PM-MCP` never executes legacy `plan-marshall` scripts (`PM-MIG-2`).
 
-* The system must require the host Python interpreter (`python3`) used for `script` jobs to be enrolled with its resolved absolute path and SHA-256 binary hash.
-* The system must verify both the Python interpreter's SHA-256 digest and the plan-marshall executor script's git-tracked hash or bundle digest before executing any `script` job.
-* The system must validate the target script notation against an explicit allowlist and verify all script arguments against that script's registered argument schema.
-* The system must refuse the `script` job (`status: refused`) if an interpreter update or file modification causes a hash mismatch, requiring the operator to refresh the enrolment before execution can proceed.
+* The system must require every host interpreter (such as `python3`) used by a `project_script` job or an interpreter-based wrapper to be enrolled with its resolved absolute path and SHA-256 binary hash.
+* The system must verify both the interpreter's SHA-256 digest and the enrolled script's or wrapper's SHA-256 digest before executing the job.
+* The system must validate every `project_script` job against the project's enrolled script allowlist and its arguments against that script's registered argument schema.
+* The system must refuse the job (`status: refused`) if an interpreter update or file modification causes a hash mismatch, requiring the operator to refresh the enrolment before execution can proceed.
 
 See the link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details.
 
@@ -42,16 +45,16 @@ See the link:specification/job-runtime.adoc[Job Runtime Specification] for imple
 
 All jobs must run as direct child subprocesses of the daemon in isolated OS process groups with deterministic lifecycle and outcome semantics.
 
-* The system must spawn all job executables (`build`, `git`, `ci`, `script`) directly via operating system process creation APIs using an explicit argument vector, strictly prohibiting shell interpolation (`sh -c`).
+* The system must spawn all job executables (`build`, `git`, `ci`, `project_script`) directly via operating system process creation APIs using an explicit argument vector, strictly prohibiting shell interpolation (`sh -c`).
 * The system must place every spawned job into its own isolated operating system process group so that cancellation or timeout signals (`SIGTERM` followed by `SIGKILL`) terminate the entire subprocess tree cleanly.
 * The system must redirect child standard input (`stdin`) from `/dev/null` by default, or stream an explicit in-memory UTF-8 payload over an OS pipe and immediately close the stream when an operation supplies a `stdin` body.
-* The system must enforce an explicit environment variable allowlist and a configurable execution timeout for every job.
+* The system must enforce an explicit environment variable allowlist and an execution budget for every job, allocated per job type and operation with engine floors that no configuration undercuts.
 * The system must allow build subprocesses to access the host's native container runtime (Docker, Docker Compose, Testcontainers) and warm build daemons (Gradle daemon, `mvnd`) under the developer's user privileges, while inheriting the Landlock filesystem confinement of the starting job on Linux (`PM-SEC-5`).
-* The system must classify every completed job using a closed outcome enumeration: `succeeded`, `failed`, `failed_unparsed` (build jobs only), `refused`, `cancelled`, `timed_out`, `killed`, and `indeterminate`.
+* The system must classify every completed job using a closed outcome enumeration: `succeeded`, `failed`, `failed_unparsed` (build jobs only), `refused`, `cancelled`, `timed_out`, `killed`, and `indeterminate`, derived by the runtime from its own evidence (refusal before spawn, the signal it sent and why, exit status or terminating signal, and log parse), never adopted from a status the job reports about itself.
 * The system must mark any job interrupted by an external signal or daemon crash as `killed` and must never automatically retry `killed` jobs without explicit workflow transition logic.
 * The system must never fold `indeterminate` outcomes into `succeeded` or `failed`, and must emit zero located code errors or findings for `timed_out`, `killed`, or `indeterminate` jobs.
 
-See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
+See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/timeouts.adoc[Timeouts & Budgets Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-19[PM-WATCH-EXT-19], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-4[PM-WATCH-GEN-4], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-1[PM-WATCH-JOB-1], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3]
 
@@ -63,7 +66,7 @@ All version control and CI provider operations must execute as verified jobs usi
 * The system must execute all git operations (status, log, diff, file-footprint capture, commit, push, fetch, merge, rebase, and worktree lifecycle) as verified `git` jobs invoking the host's enrolled `git` binary, preserving the developer's git configuration, credential helpers, SSH agent, commit signing, and repository hooks.
 * The system must execute all CI provider operations (pull/merge request management, check inspection by pull request or by commit SHA, review comment retrieval, and merges) as verified `ci` jobs invoking the provider's official CLI (`gh`, `glab`) under the developer's existing CLI authentication.
 * The system must compose all `git` and `ci` argument vectors server-side from a closed set of operations, requesting structured JSON output (`--json`) where supported and prohibiting model-supplied CLI flags.
-* The system must stream multi-line or model-authored text payloads (commit messages, pull-request bodies, issue bodies, review comments) exclusively in memory via standard input (`stdin` flags such as `git commit -F -`, `gh pr create --body-file -`, `gh pr comment --body-file -`), strictly prohibiting both command-line argument interpolation and temporary/scratch files on disk (`.plan/temp/`, `work/ci-bodies/`, or `/tmp/`).
+* The system must stream multi-line or model-authored text payloads (commit messages, pull-request bodies, issue bodies, review comments) exclusively in memory via standard input (`stdin` flags such as `git commit -F -`, `gh pr create --body-file -`, `gh pr comment --body-file -`), strictly prohibiting both command-line argument interpolation and temporary/scratch files on disk (such as `plan-marshall`'s `.plan/temp/` and `work/ci-bodies/`, or `/tmp/`).
 
 See the link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details.
 
@@ -74,13 +77,13 @@ Implementation watch: link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-2[
 
 Build execution must adapt timeouts from observed job durations, parse coverage reports natively, and verify that executed builds cover the full scope required by quality gates.
 
-* The system must compute adaptive job timeouts per canonical command and argument signature as $\max(\text{engine\_floor}, \lfloor 1.25 \times L \rfloor)$, updating the learned baseline $L$ with the max-biased blend $L_{new} = \lfloor 0.8 \times \max(L, d) + 0.2 \times \min(L, d) \rfloor$ (first observation stored raw; fed by every finished run regardless of exit code; a `timed_out` run is a non-finish that never feeds $L$ but raises a one-shot escalation budget of $\min(2 \times \text{timeout}, 1800\,s)$ for the next run of that command; a finished run poisoned by build residue is not blended while clean observations exist; `killed`/`cancelled` runs never feed $L$), with per-engine floors matching plan-marshall (Maven/Gradle/npm 300 s, pytest 330 s).
-* The system must record for every job timeout how its budget was derived (`learned`, `imported`, `escalated`, or `floor_default`) and render it with the job; a `timed_out` job whose budget was `floor_default` or `escalated` is a no-verdict outcome that offers a retry with the escalated budget and never fails a gate.
+* The system must compute adaptive job budgets per canonical command from a max-biased learned baseline of observed durations, never below per-engine floors matching `plan-marshall`, fed by every finished run regardless of exit code; a `timed_out` run is a non-finish that never feeds the baseline but raises a one-shot escalation budget for the next run of that command that never lowers the budget, a finished run poisoned by build residue is not blended while clean observations exist, and `killed`/`cancelled` runs never feed it. An operator budget may exceed the escalation cap but never undercuts the engine floors. Formulas, floors, and caps are defined only in the link:specification/timeouts.adoc#job-budgets[Timeouts & Budgets Specification].
+* The system must record for every job budget how it was derived (`learned`, `escalated`, `operator`, or `floor_default`) and render it with the job; every `timed_out` job, whatever the derivation, is a no-verdict outcome that never fails a gate and counts as `no_verdict` in every roll-up, and the derivation only selects the retry it offers.
 * The system must include native coverage report parsers (JaCoCo XML, Cobertura XML, LCOV, and Istanbul JSON) to enforce per-module and whole-tree coverage thresholds without external Python scripts.
 * The system must enforce gate honesty checks (`examined_population`, `gate_coverage`, and test-scope divergence detection) so a quality gate passes only when the build actually compiled and tested the modules affected by the plan's realized file footprint.
 * The system must separate a plan's own gate failures from failures already present on its base: a failing whole-tree gate is re-run on the plan's merge base in a scratch worktree, diagnostics present on both sides are baseline (coverage shortfalls in modules whose main sources the plan did not change are non-blocking `baseline_debt`), a gate red only through baseline diagnostics yields `baseline_red`, which only the operator can resolve and which the plan never remediates, and only the remaining diagnostics route to plan triage.
 
-See the link:specification/job-runtime.adoc[Job Runtime Specification] for implementation details.
+See the link:specification/job-runtime.adoc[Job Runtime Specification] and link:specification/timeouts.adoc[Timeouts & Budgets Specification] for implementation details.
 
 Implementation watch: link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-1[PM-WATCH-GEN-1], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-2[PM-WATCH-GEN-2], link:implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-40[PM-WATCH-GEN-40], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-15[PM-WATCH-JOB-15], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-16[PM-WATCH-JOB-16], link:implementation-watch/job-runtime.adoc#PM-WATCH-JOB-17[PM-WATCH-JOB-17]
 
