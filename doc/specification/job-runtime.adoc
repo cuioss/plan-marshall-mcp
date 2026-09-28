@@ -94,23 +94,23 @@ Step 0 of the pipeline verifies the HMAC-SHA-256 sidecar `<PM_MCP_BASE>/enrolmen
 
 == Subprocess Lifecycle & Process-Group Isolation
 
-Every job runs as a direct child of the always-on `pm-mcp` runtime, independent of any host connection (link:runtime-model.adoc[Runtime & Interaction Model Specification]), inside its own isolated operating system process group (`PM-EXEC-4`, `PM-EXEC-5`, `PM-IMPL-1`).
+Every job runs as a direct child of the always-on runtime (`pm-mcpd`), started through the launcher `pm-mcp-exec`, independent of any host connection (link:runtime-model.adoc[Runtime & Interaction Model Specification]), inside its own isolated operating system process group (`PM-EXEC-4`, `PM-EXEC-5`, `PM-IMPL-1`).
 
-=== Process-Group Creation via the `job-exec` Shim
+=== Process-Group Creation via the `pm-mcp-exec` Launcher
 _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-2[PM-WATCH-JOB-2]_
 
-Java's `ProcessBuilder` cannot place a child into a new process group or session (`setpgid`/`setsid`); a child started directly would inherit the runtime's own process group, and signalling that group would hit the runtime and every other job. The runtime therefore starts every job through a shim built into the same native binary:
+Java's `ProcessBuilder` cannot place a child into a new process group or session (`setpgid`/`setsid`); a child started directly would inherit the runtime's own process group, and signalling that group would hit the runtime and every other job. The runtime therefore starts every job through the launcher `pm-mcp-exec`, a separate tiny native binary of the release (plain GraalVM native image with FFM, no Quarkus, module `pm-mcp-modules/pm-mcp-exec`), started by its path in the runtime's own installation directory `<PM_MCP_HOME>/bin/`, never through `PATH`:
 
-. The runtime verifies the job (verify-not-resolve, `PM-EXEC-2`) and starts `pm-mcp job-exec -- <verified absolute executable> <args…>` with `ProcessBuilder`, keeping all of its I/O handling (pipes, in-memory `stdin` payloads, log redirection, exit codes).
-. The shim calls `setpgid(0, 0)` via FFM, so its PID becomes the process-group ID, and then replaces itself with the target via `execve` (never `execvp`: no `PATH` search, `PM-EXEC-1`). The job's PID recorded by the runtime is therefore both the job PID and its process-group ID.
+. The runtime verifies the job (verify-not-resolve, `PM-EXEC-2`) and starts `<PM_MCP_HOME>/bin/pm-mcp-exec -- <verified absolute executable> <args…>` with `ProcessBuilder`, keeping all of its I/O handling (pipes, in-memory `stdin` payloads, log redirection, exit codes).
+. The launcher calls `setpgid(0, 0)` via FFM, so its PID becomes the process-group ID, and then replaces itself with the target via `execve` (never `execvp`: no `PATH` search, `PM-EXEC-1`). The job's PID recorded by the runtime is therefore both the job PID and its process-group ID.
 . Cancellation and timeouts signal exactly that group (`kill(-pid, …)`). Warm build daemons that detach themselves into their own session (Gradle daemon, `mvnd`) are intentionally not affected (`PM-EXEC-4`).
-. `job-exec` is an internal verb: it accepts only an absolute executable path and an argument vector, performs no verification of its own, and is not part of the operator CLI.
+. `pm-mcp-exec` is not a user command and not a verb of the CLI `pm-mcp`: it accepts only an absolute executable path, an argument vector, and (on Linux) the confinement sets, performs no verification of its own, reads no file of `<PM_MCP_BASE>`, and holds no secret.
 
-*Alternative for later implementations (macOS only)*: Start jobs directly via FFM `posix_spawn` with `POSIX_SPAWN_SETPGROUP` (the mechanism already used for the detached runtime start, link:runtime-model.adoc[Runtime & Interaction Model Specification]). This removes the extra `execve` hop but replaces `ProcessBuilder` completely: pipes, `stdin` streaming, output capture, and exit-status reaping (`waitpid`) must then be implemented on FFM as well. The job contract (process group = job PID, outcome classification) is identical, so the runtime can switch implementations without changing any other specification. On Linux the `job-exec` shim (or an equivalent restricted spawner thread) stays mandatory: `PR_SET_NO_NEW_PRIVS` and the Landlock ruleset must be applied between `fork` and `execve`, and `posix_spawn` offers no hook for that.
+*Alternative for later implementations (macOS only)*: Start jobs directly via FFM `posix_spawn` with `POSIX_SPAWN_SETPGROUP` (the mechanism already used for the detached runtime start, link:runtime-model.adoc[Runtime & Interaction Model Specification]). This removes the extra `execve` hop but replaces `ProcessBuilder` completely: pipes, `stdin` streaming, output capture, and exit-status reaping (`waitpid`) must then be implemented on FFM as well. The job contract (process group = job PID, outcome classification) is identical, so the runtime can switch implementations without changing any other specification. On Linux the `pm-mcp-exec` launcher (or an equivalent restricted spawner thread) stays mandatory: `PR_SET_NO_NEW_PRIVS` and the Landlock ruleset must be applied between `fork` and `execve`, and `posix_spawn` offers no hook for that.
 
 [source,java]
 ----
-List<String> argv = new ArrayList<>(List.of(pmMcpBinary, "job-exec", "--"));
+List<String> argv = new ArrayList<>(List.of(pmMcpExecBinary, "--")); // <PM_MCP_HOME>/bin/pm-mcp-exec
 argv.addAll(verifiedArgv); // verifiedArgv.get(0) is the verified absolute executable path
 ProcessBuilder pb = new ProcessBuilder(argv);
 pb.directory(verifiedWorkingDir.toFile());
@@ -161,10 +161,10 @@ _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JO
 
 When a job exceeds its allocated budget (`PM-EXEC-4`, link:timeouts.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]), when the user/client calls `cancel`, or when the runtime drains:
 
-1. *SIGTERM Escalation*: `pm-mcp` sends `SIGTERM` to the job's process group (`kill(-pgid, SIGTERM)` via Java FFM, `PM-TECH-4`), whose ID equals the job PID (see <<Process-Group Creation via the `job-exec` Shim>>).
+1. *SIGTERM Escalation*: The runtime sends `SIGTERM` to the job's process group (`kill(-pgid, SIGTERM)` via Java FFM, `PM-TECH-4`), whose ID equals the job PID (see <<Process-Group Creation via the `pm-mcp-exec` Launcher>>).
 2. *Grace Period*: `pm-mcp` waits the termination grace period (link:timeouts.adoc#grace-period[Timeouts & Budgets Specification]) for all processes in the group to exit cleanly.
 3. *SIGKILL Cleanup*: If any process of the group remains alive after the grace period, `pm-mcp` issues `kill(-pgid, SIGKILL)`. Steps 1–3 address the group, never only its leader: they run to completion even when the leader has already exited and only descendants remain.
-4. *Cancel Before the Group Exists*: The shim calls `setpgid` after it starts, so a cancel (or budget expiry, or drain) that reaches a job in that window gets `ESRCH` from `kill(-pgid, …)`. The runtime then signals the PID directly (`kill(pid, SIGTERM)`) and retries against the group after the short bounded delay of link:timeouts.adoc#cancel-group-retry[Timeouts & Budgets Specification, Cancel-Before-Group Retry], and records `cancel_before_group: true` in the job record.
+4. *Cancel Before the Group Exists*: The launcher calls `setpgid` after it starts, so a cancel (or budget expiry, or drain) that reaches a job in that window gets `ESRCH` from `kill(-pgid, …)`. The runtime then signals the PID directly (`kill(pid, SIGTERM)`) and retries against the group after the short bounded delay of link:timeouts.adoc#cancel-group-retry[Timeouts & Budgets Specification, Cancel-Before-Group Retry], and records `cancel_before_group: true` in the job record.
 5. *Outcome*: The outcome of a terminated job is derived by <<outcome-derivation>>; relay termination never affects a job. A `timed_out` job is `no_verdict` in every roll-up (link:timeouts.adoc#no-verdict-rule[Timeouts & Budgets Specification, Timed-Out Outcomes Are No-Verdict]).
 6. *Live Orphans after a Runtime Crash*: Each job record stores the job PID (which is its process-group ID) and the process start instant. In the project's recovery after the next runtime start, for every record left `running` the runtime probes the process group with `kill(-pgid, 0)` together with the record: a group exists while any of its members lives, and a PGID cannot be reused while its group is alive, so a live group whose ID equals the recorded PGID of a `running` record is that job's group, even when the leader (whose start instant was recorded) has exited. Such a group is terminated with steps 1–3 and the job recorded as `killed`; it is never adopted or re-executed (link:runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]). A group that no longer exists needs no termination; the record is settled `killed` as well.
 
@@ -172,7 +172,7 @@ When a job exceeds its allocated budget (`PM-EXEC-4`, link:timeouts.adoc#job-bud
 === In-Process Operations (Native Variant)
 _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3]_
 
-A `git` or `ci` operation of the native variant (JGit, provider HTTP clients) runs inside the runtime: no argument vector, no environment, no process group, no Landlock ruleset, and no `job-exec` shim exist for it. It is still a job of the runtime, so waits, cancellation, metrics, and recovery treat it like any other job:
+A `git` or `ci` operation of the native variant (JGit, provider HTTP clients) runs inside the runtime: no argument vector, no environment, no process group, no Landlock ruleset, and no `pm-mcp-exec` launcher exist for it. It is still a job of the runtime, so waits, cancellation, metrics, and recovery treat it like any other job:
 
 * *Job Record*: Every in-process operation gets a job record of its kind (`git` or `ci`, job id prefix `g` or `c`) with `execution: in_process`, its budget key `<kind>:<operation>`, `budget_seconds`, and `budget_derivation`; the process fields (`argv_digest`, `pid`, `process_started_at`, `spawned_at`, `exit_code`, `signal`) are `null` and `confinement` is `not_applicable` (link:store-schemas.adoc#job-record[Store Schemas Specification, Job Record]). It writes no job log file.
 * *Budget & Cancellation*: The operation runs under the budget of its operation class; at budget expiry, on `cancel:<job_id>`, and at drain it is cancelled cooperatively (JGit `ProgressMonitor`, interruption of the HTTP exchange), every HTTP request carries the compiled per-request connect and read timeout, and an operation that does not return within the grace period is abandoned with its late result discarded (link:timeouts.adoc#in-process-operations[Timeouts & Budgets Specification, In-Process Operations]). A partial result is never used.
@@ -262,18 +262,21 @@ For an in-process operation of the native variant, rows 5 to 10 are replaced by 
 Language server instances of the warm LSP pool are not classified by this table; their failures are reported as the non-run reasons of link:domain-extensions.adoc[Domain Extensions Specification] (Explicit Non-Run Reporting) and the timeouts of link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle].
 
 == Linux Filesystem Confinement (Landlock)
+_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-20[PM-WATCH-JOB-20]_
 
-On Linux (`PM-SEC-5`, `PM-TECH-4`), the `job-exec` shim (<<Process-Group Creation via the `job-exec` Shim>>) confines every job before `execve`:
+On Linux (`PM-SEC-5`, `PM-TECH-4`), the `pm-mcp-exec` launcher (<<Process-Group Creation via the `pm-mcp-exec` Launcher>>) confines every job before `execve`:
 
 . `prctl(PR_SET_NO_NEW_PRIVS, 1)`: the job and all its descendants can never gain privileges (setuid/setgid binaries, file capabilities).
-. A Landlock ruleset (Landlock ABI >= 2, Linux >= 5.19, applied via FFM) that grants read and execute access to the whole filesystem and write access only to:
+. A Landlock ruleset (Landlock ABI >= 2, Linux >= 5.19, applied via FFM) that grants read and execute access to the whole filesystem except `<PM_MCP_BASE>/run/` (see *Read set* below) and write access only to:
 ** every enrolled project root (which contains all of that project's worktrees under `.marshall/local/worktrees/` and its `.marshall/local/temp/`; never the per-project machine store under `<PM_MCP_BASE>`),
 ** the build toolchain caches declared per project in the enrolment field `write_paths` (for example `~/.m2/repository`, `~/.gradle`, `~/.npm`, `~/.cache/pip`),
 ** the system temporary directory (`/tmp`; the JVM ignores `TMPDIR` for `java.io.tmpdir`) and device nodes under `/dev`.
 
 The write set never contains `<PM_MCP_BASE>` (enrolments, machine configuration, credentials, logs, and the machine stores stay out of every job's reach) and never `~/.plan-marshall/`.
 
-The ruleset is inherited across `fork`/`execve` and cannot be removed by the job. The runtime passes the writable set to the shim as an argument vector computed from the project's enrolment file at job start, so enrolment changes take effect for the next job without restarting anything.
+*Read set*: `<PM_MCP_BASE>/run/` holds the runtime token (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]) and is outside every job's read set. Because Landlock rules only grant access, the runtime builds the read set as read and execute rules on `/` minus the path to `run/`: for each directory from `/` down to `<PM_MCP_BASE>`, a rule for every entry except the next directory on that path, and for `<PM_MCP_BASE>` a rule for every entry except `run/`. The entries are enumerated at job start; an entry created later on that path (for example a new file directly in the home directory) is not readable by the job, which is accepted. On macOS and on Linux without Landlock a job can read the token like any process of the user; this lies within the same-user boundary accepted for the operator channel (link:../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]). The runtime token and every other runtime secret are never passed in a job's argument vector or environment (<<Job Environment (`PM-SEC-5`)>>).
+
+The ruleset is inherited across `fork`/`execve` and cannot be removed by the job. The runtime passes the read and write sets to the launcher as an argument vector computed from the project's enrolment file at job start, so enrolment changes take effect for the next job without restarting anything.
 
 Properties and limits:
 
@@ -285,7 +288,7 @@ Properties and limits:
 
 == Job Environment (`PM-SEC-5`)
 
-The runtime builds every job environment from scratch; nothing is inherited from the runtime's own environment, which belongs to whichever relay started it (link:runtime-model.adoc[Runtime & Interaction Model Specification]). Each variable has one provenance: `enrolment` values are captured by the operator CLI at enrolment into the project's `build_environment` (enrolment file `enrolments/<project_id>.json`) and refreshed only by re-enrolment; `runtime` values are computed at job start.
+The runtime builds every job environment from scratch; nothing is inherited from the runtime's own environment, which belongs to whichever CLI command or service manager started it (link:runtime-model.adoc[Runtime & Interaction Model Specification]). Each variable has one provenance: `enrolment` values are captured by the operator CLI at enrolment into the project's `build_environment` (enrolment file `enrolments/<project_id>.json`) and refreshed only by re-enrolment; `runtime` values are computed at job start.
 
 [cols="2,1,1,3"]
 |===

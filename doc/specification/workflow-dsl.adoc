@@ -40,7 +40,9 @@ _See Requirements:_
 == Module Boundary & Decoupled Core Architecture
 _See Requirement link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1: Decoupled Plain-Java Core Engine & Quarkus Assembly]_
 
-The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP transport libraries. All modules are created and integrated in Milestone 0 (link:../roadmap.adoc[Roadmap]), each with minimal real code and tests: the root `plan-marshall-mcp` module is renamed to `pm-mcp-server`, the library modules are gathered under the aggregator `pm-mcp-modules` (the external integrations under the nested aggregator `pm-mcp-providers`), and an automated build check enforces the dependency direction (`PM-IMPL-1`). Dependencies flow toward `pm-mcp-core`: provider contract and implementation modules depend on `pm-mcp-core`, implementation modules on their contract modules, and `pm-mcp-server` on all of them.
+_Implementation watch: link:../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-12[PM-WATCH-DSL-12], link:../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-13[PM-WATCH-DSL-13]_
+
+The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP transport libraries. All modules are created and integrated in Milestone 0 (link:../roadmap.adoc[Roadmap]), each with minimal real code and tests: the root `plan-marshall-mcp` module is renamed to `pm-mcp-server`, the library modules are gathered under the aggregator `pm-mcp-modules` (the external integrations under the nested aggregator `pm-mcp-providers`), the client modules under the top-level aggregator `pm-mcp-clients`, and an automated build check enforces the dependency direction (`PM-IMPL-1`). Dependencies flow toward `pm-mcp-core`: provider contract and implementation modules depend on `pm-mcp-core`, implementation modules on their contract modules, and `pm-mcp-server` on all of them and on `pm-mcp-api`. The client modules never depend on `pm-mcp-core` or a provider module: `pm-mcp-cli` depends on `pm-mcp-api` only, `pm-mcp-web-server` on `pm-mcp-api`, `pm-mcp-web-app`, and Quarkus. One release produces four native binaries: `pm-mcp` (CLI), `pm-mcpd` (daemon), `pm-mcp-exec` (job launcher), and `pm-mcp-web` (optional web server).
 
 [cols="1,2,3"]
 |===
@@ -49,6 +51,14 @@ The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP tra
 |`pm-mcp-core` (in `pm-mcp-modules`)
 |`de.cuioss.pm.mcp.core.workflow.*`
 |Contains the line-oriented DSL lexer/parser, immutable AST records, compile-time/startup static verifier, `Primitive<P, R>` SPI, deterministic state machine interpreter, and Mermaid/AsciiDoc-table/ASCII diagram generators, plus the service interfaces the provider modules need (e.g., `JobRunner`, `SecretSource`). Depends *only* on the JDK (`java.base`), Jackson, and `cui-java-tools`; never on JGit or `cui-http` (`PM-IMPL-1`). Unit tests execute directly in JUnit 5 without Quarkus augmentation.
+
+|`pm-mcp-api` (in `pm-mcp-modules`)
+|`de.cuioss.pm.mcp.api.*`
+|Client contract of the daemon's REST API `/api/v1`: resource representations as records, link relations, error codes, JSON/TOON codecs. Depends *only* on `jackson-core` (streaming API, never `jackson-databind`), so the CLI stays `jackson-core` only; no engine, store, or transport code.
+
+|`pm-mcp-exec` (in `pm-mcp-modules`)
+|`de.cuioss.pm.mcp.exec.*`
+|Job confinement launcher, GraalVM native binary `pm-mcp-exec` built with `native-maven-plugin` (profile `native`): process group and Landlock ruleset through FFM before `execve` (link:job-runtime.adoc[Job Runtime Specification]). No Quarkus, no picocli.
 
 |`pm-mcp-git` (in `pm-mcp-providers`)
 |`de.cuioss.pm.mcp.git.*`
@@ -80,7 +90,19 @@ The workflow engine is strictly decoupled from Quarkus, CDI, Vert.x, and MCP tra
 
 |`pm-mcp-server`
 |`de.cuioss.pm.mcp.server.*`
-|Instantiates core engine services and the provider registries via CDI `@Produces`, binds concrete `Primitive` implementations to the daemon's job runner and state stores, registers persisted records via `@RegisterForReflection`, and maps `pm_start`, `pm_state`, and `pm_do` calls to the engine. Its release profile produces the release layout: the GraalVM native executable `pm-mcp` per supported platform (with the `skill://pm/**` corpus and the client bundles compiled in), a SHA-256 digest per binary, a CycloneDX SBOM, and the release notes.
+|Daemon assembly, native binary `pm-mcpd`. Instantiates core engine services and the provider registries via CDI `@Produces`, binds concrete `Primitive` implementations to the daemon's job runner and state stores, registers persisted records via `@RegisterForReflection`, and maps `pm_start`, `pm_state`, and `pm_do` calls to the engine. Holds the local adapter as packages of its own (Unix domain socket listener with runtime-token authentication, `/mcp` for the relays, `/api/v1` for the clients) and the web device store and pairing codes; opens no TCP listener. Its release profile produces the release layout: the four GraalVM native executables `pm-mcp`, `pm-mcpd`, `pm-mcp-exec`, and `pm-mcp-web` per supported platform (the `skill://pm/**` corpus compiled into `pm-mcpd`, the client bundles into `pm-mcp`), a SHA-256 digest per binary, a CycloneDX SBOM covering the Maven and npm dependencies, and the release notes.
+
+|`pm-mcp-cli` (in `pm-mcp-clients`)
+|`de.cuioss.pm.mcp.cli.*`
+|Interactive and host-facing CLI, GraalVM native binary `pm-mcp` built with `native-maven-plugin` (profile `native`): picocli with `picocli-codegen`, own minimal HTTP/1.1 and SSE client over the daemon's Unix socket (JDK `SocketChannel`, `jackson-core` streaming), `qrcodegen` for pairing QR codes. Every state-changing command is a request to the daemon's API. Depends *only* on `pm-mcp-api`.
+
+|`pm-mcp-web-server` (in `pm-mcp-clients`)
+|`de.cuioss.pm.mcp.web.*`
+|Optional web server, Quarkus native binary `pm-mcp-web`: TCP listener (loopback, LAN with TLS), security headers, Host validation, pairing redemption, static serving of `pm-mcp-web-app`, and a proxy of `/api/v1` including SSE to the daemon's socket. Depends on `pm-mcp-api`, `pm-mcp-web-app`, and Quarkus only.
+
+|`pm-mcp-web-app` (in `pm-mcp-clients`)
+|— (SvelteKit, TypeScript)
+|Static SPA (`adapter-static`) built by `frontend-maven-plugin` with pinned Node and npm (`npm ci`, Vitest), packaged as a resource JAR under `META-INF/resources`. npm dependencies pinned by `package-lock.json`.
 
 |`pm-mcp-conformance` (in `pm-mcp-modules`)
 |`de.cuioss.pm.mcp.conformance.*`

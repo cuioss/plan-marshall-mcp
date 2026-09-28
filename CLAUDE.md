@@ -13,8 +13,8 @@ specifications in `doc/Specification.adoc` (documents in `doc/specification/`), 
 
 Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
 `@QuarkusIntegrationTest` integration tests against the packaged application. No container image
-is built (the target is a native `pm-mcp` binary on the host: an always-on runtime reached through
-the `pm-mcp serve` STDIO relay, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
+is built (the target is native binaries on the host: the always-on daemon `pm-mcpd`, reached through
+the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
 
 ## Modules
 
@@ -24,11 +24,15 @@ the `pm-mcp serve` STDIO relay, PM-TECH-1/3 and `doc/specification/runtime-model
 
 Roadmap Milestone 0 creates the target module structure in one step (PM-IMPL-1 in
 `doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus
-assembly, including the release profile), beside the aggregator `pm-mcp-modules` with
-`pm-mcp-core` (plain Java), the nested aggregator `pm-mcp-providers` (`pm-mcp-git`, `pm-mcp-ci`,
-`pm-mcp-findings`, `pm-mcp-analysis`, `pm-mcp-github`, `pm-mcp-gitlab`, `pm-mcp-sonar`), and
-`pm-mcp-conformance`. Every module gets minimal real code and tests, never an empty shell. The
-table above and the build commands below change with that milestone.
+daemon assembly, including the release profile), beside the aggregator `pm-mcp-modules` with
+`pm-mcp-api` (client contract, Jackson only), `pm-mcp-exec` (job launcher), `pm-mcp-core` (plain
+Java), the nested aggregator `pm-mcp-providers` (`pm-mcp-git`, `pm-mcp-ci`, `pm-mcp-findings`,
+`pm-mcp-analysis`, `pm-mcp-github`, `pm-mcp-gitlab`, `pm-mcp-sonar`), and `pm-mcp-conformance`,
+and the aggregator `pm-mcp-clients` with `pm-mcp-cli` (picocli, depends on `pm-mcp-api` only),
+`pm-mcp-web-server` (Quarkus) and `pm-mcp-web-app` (SvelteKit, `frontend-maven-plugin`). The
+release packages four native binaries: `pm-mcp` (CLI), `pm-mcpd` (daemon), `pm-mcp-exec`,
+`pm-mcp-web`. Every module gets minimal real code and tests, never an empty shell. The table above
+and the build commands below change with that milestone.
 
 ## Development Notes
 

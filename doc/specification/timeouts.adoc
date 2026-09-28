@@ -30,6 +30,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4: Direct Host Subprocess Management & Process-Group Isolation]_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6: Adaptive Build Timeouts, Coverage Parsing & Gate Honesty]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-7[PM-SEC-7: Optional Web Server, Device Pairing & Browser Channel Hardening]_
 * _See Requirement link:../Requirements.adoc#PM-TECH-4[PM-TECH-4: Operating System Platform Integration (macOS & Linux)]_
 * _See Requirement link:../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned Client Profile Schema & Override Hierarchy]_
 * _See Requirement link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
@@ -172,7 +173,7 @@ Learned values live in the project's `<PM_MCP_BASE>/projects/<project_id>/build-
 |link:job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]
 
 |[[cancel-group-retry]]Cancel-before-group retry
-|When `kill(-pgid, SIGTERM)` answers `ESRCH` because the `job-exec` shim has not yet called `setpgid`, the runtime signals the PID directly and retries against the group every `0.1` for at most `10` attempts (`1` in total).
+|When `kill(-pgid, SIGTERM)` answers `ESRCH` because the `pm-mcp-exec` launcher has not yet called `setpgid`, the runtime signals the PID directly and retries against the group every `0.1` for at most `10` attempts (`1` in total).
 |fixed
 |—
 |`cancel:<job_id>`, budget expiry, drain
@@ -254,7 +255,7 @@ _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JO
 |as bounded / progress wait
 |`blocked` condition, `execute.awaiting-infeasible-decision`
 |Returns the unchanged representation with its `blocked` condition; the decision stays pending until the operator resolves it or the scope terminates.
-|link:workflow-dsl.adoc#escalation-decision-wait[Workflow DSL, Escalation Without Elicitation]; link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI & Security, Operator Channel Isolation]
+|link:workflow-dsl.adoc#escalation-decision-wait[Workflow DSL, Escalation Without Elicitation]; link:cli-and-security.adoc#operator-channel-isolation[CLI & Security, Operator Channel Isolation]
 
 |[[elicitation-wait]]Elicitation request
 |Held within the window (bounded or progress) of the call that issued `elicitation/create`.
@@ -262,7 +263,7 @@ _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JO
 |as bounded / progress wait
 |operator-authorizing and routine elicitations
 |The server withdraws the request, records the decision as pending, and raises the `blocked` condition with `wait:decision:<decision_id>`; a declined or cancelled elicitation is an answer, not an expiry.
-|link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI & Security, Operator Channel Isolation]
+|link:cli-and-security.adoc#operator-channel-isolation[CLI & Security, Operator Channel Isolation]
 
 |[[ci-wait]]CI wait
 |No deadline: a CI wait is re-polled window by window and never lapses. When no learned figure exists, the operator budget of the CI key seeds the expected duration recorded with the wait (an operator view, never rendered).
@@ -315,11 +316,11 @@ a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published 
 |Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
 
 |[[runtime-start-timeout]]Runtime start timeout
-|`5` for the socket of a runtime started on demand to accept connections.
+|`5` for a runtime started on demand to answer an authenticated round trip.
 |fixed
 |—
-|`pm-mcp serve` relay; a second runtime confirming that the singleton holder answers
-|The relay answers pending requests with the JSON-RPC error `runtime_unavailable` and retries on the next request.
+|every CLI command that starts the runtime on demand (the `pm-mcp serve` relay included); `pm-mcp status` waiting for a live runtime's answer; a second runtime confirming that the singleton holder answers
+|The relay answers pending requests with the JSON-RPC error `runtime_unavailable` and retries on the next request; another CLI command fails with a diagnostic naming `logs/daemon.log`; `pm-mcp status` reports "not responding".
 |link:runtime-model.adoc#_start_modes[Runtime Model, Start Modes]; link:runtime-model.adoc#_failure_semantics[Runtime Model, Failure Semantics]
 
 |[[project-recovery-wait]]Project recovery wait
@@ -337,6 +338,14 @@ a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published 
 |running jobs at `SIGTERM`/`SIGINT` / `pm-mcp drain`
 |Remaining job groups are terminated (<<grace-period>>) and recorded `killed`; warm language servers are shut down; the runtime exits.
 |link:runtime-model.adoc#_drain_stop_upgrade[Runtime Model, Drain, Stop & Upgrade]
+
+|[[stalled-threshold]]Stalled threshold
+|`600` since the last transition or model call of a non-terminal scope without pending condition or awaited event.
+|fixed (compiled constant; the `plan_stalled` record feeds metrics, which must stay comparable across machines)
+|—
+|plans and epics
+|The scope is reported `stalled` in `pm-mcp status`, the web app, and the epic view, and one `plan_stalled` audit record is appended per episode; nothing changes in a model-facing representation.
+|link:runtime-model.adoc#stalled-plans[Runtime Model, Stalled Plans]
 
 |[[pending-entry-max-age]]Pending entry record maximum age
 |`86400`
@@ -374,7 +383,7 @@ a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published 
 |No timeout: transaction locks are held for one transaction only (link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas, Transaction Locks]); long-lived claims are leases (<<leases>>). A reporting threshold of `30` watches every wait without aborting it.
 |fixed (the threshold feeds a `PM-MIG-5` trigger, which must not vary per machine)
 |—
-|runtime and operator CLI
+|runtime
 |The wait continues; the lock manager appends one `lock_wait_exceeded` audit record (lock, holder, waited time), which counts as a `PM-MIG-5` integrity trigger event.
 |link:runtime-model.adoc#_in_process_lock_manager[Runtime Model, In-Process Lock Manager]
 |===
@@ -426,14 +435,6 @@ a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published 
 |===
 |Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
 
-|[[operator-auth-backoff]]Operator passphrase back-off
-|$2^{\text{failures}}$ after the last failed verification; the failure counter and the next-allowed instant persist in `state/operator-auth.json`; a successful verification resets the counter.
-|fixed
-|cap `300`
-|`pm-mcp` operator passphrase verification (platforms without binary-bound keyring ACLs)
-|Attempts before the next-allowed instant are refused and audited; a new CLI process does not reset it.
-|link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI & Security, Operator Channel Isolation]
-
 |Pending operator decision
 |No expiry.
 |—
@@ -457,6 +458,47 @@ a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published 
 |dispatch claims
 |—
 |link:dispatch-and-effort.adoc#_dispatch_id_generation_lifecycle_states[Dispatch & Effort, Dispatch ID Lifecycle]
+|===
+
+[#web-access]
+== Web Access
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-15[PM-WATCH-CLI-15]_
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[pairing-code-ttl]]Pairing code lifetime
+|`300` from issue.
+|fixed (compiled constant)
+|—
+|the open pairing code of `pm-mcp web pair` / `pm-mcp web open`
+|Redemption yields `400` (`pairing_invalid`) and `web_pairing_failed`; the operator issues a new code.
+|link:cli-and-security.adoc#web-pairing[CLI & Security, Pairing Protocol]
+
+|[[pairing-attempt-limit]]Pairing failed-attempt limit
+|`5` failed redemptions of one open pairing (an attempt budget, not a duration).
+|fixed (compiled constant)
+|—
+|the open pairing code
+|The failure that reaches the limit invalidates the open pairing; a later redemption, even with the right code, yields `400` (`pairing_invalid`).
+|link:cli-and-security.adoc#web-pairing[CLI & Security, Pairing Protocol]
+
+|[[device-idle-expiry]]Device idle expiry
+|`90` days since `last_used_at`.
+|fixed (compiled constant)
+|—
+|paired devices in `state/web-devices.json`
+|The next request is answered `401`; the record is removed with `web_device_revoked` (`reason: idle_expired`).
+|link:cli-and-security.adoc#web-devices[CLI & Security, Paired Devices]; link:store-schemas.adoc#web-access-records[Store Schemas, Web Access Records]
+
+|[[device-last-used-granularity]]`last_used_at` write granularity
+|`60`: `last_used_at` is written at most once per interval per device.
+|fixed (compiled constant)
+|—
+|`last_used_at` of paired devices
+|—
+|link:cli-and-security.adoc#web-devices[CLI & Security, Paired Devices]; link:store-schemas.adoc#web-access-records[Store Schemas, Web Access Records]
 |===
 
 [#retention]

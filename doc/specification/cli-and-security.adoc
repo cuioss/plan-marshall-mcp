@@ -10,7 +10,7 @@ link:../Specification.adoc[Specification] » CLI, Coordination & Security (link:
 
 == Overview
 
-This document specifies the operator-facing command line of the *plan-marshall-mcp* (`PM-MCP`) native binary (`pm-mcp`) and the machine-level security mechanisms around the runtime: cross-process `FileChannel.lock()` coordination, the embedded client bundle installer (`pm-mcp client`), the entry identity recorder (`pm-mcp enter`), token-lane credential resolution, operator channel isolation (`pm-mcp operator`), and the security audit log.
+This document specifies the command-line binary of *plan-marshall-mcp* (`PM-MCP`) (`pm-mcp`, the interactive and host-facing client of the daemon), the installation layout of the four release binaries, and the machine-level security mechanisms around the runtime: cross-process `FileChannel.lock()` coordination, the client bundle installer (`pm-mcp client`) and its drift checks, the entry identity recorder (`pm-mcp enter`), the session-start hook (`pm-mcp hook session-start`), token-lane credential resolution, operator channel isolation (`pm-mcp operator`), and the security audit log.
 
 The process topology (always-on runtime, `pm-mcp serve` STDIO relay), the local transport, `stdout` hygiene, runtime start/stop/drain, crash recovery, and logical plan sessions are specified exclusively in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
 
@@ -32,6 +32,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-5[PM-SEC-5: Subprocess Environment Sanitization & Linux Filesystem Confinement]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-6[PM-SEC-6: Security Audit Trail & Tamper-Evident Logging]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-7[PM-SEC-7: Optional Web Server, Device Pairing & Browser Channel Hardening]_
 * _See Requirement link:../Requirements.adoc#PM-TECH-1[PM-TECH-1: Java 25+ & Quarkus MCP Runtime Foundation]_
 * _See Requirement link:../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
 * _See Requirement link:../Requirements.adoc#PM-TECH-3[PM-TECH-3: GraalVM Native Executable & Startup/Memory Bounds]_
@@ -50,6 +51,120 @@ _See Requirements:_
 
 == Status: PLANNED
 
+[#cli-binary]
+== Command-Line Binary (`pm-mcp`) & Installation Layout
+_See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
+
+_See Requirement link:../Requirements.adoc#PM-DIST-3[PM-DIST-3: Uniform Host MCP STDIO Connection Configuration]_
+
+_See Requirement link:../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain]_
+
+_See Requirement link:../Requirements.adoc#PM-TECH-3[PM-TECH-3: GraalVM Native Executable & Startup/Memory Bounds]_
+
+One release ships four native executables. `pm-mcp` is the only one that hosts and users invoke; it starts the others by path.
+
+[cols="1,2,4"]
+|===
+|Binary |Built from |Role
+
+|`pm-mcp`
+|`pm-mcp-clients/pm-mcp-cli` (plain GraalVM native image, <<cli-implementation>>)
+|The interactive and host-facing command line: the `serve` relay, `enter`, `hook`, `status`, `drain`, `runtime`, `client`, `web`, and `operator` verbs. A client of the runtime's API; it holds no store logic.
+
+|`pm-mcpd`
+|`pm-mcp-server` (Quarkus native)
+|The always-on runtime (daemon), one per machine and `PM_MCP_BASE`, started on demand by `pm-mcp`; it opens no TCP listener (link:runtime-model.adoc[Runtime & Interaction Model Specification]).
+
+|`pm-mcp-exec`
+|`pm-mcp-modules/pm-mcp-exec`
+|The job launcher the runtime starts for every job (link:job-runtime.adoc[Job Runtime Specification]); not a user command.
+
+|`pm-mcp-web`
+|`pm-mcp-clients/pm-mcp-web-server` (Quarkus native)
+|The optional web server, started by `pm-mcp web enable` and stopped by `pm-mcp web disable`; a client of the runtime's API like `pm-mcp` (<<web-server>>).
+|===
+
+[#installation-layout]
+=== Installation Layout
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-10[PM-WATCH-CLI-10], link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-11[PM-WATCH-CLI-11], link:../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-13[PM-WATCH-DSL-13]_
+
+* *Installation directory*: `<PM_MCP_HOME>/` is read-only after installation and holds `bin/pm-mcp`, `bin/pm-mcpd`, `bin/pm-mcp-exec`, `bin/pm-mcp-web`, the CycloneDX SBOM of the release in `sbom/` (Java dependencies and the npm packages of the web application), and the release notes. It holds no configuration file: machine settings live in `<PM_MCP_BASE>/machine-config.json` (link:filesystem-layout.adoc#machine-layout[Filesystem Layout Specification]).
+* *Resolution of `PM_MCP_HOME`*: When the environment variable `PM_MCP_HOME` is set it names the installation directory; otherwise it is the parent of the directory that contains the running `pm-mcp` executable, with every symbolic link resolved (so a `pm-mcp` reached through a `PATH` symlink finds its own installation).
+* *Siblings by path, never by `PATH`*: `pm-mcp` starts `pm-mcpd` and `pm-mcp-web` by their absolute paths in `<PM_MCP_HOME>/bin/`, and `pm-mcpd` starts `pm-mcp-exec` from its own installation directory the same way. No binary is looked up through `PATH`, so a same-named executable earlier on `PATH` is never started.
+* *One `PATH` entry*: The installation places exactly one symbolic link, `pm-mcp` → `<PM_MCP_HOME>/bin/pm-mcp`, into a user bin directory that is on `PATH` (for example `~/.local/bin`), or prints the command that creates it when no such directory is writable. Host MCP configurations call `pm-mcp serve` through that entry (`PM-DIST-3`).
+* *Upgrade*: A new release is unpacked into a new versioned installation directory beside the current one, and the `PATH` symlink is switched to it. `pm-mcp drain` then stops the running runtime of the old release; the next command that needs the runtime starts `pm-mcpd` of the new installation (link:runtime-model.adoc#_drain_stop_upgrade[Runtime & Interaction Model Specification, Drain, Stop & Upgrade]). The old installation directory stays until that drain has completed, because the old runtime still starts its jobs through its own `pm-mcp-exec`.
+
+[#command-tree]
+=== Command Tree
+
+`pm-mcp` has two kinds of verbs. The *host-facing* verbs (`serve`, <<_entry_identity_recording_pm_mcp_enter,`enter`>>, <<session-start-hook,`hook`>>) are run by host configurations, hooks, and entry commands in the host shell, which the model drives; they are not operator verbs and grant nothing beyond the model's own tool surface. The *terminal* verbs serve the user and the operator (the installer: <<client-installer>>); those marked `[op]` are operator verbs, accepted only when the CLI's operator checks pass (<<operator-channel-isolation>>).
+
+----
+host-facing
+  pm-mcp serve                                   STDIO relay for hosts (Runtime & Interaction Model)
+  pm-mcp enter --client <id> <scope> [<id>] ...  session row or pending entry, drift notice (Entry Identity Recording)
+  pm-mcp hook session-start --client <id>        scope pointer and drift notice (Session-Start Scope Pointer)
+
+terminal
+  pm-mcp status [--plans] [--archived]           runtime, projects, plans, slots, jobs
+  pm-mcp drain                                   graceful stop of the runtime
+  pm-mcp runtime start|install|uninstall         on-demand start, per-user service registration
+  pm-mcp client install|update|remove|status     host bundles (Client Bundle Installer)
+  pm-mcp web enable|disable [--lan]        [op]  web server
+  pm-mcp web pair [--label <label>]        [op]  pairing code, URL, and QR code
+  pm-mcp web open                          [op]  pair and open the local browser
+  pm-mcp web devices list|revoke <id>|revoke --all
+                                           [op]  paired devices
+  pm-mcp operator <verb> ...               [op]  privileged verbs (Operator Channel Isolation)
+----
+
+The job launcher is not a verb of `pm-mcp`: it is the separate binary `pm-mcp-exec`. The operator verbs are listed in <<operator-channel-isolation>>; the `web` verbs are specified with the web server (<<web-server>>).
+
+[#cli-daemon-access]
+=== Runtime Access & On-Demand Start
+
+_See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
+
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-11[PM-WATCH-CLI-11], link:../implementation-watch/runtime-model.adoc#PM-WATCH-RUN-5[PM-WATCH-RUN-5]_
+
+* *Single writer*: The runtime is the only writer of the stores under `<PM_MCP_BASE>`. Every `pm-mcp` verb that reads live state or changes state is a request to the runtime: `serve` forwards to the MCP endpoint `/mcp`, every other verb calls the REST API `/api/v1`, both on the runtime's Unix domain socket (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The CLI holds no store logic and writes no store file; the runtime validates, locks, audits, and writes. A damaged store blocks only its own scope or project, so the repair verbs (for example `pm-mcp operator accept-edit`) also run through the runtime.
+* *On-demand start*: When no live runtime answers, `pm-mcp` starts `<PM_MCP_HOME>/bin/pm-mcpd` by the on-demand start procedure of the link:runtime-model.adoc#_start_modes[Runtime & Interaction Model Specification, Start Modes] (start lock, liveness re-check, detached start) and then sends its request. No command requires the user to start the runtime first.
+* *Without the runtime*: Exactly three verbs work while no runtime runs, and none of them writes: `pm-mcp status` reads `state/runtime.json` and reports that the runtime is not running; `pm-mcp drain` signals the process recorded in `state/runtime.json` and does nothing when none is recorded; `pm-mcp hook session-start` reads persisted files only and never starts the runtime (<<session-start-hook>>).
+* *Runtime token*: Before a request, the CLI verifies that `<PM_MCP_BASE>/run/` and `run/runtime.token` are owned by the current user, have modes `0700` and `0600`, and are not symbolic links; it refuses to send anything otherwise. It sends the token as `Authorization: Bearer <runtime token>`; on `401` it re-reads the file once (the runtime was restarted) and retries once. The token never appears in arguments, in the environment of a process the CLI starts, in output, or in logs (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Local Trust: Runtime Token]).
+* *Version*: The CLI sends its release version with every request, as the relay does (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]). `pm-mcp client install|update` refuse while the running runtime's version (`state/runtime.json`) differs from the CLI's, and name `pm-mcp drain`, so an upgrade never installs the bundles of the old release.
+
+[#cli-implementation]
+=== CLI Implementation
+
+_See Requirement link:../Requirements.adoc#PM-TECH-3[PM-TECH-3: GraalVM Native Executable & Startup/Memory Bounds]_
+
+The CLI is built for start time and size, without an application framework:
+
+[cols="1,3"]
+|===
+|Concern |Implementation
+
+|Native image
+|Plain GraalVM `native-image` through `org.graalvm.buildtools:native-maven-plugin`; no Quarkus, no CDI, no configuration bootstrap. The relay's start budget is defined in `PM-TECH-3`.
+
+|Command parsing
+|`info.picocli:picocli` with the `info.picocli:picocli-codegen` annotation processor, which generates the reflection and resource metadata at compile time; help, completion, and ANSI output come from picocli.
+
+|Transport
+|An own minimal HTTP/1.1 and Server-Sent Events client over the JDK `SocketChannel` with `UnixDomainSocketAddress` (`java.net.http.HttpClient` cannot use Unix domain sockets).
+
+|JSON
+|`jackson-core` streaming and tree model only, no data binding and no reflection metadata.
+
+|QR code
+|`io.nayuki:qrcodegen` for `pm-mcp web pair`, rendered with Unicode half blocks, a quiet zone of 4 modules, forced black on white.
+
+|Terminal
+|picocli ANSI and `System.console()`; no JLine (no line editing is needed).
+|===
+
+The module `pm-mcp-cli` depends on `pm-mcp-api` only (resource records, link relations, error codes, codecs); it never depends on `pm-mcp-core`, a provider, or Quarkus, so engine and store code cannot reach the CLI binary.
+
 == Process Coordination
 _See Requirement link:../Requirements.adoc#PM-ARCH-1[PM-ARCH-1: Process Ownership & Always-On Runtime]_
 
@@ -59,11 +174,12 @@ _See Requirement link:../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Runtime & Relay 
 
 _See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
 
-The runtime, the `pm-mcp serve` relays, and the operator CLI share the machine-level state under `<PM_MCP_BASE>` (default `~/.plan-marshall-mcp/`; layout and permissions in link:filesystem-layout.adoc#machine-layout[Filesystem Layout Specification]). No legacy `plan-marshall` process reads, writes, or locks this state, and `PM-MCP` takes no lock of the legacy trees (`PM-MIG-2`). Every read-modify-write of a shared store is performed under the `FileChannel.lock()` of the store's sibling lock file in `<PM_MCP_BASE>/locks/` (`build-slots`, `build-timings`, `enrolments`, `install-records`, `machine-config`, `merge`, `operator-auth`, `review-bot`), never under a lock on the store file itself, which the atomic write-and-rename that completes the write replaces. Only the append-only `logs/audit.jsonl` is locked directly; `logs/audit.head` is written under that audit lock. Locks are acquired in the one total order of link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification, Transaction Locks]. The operator CLI acts directly on these stores and never calls the runtime's MCP endpoint; the runtime revalidates state from disk inside every locked transition (link:runtime-model.adoc#_operator_cli_interaction[Runtime & Interaction Model Specification]).
+The runtime (`pm-mcpd`) is the only writer of the machine-level state under `<PM_MCP_BASE>` (default `~/.plan-marshall-mcp/`; layout and permissions in link:filesystem-layout.adoc#machine-layout[Filesystem Layout Specification]). No legacy `plan-marshall` process reads, writes, or locks this state, and `PM-MCP` takes no lock of the legacy trees (`PM-MIG-2`). Every read-modify-write of a shared store is performed under the `FileChannel.lock()` of the store's sibling lock file in `<PM_MCP_BASE>/locks/` (`build-slots`, `build-timings`, `enrolments`, `install-records`, `machine-config`, `merge`, `review-bot`, `web-devices`), never under a lock on the store file itself, which the atomic write-and-rename that completes the write replaces. Only the append-only `logs/audit.jsonl` is locked directly; `logs/audit.head` is written under that audit lock. Locks are acquired in the one total order of link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification, Transaction Locks]. The CLI (`pm-mcp`, including its `operator`, `enter`, and `client` verbs) writes none of these stores: every state change is a request to the runtime's API, which performs it under these locks (<<cli-daemon-access>>).
 
 Runtime process lifecycle, singleton discovery (`locks/runtime.lock`, `state/runtime.json`), the Unix domain socket endpoint, relay `stdout` hygiene, startup permission verification, crash recovery, and drain are specified in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
 
-== Direct Binary Bundle Extraction & Client Installer (`pm-mcp client`)
+[#client-installer]
+== Client Bundle Installer (`pm-mcp client`)
 _See Requirement link:../Requirements.adoc#PM-DIST-1[PM-DIST-1: Single Version Authority & Embedded Client Bundles]_
 
 _See Requirement link:../Requirements.adoc#PM-DIST-2[PM-DIST-2: Embedded Bundle Extraction & Interactive Client Installer]_
@@ -72,7 +188,9 @@ _See Requirement link:../Requirements.adoc#PM-DIST-3[PM-DIST-3: Uniform Host MCP
 
 _See Requirement link:../Requirements.adoc#PM-DIST-4[PM-DIST-4: Bundle Upgrade Detection & Atomic Reconciliation]_
 
-The `pm-mcp` binary is the single version authority for all client integration bundles. All bundle manifests and templates are compiled directly into the native image under `classpath:/bundles/<client>/` (`claude`, `opencode`, `antigravity`, `codex`).
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-12[PM-WATCH-CLI-12]_
+
+The release is the single version authority for all client integration bundles: the bundle version is the release version. The bundle manifests and templates are compiled into the runtime binary `pm-mcpd` under `classpath:/bundles/<client>/` (`claude`, `opencode`, `antigravity`, `codex`), which renders and applies them; `pm-mcp` carries the same bundle version for the drift checks (<<bundle-drift-notice>>), which run without the runtime. Nothing is downloaded.
 
 === Embedded Classpath Bundle Layout
 
@@ -82,41 +200,56 @@ The `pm-mcp` binary is the single version authority for all client integration b
 
 |`classpath:/bundles/{client}/bundle-manifest.json`
 |`claude`, `opencode`, `antigravity`, `codex`
-|Contains the normative `ClientBundleManifest` (see link:client-profiles.adoc[Client Profiles Specification]) declaring `bundle_version`, `daemon_version`, `manifest_sha256`, `files[]`, and `shared_configs[]` for `scope=user` and `scope=project`.
+|Contains the normative `ClientBundleManifest` (see link:client-profiles.adoc#_embedded_client_bundle_bundle_manifest_json_schema[Client Profiles Specification]): one manifest per client with `bundle_version`, `manifest_sha256`, the shared `files[]` declared once, and a `scopes` object with a `user` and a `project` section (target root, directories, `shared_configs[]` with owned keys and owned elements, scope-only files).
 
 |`classpath:/bundles/{client}/files/{bundle_path}`
 |`claude`, `opencode`, `antigravity`, `codex`
-|Immutable UTF-8 template bytes for every command (`/plan-marshall`, `/plan-orchestrator`, `/marshall-steward` or `$plan-marshall` skills), sub-agent variant template (`execution-context-level-1..7`, `execution-context`, `execution-context-reader-level-1..7`, `execution-context-reader`; rendered at install time from the effective effort ladder), and optional hook referenced in `bundle-manifest.json`.
+|Immutable UTF-8 template bytes for every command (`/plan-marshall`, `/plan-orchestrator`, `/marshall-steward` or `$plan-marshall` skills), sub-agent variant template (`execution-context-level-1..7`, `execution-context`, `execution-context-reader-level-1..7`, `execution-context-reader`; rendered at install time from the effective effort ladder), and hook file referenced in `bundle-manifest.json`.
 |===
 
 === Path Traversal & Integrity Guards During Bundle Extraction
 
 1. Every `bundle_path` and `target_path` in `bundle-manifest.json` is validated against the link:identifiers.adoc#id-bundle-path[bundle path grammar] before touching the filesystem.
-2. Target installation paths are resolved against the canonical scope root (`user` home directory or `project` repository root) via `Path.resolve(targetPath).normalize()` and verified with `startsWith(canonicalScopeRoot)` (`PM-SEC-2`).
-3. Before writing any extracted file, `pm-mcp client` computes the SHA-256 digest of the classpath resource bytes and verifies that it matches the `sha256` declared in `bundle-manifest.json`. For `rendered` files this is the template digest; the digest of the rendered output is recorded in `install-records.json` and used for later modification detection.
+2. Target installation paths are resolved against the canonical target root of the selected scope (`user` home directory or `project` repository root) via `Path.resolve(targetPath).normalize()` and verified with `startsWith(canonicalScopeRoot)` (`PM-SEC-2`).
+3. Before writing any extracted file, the runtime computes the SHA-256 digest of the classpath resource bytes and verifies that it matches the `sha256` declared in `bundle-manifest.json`. For `rendered` files this is the template digest; the digest of the rendered output is recorded in `install-records.json` and used for later modification detection.
 
 === `pm-mcp client` CLI Subcommands (`install`, `update`, `remove`, `status`)
 
+Every subcommand is a request to the runtime (<<cli-daemon-access>>). A changing subcommand takes two requests: the runtime computes the change plan and returns it; the CLI shows it and asks for confirmation (<<client-operator-gate>>); the apply request names the plan's digest, and the runtime recomputes the plan under `<PM_MCP_BASE>/locks/install-records.lock` and refuses when the target files changed in between. The runtime writes every file atomically (`*.tmp` + `fsync` + `Files.move(..., ATOMIC_MOVE)`) and records the result in `<PM_MCP_BASE>/state/install-records.json` (link:store-schemas.adoc#machine-state-records[Store Schemas Specification, Machine State Records]).
+
 * `pm-mcp client install <claude|opencode|antigravity|codex> [--scope user|project]`:
-** Reads `classpath:/bundles/<client>/bundle-manifest.json` directly in-process.
-** Computes the diff between the target filesystem and the manifest (`files[]` additions/modifications and surgical `shared_configs[]` key merges into the host configuration files of the link:client-profiles.adoc#host-integration-table[Host Integration Table]).
-** Displays the complete planned file and configuration changes on the terminal and requires interactive operator confirmation (unless `--yes` is passed for non-interactive CI/automation; see <<client-operator-gate>>).
-** Writes each file atomically (`*.tmp` + `fsync` + `Files.move(..., ATOMIC_MOVE)`) and records the installed `bundle_version`, `daemon_version`, `scope`, and per-file SHA-256 digests in `<PM_MCP_BASE>/state/install-records.json` under `<PM_MCP_BASE>/locks/install-records.lock`.
+** Selects the manifest's section of the chosen scope (default `user`; a host that declares a single scope accepts only that scope) together with the shared `files[]`.
+** Plans the missing files and the owned keys and owned elements of `shared_configs[]` for the host configuration files of the link:client-profiles.adoc#host-integration-table[Host Integration Table]: an owned key is merged at its key; an owned element (`permission_rule`, `hook_entry`) is appended to its array when no element with the same normalized value is present. An element that is already present with that value (for example authored by the user) is neither duplicated nor recorded as owned, so `remove` never deletes it.
+** Displays the complete planned file, key, and element changes and requires interactive confirmation (unless `--yes` is passed for non-interactive CI/automation; see <<client-operator-gate>>).
+** Records `scope`, target root, `bundle_version`, and the SHA-256 of every written file, owned key value, and owned element in the install record of `(client, scope, target root)`.
 * `pm-mcp client update [<client>] [--scope user|project]`:
-** Compares the running binary's embedded `bundle-manifest.json` against `install-records.json`, detects any user-modified files via SHA-256 comparison (refusing to overwrite modified files without interactive confirmation), removes retired files from prior bundle versions, and atomically applies updates.
+** Compares the runtime's embedded manifest with the install record: replaces recorded files, keys, and elements whose on-disk value still matches the recorded digest or value, appends new ones, and removes the recorded ones that the new bundle version retired.
+** A recorded file or key whose on-disk digest differs, or a recorded element that is no longer present with its recorded normalized value (edited or deleted by the user), is *modified*: it is listed and left untouched unless `--force` is confirmed interactively on a terminal (`--force` is never accepted together with `--yes`).
 * `pm-mcp client remove <client> [--scope user|project]`:
-** Removes only the unmodified files and `owned_keys` recorded in `install-records.json`, leaving all user-owned configuration keys and sibling host installations intact.
+** Removes only the recorded files, keys, and elements that are unmodified, leaving every unrecorded key and element (the user's own, those of sibling host installations, and those of a legacy `plan-marshall` plugin) intact; modified entries stay and are listed unless `--force` is confirmed interactively.
 * `pm-mcp client status`:
-** Reports installed bundle versions, binary version parity, and any local file modifications across all scopes.
+** Reports, per client and scope, the installed `bundle_version`, the drift checks `bundle_outdated` and `bundle_modified` with the modified and missing entries (<<bundle-drift-notice>>), and the host-side enforcers (the `enforcement` permission rules and the hook entries) installed in that scope. It reads files only and writes nothing.
 
 [#client-operator-gate]
 === Operator Gate for Security-Weakening Changes
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-13[PM-WATCH-CLI-13]_
 
-The host file-tool deny rules installed with a bundle (among them the rules covering `<PM_MCP_BASE>/**`, which include the fallback credential store `<PM_MCP_BASE>/credentials/`, `PM-CRED-3`) are a defense-in-depth boundary against the model; a model-driven shell bypasses them. A model-driven shell must not be able to remove them through the installer:
+The host permission rules installed with a bundle as `enforcement` rules (among them the deny rules covering `<PM_MCP_BASE>/**`, which include the fallback credential store `<PM_MCP_BASE>/credentials/`, `PM-CRED-3`, and the rules for `pm-mcp operator` and `pm-mcp web`, link:client-profiles.adoc#_ownership_digest_verification_on_installupdateremove[Client Profiles Specification]) are a defense-in-depth boundary against the model; a model-driven shell bypasses them. A model-driven shell must not be able to remove them through the installer:
 
 * `pm-mcp client remove` always requires an interactive terminal (`System.console() != null && System.console().isTerminal()`) and interactive confirmation; `--yes` is rejected.
-* `pm-mcp client install` and `pm-mcp client update` compute whether the planned change removes or weakens any installed deny rule (a rule deleted, narrowed, or replaced by an allow rule). If so, they require an interactive terminal and interactive confirmation of the listed rule changes; `--yes` is rejected for that change and the command exits without writing anything.
-* `--yes` remains accepted for `install` and `update` changes that keep or strengthen every deny rule.
+* The change plan of `pm-mcp client install` and `pm-mcp client update` marks whether it removes or weakens any installed `enforcement` rule (a rule deleted, narrowed, moved from the deny or ask list to a less restrictive list, or overridden by an allow rule). If so, the CLI requires an interactive terminal and interactive confirmation of the listed rule changes; `--yes` is rejected for that change and nothing is applied.
+* `--yes` remains accepted for `install` and `update` changes that keep or strengthen every `enforcement` rule; `convenience` rules (for example an allow rule for a read-only `pm-mcp` verb) are not gated.
+* The gate is a check of the CLI, like the operator checks; its residual risk is the one accepted for the operator channel (link:../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]).
+
+[#bundle-drift-notice]
+=== Bundle Drift Notice
+_See Requirement link:../Requirements.adoc#PM-DIST-4[PM-DIST-4: Bundle Upgrade Detection & Atomic Reconciliation]_
+
+`pm-mcp` evaluates two drift checks against the install records of a client: the user-scope record, and the project-scope record whose target root is the resolved project root. Both read files only (`state/install-records.json` and the recorded target files), write nothing, and need no runtime; one implementation serves every caller.
+
+* *`bundle_outdated`*: the record's `bundle_version` differs from the bundle version embedded in the running `pm-mcp` (its release version).
+* *`bundle_modified`*: the recomputed SHA-256 of a recorded file or owned key value differs from the recorded digest, or a recorded owned element is no longer present with its recorded normalized value; the edited and missing entries are listed.
+* *Reporting*: `pm-mcp enter` and `pm-mcp hook session-start` print a one-line notice per affected record that names the check and the fix, `pm-mcp client update <client> [--scope <scope>]` (with `--force` for modified entries); `pm-mcp client status` lists the entries. No record for the client yields no notice. The notice is terminal output for the user; it is never part of a state representation, and the session row records only the installed `bundle_version`.
 
 == Entry Identity Recording (`pm-mcp enter`)
 _See Requirement link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1: Advisory Entry Identity Declaration & Persistence]_
@@ -125,24 +258,31 @@ _See Requirement link:../Requirements.adoc#PM-CLIENT-3[PM-CLIENT-3: Three-Tier E
 
 _Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-1[PM-WATCH-CLI-1]_
 
-When a user invokes `/plan-marshall`, `/plan-orchestrator`, or `/marshall-steward` (or the corresponding Codex skill), the host's entry command executes:
+When a user invokes `/plan-marshall`, `/plan-orchestrator`, or `/marshall-steward` (or the corresponding Codex skill), the host's entry command executes the host-facing verb (<<command-tree>>):
 
 [source,bash]
 ----
 pm-mcp enter --client <claude|opencode|antigravity|codex|neutral> <plan|epic|workspace> [<plan_id>|<epic_id>] [--from-epic <epic_id>] [--model <model_id>]
 ----
 
-1. *Project Resolution & Enrolment*: Resolves the project from the current working directory by the project resolution rule (link:filesystem-layout.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]: `git rev-parse --show-toplevel` and `--git-common-dir` → enrolled `project_root` → `project_id`; a toplevel under `.marshall/local/worktrees/<x>/` → `worktree_of: <x>`; anything else refused as unenrolled), verifies the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (integrity-checked, <<enrolment-integrity>>) and, for the `plan` and `epic` scopes, that the plan lifecycle is offered in the project (lifecycle gate open, project not released, <<enrolment-lifecycle-release>>); the `workspace` scope requires enrolment only.
-2. *Three-Tier Environment Detection*: Evaluates the inherited process environment against `--client` using the detection signals and precedence of the link:client-profiles.adoc#host-integration-table[Host Integration Table] (`PM-CLIENT-3`), logging the comparison to `<PM_MCP_BASE>/logs/audit.jsonl`.
-3. *Host Build Probe*: Runs the version probe of the declared client's profile (link:client-profiles.adoc#host-identity-probes[Client Profiles Specification, Host Identity Probes]) with a bounded timeout, without a shell, and records its output as `client_build`; a host without a probe, a failed probe, or an expired timeout records `null`, never a guessed value. The model identity is taken from the host where the profile's identity probes name a source (`model_source: host`), else from `--model` (`model_source: declared`; the family is derived from the identifier by the compiled model-family table), else recorded `null`.
-4. *Session Row Persistence*: For an existing plan or epic, or the project's workspace scope (link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]), acquires the scope lock (`<PM_MCP_BASE>/projects/<project_id>/locks/{workspace,plan-<plan_id>,epic-<epic_id>}.lock`) and appends one row to the scope's session log in the per-project machine store (`plans/<plan_id>/sessions.jsonl`, `epics/<epic_id>/sessions.jsonl`, or `workspace/sessions.jsonl`) as a journaled transaction (link:store-schemas.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]). For a plan that does not exist yet, allocates a fresh `entry_id`, writes the pending entry record `<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json` (the session row plus `entry_id` and `from_epic`), and prints the `entry_id` for the host's entry command, which passes it to `pm_start`; `pm_start` makes the row the first row of the new plan's session log and copies `from_epic` into `origin.epic_id`, so concurrent sessions entering new plans never overwrite each other's record. A row carries `client_session_id` (read from the host's session ID variable of the link:client-profiles.adoc#host-integration-table[Host Integration Table], null when the host provides none), the declared `client`, `client_detected`, `environment_match_tier`, `client_build`, `model_family`, `model_id`, `model_source`, `pm_mcp_version`, `bundle_version` (from `state/install-records.json`), `project_id`, `entered_from` and `worktree_of`, `first_seen_at`, `last_seen_at`, and `transcript_locator` (rendered from the profile's transcript locator, null when unavailable; schema in link:store-schemas.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]); the detected environment signature and OS principal are recorded in `audit.jsonl` only. When the declared client differs from the previous row's, `pm-mcp enter` also appends an `identity` audit record (`event: entry_handover`) whose `details` carry the previous and the new `client` and `client_session_id`.
-5. *Bundle Drift Notice (`PM-DIST-4`)*: Compares the `bundle_version` recorded in `<PM_MCP_BASE>/state/install-records.json` against the binary's `daemon_version`; if skewed, emits a `bundle_outdated` warning so the initial `pm_start` / `pm_state` representation prompts `pm-mcp client update <client_id>`.
+`pm-mcp enter` runs in the host shell, which the model drives; it is not an operator verb. It gathers what only the host shell can see (the git top-level of the working directory, its inherited environment signature, the host session ID variable, the host build probe, `--model`) and sends it as one request to the runtime's API, starting the runtime on demand (<<cli-daemon-access>>). The runtime performs steps 1, 2, and 4 and writes every record; `pm-mcp enter` writes no store. It prints the `entry_id` for a new plan and the drift notice of step 5.
+
+1. *Project Resolution & Enrolment*: The runtime resolves the project from the transmitted working directory by the project resolution rule (link:filesystem-layout.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]: `git rev-parse --show-toplevel` and `--git-common-dir` → enrolled `project_root` → `project_id`; a toplevel under `.marshall/local/worktrees/<x>/` → `worktree_of: <x>`; anything else refused as unenrolled), verifies the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (integrity-checked, <<enrolment-integrity>>) and, for the `plan` and `epic` scopes, that the plan lifecycle is offered in the project (lifecycle gate open, project not released, <<enrolment-lifecycle-release>>); the `workspace` scope requires enrolment only.
+2. *Three-Tier Environment Detection*: The runtime evaluates the environment signature the CLI computed from its inherited process environment against `--client` using the detection signals and precedence of the link:client-profiles.adoc#host-integration-table[Host Integration Table] (`PM-CLIENT-3`), logging the comparison to `<PM_MCP_BASE>/logs/audit.jsonl`.
+3. *Host Build Probe*: The CLI runs the version probe of the declared client's profile (link:client-profiles.adoc#host-identity-probes[Client Profiles Specification, Host Identity Probes]) with a bounded timeout, without a shell, and sends its output as `client_build`; a host without a probe, a failed probe, or an expired timeout records `null`, never a guessed value. The model identity is taken from the host where the profile's identity probes name a source (`model_source: host`), else from `--model` (`model_source: declared`; the family is derived from the identifier by the compiled model-family table), else recorded `null`.
+4. *Session Row Persistence*: For an existing plan or epic, or the project's workspace scope (link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]), the runtime acquires the scope lock (`<PM_MCP_BASE>/projects/<project_id>/locks/{workspace,plan-<plan_id>,epic-<epic_id>}.lock`) and appends one row to the scope's session log in the per-project machine store (`plans/<plan_id>/sessions.jsonl`, `epics/<epic_id>/sessions.jsonl`, or `workspace/sessions.jsonl`) as a journaled transaction (link:store-schemas.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]). For a plan that does not exist yet, allocates a fresh `entry_id`, writes the pending entry record `<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json` (the session row plus `entry_id` and `from_epic`), and returns the `entry_id`, which the CLI prints for the host's entry command, which passes it to `pm_start`; `pm_start` makes the row the first row of the new plan's session log and copies `from_epic` into `origin.epic_id`, so concurrent sessions entering new plans never overwrite each other's record. A row carries `client_session_id` (read from the host's session ID variable of the link:client-profiles.adoc#host-integration-table[Host Integration Table], null when the host provides none), the declared `client`, `client_detected`, `environment_match_tier`, `client_build`, `model_family`, `model_id`, `model_source`, `pm_mcp_version`, `bundle_version` (from `state/install-records.json`), `project_id`, `entered_from` and `worktree_of`, `first_seen_at`, `last_seen_at`, and `transcript_locator` (rendered from the profile's transcript locator, null when unavailable; schema in link:store-schemas.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]); the detected environment signature and OS principal are recorded in `audit.jsonl` only. When the declared client differs from the previous row's, the runtime also appends an `identity` audit record (`event: entry_handover`) whose `details` carry the previous and the new `client` and `client_session_id`.
+5. *Bundle Drift Notice (`PM-DIST-4`)*: The CLI evaluates `bundle_outdated` and `bundle_modified` for the declared client (<<bundle-drift-notice>>) and prints the notice that names `pm-mcp client update <client_id>`; the notice never enters a state representation.
 
 [#session-start-hook]
-== Session-Start Scope Pointer (`pm-mcp hook session-start`)
+== Session-Start Hook: Scope Pointer & Drift Notice (`pm-mcp hook session-start`)
 _See Requirement link:../Requirements.adoc#PM-CLIENT-6[PM-CLIENT-6: Post-Compaction Scope Pointer]_
 
-`pm-mcp hook session-start --client <client_id>` resolves the project from the current working directory by the project resolution rule (link:filesystem-layout.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]) and the live scope from persisted records only: the session logs of the project's plans, epics, and workspace scope, matched on `client_session_id` where the host exposes it (Host Integration Table session ID variable), otherwise the scope with the most recent session row (`last_seen_at`) in the project; `mcp/status.json` supplies its phase. A working directory that does not resolve to an enrolled project yields empty output. It never contacts the runtime's MCP endpoint, loads no skill, and writes nothing. Its output is the pointer defined in link:client-profiles.adoc#session-lifecycle-hook[Client Profiles Specification, Session Lifecycle Hook & Scope Pointer]: empty when no scope matches, a one-line notice naming the scope and `pm-mcp status` when the matched scope's state is unreadable or fails its digest check, and exit code `0` in every case. The resolution is deterministic: the same records always yield the same pointer.
+`pm-mcp hook session-start --client <client_id>` is a host-facing verb run by the host's session-start hook. It reads persisted files only: it never starts the runtime, never contacts it, loads no skill, and writes nothing (<<cli-daemon-access>>). It resolves the project from the current working directory by the project resolution rule (link:filesystem-layout.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]) and the live scope from persisted records only: the session logs of the project's plans, epics, and workspace scope, matched on `client_session_id` where the host exposes it (Host Integration Table session ID variable), otherwise the scope with the most recent session row (`last_seen_at`) in the project; `mcp/status.json` supplies its phase. Its output has two independent parts:
+
+* *Scope pointer*: the pointer defined in link:client-profiles.adoc#session-lifecycle-hook[Client Profiles Specification, Session Lifecycle Hook & Scope Pointer]: empty when no scope matches or the working directory does not resolve to an enrolled project, and a one-line notice naming the scope and `pm-mcp status` when the matched scope's state is unreadable or fails its digest check. The resolution is deterministic: the same records always yield the same pointer.
+* *Drift notice*: the bundle drift notice for `<client_id>` (<<bundle-drift-notice>>), printed after the pointer. Neither part suppresses or alters the other; each is printed whenever its own condition holds.
+
+The exit code is `0` in every case, including an unreadable record, a missing runtime, and an unresolved project.
 
 == Token-Lane Credential Architecture & OS Keyring Integration
 _See Requirement link:../Requirements.adoc#PM-CRED-1[PM-CRED-1: Dual-Lane Credential Separation (System vs Token Lane)]_
@@ -233,41 +373,102 @@ The CLI variant runs the operator's enrolled `git`, `gh`, or `glab` with the ope
 
 The `CredentialStore` service uses exactly one active backend per machine, chosen at runtime start: the OS keyring when one is available, otherwise the fallback file store. A secret never exists in two backends, and within the active backend the project entry `<project>/<credential_key>` is resolved before the global entry `<credential_key>` (`PM-CRED-2`). `<project>` is the project's enrolment identifier (`PM-CRED-3`), never derived from a remote URL or a checkout path. The backends are:
 
-* *macOS Keychain (Primary on macOS)*: Invokes macOS Security framework APIs (`SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, `SecItemDelete`) directly via Java 25's Foreign Function & Memory (FFM) API (`java.lang.foreign.Linker`). Items are stored under PM-MCP's own service name `de.cuioss.pm-mcp` (qualified by the instance directory when a non-default `PM_MCP_BASE` is set, `PM-DIST-5`) with account `<credential_key>` or `<project>/<credential_key>` and a trusted-application ACL restricting unprompted read access to the signed `pm-mcp` binary.
+* *macOS Keychain (Primary on macOS)*: Invokes macOS Security framework APIs (`SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, `SecItemDelete`) directly via Java 25's Foreign Function & Memory (FFM) API (`java.lang.foreign.Linker`). Items are stored under PM-MCP's own service name `de.cuioss.pm-mcp` (qualified by the instance directory when a non-default `PM_MCP_BASE` is set, `PM-DIST-5`) with account `<credential_key>` or `<project>/<credential_key>` and a trusted-application ACL restricting unprompted read access to the signed runtime binary `pm-mcpd`, the only process that reads or writes credentials (the CLI never touches the credential store).
 * *Linux Secret Service (Primary on Linux)*: Communicates with `org.freedesktop.secrets` over the user session D-Bus (`gnome-keyring` / `KWallet`) storing attributes `service=de.cuioss.pm-mcp`, `credential_key=<credential_key>`, and optional `project=<project>`.
-* *Permission-Guarded Fallback File Store*: When no OS keyring is available (headless Linux or WSL2), secrets are stored in the `PM-MCP` credential file format (`format_version`, closed schema, written only by `pm-mcp operator credentials`, `PM-CRED-3`) at `<PM_MCP_BASE>/credentials/<credential_key>.json` and `<PM_MCP_BASE>/credentials/<project>/<credential_key>.json` (directory mode `0700`, file mode `0600`, see link:filesystem-layout.adoc[Filesystem Layout Specification] and link:store-schemas.adoc[Store Schemas Specification]). If ownership or permission checks on a credential file fail, `pm-mcp` refuses to read it and blocks only the step that needs that credential: the engine raises the `blocked` condition on the step's current state with `facts.reason: credentials_file_insecure` and `facts.operator_command` naming the exact `pm-mcp operator credentials` command that repairs it (`PM-CRED-4`). The runtime itself keeps running; it exits with code `77` only when `<PM_MCP_BASE>` or its state files fail the startup ownership and permission checks (link:runtime-model.adoc#_startup_sequence[Runtime & Interaction Model Specification]).
+* *Permission-Guarded Fallback File Store*: When no OS keyring is available (headless Linux or WSL2), secrets are stored in the `PM-MCP` credential file format (`format_version`, closed schema, written only by `pm-mcp operator credentials`, `PM-CRED-3`) at `<PM_MCP_BASE>/credentials/<credential_key>.json` and `<PM_MCP_BASE>/credentials/<project>/<credential_key>.json` (directory mode `0700`, file mode `0600`, see link:filesystem-layout.adoc[Filesystem Layout Specification] and link:store-schemas.adoc[Store Schemas Specification]). If ownership or permission checks on a credential file fail, the runtime refuses to read it and blocks only the step that needs that credential: the engine raises the `blocked` condition on the step's current state with `facts.reason: credentials_file_insecure` and `facts.operator_command` naming the exact `pm-mcp operator credentials` command that repairs it (`PM-CRED-4`). The runtime itself keeps running; it exits with code `77` only when `<PM_MCP_BASE>` or its state files fail the startup ownership and permission checks (link:runtime-model.adoc#_startup_sequence[Runtime & Interaction Model Specification]).
 
 * *No Legacy Credential Access*: The `CredentialStore` never reads legacy `plan-marshall` credentials (its keyring entries, `~/.plan-marshall/credentials/`, `PLAN_MARSHALL_CREDENTIALS_DIR`, `PLAN_MARSHALL_HOME`), and no verb imports them (`PM-MIG-2`). Credentials enter the `PM-MCP` stores only through `pm-mcp operator credentials`, each entry operator-owned, including its allowed `url`.
 
 [#operator-credential-cli]
 === Operator-Only Credential CLI & Runtime Secret Redaction
 
-* *Operator CLI Verbs*: Credential mutations and verifications are restricted exclusively to interactive TTY invocations of `pm-mcp operator credentials set|status|check|verify|remove|migrate|rotate <credential_key> [--project]`. `set` always reads the secret from the terminal with echo disabled (`System.console().readPassword()`), together with the non-secret fields (`url`, `auth_type`, header settings; for `github_app` the `client_id` and optional `installation_id`, the PKCS#8 `private_key` being read as a secret); when targeting the file store it writes the complete credential file in the `PM-MCP` format (`format_version`, closed schema, link:store-schemas.adoc#credential-store[Store Schemas Specification, Credential Store]) atomically with mode `0600`. The CLI is the only writer of credential files: no placeholder file and no hand-edited file exists, and a file the CLI did not write in the current format is refused (`credentials_file_invalid`). Secrets are never accepted from command-line arguments or environment variables.
-* *Identity, Kind & Expiry*: For `github` and `gitlab` entries, `set` and `verify` call `ci.whoami` and record the token kind (`token_kind`) and, where the provider reports one, the expiry (`expires_at`; an operator-entered expiry at `set` otherwise); `verify` shows the resolved identity, its permissions on the enrolled repository, and whether it can read check runs (`checks_visible`), without revealing the secret. `status` reports per entry one of `complete`, `incomplete`, `not_found`, `verified`, `unverified`, plus `expiring` when `expires_at` lies within 14 days (compiled constant), and names an entry without a known expiry; neither is a refusal, and neither reaches a model-facing representation, since an expiring credential still works. `rotate <credential_key>` replaces the secret of an existing entry (for the operator entry, the operator passphrase), keeps its non-secret fields, and drops every token derived from the old secret (<<derived-tokens>>); rotation is always an operator verb, never automatic.
+* *Operator CLI Verbs*: Credential mutations and verifications are restricted exclusively to interactive TTY invocations of `pm-mcp operator credentials set|status|check|verify|remove|migrate|rotate <credential_key> [--project]` (operator verbs, <<operator-channel-isolation>>). `set` and `rotate` always read the secret from the terminal with echo disabled (`System.console().readPassword()`), together with the non-secret fields (`url`, `auth_type`, header settings; for `github_app` the `client_id` and optional `installation_id`, the PKCS#8 `private_key` being read as a secret), and send them in the body of one request to the runtime's API over its Unix domain socket (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); the CLI keeps the secret only in a `char[]` that it clears after the request and never writes it anywhere. Entering a secret is CLI-only: the endpoint refuses a web-originated request (<<web-proxy>>). The runtime writes the entry into the active backend; when targeting the file store it writes the complete credential file in the `PM-MCP` format (`format_version`, closed schema, link:store-schemas.adoc#credential-store[Store Schemas Specification, Credential Store]) atomically with mode `0600`. The runtime, on an operator verb, is the only writer of credential files: no placeholder file and no hand-edited file exists, and a file it did not write in the current format is refused (`credentials_file_invalid`). Secrets are never accepted from command-line arguments or environment variables.
+* *Identity, Kind & Expiry*: For `github` and `gitlab` entries, `set` and `verify` call `ci.whoami` and record the token kind (`token_kind`) and, where the provider reports one, the expiry (`expires_at`; an operator-entered expiry at `set` otherwise); `verify` shows the resolved identity, its permissions on the enrolled repository, and whether it can read check runs (`checks_visible`), without revealing the secret. `status` reports per entry one of `complete`, `incomplete`, `not_found`, `verified`, `unverified`, plus `expiring` when `expires_at` lies within 14 days (compiled constant), and names an entry without a known expiry; neither is a refusal, and neither reaches a model-facing representation, since an expiring credential still works. `rotate <credential_key>` replaces the secret of an existing entry, keeps its non-secret fields, and drops every token derived from the old secret (<<derived-tokens>>); rotation is always an operator verb, never automatic.
 * *Zero Model Exposure & Redaction*: No MCP tool, resource, or state representation exposes credential values (`status` and `check` report only metadata: provider name, scope, backend type, and configured status). Every secret value resolved for a request, and every value derived from one (a GitHub App JWT and installation token, <<derived-tokens>>; the `user:token` form of a git transport credential), is added to the in-memory redaction registry of the `SecretRedactor` filter, which keeps it for the runtime's lifetime solely to scrub matching byte/character sequences to `[REDACTED]` across tool results, representations, log records, `audit.jsonl` entries, and error messages. The registry is never persisted and never exported to subprocess environments or logs; it is discarded when the runtime stops (`PM-CRED-5`).
+* *Runtime Secrets*: The local-trust and web secrets are redacted the same way (`PM-SEC-6`): the runtime token (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]) is registered by value when the runtime writes it and by every client process when it reads it; device secrets (`pmw_` values) and pairing codes are scrubbed by their shape (link:identifiers.adoc#id-device-secret[Identifier Registry, device secret]; link:identifiers.adoc#id-pairing-code[Identifier Registry, pairing code]), because the runtime keeps only their SHA-256 hashes. None of them is written to a log, an audit record, a command-line argument, a process environment, or a representation; request headers are never logged (<<web-proxy>>). The pairing code is printed once to the operator's terminal and never logged. No runtime secret is ever passed to a job: the runtime token file lies outside every job's Landlock read set (link:job-runtime.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]).
 
+[#operator-channel-isolation]
 == Operator Channel Isolation & Privileged CLI (`pm-mcp operator`)
 _See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
 
 _See Requirement link:../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
 
-_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-3[PM-WATCH-CLI-3]_
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-3[PM-WATCH-CLI-3], link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-14[PM-WATCH-CLI-14]_
 
-Privileged actions—project enrolment (`enrol`, `unenrol`), project release (`release-project`, <<enrolment-lifecycle-release>>), credential management (`credentials`), gate overrides (`force-gate`), merge-barrier overrides (`authorize-merge`), cross-project access grants (`grant-access`), plan deletion (`delete-plan`), removal of a retained capture ref (`drop-capture`, <<operator-drop-capture>>), acceptance of manual store edits (`accept-edit`), and maintenance of the shared epic worktree (`epic-worktree teardown|adopt`, link:filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification])—are unreachable from every MCP tool.
+Privileged actions are unreachable from every MCP tool and every link. They are operator verbs of the CLI, each an endpoint under `/api/v1/operator/` or `/api/v1/web/` of the runtime's API (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); the runtime executes them as audited transactions, and the CLI writes nothing itself. The complete list:
 
-1. *Dual Operator Channels*: Authorizing decisions require either (a) native MCP Elicitation (`elicitation/create`) on hosts where `client_profile.connection.elicitation_supported == true`, or (b) the interactive `pm-mcp operator <action>` CLI executing directly against the local state stores under `FileChannel.lock()`.
-2. *Interactive TTY & Keyring / Passphrase Verification*: `pm-mcp operator` verifies that it is attached to an interactive terminal (`System.console() != null && System.console().isTerminal()`), detects and rejects the coding-agent environment signals of the link:client-profiles.adoc#host-integration-table[Host Integration Table] (primary and secondary) unless interactive operator authentication succeeds, and verifies the operator credential stored in the OS keyring (service name `de.cuioss.pm-mcp`, account `operator`). On platforms without binary-bound Keychain ACLs (Linux Secret Service or fallback file store), `pm-mcp operator` additionally prompts interactively (no echo) for the operator passphrase, verified against a salted PBKDF2-HMAC-SHA256 hash (`>= 600,000` iterations) with exponential back-off rate-limiting (link:timeouts.adoc#operator-auth-backoff[Timeouts & Budgets Specification, Operator Passphrase Back-Off]) and audit logging on every attempt. The failure counter and the next-allowed timestamp persist in `<PM_MCP_BASE>/state/operator-auth.json` (mode `0600`, updated under `<PM_MCP_BASE>/locks/operator-auth.lock`), so starting a new CLI process does not reset the back-off; a successful verification resets the counter.
-3. *Accepted Residual Risk (macOS)*: Because the Keychain ACL trusts the `pm-mcp` binary itself and no passphrase is required on macOS, a model-driven shell can pass the operator checks by running `pm-mcp operator` inside a pseudo-terminal (for example via `script`) with the agent environment markers removed. This is accepted and documented as a residual risk (`PM-SEC-3`); the TTY and environment-marker checks remain as guards against accidental invocation.
-4. *Blocked Condition*: When a workflow requires operator authorization and MCP Elicitation is unavailable, the engine raises the `blocked` condition on the scope's current state (link:state-catalogue.adoc#condition-blocked[State Catalogue, Conditions]; the state and `call_stack` stay unchanged), records the pending operator decision (`decision_id`) in the scope's `mcp/status.json`, populates `facts.operator_command` with the exact `pm-mcp operator ...` invocation, and offers only the link `wait:decision:<decision_id>` (rel `wait`). Following it performs a bounded wait (`PM-IMPL-4`, link:timeouts.adoc#decision-wait[Timeouts & Budgets Specification, Operator Decision Wait]) on that decision record and returns the next state as soon as the operator resolves the decision on the terminal, or the unchanged representation with its `blocked` condition when the wait bound expires. An elicitation left unanswered when its call's wait window expires falls back to this condition (link:timeouts.adoc#elicitation-wait[Timeouts & Budgets Specification, Elicitation Request]).
+[cols="2,3"]
+|===
+|Verb |Effect
+
+|`pm-mcp operator enrol`, `unenrol`
+|Project enrolment and its removal (<<enrolment-lifecycle-release>>, <<enrolment-integrity>>)
+
+|`pm-mcp operator release-project`
+|Project release (<<enrolment-lifecycle-release>>)
+
+|`pm-mcp operator config`
+|Machine and per-project operator configuration (`machine-config.json`, `local-config.json`), including the integration variants
+
+|`pm-mcp operator credentials set\|status\|check\|verify\|remove\|migrate\|rotate`
+|Token Lane credentials (<<operator-credential-cli>>)
+
+|`pm-mcp operator authorize-merge`, `force-gate`
+|Merge-barrier and gate overrides
+
+|`pm-mcp operator grant-access`
+|Cross-project access grants (`PM-SEC-2`)
+
+|`pm-mcp operator approve-outline`, `resolve-deviation`
+|Operator approval of an outline and resolution of a recorded deviation (link:phase-workflows.adoc[Phase Workflows Specification])
+
+|`pm-mcp operator continuation-policy`
+|The continuation policy of a plan or epic (link:hypermedia-format.adoc[Hypermedia Format Specification])
+
+|`pm-mcp operator discharge-owed`
+|Operator discharge of an owed item (link:store-schemas.adoc[Store Schemas Specification])
+
+|`pm-mcp operator delete-plan`
+|Plan deletion
+
+|`pm-mcp operator drop-capture`
+|Removal of a retained capture ref (<<operator-drop-capture>>)
+
+|`pm-mcp operator accept-edit`
+|Acceptance of a manual store edit and re-baselining of an enrolment file
+
+|`pm-mcp operator lesson release`
+|Content-reviewed upstream release of a lesson (`PM-ARCH-2`)
+
+|`pm-mcp operator quality-report`
+|Quality report over the project's plans (link:phase-workflows.adoc[Phase Workflows Specification])
+
+|`pm-mcp operator audit verify`
+|Full audit chain verification (<<_security_audit_trail_three_tier_identity_verification>>)
+
+|`pm-mcp operator upstream allow\|deny`
+|The upstream MCP allowlist (`conf/upstream-mcp.json`, `PM-SVC-3`)
+
+|`pm-mcp operator epic-worktree teardown\|adopt`
+|Maintenance of the shared epic worktree (link:filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification])
+
+|`pm-mcp web enable\|disable`, `pm-mcp web pair`, `pm-mcp web open`, `pm-mcp web devices list\|revoke`
+|The optional web server, device pairing, and paired devices (<<web-server>>)
+|===
+
+1. *Three Operator Channels*: Authorizing decisions require one of (a) native MCP Elicitation (`elicitation/create`) on hosts where `client_profile.connection.elicitation_supported == true`, (b) an operator verb of the CLI (`pm-mcp operator <verb>`, `pm-mcp web ...`), or (c) a paired web device (<<web-operator-channel>>), which has operator rights because only an operator verb can pair it. None of them routes through the model; every privileged action is audited with its channel (`elicitation`, `cli`, or `web` with the `device_id`).
+2. *CLI Operator Checks*: Before it sends an operator verb, `pm-mcp` verifies that it is attached to an interactive terminal (`System.console() != null && System.console().isTerminal()`) and that none of the coding-agent environment signals of the link:client-profiles.adoc#host-integration-table[Host Integration Table] (primary and secondary) is present; either failure refuses the verb with a diagnostic before any request is sent. Every verb then asks for interactive confirmation of the displayed change. The host deny rules installed with the bundles (`Bash(pm-mcp operator:*)`, `Bash(pm-mcp web:*)`, link:client-profiles.adoc[Client Profiles Specification]) are defence in depth against a model shell. There is no passphrase, no operator session, and no operator entry in the OS keyring: the operator proof of the first iteration is these checks alone.
+3. *Accepted Risk*: The checks guard against accidental and naive invocation, not against a model shell that deliberately defeats them (a pseudo-terminal, a cleared environment, indirect invocation). The runtime cannot verify the CLI's checks, so any process of the same OS user that holds the runtime token can call the operator endpoints directly (for example with `curl --unix-socket`). This is accepted for the first iteration and documented as a residual risk (`PM-SEC-3`); a user proof the model cannot produce (an operator passphrase session, OS user presence) and device roles with step-up are deferred (link:../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]). Every privileged action stays recorded in the audit log (`PM-SEC-6`).
+4. *Blocked Condition*: When a workflow requires operator authorization and MCP Elicitation is unavailable, the engine raises the `blocked` condition on the scope's current state (link:state-catalogue.adoc#condition-blocked[State Catalogue, Conditions]; the state and `call_stack` stay unchanged), records the pending operator decision (`decision_id`) in the scope's `mcp/status.json`, populates `facts.operator_command` with the exact `pm-mcp operator ...` invocation, and offers only the link `wait:decision:<decision_id>` (rel `wait`). Following it performs a bounded wait (`PM-IMPL-4`, link:timeouts.adoc#decision-wait[Timeouts & Budgets Specification, Operator Decision Wait]) on that decision record and returns the next state as soon as the operator resolves the decision through the CLI or a paired web device, or the unchanged representation with its `blocked` condition when the wait bound expires. An elicitation left unanswered when its call's wait window expires falls back to this condition (link:timeouts.adoc#elicitation-wait[Timeouts & Budgets Specification, Elicitation Request]).
 5. [[operator-drop-capture]]*Capture Ref Removal (`pm-mcp operator drop-capture <plan_id>`)*: A `land` plan that ended without `merged` keeps its capture ref `refs/pm-mcp/captures/<plan_id>` in the enrolled repository as the user's recovery point and owes `capture_ref_retained` (link:phase-workflows.adoc#land-lane[Phase Workflows Specification, Land Lane, item 6]). The verb shows the ref's snapshot commit and its paths, deletes the ref after confirmation, discharges the owed item (also for an archived plan), and appends an `audit.jsonl` record. It is operator-only like every verb of this section; no workflow state, recovery sweep, or MCP tool removes a retained capture ref.
 
 [#enrolment-integrity]
 === Enrolment Integrity
 _See Requirement link:../Requirements.adoc#PM-SEC-5[PM-SEC-5: Subprocess Environment Sanitization & Linux Filesystem Confinement]_
 
-* *One File, One HMAC, One Lock per Project*: Every project has its own enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (link:store-schemas.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]). Every write of it by the operator CLI (`enrol`, `unenrol`, re-baselining) runs under `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock` and also writes the sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac`, an HMAC-SHA-256 over the canonical file content. `unenrol` removes the file and its sidecar. The key lives in the OS keyring under the `PM-MCP` namespace (service `de.cuioss.pm-mcp`, operator lane); on hosts without a keyring it lives in `<PM_MCP_BASE>/state/enrolment-hmac.key` (mode `0600`).
-* *Verification*: The runtime verifies a project's HMAC in the project's recovery after a runtime start, before the project is first served (link:runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]), and before every verify-not-resolve check of the project's jobs (`PM-EXEC-2`, link:job-runtime.adoc#enrolment-integrity[Job Runtime Specification]); `pm-mcp enter` and the operator CLI verify it before they use the file. On mismatch it refuses with `enrolment_tampered`, appends an `audit.jsonl` record, and names the operator command; nothing in that file is trusted until the operator re-baselines it interactively (`pm-mcp operator accept-edit --enrolment <project_id>`, after reviewing the displayed difference). A tampered file blocks only its own project; every other enrolled project keeps being served.
-* *Residual Risk*: Landlock keeps jobs from writing `<PM_MCP_BASE>` on Linux (`PM-SEC-5`), but a host shell driven by the model is not a job and is not confined; the HMAC is the control against it. On macOS the Keychain releases the key to the `pm-mcp` binary without a passphrase, so a model-driven shell that passes the operator checks (Accepted Residual Risk (macOS) above) can re-baseline a tampered file. On hosts without a keyring the key file is readable by every process of the same user, so the HMAC detects edits made without the key but not a deliberate forgery. Both are documented as accepted residual risks (`PM-SEC-5`).
+* *One File, One HMAC, One Lock per Project*: Every project has its own enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (link:store-schemas.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]). Every write of it (the operator verbs `enrol`, `unenrol`, and re-baselining, executed by the runtime on the verb's request) runs under `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock` and also writes the sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac`, an HMAC-SHA-256 over the canonical file content. `unenrol` removes the file and its sidecar. The key lives in the OS keyring under the `PM-MCP` namespace (service `de.cuioss.pm-mcp`, operator lane); on hosts without a keyring it lives in `<PM_MCP_BASE>/state/enrolment-hmac.key` (mode `0600`).
+* *Verification*: The runtime verifies a project's HMAC in the project's recovery after a runtime start, before the project is first served (link:runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]), and before every verify-not-resolve check of the project's jobs (`PM-EXEC-2`, link:job-runtime.adoc#enrolment-integrity[Job Runtime Specification]); the runtime also verifies it before it serves an `enter` request or an operator verb that uses the file. On mismatch it refuses with `enrolment_tampered`, appends an `audit.jsonl` record, and names the operator command; nothing in that file is trusted until the operator re-baselines it interactively (`pm-mcp operator accept-edit --enrolment <project_id>`, after reviewing the displayed difference). A tampered file blocks only its own project; every other enrolled project keeps being served.
+* *Residual Risk*: Landlock keeps jobs from writing `<PM_MCP_BASE>` on Linux (`PM-SEC-5`), but a host shell driven by the model is not a job and is not confined; the HMAC is the control against it. The key never leaves the runtime (`pm-mcpd`), but a model-driven shell that defeats the CLI's operator checks, or any same-user process that calls the operator endpoint directly with the runtime token, can re-baseline a tampered file (Accepted Risk of <<operator-channel-isolation>>). On hosts without a keyring the key file is readable by every process of the same user, so the HMAC detects edits made without the key but not a deliberate forgery. Both are documented as accepted residual risks (`PM-SEC-5`).
 
 [#enrolment-lifecycle-release]
 === Enrolment, Lifecycle Gate & Release
@@ -296,7 +497,7 @@ Every MCP tool call, state transition, job execution, credential lookup, and ope
 * *Anchored Head (`logs/audit.head`)*: After every append the writer updates, under the same lock, the sidecar `logs/audit.head` with the current file name, record count, last `event_id`, and head hash (the hash of the last canonical line), protected by an HMAC-SHA-256 under the integrity key of the enrolment store (<<enrolment-integrity>>). The chain alone proves only that the records present are consistent; the anchored head makes a deleted log, a reset to the genesis value, a truncated tail, and a consistently rewritten chain detectable.
 * *Rotation & Checkpoints*: When `audit.jsonl` exceeds `audit_rotation.max_bytes` or `audit_rotation.max_days` (`machine-config.json`, link:timeouts.adoc#audit-rotation-age[Timeouts & Budgets Specification]), the writer appends a `checkpoint` record (record count, head hash, HMAC under the same key), renames the file to `audit-<first_event_id>.jsonl`, and starts the new `audit.jsonl` with a record whose `prev_hash` is the hash of that checkpoint line. Every rotated file is listed in the append-only index `logs/audit-index.jsonl` (file name, first and last `event_id`, record count, checkpoint hash), itself hash-chained and anchored in `audit.head`. A retention purge (link:store-schemas.adoc#evidence-based-removal-sweeps[Store Schemas, Evidence-Based Removal Sweeps]) removes only whole rotated files and never their index entries, so a purged file stays accounted for.
 * *Chain Verification at Runtime Start*: The runtime verifies incrementally: the HMAC of `audit.head`, the index, and the records of the current file after its last checkpoint. A missing log, a reset to genesis, a record count below the anchored count, or a head mismatch is reported as `audit_chain_broken` with `reason` `missing`, `reset`, `truncated`, or `head_mismatch`; a broken link inside the verified range uses `reason: link_broken` and names the first broken line. The full chain across all rotated files is verified on demand by `pm-mcp operator audit verify`. The same reporting rules apply to every result: on `stderr`, in `pm-mcp status`, and as an `audit_chain_broken` security record; the log is never rewritten or silently repaired, and the next record chains to the last line as found.
-* *Residual Risk*: The anchoring is tamper-evident, not tamper-proof: a process that holds the integrity key (on macOS, anything that runs the `pm-mcp` binary, <<enrolment-integrity>>; on hosts without a keyring, any process of the user) can forge a consistent head. This is accepted and documented with the enrolment integrity risk (`PM-SEC-6`).
+* *Residual Risk*: The anchoring is tamper-evident, not tamper-proof: a process that holds the integrity key (on macOS, anything that runs the `pm-mcpd` binary, <<enrolment-integrity>>; on hosts without a keyring, any process of the user) can forge a consistent head. This is accepted and documented with the enrolment integrity risk (`PM-SEC-6`).
 * *Error Sanitization*: Unhandled exceptions or protocol errors return only a closed-enum error code to the MCP caller, plus the `audit_id` (a UUIDv7, link:identifiers.adoc#id-audit-id[Identifier Registry]) only where the operator must look the error up (`internal_fault`, `file_unreadable`; link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]); stack traces and host filesystem paths are written exclusively to `<PM_MCP_BASE>/logs/daemon.log`.
 
 == Outbound HTTPS Security (`cui-http`) & Native Runtime Stack
@@ -313,6 +514,106 @@ _See Requirement link:../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream
 _See Requirement link:../Requirements.adoc#PM-TEST-5[PM-TEST-5: Security Boundary & Confinement Adversarial Testing]_
 
 * *Outbound HTTPS Hardening (`de.cuioss:cui-http`)*: All outbound REST and GraphQL calls (SonarQube/SonarCloud, the native GitHub and GitLab clients) and remote upstream MCP calls use `de.cuioss:cui-http`'s `HttpHandler` and `ResilientHttpAdapter` with TLS 1.2+, mandatory certificate/hostname verification, HTTPS-only redirect following, and origin-pinned bearer token transmission (stripping `Authorization` headers on any cross-origin redirect). All URL/path/header parameters composed into outbound requests are validated through `de.cuioss.http.security` pipelines. The native git transport (JGit) uses a connection factory with the same TLS rules that connects only to the credential entry's origin (<<native-confinement>>).
-* *GraalVM Native Image & Resource Bounds*: Compiled as a standalone native executable (`Java 25+`, Quarkus `quarkus-mcp-server-http`, Virtual Threads); startup and memory bounds for the runtime and the relay are defined in `PM-TECH-3` and verified as described in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
-* *STDIO & Confinement Adversarial Verification (`PM-TEST-5`)*: Integration tests (`*IT`) using `McpAssured` (`McpStdioTestClient`) verify the transport isolation properties listed in the link:runtime-model.adoc#_verification[Runtime & Interaction Model Specification], that insecure permissions (`0755`) on `<PM_MCP_BASE>/enrolments/` trigger fail-closed termination at runtime start (exit code `77`), that insecure permissions (`0644`) on one project's enrolment file block only that project (`enrolment_insecure`), that a project's enrolment file edited outside the operator CLI is refused with `enrolment_tampered` for that project while a second enrolled project is still served, that a job writing `<PM_MCP_BASE>/enrolments/<project_id>.json` fails under the Linux Landlock write set, while an insecure fallback credential file blocks only the step that needs it (`credentials_file_insecure`), that path-traversal or command-injection payloads are deterministically rejected and logged to `audit.jsonl`, and that hostile repository configuration against the native git variant is contained: a `url.<base>.insteadOf` or `pushInsteadOf` rewrite and a `remote.<name>.pushurl` to a foreign host yield `remote_origin_mismatch` with a `security` audit record and no credential-bearing request to that host, while `core.sshCommand`, `core.fsmonitor`, a `.gitattributes` filter driver, and a hook in a native-selected repository start no process and yield `capability_missing`; CLI-variant `git` and `ci` jobs are shown to carry no token variable or askpass helper in their environment.
+* *GraalVM Native Image & Resource Bounds*: The runtime `pm-mcpd` is compiled as a standalone Quarkus native executable (`Java 25+`, `quarkus-mcp-server-http`, Virtual Threads); the CLI `pm-mcp` (with the relay) and the launcher `pm-mcp-exec` are plain native images without Quarkus (<<cli-implementation>>). Startup and memory bounds for the runtime, the relay, and the CLI are defined in `PM-TECH-3` and verified as described in the link:runtime-model.adoc[Runtime & Interaction Model Specification].
+* *STDIO & Confinement Adversarial Verification (`PM-TEST-5`)*: Integration tests (`*IT`) using `McpAssured` (`McpStdioTestClient`) verify the transport isolation properties listed in the link:runtime-model.adoc#_verification[Runtime & Interaction Model Specification], that insecure permissions (`0755`) on `<PM_MCP_BASE>/enrolments/` trigger fail-closed termination at runtime start (exit code `77`), that insecure permissions (`0644`) on one project's enrolment file block only that project (`enrolment_insecure`), that a project's enrolment file edited outside the operator verbs is refused with `enrolment_tampered` for that project while a second enrolled project is still served, that a job writing `<PM_MCP_BASE>/enrolments/<project_id>.json` fails under the Linux Landlock write set, that a job cannot read `<PM_MCP_BASE>/run/runtime.token` under the Linux Landlock read set, that a request without the runtime token is refused on `/mcp` and `/api/v1`, that an operator verb run without a terminal or with an agent environment marker is refused before any request is sent, while an insecure fallback credential file blocks only the step that needs it (`credentials_file_insecure`), that path-traversal or command-injection payloads are deterministically rejected and logged to `audit.jsonl`, and that hostile repository configuration against the native git variant is contained: a `url.<base>.insteadOf` or `pushInsteadOf` rewrite and a `remote.<name>.pushurl` to a foreign host yield `remote_origin_mismatch` with a `security` audit record and no credential-bearing request to that host, while `core.sshCommand`, `core.fsmonitor`, a `.gitattributes` filter driver, and a hook in a native-selected repository start no process and yield `capability_missing`; CLI-variant `git` and `ci` jobs are shown to carry no token variable or askpass helper in their environment.
 
+[#web-server]
+== Web Server & Pairing (`pm-mcp-web`, `pm-mcp web`)
+_See Requirement link:../Requirements.adoc#PM-SEC-7[PM-SEC-7: Optional Web Server, Device Pairing & Browser Channel Hardening]_
+
+_See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
+
+_See Requirement link:../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
+
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-3[PM-WATCH-CLI-3]_
+
+The optional web server `pm-mcp-web` (module `pm-mcp-clients/pm-mcp-web-server`, Quarkus native, link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]) gives a paired browser access to the runtime. It is a *client* of the runtime's link:runtime-model.adoc#local-api[Local API] like the CLI, not a part of the runtime: it owns every browser-facing concern (the TCP listener, TLS, security headers, `Host` validation, the static web app, pairing redemption) and holds no store logic. It depends only on `pm-mcp-api` and `pm-mcp-web-app`. The runtime keeps zero TCP listeners (`PM-SEC-4`); the web device store and the pairing code live in the runtime, the only store writer. The web server is a backend-for-frontend, the placement the later OAuth iteration builds on (link:../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-server-lifecycle]
+=== Lifecycle (`pm-mcp web enable|disable`)
+
+* *Off by default*: Without an explicit `pm-mcp web enable` (or a first `pm-mcp web pair` / `pm-mcp web open`, which enables the loopback listener) no `pm-mcp-web` process and no TCP listener exist.
+* `pm-mcp web enable [--lan]` is an operator verb (the CLI's operator checks, <<operator-channel-isolation>>). It starts the runtime on demand, then starts `<PM_MCP_HOME>/bin/pm-mcp-web` by path (never through `PATH`) as a detached process with the chosen listener settings, and reports success only after a round trip on the new listener. The listener uses the compiled port `7420`; an occupied port fails the command, another port is never chosen silently. A running web server with different settings is refused with a notice to run `pm-mcp web disable` first.
+* *Singleton and record*: `pm-mcp-web` holds the process lock `<PM_MCP_BASE>/locks/web.lock` for its lifetime and writes its process record `<PM_MCP_BASE>/run/web.json` (link:store-schemas.adoc#web-access-records[Store Schemas Specification, Web Access Records]); `pm-mcp status`, `web pair`, `web open`, and `web disable` read it. These are the web server's own process files, not stores; it writes no store.
+* `pm-mcp web disable` (operator verb) sends `SIGTERM` to the recorded process after checking its identity (pid and start instant); the web server ends every open stream, releases the listener, and removes `run/web.json`. Paired devices stay paired; `web enable` later serves them again.
+* *Runtime availability*: The web server never starts the runtime. While the runtime is unreachable it answers every `/api/v1` request with `503` (`runtime_unavailable`), which the web app shows as "runtime not running". It reads the runtime token as every local client does (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), including the one re-read after a `401`. A runtime of another release version is answered `503` (`version_skew`); `pm-mcp web enable` after the upgrade restarts the web server of the new release.
+
+[#web-listener]
+=== Listener Exposure
+
+* *Loopback (default)*: plain HTTP on `127.0.0.1:<port>` only. Loopback is a secure context for the browser; nothing leaves the machine.
+* *LAN (`--lan`)*: HTTPS only, on all interfaces, with a certificate the web server generates itself on the first `--lan` enable: a self-signed ECDSA P-256 certificate whose subject alternative names are the host name, `<hostname>.local`, the interface addresses at generation, and the loopback addresses. Key and certificate are kept in `<PM_MCP_BASE>/web/tls/` (directory `0700`, key `0600`) and reused on every later `--lan` enable, so paired devices keep a stable fingerprint. Its SHA-256 fingerprint (of the DER certificate) is printed by `pm-mcp web enable --lan`, `pm-mcp web pair`, and `pm-mcp status`, and shown on the pairing page, so the operator compares it with the browser's certificate details before accepting the warning. Plain HTTP is never served on a non-loopback address. A local certificate authority that removes the warning is deferred (link:../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-security-headers]
+=== Request Validation & Security Headers
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-18[PM-WATCH-CLI-18], link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-19[PM-WATCH-CLI-19]_
+
+* *`Host` validation*: Before routing, the web server accepts a request only when its `Host` header names the listener's own origin: `127.0.0.1:<port>` or `localhost:<port>` in loopback mode, and additionally one of the certificate's names or addresses with `<port>` in LAN mode (Quarkus `quarkus.http.host-validation.*`). Every other `Host` is refused with `403` and never reaches the proxy. This defeats DNS rebinding.
+* *No CORS*: The web server sends no `Access-Control-*` header on any response; a preflight `OPTIONS` request is refused. A state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) whose `Origin` header is present and differs from the listener's own origin is refused with `403`.
+* *Security headers on every response* (static files, API responses, event streams, errors, and `404`s alike):
+** `Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'` (as an HTTP header, never a `<meta>` element);
+** `X-Frame-Options: DENY` (anti-framing together with `frame-ancestors 'none'`);
+** `X-Content-Type-Options: nosniff`;
+** `Referrer-Policy: no-referrer`.
+* *Static web app*: The web server serves the `pm-mcp-web-app` resource JAR (`META-INF/resources`) for every `GET` outside `/api/`; a path without a matching file returns the app's fallback page (client-side routing). No server-side rendering exists.
+
+[#web-proxy]
+=== API Proxy & Device Secret Forwarding
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-16[PM-WATCH-CLI-16], link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-20[PM-WATCH-CLI-20], link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-21[PM-WATCH-CLI-21]_
+
+* *Allowlisted prefix*: The web server proxies exactly the path prefix `/api/v1/` to the runtime's Unix socket. `/mcp`, every other `/api/` path, and a path that changes under normalization (encoded `/`, `..`, duplicate `/`) are refused (`404`, `400`) before routing; `/mcp` is never reachable through the web server.
+* *Credential rewrite*: From the browser request the web server removes the `Authorization` header and every `PM-MCP-*` header, then sets `Authorization: Bearer <runtime token>` and `PM-MCP-Device-Secret: <device secret>` (the browser's former Bearer value). A request without a well-formed device secret (link:identifiers.adoc#id-device-secret[Identifier Registry, device secret]) is answered `401` without contacting the runtime; the only unauthenticated API endpoint is pairing redemption (<<web-pairing>>).
+* *Runtime re-check*: The runtime checks the forwarded device secret against the web device store on every request, without a cache, and ties the request to the device id (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The web server's own check covers the secret's shape only; it never decides that a device is valid, so no request is trusted on the web server's word alone. A request carrying `PM-MCP-Device-Secret` is web-originated for the runtime: CLI-only endpoints (issuing a pairing code, starting or stopping the web server, entering a credential secret) refuse it with `403` (`cli_only`).
+* *Event streams*: `GET /api/v1/events` and `GET /api/v1/plans/{plan_id}/events` are streamed through unbuffered and uncompressed, with `Last-Event-ID` forwarded; the device is checked by the runtime when the stream connects. When the runtime ends a stream (among others because the device was revoked), the web server ends the browser's stream.
+* *Logging*: Neither process logs a request header. The runtime token and every `pmw_` value are redacted by the `SecretRedactor` (<<operator-credential-cli>>): the runtime token by value, device secrets by their shape, because the runtime keeps only their hashes.
+
+[#web-pairing]
+=== Pairing Protocol
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-15[PM-WATCH-CLI-15]_
+
+Pairing follows the device-grant pattern: a short one-time code only authorizes; the browser receives a separate per-device secret.
+
+. *Issue*: `pm-mcp web pair [--label <label>]` (operator verb; enables the loopback listener when no web server runs) asks the runtime for a pairing code (`POST /api/v1/web/pairings`, CLI-only). The code has 8 characters of the alphabet `BCDFGHJKLMNPQRSTVWXZ` (about 34.5 bits, link:identifiers.adoc#id-pairing-code[Identifier Registry, pairing code]), is valid for 5 minutes (link:timeouts.adoc#pairing-code-ttl[Timeouts & Budgets Specification, Pairing Code Lifetime]), single use, and allows 5 failed redemptions (link:timeouts.adoc#pairing-attempt-limit[Timeouts & Budgets Specification, Pairing Failed-Attempt Limit]). At most one pairing is open: a new one invalidates the previous. The runtime keeps only the code's SHA-256, the label, the expiry, and the failure count, in memory (link:store-schemas.adoc#web-access-records[Store Schemas Specification, Web Access Records]).
+. *Show*: The CLI prints the code as `XXXX-XXXX`, the URL `http(s)://<host>:<port>/pair#code=<code>`, a QR code of that URL (Unicode half blocks, 4-module quiet zone, black on white), the expiry, and in LAN mode the certificate fingerprint. The code travels in the URL fragment, which the browser never sends to a server, so it appears in no request line, log, or `Referer`.
+. *Open on the same machine*: `pm-mcp web open` (operator verb) issues a pairing code and opens the loopback pairing URL in the default browser (`open` on macOS, `xdg-open` on Linux, started with an argument vector, never through a shell).
+. *Redeem*: The web app's pairing page reads the code from the fragment (or from manual input, normalized to upper case without `-` and spaces), removes the fragment with `history.replaceState`, and sends `POST /api/v1/pair` with `{code}`. The web server forwards it without a device header. The runtime compares the SHA-256 in constant time; on success it consumes the code, generates the device secret (`pmw_` plus 256 bits from `SecureRandom`, base64url; link:identifiers.adoc#id-device-secret[Identifier Registry, device secret]), stores only its SHA-256 with a new `device_id` and the pairing's label (default: the `device_id`), appends the audit record `web_device_paired`, and returns `{device_id, label, device_secret}` once. The secret is opaque: the runtime is issuer and validator, so a self-contained token would add nothing and could not be revoked instantly.
+. *Failure*: A wrong, expired, consumed, or superseded code yields the same `400` (`pairing_invalid`) without saying which, and appends `web_pairing_failed`. The failure that reaches the attempt limit invalidates the open pairing, so a later redemption fails even with the right code. A runtime restart discards the open pairing; the operator runs `pm-mcp web pair` again.
+. *Keep*: The web app stores the device secret in `localStorage` and sends it as `Authorization: Bearer <device secret>` on every API request (<<web-app>>).
+
+[#web-devices]
+=== Paired Devices (`pm-mcp web devices`)
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-17[PM-WATCH-CLI-17]_
+
+* `pm-mcp web devices list` shows `device_id`, label, `created_at`, and `last_used_at` of every paired device; `pm-mcp web devices revoke <device_id>` and `pm-mcp web devices revoke --all` remove devices (`GET /api/v1/web/devices`, `DELETE /api/v1/web/devices/{device_id}`, `DELETE /api/v1/web/devices`, link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). All three are operator verbs; the web app offers the same list and revocation to a paired device.
+* *Immediate revocation*: A revoked device's record is removed from `state/web-devices.json`; the runtime ends the device's open event streams at once and answers its next request `401`, whereupon the web app deletes its stored secret and shows the pairing page. Every revocation appends `web_device_revoked`.
+* *Idle expiry*: A device whose `last_used_at` is older than 90 days (compiled, link:timeouts.adoc#device-idle-expiry[Timeouts & Budgets Specification, Device Idle Expiry]) is expired: its next request is answered `401`, and its record is removed with `web_device_revoked` (`reason: idle_expired`). `last_used_at` is written at most once per minute per device (link:timeouts.adoc#device-last-used-granularity[Timeouts & Budgets Specification]). Rotation and absolute expiry are deferred (link:../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+* *Store damage*: An unreadable or invalid `state/web-devices.json` authenticates no device (every web-originated request `401`, reported by `pm-mcp status`) and leaves the CLI unaffected; `pm-mcp web devices revoke --all` rewrites an empty store.
+
+[#web-operator-channel]
+=== Every Paired Device Is an Operator Channel
+
+In the first iteration there are no device roles: every paired device may do what the operator verbs do (answer pending operator decisions, grants, gate and merge overrides), except the CLI-only endpoints of <<web-proxy>>. The web app is therefore a third operator channel next to MCP elicitation and the CLI (`PM-SEC-3`); every action through it is audited with channel `web` and the `device_id`. Pairing a device is an operator act for this reason, and every device secret is as powerful as the operator. Roles (`viewer`, `operator`) and step-up before operator actions from a browser are deferred (link:../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]).
+
+[#web-auth-seam]
+=== Authentication Seam
+
+Both processes use Quarkus Security: one `HttpAuthenticationMechanism` (Bearer) and one `IdentityProvider` per token kind, selected by token shape, and resources annotated only `@Authenticated` (`@RolesAllowed` once roles exist). The runtime has the provider for the runtime token and checks the forwarded device secret against its store; `pm-mcp-web` has the provider for `pmw_` device secrets, which checks the shape and leaves validity to the runtime. The OAuth iteration adds a provider wrapping Token-Sheriff validation for three-part JWTs next to the `pmw_` provider, so paired devices keep working during the switch; `token-sheriff-bom` stays imported for it (link:../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-app]
+=== Web App (`pm-mcp-web-app`)
+
+* *Build*: SvelteKit 3 (release candidate, pinned; moved to 3.0 final when released) with Svelte 5 and TypeScript, built as a static single-page app (`@sveltejs/adapter-static`, `ssr = false`, fallback page) by `frontend-maven-plugin` with pinned Node and npm (`npm ci` from `package-lock.json`), tested with Vitest, and packaged as a resource JAR (`META-INF/resources`) that `pm-mcp-web` serves. The npm packages are covered by the CycloneDX SBOM. During development the Vite dev server proxies `/api` to a running web server.
+* *Views*: pairing (code from the fragment or typed, the certificate fingerprint in LAN mode), paired devices (list, revoke), runtime status (projects, plans including `stalled` plans, build slots, jobs), the live view of one plan (state, phase, tasks, jobs, findings counts), and pending operator decisions and operator actions.
+* *Live updates*: The app reads the event streams with `fetch()` and a `ReadableStream`, because `EventSource` cannot send an `Authorization` header; a credential never appears in a URL. It reconnects with `Last-Event-ID`.
+* *Browser storage*: The device secret is kept in `localStorage`, so the pairing survives browser restarts; the app never uses cookies. Its exposure to injected script is contained by the security headers (<<web-security-headers>>), Trusted Types, no third-party scripts or origins, no `{@html}` or other raw-HTML sink (all server text is rendered as text), and lockfile-pinned dependencies; revocation and idle expiry are the recovery. Sender-constrained credentials (a non-extractable WebCrypto key, DPoP) are deferred (link:../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-threats]
+=== Threat Notes
+
+* *Cross-site scripting*: `script-src 'self'` with Trusted Types blocks injected and inline script and raw-HTML sinks; `connect-src 'self'` keeps script from sending the secret to another origin by `fetch`. Accepted residual: script that does run in the app's origin can read `localStorage` and act as the device until it is revoked (link:../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+* *DNS rebinding*: A rebound page carries a foreign `Host` and is refused before routing; it also has no access to the app origin's `localStorage`, and the credential is never ambient.
+* *Cross-site request forgery*: Not applicable: the credential is an explicit `Authorization` header, never a cookie; no CORS is granted.
+* *Framing*: `frame-ancestors 'none'` and `X-Frame-Options: DENY` on every response prevent clickjacking of operator actions.
+* *Code interception*: The pairing code is short-lived, single use, limited to 5 failures, carried in the URL fragment, and on the LAN only over TLS.
+* *Same-user processes*: The web server adds no boundary against processes of the same OS user: any of them can read the runtime token and call the Local API directly, including operator endpoints (link:../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]). A compromised web server holds the same power and no more; it has no store access by construction.
+* *Model surface*: Nothing of the web server, the pairing, or the device store is reachable through an MCP tool or appears in a model-facing representation (link:mcp-tools.adoc[MCP Tools Specification], Architectural Constraints; link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).

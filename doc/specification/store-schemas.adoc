@@ -26,6 +26,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
 * _See Requirement link:../Requirements.adoc#PM-CRED-3[PM-CRED-3: Permission-Guarded Fallback File Credential Store]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-6[PM-SEC-6: Security Audit Trail & Tamper-Evident Logging]_
+* _See Requirement link:../Requirements.adoc#PM-SEC-7[PM-SEC-7: Optional Web Server, Device Pairing & Browser Channel Hardening]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-1[PM-MIG-1: Six-Stage Build-Out & Per-Project Plan Lifecycle]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-2[PM-MIG-2: Separate State Trees & Legacy Coexistence]_
 * _See Requirement link:../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Lifecycle Gate]_
@@ -3186,11 +3187,11 @@ The allowed origin for a credential is the origin of the `url` of its operator-o
 A file exists only for a complete credential: `pm-mcp operator credentials set` refuses to write an empty secret, so no placeholder state exists. The `auth_type` values `none` and `system` of `plan-marshall` have no file: a provider without authentication needs no credential, and the System Lane (the CLI variant of `git`, `github`, `gitlab`) uses the operator's ambient CLI authentication by design (link:cli-and-security.adoc#cli-variant-credentials[CLI, Coordination & Security Specification, Credentials of the CLI Variant]). A GitHub App installation token is derived from the `private_key` at run time and never stored in any backend (link:cli-and-security.adoc#derived-tokens[CLI, Coordination & Security Specification, Short-Lived Derived Tokens]).
 
 [#machine-state-records]
-=== Machine State Records (`install-records.json`, `runtime.json`, `operator-auth.json`)
+=== Machine State Records (`install-records.json`, `runtime.json`)
 
-Three single-writer records in `<PM_MCP_BASE>/state/` (mode `0600`), each with `format_version` and a closed schema.
+Two single-writer records in `<PM_MCP_BASE>/state/` (mode `0600`), each with `format_version` and a closed schema.
 
-*`state/install-records.json`*: written by `pm-mcp client install|update|remove` under `locks/install-records.lock`; read by `pm-mcp client` (ownership and digest verification, link:client-profiles.adoc#_ownership_digest_verification_on_installupdateremove[Client Profiles Specification]) and by `pm-mcp enter` (bundle drift notice, the session row's `bundle_version`).
+*`state/install-records.json`*: written by the runtime on the requests of `pm-mcp client install|update|remove` under `locks/install-records.lock` (link:cli-and-security.adoc#client-installer[CLI, Coordination & Security Specification, Client Bundle Installer]); read by the runtime (ownership and digest verification, link:client-profiles.adoc#_ownership_digest_verification_on_installupdateremove[Client Profiles Specification]; the session row's `bundle_version`) and, read-only, by `pm-mcp enter`, `pm-mcp hook session-start`, and `pm-mcp client status` for the drift checks `bundle_outdated` and `bundle_modified` (link:cli-and-security.adoc#bundle-drift-notice[CLI, Coordination & Security Specification, Bundle Drift Notice]). One install exists per `(client_id, scope, target_root)`; every owned file, key, and element carries the digest the drift checks compare.
 
 [source,json]
 ----
@@ -3205,16 +3206,16 @@ Three single-writer records in `<PM_MCP_BASE>/state/` (mode `0600`), each with `
     "format_version": { "type": "integer", "const": 1 },
     "installs": {
       "type": "array",
+      "description": "At most one entry per (client_id, scope, target_root).",
       "items": {
         "type": "object",
-        "required": ["client_id", "scope", "target_root", "bundle_version", "daemon_version", "installed_at", "files", "shared_configs"],
+        "required": ["client_id", "scope", "target_root", "bundle_version", "installed_at", "files", "shared_configs"],
         "additionalProperties": false,
         "properties": {
           "client_id": { "type": "string", "enum": ["claude", "opencode", "antigravity", "codex"] },
-          "scope": { "type": "string", "enum": ["user", "project"] },
+          "scope": { "type": "string", "enum": ["user", "project"], "description": "The manifest section applied (client install --scope)." },
           "target_root": { "type": "string", "minLength": 1, "description": "Absolute path of the user home or project root the bundle was installed into." },
-          "bundle_version": { "type": "string", "minLength": 1 },
-          "daemon_version": { "type": "string", "minLength": 1, "description": "Version of the pm-mcp binary that installed the bundle." },
+          "bundle_version": { "type": "string", "minLength": 1, "description": "Bundle version applied (the release version of the runtime that applied it); compared with the bundle version embedded in the running pm-mcp (bundle_outdated)." },
           "installed_at": { "type": "string", "format": "date-time" },
           "files": {
             "type": "array",
@@ -3233,12 +3234,29 @@ Three single-writer records in `<PM_MCP_BASE>/state/` (mode `0600`), each with `
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["path", "owned_keys", "sha256"],
+              "required": ["path", "owned_keys", "sha256", "owned_elements"],
               "additionalProperties": false,
               "properties": {
-                "path": { "type": "string", "minLength": 1 },
-                "owned_keys": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
-                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Digest of the canonical serialization of the owned keys' values as written." }
+                "path": { "type": "string", "minLength": 1, "description": "Relative to target_root." },
+                "owned_keys": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "Digest of the canonical serialization of the owned keys' values as written; null when the file carries no owned key." },
+                "owned_elements": {
+                  "type": "array",
+                  "description": "Array elements owned by exact normalized value; an element already present before install is never recorded here.",
+                  "items": {
+                    "type": "object",
+                    "required": ["kind", "array_path", "value", "sha256"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": { "type": "string", "enum": ["permission_rule", "hook_entry"] },
+                      "array_path": { "type": "string", "minLength": 1, "description": "Dotted key path of the shared array, e.g. permissions.deny or hooks.SessionStart." },
+                      "list": { "type": "string", "enum": ["deny", "ask", "allow"], "description": "permission_rule only." },
+                      "class": { "type": "string", "enum": ["enforcement", "convenience"], "description": "permission_rule only." },
+                      "value": { "type": "string", "minLength": 1, "description": "Normalized value as written: the rendered rule text, or the RFC 8785 canonical JSON of the hook entry." },
+                      "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the UTF-8 bytes of value." }
+                    }
+                  }
+                }
               }
             }
           }
@@ -3258,38 +3276,89 @@ Three single-writer records in `<PM_MCP_BASE>/state/` (mode `0600`), each with `
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/runtime.json",
   "title": "RuntimeRecord",
   "type": "object",
-  "required": ["format_version", "pid", "start_instant", "version", "socket_path", "started_at"],
+  "required": ["format_version", "pid", "start_instant", "version", "listener", "socket_path", "started_at"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "pid": { "type": "integer", "minimum": 1 },
     "start_instant": { "type": "string", "format": "date-time", "description": "OS process start instant (ProcessHandle.info().startInstant()); with pid the liveness identity." },
     "version": { "type": "string", "minLength": 1, "description": "Release version of the running binary." },
-    "socket_path": { "type": "string", "minLength": 1, "description": "Effective socket path, default or fallback." },
+    "listener": { "type": "string", "enum": ["domain_socket", "loopback_tcp", "jdk_socket"], "description": "Listener in use: the Quarkus domain socket, fallback (1) loopback TCP, or fallback (2) the own JDK socket listener (Runtime Model, Transport Endpoint); reported by pm-mcp status." },
+    "socket_path": { "type": "string", "minLength": 1, "description": "Effective socket path, default or fallback; for listener loopback_tcp the address 127.0.0.1:<port>." },
     "started_at": { "type": "string", "format": "date-time", "description": "Instant the socket was bound." }
   }
 }
 ----
 
-*`state/operator-auth.json`*: the operator passphrase back-off state (link:cli-and-security.adoc#_operator_channel_isolation_privileged_cli_pm_mcp_operator[CLI, Coordination & Security Specification, Operator Channel Isolation]; link:timeouts.adoc#operator-auth-backoff[Timeouts & Budgets Specification, Operator Passphrase Back-Off]), written by the operator CLI under `locks/operator-auth.lock`. An absent record means no failures; an unreadable record is treated as the maximum back-off, never as zero failures.
+[#web-access-records]
+=== Runtime Token & Web Access Records (`run/runtime.token`, `state/web-devices.json`, `run/web.json`)
+_See Requirement link:../Requirements.adoc#PM-SEC-7[PM-SEC-7: Optional Web Server, Device Pairing & Browser Channel Hardening]_
+
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-16[PM-WATCH-CLI-16]_
+
+The records of local trust and browser access (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]; link:cli-and-security.adoc#web-server[CLI, Coordination & Security Specification, Web Server & Pairing]). None of their content reaches a model-facing representation (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+
+*`run/runtime.token`*: not JSON and without `format_version`: the file content is exactly the runtime token, 43 base64url characters without padding and without a trailing newline (256 bits, link:identifiers.adoc#id-runtime-token[Identifier Registry, runtime token]). Mode `0600` in the `0700` directory `<PM_MCP_BASE>/run/`; written atomically by the runtime at every start before the socket is bound, replacing the previous token; read by every local client after its owner, mode, and no-symlink check; never read by a job (outside every job's Landlock read set). A token file that is absent, of another length, or outside the alphabet makes a client refuse with a diagnostic naming the path, never guess.
+
+*`state/web-devices.json`*: the web device store, mode `0600`, written only by the runtime under `locks/web-devices.lock` (pairing, revocation, idle expiry, and the `last_used_at` update at most once per minute per device). A device secret is never stored, only its SHA-256. An unreadable or invalid store authenticates no device and leaves every other function of the runtime unaffected; `pm-mcp web devices revoke --all` rewrites it empty.
 
 [source,json]
 ----
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/operator-auth.json",
-  "title": "OperatorAuthState",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/web-devices.json",
+  "title": "WebDeviceStore",
   "type": "object",
-  "required": ["format_version", "failures", "next_allowed_at", "last_failure_at"],
+  "required": ["format_version", "devices"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "failures": { "type": "integer", "minimum": 0, "description": "Consecutive failed verifications; reset to 0 by a successful one." },
-    "next_allowed_at": { "type": ["string", "null"], "format": "date-time" },
-    "last_failure_at": { "type": ["string", "null"], "format": "date-time" }
+    "devices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["device_id", "label", "secret_sha256", "created_at", "last_used_at"],
+        "additionalProperties": false,
+        "properties": {
+          "device_id": { "type": "string", "pattern": "^dev-[0-9a-f]{12}$", "description": "identifiers.adoc, device_id; unique in the store, never reused." },
+          "label": { "type": "string", "minLength": 1, "maxLength": 64, "description": "From pm-mcp web pair --label, else the device_id; display only." },
+          "secret_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the UTF-8 device secret (pmw_...); the secret itself is returned once at pairing and never stored." },
+          "created_at": { "type": "string", "format": "date-time" },
+          "last_used_at": { "type": "string", "format": "date-time", "description": "Last authenticated request, written at most once per minute; older than 90 days (compiled) expires the device." }
+        }
+      }
+    }
   }
 }
 ----
+
+*Pairing code (in memory only)*: The open pairing is held in the runtime's memory, never persisted: the SHA-256 of the normalized code, the label, `expires_at` (issue plus 5 minutes), and the failure count (at most 5). At most one pairing is open; a new one replaces it, a redemption or the fifth failure removes it. A runtime restart discards it, so a pairing code never survives a restart and nothing about it is recoverable from disk.
+
+*`run/web.json`*: the process record of the web server, written by `pm-mcp-web` itself at start (under its process lock `locks/web.lock`, held for its lifetime) and removed at stop; read by `pm-mcp status`, `pm-mcp web pair|open|disable`. It is the web server's own process file, not a store the runtime writes; a record whose `pid` and `start_instant` do not match a live process is stale and reported as "web server not running".
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/web-server.json",
+  "title": "WebServerRecord",
+  "type": "object",
+  "required": ["format_version", "pid", "start_instant", "version", "mode", "port", "started_at", "cert_sha256"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "pid": { "type": "integer", "minimum": 1 },
+    "start_instant": { "type": "string", "format": "date-time", "description": "OS process start instant; with pid the liveness identity." },
+    "version": { "type": "string", "minLength": 1, "description": "Release version of the pm-mcp-web binary." },
+    "mode": { "type": "string", "enum": ["loopback", "lan"], "description": "loopback: HTTP on 127.0.0.1; lan: HTTPS on all interfaces." },
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "started_at": { "type": "string", "format": "date-time", "description": "Instant the listener was bound." },
+    "cert_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 fingerprint of the DER certificate in lan mode; null in loopback mode." }
+  }
+}
+----
+
+The generated certificate and its private key live in `<PM_MCP_BASE>/web/tls/` (`cert.pem`, `key.pem`; directory `0700`, files `0600`), written only by `pm-mcp-web` on the first LAN enable and reused afterwards.
 
 [#audit-log]
 === Security & Transition Audit Log (`<PM_MCP_BASE>/logs/audit.jsonl`, `PM-SEC-6`)
@@ -3330,6 +3399,10 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
 *Exemption and self-report records*: An operator exemption from a gate is an `operator` record whose `details.exemption_class` holds `{gate_id, reason_class}` (`gate_false_positive`, `gate_not_applicable`, `tooling_unavailable`, `deliberate_deferral`, or `unknown`); the recurrence count across plans (link:phase-workflows.adoc[Phase Workflows Specification], Artifact Gate) is derived from these records. A model self-report (`report_bypass`) is a `transition` record with `event: self_report` and `details{action, reason, finding_id}`.
 
 *Integration records*: Every git or provider operation, in-process (native variant) or as a job (CLI variant), appends a `job` record whose `details` carry `integration` (`git`, `github`, `gitlab`, `sonar`), `variant` (`native` or `cli`), and `identity`: for the native variant the credential key that authenticated it (`github`, `gitlab`, `git-https`, link:identifiers.adoc#id-credential-key[Identifier Registry, `credential_key`]; never the secret or a derived token) and the resolved agent identity, for the CLI variant the value `operator_ambient` (link:cli-and-security.adoc#cli-variant-credentials[CLI & Security Specification, Credentials of the CLI Variant]). A native operation refused by the origin check appends a `security` record with `event: remote_origin_mismatch`, `outcome: refused`, and `details{integration, remote, effective_url_host, credential_origin}` (link:cli-and-security.adoc#native-confinement[CLI & Security Specification, Native Operation Confinement]). The operator's selection of a variant in `setup.select-integration-variants` is an `operator` record with `event: integration_variant_selected` and `details{integration, variant}`. These fields are operator and audit data only: they never appear in a model-facing representation, resource, or tool result (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+
+*Web access records*: A successful pairing appends an `operator` record with `event: web_device_paired`, `outcome: succeeded`, and `details{device_id, label, mode}`; a failed redemption a `security` record with `event: web_pairing_failed`, `outcome: refused`, and `details{failures, pairing_invalidated}` (never the submitted code); a revocation an `operator` record with `event: web_device_revoked`, `outcome: succeeded`, and `details{device_id, reason}` (`reason`: `operator` for `pm-mcp web devices revoke` or a revocation from the web app, `idle_expired` for the 90-day idle expiry), including one record per device for `revoke --all`. An action taken through a paired device carries `details.channel: web` and `details.device_id`; one through the CLI `details.channel: cli`. No record carries a device secret, its hash, or the runtime token (link:cli-and-security.adoc#web-server[CLI, Coordination & Security Specification, Web Server & Pairing]).
+
+*Stall records*: A plan that becomes stalled (link:runtime-model.adoc#stalled-plans[Runtime & Interaction Model Specification]) appends one `transition` record per stall episode with `event: plan_stalled`, `outcome: warning`, `scope_type: plan`, and `details{state, idle_since, idle_seconds}`; the next transition or model call on the plan ends the episode, and a later stall starts a new one. The record is operator and metrics data only and never appears in a model-facing representation.
 
 *Hash chain (`PM-SEC-6`)*: The canonical line of a record is its exact UTF-8 byte sequence in `audit.jsonl`, excluding the terminating newline. A writer appends only under the log's `FileChannel.lock()`, after reading the current last line to compute `prev_hash`. The writer also maintains the HMAC-anchored head `logs/audit.head` and, on rotation, a `checkpoint` record plus an entry in the hash-chained index `logs/audit-index.jsonl` (link:cli-and-security.adoc[CLI, Coordination & Security Specification], Security Audit Logging). The runtime verifies incrementally from the last checkpoint at startup; a mismatch, unparsable line, missing log, reset, truncation, or head mismatch is reported to the operator and recorded as an `audit_chain_broken` record (`category: security`, `details.reason` `link_broken | missing | reset | truncated | head_mismatch`, and `details.first_broken_line` for `link_broken`), and the log is never rewritten or repaired.
 
@@ -3435,8 +3508,8 @@ When the operator invokes plan deletion (`delete-plan` via elicitation or CLI), 
 ** `<PM_MCP_BASE>/locks/install-records.lock`: `state/install-records.json`
 ** `<PM_MCP_BASE>/locks/machine-config.lock`: `machine-config.json`
 ** `<PM_MCP_BASE>/locks/merge.lock`: `state/merge-queue.json`
-** `<PM_MCP_BASE>/locks/operator-auth.lock`: `state/operator-auth.json`
 ** `<PM_MCP_BASE>/locks/review-bot.lock`: `state/review-bot-windows.json`
+** `<PM_MCP_BASE>/locks/web-devices.lock`: `state/web-devices.json`
 +
 The per-project server and operator stores that are not guarded by a scope lock have their own lock files in the per-project machine store: `projects/<project_id>/locks/local-config.lock` guards `local-config.json`, and `projects/<project_id>/locks/build-timings.lock` guards `build-timings.json` (<<build-timings-store>>).
 +
@@ -3449,10 +3522,10 @@ The append-only `logs/audit.jsonl` is never replaced by rename (rotation renames
 . lesson store lock: `<PM_MCP_BASE>/projects/<project_id>/locks/lessons.lock` (lesson id allocation and every write, claim, release, or retirement in the lesson store)
 . local configuration lock: `<PM_MCP_BASE>/projects/<project_id>/locks/local-config.lock` (`local-config.json`)
 . build timings lock: `<PM_MCP_BASE>/projects/<project_id>/locks/build-timings.lock` (`build-timings.json`)
-. machine store locks: `<PM_MCP_BASE>/locks/{build-slots,enrolments/<project_id>,install-records,machine-config,merge,operator-auth,review-bot}.lock`, alphabetical by lock path (several enrolment locks lexicographic by `project_id`)
+. machine store locks: `<PM_MCP_BASE>/locks/{build-slots,enrolments/<project_id>,install-records,machine-config,merge,review-bot,web-devices}.lock`, alphabetical by lock path (several enrolment locks lexicographic by `project_id`)
 . leaf locks: the audit log lock (`<PM_MCP_BASE>/logs/audit.jsonl`) and the digest sidecar writes; nothing is acquired after a leaf lock
 +
-The runtime singleton lock (`locks/runtime.lock`, held for the process lifetime) and the relay start lock (`locks/runtime-start.lock`) are process locks, not transaction locks, and stay outside this order. Workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings locks live in the per-project machine store outside the directories they protect (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), so archiving a plan directory or editing an epic in a worktree never splits a lock.
+The runtime singleton lock (`locks/runtime.lock`, held for the process lifetime), the relay start lock (`locks/runtime-start.lock`), and the web server's singleton lock (`locks/web.lock`, held by `pm-mcp-web` for its lifetime) are process locks, not transaction locks, and stay outside this order. Workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings locks live in the per-project machine store outside the directories they protect (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), so archiving a plan directory or editing an epic in a worktree never splits a lock.
 * *Order Assertion*: The lock manager asserts the order on every acquisition against the locks the current transaction already holds (re-entry of a held lock is allowed). An out-of-order acquisition is refused: the call fails with `internal_fault` (link:mcp-tools.adoc[MCP Tools Specification]), nothing is written, and an audit record `lock_order_violation` (`category: store`, `outcome: refused`, `details{held, requested}`) is appended. A unit test of the lock manager covers an out-of-order acquisition at every level boundary.
 * *Leases*: Long-lived claims (merge holder in `merge-queue.json`, review-bot windows in `review-bot-windows.json`, build slots in `build-slots.json`) are lease records owned by a scope (`scope_type`, `scope_id`), served by a runtime instance (`holder_instance`: PID and start instant), and bounded by an expiry (<<machine-lease-stores>>); a restart orphans a lease instead of releasing it, and the owning scope adopts it on its next call. A lease is claimed or released inside a short transaction on the machine store lock and is never held as an OS lock, so holding a lease while taking a plan lock does not invert the lock order.
 * *Lock Manager*: All acquisitions in the runtime go through one lock manager (link:runtime-model.adoc#_in_process_lock_manager[Runtime & Interaction Model Specification]).

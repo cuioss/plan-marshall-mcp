@@ -115,7 +115,7 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 [#machine-layout]
 == Machine-Wide Runtime Layout (`<PM_MCP_BASE>`)
 
-`pm-mcp` persists machine-wide configuration, cross-process `FileChannel.lock()` files, audit logs, project enrolments, the fallback credential store, and the per-project machine stores in its instance directory `<PM_MCP_BASE>`, default `~/.plan-marshall-mcp/`; the only override is the environment variable `PM_MCP_BASE` (`PM-ARCH-2`, `PM-ARCH-6`, `PM-DIST-5`). `PM-MCP` never reads `PLAN_MARSHALL_HOME` or `PLAN_MARSHALL_CREDENTIALS_DIR`, and never reads or writes `~/.plan-marshall/`.
+`pm-mcp` persists machine-wide configuration, cross-process `FileChannel.lock()` files, audit logs, project enrolments, the fallback credential store, and the per-project machine stores in its instance directory `<PM_MCP_BASE>`, default `~/.plan-marshall-mcp/`; the only override is the environment variable `PM_MCP_BASE` (`PM-ARCH-2`, `PM-ARCH-6`, `PM-DIST-5`). `PM-MCP` never reads `PLAN_MARSHALL_HOME` or `PLAN_MARSHALL_CREDENTIALS_DIR`, and never reads or writes `~/.plan-marshall/`. The binaries live apart from it in the read-only installation directory `<PM_MCP_HOME>/bin/` (link:cli-and-security.adoc#installation-layout[CLI, Coordination & Security Specification, Installation Layout]), which holds no configuration file: machine settings are `machine-config.json`.
 
 [source,text]
 ----
@@ -123,7 +123,7 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 ├── machine-config.json                  # Build slot caps, warm LSP pool defaults, project_defaults (mode 0600)
 ├── enrolments/                          # Operator enrolments, one file per project (mode 0700)
 │   ├── <project_id>.json                # Root, wrappers, tools, templates, scripts, budgets (mode 0600)
-│   └── <project_id>.json.hmac           # HMAC-SHA-256 sidecar of that file, written by every operator CLI write (mode 0600)
+│   └── <project_id>.json.hmac           # HMAC-SHA-256 sidecar of that file, written with every enrolment write (mode 0600)
 │
 ├── credentials/                         # Token-lane file credential fallback (PM-CRED-3, mode 0700)
 │   ├── <credential_key>.json            # Global entry (e.g. workflow-integration-sonar.json, mode 0600)
@@ -143,18 +143,23 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 │   ├── build-slots.json                 # Active PID-keyed build concurrency leases
 │   ├── merge-queue.json                 # Per-repo FIFO merge admission queues & active holders
 │   ├── review-bot-windows.json          # Per-bot cross-plan rate-window claims
-│   ├── operator-auth.json               # Operator passphrase failure counter & next-allowed time (mode 0600)
+│   ├── web-devices.json                 # Paired web devices: device_id, label, secret hash, timestamps (mode 0600)
 │   ├── enrolment-hmac.key               # Enrolment HMAC key, only on hosts without an OS keyring (mode 0600)
 │   └── runtime.json                     # Runtime record: pid, start instant, version, effective socket path
 │                                        # (default or $TMPDIR fallback), written at socket bind
 │
-├── run/                                 # Runtime socket directory (mode 0700)
-│   └── runtime.sock                     # Unix domain socket of the runtime (mode 0600); if this path
-│                                        # exceeds sun_path, $TMPDIR/pm-mcp-<hash>/runtime.sock instead
+├── run/                                 # Runtime directory (mode 0700); outside every job's Landlock read set
+│   ├── runtime.token                    # Runtime token, rewritten at every runtime start before bind (mode 0600)
+│   ├── runtime.sock                     # Unix domain socket of the runtime (mode 0600); if this path
+│   │                                    # exceeds sun_path, $TMPDIR/pm-mcp-<hash>/runtime.sock instead
+│   └── web.json                         # Process record of the running web server pm-mcp-web (mode 0600)
+│
+├── web/                                 # Web server files (mode 0700)
+│   └── tls/                             # Self-signed LAN certificate and key of pm-mcp-web (key mode 0600)
 │
 ├── locks/                               # Cross-process OS FileChannel.lock() primitives
 │   ├── runtime.lock                     # Runtime singleton lock (held for the runtime lifetime)
-│   ├── runtime-start.lock               # Serializes on-demand runtime start by relays
+│   ├── runtime-start.lock               # Serializes on-demand runtime start by CLI commands
 │   │                                    # Machine store locks, one sibling lock per renamed store,
 │   │                                    # acquired alphabetically after all scope locks:
 │   ├── build-slots.lock                 # state/build-slots.json
@@ -163,8 +168,9 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 │   ├── install-records.lock             # state/install-records.json
 │   ├── machine-config.lock              # machine-config.json
 │   ├── merge.lock                       # state/merge-queue.json (merge leases)
-│   ├── operator-auth.lock               # state/operator-auth.json
-│   └── review-bot.lock                  # state/review-bot-windows.json
+│   ├── review-bot.lock                  # state/review-bot-windows.json
+│   ├── web-devices.lock                 # state/web-devices.json
+│   └── web.lock                         # Web server singleton (held for the pm-mcp-web lifetime)
 │
 └── logs/                                # Diagnostic logs and structured security audit
     ├── daemon.log                       # Rolling runtime diagnostic log (mode 0600)
@@ -176,7 +182,7 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
         └── <job_id>.log
 ----
 
-The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `projects/` (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator CLI.
+The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `projects/` (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The Landlock read set of jobs excludes `<PM_MCP_BASE>/run/`, so no job reads the runtime token (link:job-runtime.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]).
 
 === File Permissions & Security Attributes
 
@@ -186,11 +192,11 @@ The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `
 
 |`<PM_MCP_BASE>/credentials/`
 |`0700` (`drwx------`)
-|Strict user-only read/write directory (`PM-CRED-3`). Checked when a credential is resolved, not at runtime start: if group/others have read, write, or execute permissions, `pm-mcp` reads no credential from it and the step needing the credential raises the `blocked` condition on its current state with the repairing `pm-mcp operator credentials` command (`PM-CRED-4`).
+|Strict user-only read/write directory (`PM-CRED-3`). Checked when a credential is resolved, not at runtime start: if group/others have read, write, or execute permissions, the runtime reads no credential from it and the step needing the credential raises the `blocked` condition on its current state with the repairing `pm-mcp operator credentials` command (`PM-CRED-4`).
 
 |`<PM_MCP_BASE>/credentials/<credential_key>.json` and `<project>/<credential_key>.json`
 |`0600` (`-rw-------`)
-|Strict user-only access (`PM-CRED-3`). `pm-mcp` refuses to read any credential file whose permissions are broader than `0600`; only the step needing that credential is blocked (`credentials_file_insecure`, `PM-CRED-4`).
+|Strict user-only access (`PM-CRED-3`). The runtime refuses to read any credential file whose permissions are broader than `0600`; only the step needing that credential is blocked (`credentials_file_insecure`, `PM-CRED-4`).
 
 |`<PM_MCP_BASE>/enrolments/`
 |`0700` (`drwx------`)
@@ -198,7 +204,7 @@ The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `
 
 |`<PM_MCP_BASE>/enrolments/<project_id>.json` and `<project_id>.json.hmac`
 |`0600` (`-rw-------`)
-|Operator-verified project root, pinned tool and wrapper digests, command templates, and project scripts (`PM-EXEC-2`). A file with permissions broader than `0600` blocks only its project (`enrolment_insecure`), like a tampered one. Every operator CLI write also writes the file's HMAC-SHA-256 sidecar, verified before the project is first served after a runtime start and before every verify-not-resolve check (`enrolment_tampered` on mismatch, link:cli-and-security.adoc#enrolment-integrity[CLI, Coordination & Security Specification]).
+|Operator-verified project root, pinned tool and wrapper digests, command templates, and project scripts (`PM-EXEC-2`). A file with permissions broader than `0600` blocks only its project (`enrolment_insecure`), like a tampered one. Every write of it (by the runtime, on an operator verb) also writes the file's HMAC-SHA-256 sidecar, verified before the project is first served after a runtime start and before every verify-not-resolve check (`enrolment_tampered` on mismatch, link:cli-and-security.adoc#enrolment-integrity[CLI, Coordination & Security Specification]).
 
 |`<PM_MCP_BASE>/state/enrolment-hmac.key`
 |`0600` (`-rw-------`)
@@ -210,7 +216,15 @@ The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `
 
 |`<PM_MCP_BASE>/locks/*.lock` and `<PM_MCP_BASE>/projects/<project_id>/locks/*.lock`
 |`0600` (`-rw-------`)
-|Held via OS kernel `FileChannel.lock()` across the runtime, `pm-mcp serve` relays, and CLI processes.
+|Held via OS kernel `FileChannel.lock()`. The store and scope locks are taken only by the runtime, the only store writer; `runtime-start.lock` is also taken by a CLI command during the on-demand start, and `web.lock` by `pm-mcp-web`.
+
+|`<PM_MCP_BASE>/run/`
+|`0700` (`drwx------`), no symlink
+|Checked by the runtime at start and by every client before it reads the token or connects; a foreign owner, a broader mode, or a symlink makes the runtime exit with code `77` and a client refuse (`PM-SEC-4`).
+
+|`<PM_MCP_BASE>/run/runtime.token`
+|`0600` (`-rw-------`), no symlink
+|The runtime token of the running instance (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), written atomically at every start before the socket is bound; format in link:store-schemas.adoc#web-access-records[Store Schemas Specification]. Stays in `run/` also when the socket uses the fallback path. Never in a job's Landlock read set, never in a log or job environment.
 
 |`<PM_MCP_BASE>/run/runtime.sock`, or the fallback `$TMPDIR/pm-mcp-<hash>/runtime.sock`
 |`0600` (`srw-------`) in a `0700` directory owned by the effective UID
@@ -300,7 +314,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 * *Never Moved*: A plan directory is created by `pm_start` in `plans/<plan_id>/` and stays there until `archive-plan` moves it to `archive/<plan_id>/` (a rename within the same store directory) or `delete-plan` removes it. No worktree creation, worktree removal, or finalize step moves it.
 * *Scope Directories*: The FSM state of a scope lives in its scope metadata directory: `plans/<plan_id>/mcp/`, `epics/<epic_id>/`, and `workspace/mcp/`. For an epic the metadata directory is `epics/<epic_id>/` itself, which holds nothing else; where the specifications name a scope's `mcp/` files (`mcp/status.json`, `mcp/digests.json`, `mcp/transaction-journal.json`), an epic's are these files in `epics/<epic_id>/`. Every scope's session log `sessions.jsonl` lies directly in the scope directory (`plans/<plan_id>/`, `epics/<epic_id>/`, `workspace/`; link:store-schemas.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]). The epic ledger (`epic.json`, queue, inbox, landings, spec) stays git-tracked in `.marshall/orchestrator/<epic_id>/` of the shared epic worktree; `epics/<epic_id>/` holds only what is not tracked.
 * *Locks*: The scope locks live in `locks/`, outside the directories they protect (link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification, Transaction Locks]); the machine-wide store locks stay in `<PM_MCP_BASE>/locks/`.
-* *Writers*: Only the runtime and the operator CLI write the store, always through the stores' transactions; jobs never write it, and the model reaches it only through server links and resources (`pm://plan/…`, `pm://epic/…`, `pm://workspace/…`), never through file paths.
+* *Writers*: Only the runtime writes the store (operator verbs included, which reach it through the runtime's local API), always through the stores' transactions; jobs never write it, and the model reaches it only through server links and resources (`pm://plan/…`, `pm://epic/…`, `pm://workspace/…`), never through file paths.
 
 [#workspace-home]
 === Workspace Home (`<PM_MCP_BASE>/projects/<project_id>/workspace/`)
