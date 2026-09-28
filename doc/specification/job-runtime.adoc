@@ -10,7 +10,7 @@ link:../Specification.adoc[Specification] » Job Runtime
 
 == Overview
 
-This document specifies the technical design, process management, security controls, and output parsers for the PM-MCP **Job Runtime**. The runtime manages native host subprocesses for builds, git operations, CI command-line integrations (`gh`, `glab`), and out-of-process project scripts (`PM-EXT-5`) under strict operator enrolment (`PM-EXEC-1`..`PM-EXEC-5`). The runtime never executes legacy `plan-marshall` scripts (`PM-MIG-2`). The git, CI, findings, and static-analysis operation contracts that these jobs serve live in the provider modules `pm-mcp-git`, `pm-mcp-ci`, `pm-mcp-findings`, and `pm-mcp-analysis`; their CLI adapter variants run as jobs of this runtime (link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]).
+This document specifies the technical design, process management, security controls, and output parsers for the PM-MCP **Job Runtime**. The runtime manages native host subprocesses for builds, the git and CI operations of the CLI variant (`git`, `gh`, `glab`), and out-of-process project scripts (`PM-EXT-5`) under strict operator enrolment (`PM-EXEC-1`..`PM-EXEC-5`). The git and CI operations of the native variant run in-process; they get a job record without process fields and the same budgets, cancellation, and outcome rules (<<in-process-operations>>). The runtime never executes legacy `plan-marshall` scripts (`PM-MIG-2`). The git, CI, findings, and static-analysis operation contracts that these jobs serve live in the provider modules `pm-mcp-git`, `pm-mcp-ci`, `pm-mcp-findings`, and `pm-mcp-analysis`; their CLI adapter variants run as jobs of this runtime (link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]).
 
 == Traceability
 _See Requirements:_
@@ -25,7 +25,7 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-2[PM-EXEC-2: Operator Enrolment & Verify-Not-Resolve Contract]_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-3[PM-EXEC-3: Python Interpreter Pinning & Hash Verification]_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4: Direct Host Subprocess Management & Process-Group Isolation]_
-* _See Requirement link:../Requirements.adoc#PM-EXEC-5[PM-EXEC-5: Native Git & CI CLI Job Execution]_
+* _See Requirement link:../Requirements.adoc#PM-EXEC-5[PM-EXEC-5: Git & Provider Operations: Native and CLI Variants]_
 * _See Requirement link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6: Adaptive Build Timeouts, Coverage Parsing & Gate Honesty]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
 * _See Requirement link:../Requirements.adoc#PM-SEC-2[PM-SEC-2: Workspace Confinement & Path Traversal Prevention]_
@@ -142,7 +142,15 @@ if (stdinPayload.isPresent()) {
 
 === In-Memory `stdin` Streaming vs Retired Temp-File Patterns (`PM-EXEC-5`)
 
-When a workflow primitive passes multi-line text to an enrolled `git` or `ci` tool (`git -C <tree> commit -F -`, `gh pr create --body-file -`, `gh pr edit --body-file -`, `gh pr comment --body-file -`, `gh issue comment --body-file -`, `glab mr create`), `JobRuntime` supplies the validated UTF-8 bytes in `stdinPayload`:
+When a workflow primitive served by the CLI variant (link:cli-and-security.adoc#cli-variant-credentials[CLI, Coordination & Security Specification, Credentials of the CLI Variant]) passes multi-line text to an enrolled `git` or `ci` tool, `JobRuntime` supplies the validated UTF-8 bytes in `stdinPayload`. The native variant runs in process and passes the same text as an in-memory request payload; it has no job and no `stdin`.
+
+The `stdin` forms of the CLI variant are closed:
+
+* `git`: `git -C <tree> commit -F -`.
+* `gh`: `gh pr create|edit|comment --body-file -`, `gh issue create|comment --body-file -`, and `gh api graphql --input -` for the fixed GraphQL documents.
+* `glab`: the operations whose `glab` subcommand has no confirmed `stdin` form (`mr create`, `mr note`, `issue note`) are sent as `glab api <endpoint> --input -` with a server-composed JSON body. Until the Milestone-1 verification of these forms passes, these operations return `unsupported_by_variant{reason: no_stdin_form}` in the CLI variant, and the `gitlab` integration needs the native variant for them; free text is never moved to the argument vector or a file to work around it.
+
+For every form:
 
 * *Zero Temp or Scratch Files*: The server never writes commit messages or PR/issue bodies to scratch files, neither in the manner of `plan-marshall`'s `.plan/temp/{plan_id}-commit-msg.txt` and `<plan>/work/ci-bodies/` nor to `/tmp/`.
 * *Zero Shell / Argv Exposure*: Multi-line text is never placed in `verifiedArgv`, avoiding OS `ARG_MAX` limits and `ps` command-line inspection.
@@ -160,15 +168,25 @@ When a job exceeds its allocated budget (`PM-EXEC-4`, link:timeouts.adoc#job-bud
 5. *Outcome*: The outcome of a terminated job is derived by <<outcome-derivation>>; relay termination never affects a job. A `timed_out` job is `no_verdict` in every roll-up (link:timeouts.adoc#no-verdict-rule[Timeouts & Budgets Specification, Timed-Out Outcomes Are No-Verdict]).
 6. *Live Orphans after a Runtime Crash*: Each job record stores the job PID (which is its process-group ID) and the process start instant. In the project's recovery after the next runtime start, for every record left `running` the runtime probes the process group with `kill(-pgid, 0)` together with the record: a group exists while any of its members lives, and a PGID cannot be reused while its group is alive, so a live group whose ID equals the recorded PGID of a `running` record is that job's group, even when the leader (whose start instant was recorded) has exited. Such a group is terminated with steps 1–3 and the job recorded as `killed`; it is never adopted or re-executed (link:runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]). A group that no longer exists needs no termination; the record is settled `killed` as well.
 
+[#in-process-operations]
+=== In-Process Operations (Native Variant)
+_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3]_
+
+A `git` or `ci` operation of the native variant (JGit, provider HTTP clients) runs inside the runtime: no argument vector, no environment, no process group, no Landlock ruleset, and no `job-exec` shim exist for it. It is still a job of the runtime, so waits, cancellation, metrics, and recovery treat it like any other job:
+
+* *Job Record*: Every in-process operation gets a job record of its kind (`git` or `ci`, job id prefix `g` or `c`) with `execution: in_process`, its budget key `<kind>:<operation>`, `budget_seconds`, and `budget_derivation`; the process fields (`argv_digest`, `pid`, `process_started_at`, `spawned_at`, `exit_code`, `signal`) are `null` and `confinement` is `not_applicable` (link:store-schemas.adoc#job-record[Store Schemas Specification, Job Record]). It writes no job log file.
+* *Budget & Cancellation*: The operation runs under the budget of its operation class; at budget expiry, on `cancel:<job_id>`, and at drain it is cancelled cooperatively (JGit `ProgressMonitor`, interruption of the HTTP exchange), every HTTP request carries the compiled per-request connect and read timeout, and an operation that does not return within the grace period is abandoned with its late result discarded (link:timeouts.adoc#in-process-operations[Timeouts & Budgets Specification, In-Process Operations]). A partial result is never used.
+* *Outcome*: Rows 1 to 4 of <<outcome-derivation>> apply unchanged (`refused` before the operation starts, `cancelled`, `timed_out` as `no_verdict`, `killed` at drain or for a record left `running` by a previous runtime instance; nothing is probed or adopted). Otherwise the fate is `succeeded` when the operation returned a domain outcome of its closed contract enumeration, `failed` when it returned a transport outcome (`auth_failed`, `permission_denied`, `provider_unavailable`, `malformed_response`, `unsupported_by_variant`, `capability_missing`), and `indeterminate` when it ended outside its contract (an unexpected exception, recorded by its class). A provider rate limit (`rate_limited{reset_at}`, or a `Retry-After`) is neither a failure nor a timeout: the operation is re-issued after the stated instant, the time until then does not count against its budget, and the wait records `provider_rate_limit` (<<_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4>>).
+
 === Bounded Long-Poll & Progress-Reset Waiting Primitives (`PM-WF-8`, `PM-IMPL-4`)
-_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-5[PM-WATCH-JOB-5], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-6[PM-WATCH-JOB-6]_
+_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-5[PM-WATCH-JOB-5], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-6[PM-WATCH-JOB-6], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-19[PM-WATCH-JOB-19]_
 
 When a workflow transition spawns a long-running `build`, `ci`, or `project_script` job, or when the model invokes `pm_build` (`PM-SVC-1`, `PM-SVC-4`):
 
 * *Bounded Wait Slice*: The server holds the request open for at most the bounded wait window (`bounded_wait_seconds` of the client profile; value, bounds, and the rule relating it to the host idle timeout in link:timeouts.adoc#bounded-wait[Timeouts & Budgets Specification, Bounded Wait Window]). If the job completes within the window, the server immediately evaluates the completion guard and returns the next workflow state.
 * *Progress Notifications*: When the client profile supports `progress_resets_timeout == true` and supplies a `_meta.progressToken`, the call waits up to the progress wait upper bound (link:timeouts.adoc#progress-wait[Timeouts & Budgets Specification]) and the job runner emits periodic `notifications/progress` frames (current build stage and elapsed time, at the interval of link:timeouts.adoc#progress-interval[Timeouts & Budgets Specification]) over the calling host connection (relayed to the host by `pm-mcp serve`).
 * *Non-Blocking Wait Links*: If the job is still running when the window elapses, the call returns a valid hypermedia state with the implicit `wait:<job_id>` (`rel: wait`, `form: wait`) and `cancel:<job_id>` (`rel: abort`, `form: noop`) links (`PM-WF-8`, link:workflow-dsl.adoc#implicit-job-links[Workflow DSL Specification, Implicit Links of Job States]), never failing with an MCP transport timeout.
-* *Wait Attribution*: Every wait slice records `wait_reason` (closed enum `build`, `ci`, `review_bot_window`, `operator_decision`, `merge_queue`, `precondition_poll`) and `deliberate` (`true` for an operator ruling or a rate window). `record-metrics` sums wait time per reason and reports deliberate waits separately from poll misses, never as one "waste" figure.
+* *Wait Attribution*: Every wait slice records `wait_reason` (closed enum `build`, `ci`, `review_bot_window`, `operator_decision`, `merge_queue`, `precondition_poll`, `provider_rate_limit`) and `deliberate` (`true` for an operator ruling or a rate window). `provider_rate_limit` is the time a provider's API rate limit (`Retry-After` or a rate-limit reset instant) deferred the next observation (link:timeouts.adoc#ci-repoll-cadence[Timeouts & Budgets Specification, Provider Re-Poll Cadence]); it is never a timeout and never a failure. `record-metrics` sums wait time per reason and reports deliberate waits separately from poll misses, never as one "waste" figure.
 
 === Warm Language Server Pool & Orthogonal Service Access (`PM-SVC-2`, `PM-SVC-4`, `PM-TOOL-2`)
 _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-5[PM-WATCH-TOOL-5]_
@@ -239,6 +257,8 @@ The runtime derives every job outcome itself, at the boundary, from evidence it 
 |<<Unparseable Output Fallback (`failed_unparsed`)>>.
 |===
 
+For an in-process operation of the native variant, rows 5 to 10 are replaced by the contract-based rule of <<in-process-operations>>; the success markers of row 7 for `git` and `ci` apply to the jobs of the CLI variant.
+
 Language server instances of the warm LSP pool are not classified by this table; their failures are reported as the non-run reasons of link:domain-extensions.adoc[Domain Extensions Specification] (Explicit Non-Run Reporting) and the timeouts of link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle].
 
 == Linux Filesystem Confinement (Landlock)
@@ -307,7 +327,58 @@ The runtime builds every job environment from scratch; nothing is inherited from
 |Never passed and never captured at enrolment; the enrolment refuses to record a variable matching these patterns.
 |===
 
-A variable not listed is not passed. Environment and write paths specific to `git` and `ci` jobs (SSH agent, commit signing, provider CLI configuration and authentication, non-interactive guards) are not yet specified; they are an open design topic.
+A variable not listed is not passed.
+
+*`git` and `ci` jobs*: These jobs exist only for the CLI variant of an integration (`PM-EXEC-5`); a native-variant operation runs in process and has no job environment. The CLI variant authenticates with the operator's ambient credentials by design (link:cli-and-security.adoc#cli-variant-credentials[CLI, Coordination & Security Specification, Credentials of the CLI Variant]); its jobs receive the rows above that name all job types plus:
+
+[cols="2,1,1,3"]
+|===
+|Variable |Job types |Provenance |Rule
+
+|`HOME`
+|`git`, `ci`
+|runtime
+|Configuration discovery (`~/.gitconfig`, credential helpers, `~/.ssh`, the GPG agent socket for signing); already passed to all job types.
+
+|`SSH_AUTH_SOCK`
+|`git` (network operations and signing)
+|enrolment
+|Only when the effective remote is an SSH remote or the repository signs with SSH; a socket missing at job start is not replaced, and the job fails with the tool's authentication error.
+
+|`GH_CONFIG_DIR`, `GLAB_CONFIG_DIR`, `XDG_CONFIG_HOME`
+|`ci`
+|enrolment
+|As captured, so that `gh` and `glab` find the operator's login.
+
+|`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`
+|`git`
+|runtime
+|Non-interactive guards: a missing credential fails instead of prompting.
+
+|`GIT_OPTIONAL_LOCKS=0`
+|`git` (read operations)
+|runtime
+|Read-only calls never take the index lock.
+
+|`GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`
+|`ci`
+|runtime
+|Non-interactive, parseable output.
+
+|`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`
+|`git` (commit-creating operations)
+|runtime
+|The committer resolved from the agent credential, or the fixed `plan-marshall-mcp` noreply identity (link:cli-and-security.adoc#agent-credentials[CLI, Coordination & Security Specification, Agent Credentials of the Native Variant]); the author is set on the argument vector (`-c user.name=… -c user.email=…` from `commit_identity`), so both variants produce identical commit metadata.
+
+|`JAVA_HOME`, `GRADLE_USER_HOME`
+|`git` (operations that run repository hooks)
+|enrolment
+|As for `build` jobs, because a hook started by `git` typically runs the project's build tools; the flag-injecting variables stay excluded.
+|===
+
+The credential row applies unchanged, and additionally `GH_ENTERPRISE_TOKEN`, `GITLAB_PRIVATE_TOKEN`, `GIT_ASKPASS`, `SSH_ASKPASS`, and `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` are never passed: no agent token reaches a CLI job, neither as a variable nor through an askpass or credential helper served by `pm-mcp`.
+
+*Write paths of CLI-variant jobs*: The Landlock write set of a `ci` job additionally contains the `gh` or `glab` configuration directory (token refresh rewrites `hosts.yml`). `~/.ssh/known_hosts` stays read-only for every job: an unknown host key fails the job and is never accepted (no `accept-new`). Repository hooks and signing programs are started by `git` inside the CLI `git` job and inherit its environment, write set, and budget (the hook-running `git` class, link:timeouts.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]); there is no separate hook or filter job type.
 
 [#canonical-build-verbs]
 == Canonical Build Verb Set
@@ -411,16 +482,16 @@ If a build exits with a non-zero exit code but the output parser cannot extract 
 === Adaptive Timeout Learning
 _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-15[PM-WATCH-JOB-15], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-16[PM-WATCH-JOB-16]_
 
-`pm-mcp` persists observed execution durations per project in `<PM_MCP_BASE>/projects/<project_id>/build-timings.json` (link:store-schemas.adoc#build-timings-store[Store Schemas Specification, Build Timings Store]), keyed by budget key (for build jobs the canonical command: build system, canonical verb of the <<canonical-build-verbs>>, module, and sorted profiles; for `git` and `ci` jobs the operation key); there is no repository-local and no machine-level timeout store, so a moved checkout keeps its budgets. The blend formula, the engine floors, the allocation rule, the escalation budget and its cap, operator budgets, and the no-verdict rule for `timed_out` are defined only in link:timeouts.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]; this section defines which runs feed the learned baseline $L$:
+`pm-mcp` persists observed execution durations per project in `<PM_MCP_BASE>/projects/<project_id>/build-timings.json` (link:store-schemas.adoc#build-timings-store[Store Schemas Specification, Build Timings Store]), keyed by budget key (for build jobs the canonical command: build system, canonical verb of the <<canonical-build-verbs>>, module, and sorted profiles; for `git` and `ci` operations the operation key `<kind>:<operation>`, the same for an in-process operation of the native variant and a job of the CLI variant, <<in-process-operations>>); there is no repository-local and no machine-level timeout store, so a moved checkout keeps its budgets. The blend formula, the engine floors, the allocation rule, the escalation budget and its cap, operator budgets, and the no-verdict rule for `timed_out` are defined only in link:timeouts.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]; this section defines which runs feed the learned baseline $L$:
 
-* *Finished Runs Feed $L$*: Every finished run (any exit code) feeds $L$ with its duration; `killed` and `cancelled` runs never do.
+* *Finished Runs Feed $L$*: Every finished run (any exit code) feeds $L$ with its duration; `killed` and `cancelled` runs never do. An in-process operation has finished when it returned a result of its contract; the time it spent deferred by a provider rate limit is excluded from the duration.
 * *Timed-Out Runs Never Feed $L$*: A `timed_out` run is a non-finish, so its duration is unknown. It never feeds $L$; it sets the one-shot escalation budget of link:timeouts.adoc#escalation-budget[Timeouts & Budgets Specification] for the next run of the same key, which the next finished run clears. *Deliberate change vs. `plan-marshall`*: `plan-marshall` blends its doubled timeout into $L$, so one residue-slowed timeout inflates every later budget.
 * *Residue-Poisoned Runs*: A finished run whose worktree held build residue above the hygiene threshold at its start (the count of git-ignored build output files measured at job start, beside the <<worktree-sha>> scan; the threshold is a named engine constant recorded with the observation) is stored as `poisoned` and not blended while clean observations exist. The learned value's hygiene (`observations`, `poisoned`, `escalated`) is recorded in the build timings store and the job record and shown by `pm-mcp status`; it is never rendered in the job facts (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 * *Budget Derivation*: Every allocated budget records `budget_derivation` (`learned` with its observation count, `escalated`, `operator`, or `floor_default`; link:timeouts.adoc#budget-allocation[Timeouts & Budgets Specification, Allocated Budget]) in the job record, never in the representation: the model acts on the offered links, not on the derivation. Every `timed_out` outcome is `no_verdict`, whatever the derivation; the derivation selects only the retry offer, server-side (link:timeouts.adoc#no-verdict-rule[Timeouts & Budgets Specification]).
 * *Budget Scope & Measurement*: Every budget states the statistic it came from and the scope it applies to (link:timeouts.adoc#no-verdict-rule[Timeouts & Budgets Specification], Budget statistic). Its scope is the budget key, so a figure measured under one key is never applied to another.
 * *Runner-Dependent Verdicts*: When the same test population is red under one canonical command and green under another (for example a real-tree test that times out under a module-scoped test run but passes under `verify`), the job facts report both keys with their verdicts (the budgets stay in the job records); the difference is never left implicit.
 * *Cold Rebuilds*: A finished run that starts after a dependency sync or a build-cache invalidation since the key's previous observation (a changed resolved-dependency set or a cleared build cache) is stored as `cold`. Like a `poisoned` run it is not blended into $L$ while warm observations exist, and it is never read as a regression of $L$.
-* *Seeded Wait Budgets*: The expected duration of a CI wait (link:hypermedia-format.adoc#_deterministic_evaluation_immediate_short_circuit_matrix[Hypermedia Format Specification, Short-Circuit Matrix]) is seeded from the project's known-slow ceilings (the operator budgets in the enrolment) when no learned figure exists. CI waits are re-polled and never lapse, so a seeded figure sets only the expected duration recorded with the wait (shown by `pm-mcp status`, never rendered), never a failure deadline (link:timeouts.adoc#ci-wait[Timeouts & Budgets Specification, CI Wait]); review-bot waits belong to the open git/GitHub/GitLab design topic (link:timeouts.adoc#review-bot-windows[Timeouts & Budgets Specification]).
+* *Seeded Wait Budgets*: The expected duration of a CI wait (link:hypermedia-format.adoc#_deterministic_evaluation_immediate_short_circuit_matrix[Hypermedia Format Specification, Short-Circuit Matrix]) is seeded from the project's known-slow ceilings (the operator budgets in the enrolment) when no learned figure exists. CI waits are re-polled and never lapse, so a seeded figure sets only the expected duration recorded with the wait (shown by `pm-mcp status`, never rendered), never a failure deadline (link:timeouts.adoc#ci-wait[Timeouts & Budgets Specification, CI Wait]). Review-bot waits are bounded by the bot's rate window, re-review timeout, and attempt ceiling, never by a learned or seeded figure (link:timeouts.adoc#review-bot-windows[Timeouts & Budgets Specification, Review-Bot Rate Windows]).
 * *No Inherited Baselines*: Every learned value starts from the project's own finished runs under `PM-MCP`; learned timeouts of legacy `plan-marshall` are never read or imported (`PM-MIG-2`).
 
 === Native Coverage Report Parsers
@@ -446,7 +517,7 @@ Before marking a module or pre-push quality gate as `fresh` in `change-ledger.js
 +
 All four are persisted in the gate's job record and step record. The representation of a gate result renders only what the model acts on: `gate_coverage` with, for `PARTIAL`, the degraded dimensions and their reasons, and `uncovered`, so a clean exit is never reported as a full pass. `structural_limits` (a static, registered property of each analysis kind) and `parity_population` (local-versus-CI parity evidence for metrics and the quality report) are never rendered (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 3. *Test-Scope Divergence Detection*: Detects and rejects runs where test filtering flags or skipped-test properties excluded tests belonging to modified modules.
-4. *Baseline Separation*: A failing whole-tree gate (`quality-gate`, `verify`, `coverage`) is re-run on the plan's merge base in a scratch worktree (created and removed by the runtime under `.marshall/local/worktrees/`, never the primary checkout) before any routing. Located diagnostics present on both sides are `baseline` and never become plan findings; for coverage, a threshold failure in a module whose main sources the plan did not change is `baseline_debt` (one non-blocking finding of severity `info` per module, never fanned out into build-error or Q-Gate findings). A gate red only through baseline diagnostics yields the gate verdict `baseline_red` (a verdict of the gate step, not a job outcome; both build jobs keep their own outcomes), which routes to `<phase>.baseline-red` (escalate only; the plan never remediates it) and is recorded with the merge-base SHA; the remaining diagnostics route to `triage_required`. A base run that cannot be executed or parsed leaves every diagnostic attributed to the plan (fail-closed) and says so in `facts`. A quality-gate or format job run in the baseline scratch worktree (or any fresh worktree of the base) must leave `git status --porcelain` empty; a job that rewrites committed files there is reported as dirtying the base, never silently accepted.
+4. *Baseline Separation*: A failing whole-tree gate (`quality-gate`, `verify`, `coverage`) is re-run on the plan's merge base (`merge-base(HEAD, origin/<base_branch>)`) in the plan's baseline scratch worktree before any routing. The baseline worktree is a detached worktree at the merge base, created natively with `git.worktree-add` at `.marshall/local/worktrees/baseline-<plan_id>-<sha12>` (`<sha12>` the first 12 hex digits of the merge-base SHA), never the primary checkout and never the plan's worktree; it is reused by every base run of the plan while the merge base is unchanged, replaced (the old one removed, a new one created) when the merge base moves, and removed when the plan leaves `finalize`, is archived, or is aborted; the recovery sweep removes one whose plan is gone or terminal (link:filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). Before each reuse it must be clean (`git.status` empty); a dirty baseline worktree is replaced, never used. Located diagnostics present on both sides are `baseline` and never become plan findings; for coverage, a threshold failure in a module whose main sources the plan did not change is `baseline_debt` (one non-blocking finding of severity `info` per module, never fanned out into build-error or Q-Gate findings). A gate red only through baseline diagnostics yields the gate verdict `baseline_red` (a verdict of the gate step, not a job outcome; both build jobs keep their own outcomes), which routes to `<phase>.baseline-red` (escalate only; the plan never remediates it) and is recorded with the merge-base SHA; the remaining diagnostics route to `triage_required`. A base run that cannot be executed or parsed leaves every diagnostic attributed to the plan (fail-closed) and says so in `facts`. A quality-gate or format job run in the baseline scratch worktree (or any fresh worktree of the base) must leave `git.status` empty; a job that rewrites committed files there is reported as dirtying the base, never silently accepted, and the worktree is replaced before the next base run.
 
 [#worktree-sha]
 == Working-Tree Hash (`worktree_sha`, `PM-SVC-1`)

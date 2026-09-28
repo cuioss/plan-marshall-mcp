@@ -22,10 +22,13 @@ the `pm-mcp serve` STDIO relay, PM-TECH-1/3 and `doc/specification/runtime-model
 |---|---|
 | `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
 
-New modules from the concept are added with their first code, not as empty shells: a plain Java
-`pm-mcp-core` (primitives, workflow DSL and engine, stores) with the module renamed to
-`pm-mcp-server`, then `pm-mcp-dist` for the release layout (PM-IMPL-1 in
-`doc/requirements/14-implementation.adoc`).
+Roadmap Milestone 0 creates the target module structure in one step (PM-IMPL-1 in
+`doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus
+assembly, including the release profile), beside the aggregator `pm-mcp-modules` with
+`pm-mcp-core` (plain Java), the nested aggregator `pm-mcp-providers` (`pm-mcp-git`, `pm-mcp-ci`,
+`pm-mcp-findings`, `pm-mcp-analysis`, `pm-mcp-github`, `pm-mcp-gitlab`, `pm-mcp-sonar`), and
+`pm-mcp-conformance`. Every module gets minimal real code and tests, never an empty shell. The
+table above and the build commands below change with that milestone.
 
 ## Development Notes
 

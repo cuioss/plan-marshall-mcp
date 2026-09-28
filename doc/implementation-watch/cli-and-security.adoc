@@ -42,7 +42,10 @@ Guard:: Cross-project grants and CI queries identify the target by remote owner/
 location. The credential project key is the enrolment identifier, so a remote rename leaves it
 unchanged; `pm-mcp status` and `enter` still detect a remote-name change and report it, because provider-side
 calls (App installation tokens, cross-project grants) address the remote by owner/name. A rename is probed before
-it is declared safe.
+it is declared safe. The installation discovery (`GET /repos/{owner}/{repo}/installation`) and the cached derived
+installation tokens (keyed by installation and permission set) are invalidated when the remote's owner/name changes,
+and the native transport's origin check (`remote_origin_mismatch`) compares origins, never checkout paths or
+repository names.
 Fixture:: `pr-agent-settings` → `cuioss-review-bot` (cuioss-organization 0.30.0, plan-marshall #1603).
 Source:: lessons-routing lessons 2026-09-24-12-001 (`.plan/orchestrator/review-apparatus/landings/PLAN-PR-066.md` (`foreign_pr_gate` item)) and 2026-09-24-12-007 (`.plan/orchestrator/review-apparatus/inbox/archive/charter-assembled-at-run-time/charter-assembled-at-run-time-007.md`).
 
@@ -58,6 +61,76 @@ Guard:: Before the operator-confirmed filing job is implemented, a probe verifie
 tracker with the enrolled credential; without it the release action only renders the issue body for the operator to
 file (the other fallbacks: a flushed outbox, an operator-provisioned per-repository token).
 Source:: lessons-routing PLAN-LR-03 D0.
+
+[#PM-WATCH-CLI-5]
+=== PM-WATCH-CLI-5: A derived installation token never outlives its secret and never leaks
+
+Anchor:: link:../specification/cli-and-security.adoc#derived-tokens[CLI & Security § Short-Lived Derived Tokens],
+link:../Requirements.adoc#PM-CRED-5[PM-CRED-5]
+Hazard:: An in-memory cache of App installation tokens keeps acting after the App key was rotated or revoked, or a
+cached token reaches a log, an audit record, a job output, or a tool result unredacted, because it never passed the
+stored-secret resolution path that registers redaction.
+Guard:: Tests rotate, remove, and re-set the `github` entry and answer a request with `auth_failed`: each drops every
+cached token of the entry, and the next operation mints a new one; no token is used later than 5 minutes before its
+expiry; every token is registered for redaction at mint, and a canary token value echoed in a recorded provider error
+body is absent from `daemon.log`, `audit.jsonl`, job logs, and every tool result; no derived token is written to a
+store or exported.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-13); no plan-marshall defect record.
+
+[#PM-WATCH-CLI-6]
+=== PM-WATCH-CLI-6: The origin check sees the effective URL, whatever rewrites it
+
+Anchor:: link:../specification/cli-and-security.adoc#native-confinement[CLI & Security § Native Operation Confinement]
+Hazard:: A repository-controlled rewrite (`url.<base>.insteadOf`, `pushInsteadOf`, `remote.<name>.pushurl`, a file
+included through `includeIf`) or an HTTP redirect in the JGit transport sends the agent credential to a host other
+than the origin of the credential entry.
+Guard:: Adversarial fixture repositories whose remote is redirected to a foreign host by each of `insteadOf`,
+`pushInsteadOf`, `pushurl`, and an `includeIf`-included file (inside and outside the repository), plus a recorded
+redirect from the provider origin to a foreign host: every fetch and push refuses with `remote_origin_mismatch`,
+appends one `security` audit record, and a listener on the foreign host counts zero connections; matched control:
+the same rewrites onto the credential origin pass.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-19); no plan-marshall defect record.
+
+[#PM-WATCH-CLI-7]
+=== PM-WATCH-CLI-7: The GitHub API and web origins are paired, never confused
+
+Anchor:: link:../specification/cli-and-security.adoc#agent-credentials[CLI & Security § Agent Credentials of the Native Variant],
+link:../Requirements.adoc#PM-CRED-5[PM-CRED-5]
+Hazard:: For `github.com` the API origin (`https://api.github.com`) differs from the web and transport origin
+(`https://github.com`); an origin pin that takes one for the other sends the credential to the wrong origin or
+refuses a valid request.
+Guard:: Table test over a `github.com` entry, a GitHub Enterprise entry, and a GitLab entry: REST and GraphQL go to
+the derived API origin and git transport to the `url` origin, each authenticated; a request to any other origin (for
+example `api.github.com` with an Enterprise entry) carries no authentication header and is refused; GitLab uses the
+`url` origin for both.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-9, Z2-19); no plan-marshall defect record.
+
+[#PM-WATCH-CLI-8]
+=== PM-WATCH-CLI-8: No agent token and no askpass helper reach a CLI-variant job
+
+Anchor:: link:../specification/cli-and-security.adoc#cli-variant-credentials[CLI & Security § Credentials of the CLI Variant]
+Hazard:: A token variable (`GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`) or an askpass or credential helper served by
+`pm-mcp` reaches the environment of a CLI `git`, `gh`, or `glab` job, where every descendant, repository hooks
+included, and every same-user process can read it.
+Guard:: CLI-variant job fixtures with a hook that records its environment and argument vector, run while the
+runtime's own environment contains the forbidden variables: no token variable, no `GIT_ASKPASS` or `SSH_ASKPASS`, no
+credential helper naming `pm-mcp`, and no secret canary value appear, while the operator's ambient rows of the Job
+Environment are present; the job's audit record carries `identity: operator_ambient`.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-16); no plan-marshall defect record.
+
+[#PM-WATCH-CLI-9]
+=== PM-WATCH-CLI-9: A native operation never starts a process
+
+Anchor:: link:../specification/cli-and-security.adoc#native-confinement[CLI & Security § Native Operation Confinement]
+Hazard:: JGit has several process entry points (hooks, filter drivers, `core.fsmonitor`, commit signing,
+`FS.runInShell`); an `FS` subclass that covers only some of them leaves a repository value able to start a process
+inside the runtime.
+Guard:: Native-selected fixture repositories with a hook in `.git/hooks/`, a `core.hooksPath` hook, a clean/smudge
+filter driver, `core.fsmonitor`, `commit.gpgSign` with `gpg.program`, and `core.sshCommand`: every native operation
+that would reach one refuses with `capability_missing` or ignores the non-allowlisted key, and a sentinel file each
+program would write stays absent; a build test enumerates the process call sites of the pinned JGit version, so an
+upgrade that adds one fails until the `FS` subclass covers it.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-15, Z2-19); no plan-marshall defect record.
 
 == Operator Channel Isolation & Privileged CLI (`pm-mcp operator`)
 

@@ -46,12 +46,16 @@ Source:: orchestrator-refactor epic Open Defect (PLAN-08).
 === PM-WATCH-JOB-3: A git timeout is not a refusal
 
 Anchor:: link:../specification/job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime § Process Termination & Cancellation Protocol],
+link:../specification/job-runtime.adoc#in-process-operations[Job Runtime § In-Process Operations],
 link:../specification/timeouts.adoc#job-budgets[Timeouts & Budgets § Job Budgets & Escalation],
 link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4]
 Hazard:: A git timeout was treated like a refusal and answered with `--force`; a timed-out worktree removal could
 leave a partially deleted tree.
 Guard:: `timed_out` git jobs never trigger `--force`; a timed-out `worktree remove` is re-checked for partial
-deletion before a retry; git timeouts adapt for large checkouts.
+deletion before a retry; git timeouts adapt for large checkouts. The same holds for in-process operations of the
+native variant: a test lets a JGit operation and a provider request exceed their class budget and asserts
+cooperative cancellation, a discarded partial result, `timed_out` as `no_verdict`, and a job record without process
+fields.
 Fixture:: the 60 s budget fired twice on one plan.
 Source:: code-intelligence-substrate PLAN-CIS-052 fold-N6.
 
@@ -79,7 +83,8 @@ Hazard:: A wait budget passed as an iteration count expired in seconds and repor
 running; a wait at its ceiling could not tell waiting from re-polling finished work; wait cost was invisible.
 Guard:: Wait jobs use monotonic wall-clock deadlines (test with fast pollers); an exhausted poll is `unproven`, not
 absent; a bounded wait returning `running` reports whether the job state changed during the window; a wait on an
-already-settled job returns immediately. The wait population below is the baseline for bounded-wait metrics.
+already-settled job returns immediately; time deferred by a provider rate limit is attributed `provider_rate_limit`,
+never counted as a timeout. The wait population below is the baseline for bounded-wait metrics.
 Fixture:: 600 s budget burned in seconds ("CodeRabbit absent" while running); a script cost rollup of 2,051 calls, 14,423,580 ms, dominated by the three wait notations
 build_server 27.4%, ci 27.3%, ci_complete_precondition 23.1% (77.8% together). Wait attribution by reason:
 deliberate (an operator ruling to wait out a CodeRabbit quota window) vs poll miss (8 `ci_complete_precondition`
@@ -117,6 +122,20 @@ Hazard:: Filtering CI runs by `pull_requests[].number` missed fork PRs, where th
 Guard:: `ci-verify` resolves runs by head SHA (and branch), never by `pull_requests[]`; fixture with an empty
 `pull_requests`.
 Source:: review-apparatus PLAN-PR-026 § FOLDED IN 2026-08-27 (lesson 2026-08-08-21-005).
+
+[#PM-WATCH-JOB-19]
+=== PM-WATCH-JOB-19: One shared provider poll honours `304` and `Retry-After`
+
+Anchor:: link:../specification/job-runtime.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../specification/timeouts.adoc#ci-repoll-cadence[Timeouts & Budgets § Provider Re-Poll Cadence]
+Hazard:: Every wait polls the provider on its own and ignores rate-limit signals; the credential's rate budget is
+exhausted, and the throttling is reported as a timeout or as a failure of the checks being waited for.
+Guard:: Recorded provider with `ETag` support and a rate limit: two concurrent waits on the same `(credential,
+resource)` cause one request per 30 s cadence; a `304` is an observation that changes nothing; a rate-limit answer
+with `Retry-After` or a reset instant defers the next request to that instant, the wait slices carry the reason
+`provider_rate_limit`, the deferral is not counted against the wait's budget, and the wait never ends `timed_out`
+because of it.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-27); no plan-marshall defect record.
 
 == Native Build Output Parsers
 
@@ -225,7 +244,8 @@ link:../Requirements.adoc#PM-WF-10[PM-WF-10]
 Hazard:: A local auto-fixing formatter rewrote committed files that CI accepted, dirtying every worktree before the
 clean-tree guard ran (no longer reproduced with ruff 0.16.8).
 Guard:: Quality-gate and format jobs run on a fresh worktree of the base leave `git status --porcelain` empty; test
-in a nested-worktree location.
+in a nested-worktree location. The baseline scratch worktree `baseline-<plan_id>-<sha12>` is reused only when clean
+and at its merge base; a test dirties it and asserts that the next base run replaces it.
 Fixture:: import-order churn on `test/test_shared_harness_parse_ns_{defaults,no_seam}.py`, files never edited by hand,
 recurring across plans (test-quality PLAN-183 quality-gate run, orchestrator-refactor PLAN-02 chore commit, PR body of
 review-apparatus PLAN-PR-067).
