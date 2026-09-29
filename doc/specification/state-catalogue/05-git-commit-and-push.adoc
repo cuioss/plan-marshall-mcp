@@ -11,9 +11,9 @@ link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[Sta
 [#state-catalogue-git]
 == Sub-Workflow `git.commit_and_push`
 
-Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-worktree`). Every state declares `phase inherit`: the phase value is the caller's. Callers: `execute.chain-tail-commit`, `execute.remediation-commit`, `finalize.settle-commit`, `finalize.push-barrier`, `setup.land-changes`, `epic.commit-ledger`. Every caller routes the terminal outcome `aborted` (class `aborted`) to one of its own `link` states, never to its scope's abort terminal (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Static Verification Rule 6]).
+Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-worktree`). Every state declares `phase inherit`: the phase value is the caller's. Callers: `execute.chain-tail-commit`, `execute.remediation-commit`, `finalize.settle-commit`, `finalize.push-barrier`, `setup.land-changes`, `epic.commit-ledger`, and the `commit-fix` states of the remediation units.
 
-The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `force_stale_push`, `force_push_with_lease`); each `approved` exit enters an `auto` state performing the approved action (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Static Verification Rule 10]): `git.stage-under-oracle-override`, `git.push-under-freshness-override`, `git.push-with-lease`. A hook failure is never bypassed (`git.commit-fix`), and a rebase conflict is resolved by the model (`git.resolve-conflicts`). Every caller routes `in_sync` like `pushed_clean`.
+*Exit contract* (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Rule 6]): `done` with the result record `{commit: sha?, pushed: bool, clean: bool}`, where `pushed` means that the remote branch holds `HEAD` after the call (so a branch already in sync is `{commit: null, pushed: true, clean: true}`), and the control outcome `stepped_out {by: model | server, cause, reason}`. Callers branch on the result by guards (`guard result.pushed`). The model's `step_out` is the implicit link of every resting `link` state below; the server steps out after a spent commit-attempt cap or oracle retry, or when a rebase could not start (`git.stepped-out`). Internal cases are handled by the unit's own states: a hook failure is never bypassed (`git.commit-fix`), a rebase conflict is resolved by the model (`git.resolve-conflicts`), and a lease-protected force push to the plan's own branch after a server rebase is routine (`git.push-with-lease`); any other force push is refused. Every link state asks for one judgment through one link naming its skill section.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -24,45 +24,37 @@ The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `fo
 |`auto`
 |`call` (start state).
 |Resolves the checkout (plan worktree, the main checkout at the enrolled `project_root`, or the shared epic worktree); `git status --porcelain` ignoring `.marshall/local/**`.
-|`dirty` -> `git.detect-artifacts`; `clean_skip_push` -> `git.done-clean`; `clean_needs_push_check` -> `git.evaluate-push-policy`.
+|`dirty` -> `git.detect-artifacts`; `clean_skip_push` -> `git.done`; `clean_needs_push_check` -> `git.evaluate-push-policy`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 1]
 
 |[[state-git.detect-artifacts]]`git.detect-artifacts`
 |inherit
 |`auto`
-|`git.inspect-worktree` (`dirty`); `git.artifact-escalate` (`retry` ok).
+|`git.inspect-worktree` (`dirty`).
 |Scans against `artifact-patterns.json` with the `.gitignore` oracle; deletes `safe` untracked artifacts.
 |`clean_or_safe_deleted` -> `git.resolve-message`; `uncertain_or_prohibited` -> `git.artifact-review`; `oracle_failed` -> `git.artifact-escalate`.
+|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 2]
+
+|[[state-git.artifact-escalate]]`git.artifact-escalate`
+|inherit
+|`auto`
+|`git.detect-artifacts` (`oracle_failed`).
+|Bounded retry of the scan with the `.gitignore` oracle (compiled retry budget `2`, link:../timeouts/01-job-budgets-and-waits.adoc#remediation-budgets[Timeouts & Budgets Specification, Remediation Budgets]); no override stages an unclassified path.
+|`clean_or_safe_deleted` -> `git.resolve-message`; `uncertain_or_prohibited` -> `git.artifact-review`; `exhausted` -> `git.stepped-out` (cause `oracle_failed`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 2]
 
 |[[state-git.artifact-review]]`git.artifact-review`
 |inherit
 |`link`
-|`git.detect-artifacts` (`uncertain_or_prohibited`); itself (`prohibited_remaining`).
-|`confirm_cleanup` (`next`, `submit`, `action` `delete_uncertain` / `keep_tracked`, optional `paths`); `abort` (`noop`). Skill `pm/git/artifact-cleanup`.
-|`resolved` -> `git.resolve-message`; `prohibited_remaining` -> `git.artifact-review`; `aborted` -> `git.done-aborted`.
+|`git.detect-artifacts`, `git.artifact-escalate` (`uncertain_or_prohibited`); itself (`prohibited_remaining`).
+|`confirm_cleanup` (`next`, `submit`, `action` `delete_uncertain` / `keep_tracked`, optional `paths`); implicit `step_out`. Skill `pm/git/artifact-cleanup`. For a dirty tree at an exit barrier the review separates build leftovers from real changes.
+|`resolved` -> `git.resolve-message`; `prohibited_remaining` -> this state.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
-
-|[[state-git.artifact-escalate]]`git.artifact-escalate`
-|inherit
-|`link`
-|`git.detect-artifacts` (`oracle_failed`).
-|`retry` (`noop`); `escalate` (`gitignore_oracle_failure`). `facts`: `git.artifact-oracle-error`.
-|`ok` -> `git.detect-artifacts`; `approved` -> `git.stage-under-oracle-override`; `denied` -> `git.done-aborted`.
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
-
-|[[state-git.stage-under-oracle-override]]`git.stage-under-oracle-override`
-|inherit
-|`auto`
-|`git.artifact-escalate` (`gitignore_oracle_failure`: `approved`).
-|`auto git.apply-oracle-override`, the approved action (Rule 10): records an override bound to the current `HEAD` naming the paths the `.gitignore` oracle could not classify; the next `git.stage-and-commit` stages them under it.
-|`recorded` -> `git.resolve-message`.
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 2]; link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Decision Registry]
 
 |[[state-git.resolve-message]]`git.resolve-message`
 |inherit
 |`auto`
-|`git.detect-artifacts`, `git.artifact-review` (`resolved`), `git.stage-under-oracle-override` (`recorded`).
+|`git.detect-artifacts`, `git.artifact-escalate` (`clean_or_safe_deleted`), `git.artifact-review` (`resolved`).
 |Resolves the deterministic message for `auto_deliverable` / `step_or_fallback`.
 |`ready` -> `git.stage-and-commit`; `needs_interactive` -> `git.compose-message`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 3]
@@ -71,15 +63,15 @@ The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `fo
 |inherit
 |`link`
 |`git.resolve-message` (`needs_interactive`: `interactive`, or `none_assert_clean` with unexpected dirty files).
-|`commit` (`next`, `submit`, `message:text[1..2000]`, a `Co-Authored-By:` line is rejected); `abort` (`noop`). Skill `pm/git/commit-message`; `facts`: `git.diff-summary`.
-|`valid` -> `git.stage-and-commit`; `aborted` -> `git.done-aborted`.
+|`commit` (`next`, `submit`, `message:text[1..2000]`, a `Co-Authored-By:` line is rejected); implicit `step_out`. Skill `pm/git/commit-message`; `facts`: `git.diff-summary`.
+|`valid` -> `git.stage-and-commit`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 3]
 
 |[[state-git.stage-and-commit]]`git.stage-and-commit`
 |inherit
 |`auto`
 |`git.resolve-message` (`ready`); `git.compose-message`, `git.commit-fix` (`valid`).
-|First, for every caller, the footprint check (worktree boundary and staging set, pinned build files, main checkout since `entry_baseline`); a violation raises the `footprint_violation` condition on this state (xref:01-conventions-generic-conditions.adoc#condition-footprint_violation[Condition footprint violation]) and nothing is committed. Then stages only the plan-derived staging set (and paths under a recorded oracle override); commits over `stdin` with the operator's `commit_identity` as author and the resolved agent identity as committer, identically in both variants; appends a `kind = "change"` ledger row; re-stamps `head_at_completion` and writes `freshness_reconcile` for Phase 6 `mutates_source` steps.
+|First, for every caller, the footprint check for boundary breaches (a path outside the plan's worktree, a pinned build file or protected path, a main-checkout change since `entry_baseline`); a breach raises the `footprint_violation` condition on this state (xref:01-conventions-generic-conditions.adoc#condition-footprint_violation[Condition footprint violation]) and nothing is committed. Paths inside the worktree beyond the declared footprint are staged and recorded as unplanned changes with their provenance. Commits over `stdin` with the operator's `commit_identity` as author and the resolved agent identity as committer, identically in both variants; appends a `kind = "change"` ledger row; re-stamps `head_at_completion` and writes `freshness_reconcile` for Phase 6 `mutates_source` steps.
 |`committed`, `nothing_to_commit` -> `git.evaluate-push-policy`; `hook_failed` -> `git.commit-fix`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 4]
 
@@ -87,23 +79,23 @@ The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `fo
 |inherit
 |`link`
 |`git.stage-and-commit` (`hook_failed`); itself.
-|`retry` (`noop`); `recompose` (`fix`, `submit`, `message`); `abort` (`noop`). No hook bypass exists. Reached only in the CLI variant, the only one that runs hooks. Skill `pm/git/commit-recovery`; `facts`: `git.hook-failure`.
-|`ok` -> `git.evaluate-push-policy`; `hook_failed` -> `git.commit-fix`; `attempts_exhausted` (compiled cap: `3` failed commit attempts per identical staged change set, the staged tree id and the message; the counter resets when either changes through a fix, a hook rewrite, or `recompose`) -> `git.done-aborted`, whose `aborted` the caller routes to its `<phase>.commit-aborted`; `valid` -> `git.stage-and-commit`; `aborted` -> `git.done-aborted`.
+|`retry` (`noop`) or `recompose` (`fix`, `submit`, `message`); implicit `step_out`. No hook bypass exists. Reached only in the CLI variant, the only one that runs hooks. Skill `pm/git/commit-recovery`; `facts`: `git.hook-failure`.
+|`ok` -> `git.evaluate-push-policy`; `hook_failed` -> this state; `valid` -> `git.stage-and-commit`; `attempts_exhausted` (compiled cap: `3` failed commit attempts per identical staged change set, the staged tree id and the message; the counter resets when either changes through a fix, a hook rewrite, or `recompose`) -> `git.stepped-out` (cause `attempts_exhausted`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
 
 |[[state-git.evaluate-push-policy]]`git.evaluate-push-policy`
 |inherit
 |`auto`
 |`git.inspect-worktree` (`clean_needs_push_check`), `git.stage-and-commit`, `git.commit-fix` (`ok`).
-|Evaluates `push_mode` with the derived fact `push_remote` (no push remote: nothing is pushed, the plan runs local-only) and, for `post_pr_conditional`, the caller step's `order > 20`.
-|`skip_push_committed` -> `git.done-committed-local`; `skip_push_clean` -> `git.done-clean`; `push_required` -> `git.verify-freshness`.
+|Evaluates `push_mode` with the derived fact `push_remote` (no push remote: nothing is pushed) and, for `post_pr_conditional`, the `order` of the persisted `settle_trigger` (`> 20`).
+|`skip_push` -> `git.done`; `push_required` -> `git.verify-freshness`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 5]
 
 |[[state-git.verify-freshness]]`git.verify-freshness`
 |inherit
 |`auto`
-|`git.evaluate-push-policy` (`push_required`); `git.freshness-build-running` (`succeeded`); `git.sync-required`, `git.resolve-conflicts`, `git.sync-escalate` (`rebased`).
-|`git.pre-commit-verify-freshness` over `change-ledger.jsonl` (`fresh`, `exempt`, or reconciled by `freshness_reconcile`).
+|`git.evaluate-push-policy` (`push_required`); `git.freshness-build-running` (`succeeded`); `git.sync-required`, `git.resolve-conflicts` (`rebased`).
+|`git.pre-commit-verify-freshness` over `change-ledger.jsonl` (`fresh`, `exempt`, a `baseline_red` row of the same `worktree_sha`, or reconciled by `freshness_reconcile`).
 |`fresh_or_exempt` -> `git.check-branch-parity`; `stale_or_undecidable` -> `git.freshness-blocked`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 5]
 
@@ -111,8 +103,8 @@ The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `fo
 |inherit
 |`link`
 |`git.verify-freshness` (`stale_or_undecidable`); `git.freshness-build-running` (every non-success outcome).
-|`run_verification_build` (`fix`, `noop`); `escalate` (`force_stale_push`). Skill `pm/finalize/push-barrier`; `facts`: `stale_reason`, `admitted_causes`, required notations, scope (the current `worktree_sha` stays in the ledger and audit record; the model makes no decision on it).
-|`started` -> `git.freshness-build-running`; `approved` -> `git.push-under-freshness-override`; `denied` -> `git.done-aborted`.
+|`run_verification_build` (`fix`, `noop`); implicit `step_out`. Never a push under a stale verdict. Skill `pm/finalize/push-barrier`; `facts`: `stale_reason`, `admitted_causes`, required notations, scope.
+|`started` -> `git.freshness-build-running`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 5]
 
 |[[state-git.freshness-build-running]]`git.freshness-build-running`
@@ -123,20 +115,12 @@ The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `fo
 |`succeeded` -> `git.verify-freshness`; `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate` -> `git.freshness-blocked`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
 
-|[[state-git.push-under-freshness-override]]`git.push-under-freshness-override`
-|inherit
-|`auto`
-|`git.freshness-blocked` (`force_stale_push`: `approved`).
-|`auto git.push`, the approved action (Rule 10), under an override record bound to the current `HEAD` and the rendered `stale_reason`; sets or refreshes `branch_pushed_at`.
-|`pushed_with_commit` -> `git.done-committed-and-pushed`; `pushed_clean_tree` -> `git.done-pushed-clean`; `up_to_date` -> `git.done-in-sync`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required` (the outcome set of `git.push`, routed alike in all three push states).
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 5]; link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Decision Registry]
-
 |[[state-git.check-branch-parity]]`git.check-branch-parity`
 |inherit
 |`auto`
 |`git.verify-freshness` (`fresh_or_exempt`).
-|`git.push-barrier-decision`: `first_push` when `branch_pushed_at` is unset; otherwise `git.branch-sync-state` (fetched) with `refire` only for `ahead` and for `never_pushed` (a `remote_absent_unverified` branch for which `ci.pr-find` found no pull request); a merged pull request makes it `remote_absent_landed`.
-|`first_push`, `refire` -> `git.execute-push`; `skip` -> `git.done-in-sync`.
+|`git.push-barrier-decision`: `first_push` when `branch_pushed_at` is unset; `rewritten_by_rebase` when the recorded last push (`branch_pushed_at`) is no ancestor of `HEAD` because a server rebase rewrote the plan's own branch; otherwise `git.branch-sync-state` (fetched) with `refire` only for `ahead` and for `never_pushed` (a `remote_absent_unverified` branch for which `ci.pr-find` found no pull request); a merged pull request makes it `remote_absent_landed`.
+|`first_push`, `refire` -> `git.execute-push`; `rewritten_by_rebase` -> `git.push-with-lease`; `skip` -> `git.done`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
 
 |[[state-git.execute-push]]`git.execute-push`
@@ -144,86 +128,46 @@ The sub-workflow has three operator escalations (`gitignore_oracle_failure`, `fo
 |`auto`
 |`git.check-branch-parity` (`first_push`, `refire`).
 |`git.push`; sets `branch_pushed_at` on the first successful push and refreshes it on every later one.
-|`pushed_with_commit` -> `git.done-committed-and-pushed`; `pushed_clean_tree` -> `git.done-pushed-clean`; `up_to_date` -> `git.done-in-sync`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required` (the outcome set of `git.push`, routed alike in all three push states).
+|`pushed`, `up_to_date` -> `git.done`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required` (the outcome set of `git.push`, routed alike in both push states).
+|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
+
+|[[state-git.push-with-lease]]`git.push-with-lease`
+|inherit
+|`auto`
+|`git.check-branch-parity` (`rewritten_by_rebase`).
+|`auto git.push`, the routine forced push to the plan's own branch after a server rebase, with an explicit lease: the `remote_sha` observed at the rejection, else the last recorded push (`branch_pushed_at`), re-read by `ls-remote` before the push; never the remote-tracking ref. Refreshes `branch_pushed_at`.
+|`pushed`, `up_to_date` -> `git.done`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
 
 |[[state-git.sync-required]]`git.sync-required`
 |inherit
 |`link`
-|`git.execute-push`, `git.push-under-freshness-override`, `git.push-with-lease` (`rejected_non_ff`, `rejected_lease`).
-|`sync_rebase` (`fix`, `noop`); `escalate` (`force_push_with_lease`). Skill `pm/git/sync-recovery`; `facts`: `git.branch-divergence`.
-|`rebased` -> `git.verify-freshness`; `conflict` -> `git.resolve-conflicts`; `approved` -> `git.push-with-lease`; `denied` -> `git.done-aborted`.
+|`git.execute-push`, `git.push-with-lease` (`rejected_non_ff`, `rejected_lease`).
+|`sync_rebase` (`fix`, `noop`, `git.rebase-onto-upstream`); implicit `step_out`. Skill `pm/git/sync-recovery`; `facts`: `git.branch-divergence`.
+|`rebased` -> `git.verify-freshness`; `conflict` -> `git.resolve-conflicts`; `rebase_failed` (the fetch or the rebase could not start) -> `git.stepped-out` (cause `rebase_failed`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
-
-|[[state-git.push-with-lease]]`git.push-with-lease`
-|inherit
-|`auto`
-|`git.sync-required` (`force_push_with_lease`: `approved`).
-|`auto git.push`, the approved forced push (Rule 10), with an explicit lease: the `remote_sha` observed at the rejection, else the last recorded push (`branch_pushed_at`), re-read by `ls-remote` before the push; never the remote-tracking ref. Refreshes `branch_pushed_at`.
-|`pushed_with_commit` -> `git.done-committed-and-pushed`; `pushed_clean_tree` -> `git.done-pushed-clean`; `up_to_date` -> `git.done-in-sync`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required` (the outcome set of `git.push`, routed alike in all three push states).
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]; link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Decision Registry]
 
 |[[state-git.resolve-conflicts]]`git.resolve-conflicts`
 |inherit
 |`link`
-|`git.sync-required` (`sync_rebase`: `conflict`); `git.sync-escalate` (`retry`: `conflict`); itself (`conflict`).
-|The model resolves the conflicted files in the checkout. `continue_rebase` (`fix`, `noop`, `git.rebase-continue`); `abort_rebase` (`alt`, `noop`, `git.rebase-abort`, restores the pre-rebase branch). Skill `pm/git/sync-recovery`; `facts`: `git.rebase-conflict` (the conflicted paths).
-|`rebased` -> `git.verify-freshness`; `conflict` -> `git.resolve-conflicts`; `aborted` -> `git.sync-escalate`.
+|`git.sync-required` (`conflict`); itself (`conflict`).
+|The model resolves the conflicted files in the checkout. `continue_rebase` (`fix`, `noop`, `git.rebase-continue`); implicit `step_out` (the server aborts the interrupted rebase, restoring the pre-rebase branch, before the frame unwinds). Skill `pm/git/sync-recovery`; `facts`: `git.rebase-conflict` (the conflicted paths).
+|`rebased` -> `git.verify-freshness`; `conflict` -> this state.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
 
-|[[state-git.sync-escalate]]`git.sync-escalate`
-|inherit
-|`link`
-|`git.resolve-conflicts` (`abort_rebase`: `aborted`).
-|`retry` (`noop`, `git.rebase-onto-upstream`); `abort` (`noop`). No operator decision. `facts`: `git.rebase-conflict`.
-|`rebased` -> `git.verify-freshness`; `conflict` -> `git.resolve-conflicts`; `aborted` -> `git.done-aborted` (the caller's `<phase>.commit-aborted` offers `abort-plan`).
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
-
-|[[state-git.done-committed-local]]`git.done-committed-local`
+|[[state-git.done]]`git.done`
 |inherit
 |`terminal`
-|`git.evaluate-push-policy` (`skip_push_committed`).
-|Returns outcome `committed_local` (class `success`).
-|The caller's `committed_local` transition.
+|`git.inspect-worktree` (`clean_skip_push`); `git.evaluate-push-policy` (`skip_push`); `git.check-branch-parity` (`skip`); `git.execute-push`, `git.push-with-lease` (`pushed`, `up_to_date`).
+|Returns outcome `done` (class `success`) with the result `{commit, pushed, clean}` of the path taken.
+|The caller's `done` transition.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
 
-|[[state-git.done-committed-and-pushed]]`git.done-committed-and-pushed`
+|[[state-git.stepped-out]]`git.stepped-out`
 |inherit
 |`terminal`
-|`git.execute-push`, `git.push-under-freshness-override`, `git.push-with-lease` (`pushed_with_commit`).
-|Returns outcome `committed_and_pushed` (class `success`).
-|The caller's `committed_and_pushed` transition.
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
-
-|[[state-git.done-pushed-clean]]`git.done-pushed-clean`
-|inherit
-|`terminal`
-|`git.execute-push`, `git.push-under-freshness-override`, `git.push-with-lease` (`pushed_clean_tree`).
-|Returns outcome `pushed_clean` (class `success`): a push of a clean tree was executed.
-|The caller's `pushed_clean` transition.
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
-
-|[[state-git.done-in-sync]]`git.done-in-sync`
-|inherit
-|`terminal`
-|`git.check-branch-parity` (`skip`); `git.execute-push`, `git.push-under-freshness-override`, `git.push-with-lease` (`up_to_date`).
-|Returns outcome `in_sync` (class `skip`): nothing was pushed because the remote branch already holds the local `HEAD` (or the branch landed and was deleted).
-|The caller's `in_sync` transition, routed like `pushed_clean`.
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
-
-|[[state-git.done-clean]]`git.done-clean`
-|inherit
-|`terminal`
-|`git.inspect-worktree` (`clean_skip_push`); `git.evaluate-push-policy` (`skip_push_clean`).
-|Returns outcome `clean` (class `skip`).
-|The caller's `clean` transition.
-|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
-
-|[[state-git.done-aborted]]`git.done-aborted`
-|inherit
-|`terminal`
-|`abort` links of `git.artifact-review`, `git.compose-message`, `git.commit-fix`, and `git.sync-escalate`; `git.commit-fix` (`attempts_exhausted`); denied escalations.
-|Returns outcome `aborted` (class `aborted`): it only leaves the sub-workflow and never ends the calling scope.
-|The caller's `aborted` transition, into a `link` state of the caller: `execute.commit-aborted`, `finalize.commit-aborted` (xref:01-conventions-generic-conditions.adoc#state-phase.commit-aborted[Commit aborted]), `setup.commit-changes`, `epic.active`.
+|`git.commit-fix` (`attempts_exhausted`); `git.artifact-escalate` (`exhausted`); `git.sync-required` (`rebase_failed`).
+|Returns the control outcome `stepped_out {by: server, cause, reason}`; it only leaves the sub-workflow and never ends the calling scope. The model's `step_out` returns the same outcome from any resting link state without entering this state.
+|The caller's `stepped_out` transition: `finalize.hand-back` from the plan callers, the remediation unit's `remediation-<class>.decide`, `setup.commit-changes`, `epic.active`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
 |===

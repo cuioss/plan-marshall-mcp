@@ -1,4 +1,4 @@
-= Workflow DSL & Engine Specification: Workflow Units, Job States & Decisions
+= Workflow DSL & Engine Specification: Workflow Units, Implicit Links, Questions & Waivers
 :toc: left
 :toclevels: 3
 :toc-title: Table of Contents
@@ -6,44 +6,71 @@
 :source-highlighter: highlight.js
 :nofooter:
 
-link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Workflow Units, Job States & Decisions
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Workflow Units, Implicit Links, Questions & Waivers
 
 [#workflow-definition-units]
 == Workflow Definition Units (Multi-File Workflows)
 
 A workflow definition may be split across several `.pmwf` files:
 
-* *Plan workflow*: All phase workflow files of a plan (`init.pmwf`, `refine.pmwf`, `outline.pmwf`, `plan.pmwf`, `execute.pmwf`, `land.pmwf` for the `land` lane states, `finalize.pmwf`) together form *one* workflow definition. The loader merges them into a single `WorkflowDefinition` before validation: `states` and `migrations` are the union of all files, the definition's `startState` is the `start` of `init.pmwf`, and the `start` of every other phase file names that phase's entry state. A transition in one phase file may therefore target a state declared in another (for example `allocated -> execute.dispatch-ready` in `finalize.pmwf`). Every phase file declares `scope plan` and its own `workflow <part> version <n>` header; the part headers identify files only. The merged unit carries a header of its own, which no file declares: `id` is `plan`, `scope` is `plan`, and `version` is derived from the part versions as their sum, recorded with the part versions themselves (`WorkflowDefinition.partVersions`, xref:04-ast-node-model.adoc#_ast_node_model[AST Node Model]). Because a part version only ever increases, the derived version increases with every change of any part. The unit id `plan` is the value of `CallFrame.callerWorkflowId` for every `call` made from a plan-workflow state (`status.json` `call_stack[].caller_workflow_id`), whichever phase file declares the calling state; the part header `workflow plan` of `plan.pmwf` (Phase 4) is a file identifier and never names the unit.
-* *Other top-level workflows*: Every other file with `scope plan`, `epic`, `workspace`, or `entity` (for example `epic.pmwf` with `scope epic`, `project-setup.pmwf` with `scope workspace`) forms a single-file definition.
-* *Sub-workflows*: Every `scope subworkflow` file (for example `git-commit-and-push.pmwf`) is a separately scoped definition. Its states are never merged into a caller's definition and are reachable only through `call`; transitions inside a sub-workflow may target only states of the same sub-workflow, and transitions outside it may never target a sub-workflow state.
+* *Plan workflow*: All phase workflow files of a plan (`init.pmwf`, `refine.pmwf`, `outline.pmwf`, `plan.pmwf`, `execute.pmwf`, `land.pmwf` for the `land` lane states, `finalize.pmwf`) together form *one* workflow definition, the plan *template*. The loader merges them into a single `WorkflowDefinition` before validation: `states` and `migrations` are the union of all files, the definition's `startState` is the `start` of `init.pmwf`, and the `start` of every other phase file names that phase's entry state. A transition in one phase file may therefore target a state declared in another (for example `allocated -> execute.dispatch-ready` in `finalize.pmwf`). Every phase file declares `scope plan` and its own `workflow <part> version <n>` header; the part headers identify files only. The merged unit carries a header of its own, which no file declares: `id` is `plan`, `scope` is `plan`, and `version` is derived from the part versions as their sum, recorded with the part versions themselves (`WorkflowDefinition.partVersions`, xref:04-ast-node-model.adoc#_ast_node_model[AST Node Model]). Because a part version only ever increases, the derived version increases with every change of any part. The unit id `plan` is the value of `CallFrame.callerWorkflowId` for every `call` made from a plan-workflow state (`status.json` `call_stack[].caller_workflow_id`), whichever phase file declares the calling state; the part header `workflow plan` of `plan.pmwf` (Phase 4) is a file identifier and never names the unit.
+* *Plan instance*: A plan never executes the template directly. It executes its *plan instance*, a single-file unit composed by the server from the template, the sub-units it calls, the composition rules, and the plan's facts, and versioned per composition event (xref:09-plan-instance.adoc#plan-instance[Plan Instance]). Every rule of this document applies to each instance version as to the template.
+* *Other top-level workflows*: Every other file with `scope plan`, `epic`, `workspace`, or `entity` forms a single-file definition: `epic.pmwf` (`scope epic`), `project-setup.pmwf` (`scope workspace`), the envelope units, and the generic entity unit `entity.pmwf` (`scope entity`: `entity.active`, which offers the dispatched kind's `submit` link, and the terminal `entity.completed` declared `terminal submitted success`) that serves every single-submit entity kind (triage, enrichment, refine and outline authoring, Q-Gate validation, re-grounding). Every entity unit declares `phase inherit`; no entity state waits on a question (a task envelope's `ask:TASK-NNN` records the question and ends the entity).
+* *Sub-workflows*: Every `scope subworkflow` file (`git-commit-and-push.pmwf`, and the remediation policy units `remediation-*.pmwf`, xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]) is a separately scoped definition. Its states are never merged into a caller's definition and are reachable only through `call`; transitions inside a sub-workflow may target only states of the same sub-workflow, and transitions outside it may never target a sub-workflow state.
 
 The same unit rules apply to the default units of the binary and to a project's own copies in `.marshall/config/` (xref:04-ast-node-model.adoc#project-owned-units[Project-Owned Workflow Units & Compiled Invariants]); a project never mixes a default file with its own copies inside one definition unit.
 
 All static verification rules (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]) run over the merged definition unit: state identifiers must be unique across all files of the unit, transition targets must exist in the unit, every state must be reachable from the unit's `startState` under every combination of the configuration keys its guards declare, outcome coverage is exhaustive per state, and link identifier patterns are unique within their state.
 
 [#implicit-job-links]
-== Implicit Links of Job States
+== Implicit Links
 
-Every `job` and `composite_job` state implicitly offers two links that are never declared in DSL source:
+The engine offers the following links without a declaration in DSL source. Each counts as offered for every check that compares link identifiers against the workflow definitions (for example the vocabulary-skill link check, `PM-WATCH-TOOL-6`), and a DSL link whose identifier pattern collides with one fails validation (Rule 3).
 
-[cols="1,1,1,3"]
+[cols="2,1,1,2,4"]
 |===
-|Link |`rel` |`form` |Semantics
+|Link |`rel` |`form` |Offered on |Semantics
 
 |`wait:<job_id>`
 |`wait`
 |`wait`
+|every `job` and `composite_job` state
 |Bounded blocking wait on the running job (`PM-WF-8`); returns the next state's representation once the job settles, or the updated running representation.
 
 |`cancel:<job_id>`
 |`abort`
 |`noop`
+|every `job` and `composite_job` state
 |Cancels the running job (for a composite job, all constituent jobs); the job settles with the outcome `cancelled`.
+
+|`returned:<dispatch_id>`
+|`submit`
+|`submit`
+|every state that offers a `dispatch` clause, while its dispatch is active
+|The parent's report of the sub-agent's return (for a reader dispatch `ingest_candidates:<dispatch_id>`). Its primitive is the return-evaluation primitive the dispatched entity kind registers (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#return-evaluation[Dispatch & Effort Specification, Return Evaluation]); the outcome transitions written under the `dispatch` clause are its transitions, and Rule 2 checks them against that primitive's closed outcomes (for a task envelope `execute.evaluate-envelope-return`: `question_pending`, `infeasible_pending`, `chain_tail`, `continue`, `all_complete`, in that precedence).
+
+|`step_out`
+|`abort`
+|`submit`
+|every resting `link` state (including a question state) of a `scope subworkflow` unit
+|`reason: text[1..2000]`. Unwinds exactly one call frame and returns the control outcome `stepped_out {by: model, cause: step_out, reason}` to the caller (xref:01-module-boundary-and-grammar.adoc#sub-workflow-exits[Sub-Workflow Exit Contract]). Never guarded, never charged to a budget, never writes a waiver; before the frame unwinds the engine undoes an interrupted in-flight operation of the frame (an unfinished rebase is aborted). Never offered on `auto`, `job`, or `composite_job` states, and never at plan scope, where the declared `hand_back` link is the equivalent.
+
+|`answer_questions`
+|`submit`
+|`submit`
+|every question state whose open record has `session` delivery, and a `task` question state after its deadline
+|`answers: list<schema[question-answer]>` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]); the relayed human answer (`channel: user_relayed`), or for a `task` question after its deadline the parent model's own answer (`channel: model`) (<<question-states>>).
+
+|`wait:question:<question_id>`
+|`wait`
+|`wait`
+|every question state whose open record has `elicitation` or `web` delivery
+|Bounded long-poll on the question record; returns the next state's representation once the question is resolved, or the unchanged representation.
 |===
 
-Independently of the state kind, the engine accepts the self-report link `report_bypass` in every state of a live plan, epic, or entity scope and never renders it (link:../hypermedia-format/01-representation-and-link-forms.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]); it returns the unchanged representation and never changes state, so it needs no outcome transition. Implicit links count as offered for every check that compares link identifiers against the workflow definitions (for example the vocabulary-skill link check, `PM-WATCH-TOOL-6`).
+Independently of the state kind, the engine accepts the self-report link `report_bypass` in every state of a live plan, epic, or entity scope and never renders it (link:../hypermedia-format/01-representation-and-link-forms.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]); it returns the unchanged representation and never changes state, so it needs no outcome transition.
 
-`<job_id>` is the job identifier of a `job` state (for example `wait:b-3f9a2c417e0d8b65`) and the composite identifier, which equals the state identifier, of a `composite_job` state (for example `wait:finalize.concurrent-wait`). The outcome enumeration of every `job` and `composite_job` primitive contains `cancelled`, so every such state must declare an explicit `cancelled -> <state>` outcome transition; Rule 2 (exhaustive outcome coverage) enforces it. A `job` state's outcome enumeration is the closed job outcome set of `PM-EXEC-4` (`succeeded`, `failed`, `failed_unparsed` for build jobs only, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`); a `composite_job` primitive declares its own closed workflow outcomes (`PM-WF-8`). A DSL link whose identifier pattern collides with an implicit link fails validation. `<job_id>` is always the job bound in `active_job` (<<job-state-binding>>); `wait` on a bound job only waits and never starts one.
+`<job_id>` is the job identifier of a `job` state (for example `wait:b-3f9a2c417e0d8b65`) and the composite identifier, which equals the state identifier, of a `composite_job` state (for example `wait:finalize.concurrent-wait`). The outcome enumeration of every `job` and `composite_job` primitive contains `cancelled`, so every such state must declare an explicit `cancelled -> <state>` outcome transition; Rule 2 (exhaustive outcome coverage) enforces it. A `job` state's outcome enumeration is exactly the closed job outcome set of `PM-EXEC-4` (`succeeded`, `failed`, `failed_unparsed` for build jobs only, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`); a state that runs several jobs or routes domain outcomes is a `composite_job`, whose primitive declares its own closed workflow outcomes (`PM-WF-8`). `<job_id>` is always the job bound in `active_job` (<<job-state-binding>>); `wait` on a bound job only waits and never starts one.
 
 [#job-state-binding]
 == Job State Entry & Binding (`JobStep`)
@@ -53,118 +80,67 @@ A `job` state is a resting state over exactly one job. The engine binds it as fo
 
 1. *One job per entry*: Entering a `job` state starts exactly one job through the state's primitive, unless a job id is already bound for the state. A job id is bound when the entering transition carries one (item 3) or when `active_job` already names this state.
 2. *`active_job` in the state transaction*: `mcp/status.json` records `active_job {state_id, job_id}` (link:../store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas Specification, Workflow State Store]) in the same journaled transaction (link:../store-schemas/01-format-and-session-log.adoc#transaction-journal[Transaction Journal]) as the state change that enters the state and the enqueue of the job. A crash therefore leaves either the old state without a job or the new state with its bound job, never a job without a binding or a job state without its job.
-3. *Enqueued by a preceding primitive*: A primitive that enqueues a job for the following state (an `auto` state or a `do` link action, for example `build.enqueue-verification` before `git.freshness-build-running`) declares `enqueuesJob()` and returns the job's id as its primitive result (`PrimitiveResult.spawnedJobId`) with the outcome `started`. The `started` transition enters the `job` (or `composite_job`) state, which binds that id and starts nothing itself. Rule 1 (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]) verifies the binding: every `started` outcome of an `enqueuesJob()` primitive targets a `job` or `composite_job` state, and no other outcome of such a primitive does.
+3. *Enqueued by a preceding primitive*: A primitive that enqueues a job for the following state (an `auto` state or a `do` link action, for example `build.enqueue-verification` before `git.freshness-build-running`, or `finalize.restart-watch` before `finalize.concurrent-wait`) declares `enqueuesJob()` and returns the job's id as its primitive result (`PrimitiveResult.spawnedJobId`) with the outcome `started`. The `started` transition enters the `job` (or `composite_job`) state, which binds that id and starts nothing itself. Rule 1 (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]) verifies the binding: every `started` outcome of an `enqueuesJob()` primitive targets a `job` or `composite_job` state, and no other outcome of such a primitive does.
 4. *Re-entry only waits*: A `pm_state` or `pm_do` on a job state whose bound job is `queued` or `running`, including the first call after a runtime restart, only waits on it (`wait:<job_id>`); it never starts a second job.
-5. *Killed jobs are routed, never restarted*: A bound job that the runtime recorded `killed` (for example an orphaned `running` job marked on restart, `PM-ARCH-8`) settles the state with the outcome `killed`, which every `job` state routes explicitly (Rule 2). The engine never re-enqueues a job on its own (no blind re-execution); a new job starts only when a declared transition enters a job state again, for example through a `retry` link.
+5. *Killed jobs are routed, never restarted*: A bound job that the runtime recorded `killed` (for example an orphaned `running` job marked on restart, `PM-ARCH-8`) settles the state with the outcome `killed`, which every `job` state routes explicitly (Rule 2). The engine never re-enqueues a job on its own (no blind re-execution); a new job starts only when a declared transition enters a job state again, for example through a `retry` link or the bounded `auto` restart `finalize.restart-watch`.
 6. *Leaving clears the binding*: The transition that leaves the state (on the job's outcome, or on `cancel:<job_id>`) clears `active_job` in the same transaction.
+7. *Composite constituents*: A `composite_job` state follows the same rules with its composite identifier (the state identifier) as the bound id; its constituent jobs are recorded in `active_jobs`. Its primitive declares how every constituent fate other than success maps onto its closed outcomes (`killed`, `timed_out`, `indeterminate`, and `refused` or `failed` where they are no domain result); the watches of the finalize wait region map them, and a deliberate `cancel`, to `watch_interrupted {constituent, fate}` (xref:03-reference-excerpt.adoc#_reference_workflow_dsl_excerpt_finalize_pmwf[Reference Workflow Excerpt]). A timer constituent (the waiver wait, xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]) keeps its persisted deadline, so a restart never extends the wait.
 
-A `composite_job` state follows the same rules with its composite identifier (the state identifier) as the bound id; its constituent jobs are recorded in `active_jobs`.
+[#question-states]
+== Question States & the Question Deadline
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
 
-[#escalation-decision-wait]
-== Escalation Without Elicitation & the Implicit Decision Wait
+Every content question is a server-owned question record (link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]). The model creates one through a declared `ask` link (rel `submit`, form `submit`, `question: schema[question-envelope]`, primitive `question.create`, outcome `created` into the state's question state), through `ask:TASK-NNN` on a task envelope (which ends the entity), or through the `questions` list of a refine or outline `submit`; a server primitive creates the questions whose options it owns (init classifiers, the optional outline review, workspace setup choices that write team configuration). Choices that write operator configuration, waivers, `abort`, and integrity resolutions are never question records; they use the operator channel only.
 
-An `escalate <decision>` link action requests an operator decision (`PM-SEC-3`). On a connection that declared elicitation support, the engine prompts through `elicitation/create` and takes the link's outcome transition for the answer. Otherwise it records the pending decision in the scope's `mcp/status.json` (`pending_decision` with a fresh `decision_id`, link:../store-schemas.adoc[Store Schemas Specification]) and raises the `blocked` condition on the current state (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]): `state` and `call_stack` stay unchanged, and the representation carries `condition: blocked` and `facts.operator_command` and offers exactly one implicit link. `facts.operator_command` is the exact CLI invocation that resolves the decision: the dedicated verb where the decision kind has one (the unsolicited operator actions `authorize-merge`, `force-gate`, `delete-plan`), otherwise the generic `pm-mcp operator decide <plan|epic> <scope_id> <decision_id> <outcome> [--param k=v …]` with the scope and `decision_id` filled in and the declared outcomes and `escalateParams` of the decision kind listed (`decide` posts to the same `/api/v1/operator/` decision endpoint the web app uses):
+A *question state* is a state whose body starts with `question <class>` (xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar]; `StateBehavior.QuestionWait`, xref:04-ast-node-model.adoc#_ast_node_model[AST Node Model]). It rests until the scope's open record of that class is resolved and then takes the outcome transition of the resolution; it may declare further links (for example `hand_back`). The catalogue kind `awaiting_user` is derived from this clause, so the kind stays derivable from the AST.
 
-[cols="1,1,1,3"]
+* *Mode and delivery*: The effective `questions.mode` of the class (operator `local-config.json`, per project with per-class overrides) decides how the record resolves. `auto` (default) delivers per `questions.delivery` (`elicitation` where the connection declared support, otherwise `session`; resolved per question at creation and recorded as the answer's `channel`) and sets the deadline `questions.wait_seconds` (default `1800`); `operator` delivers to a human and sets no deadline (the only unbounded wait a plan can have, chosen by the operator); `model` accepts the model's self-answer at or above the compiled refine confidence threshold (`95`, `channel: model`), otherwise continues as `auto`; `none` applies the `recommended` option or `default_assumption` at once, so the question state resolves in the transaction that entered it.
+* *Deadline*: The deadline is engine-owned and processed by the job runtime's timer (link:../job-runtime.adoc[Job Runtime Specification]): on expiry the engine resolves the record through the class's compiled fallback and takes the matching outcome transition without a model call. The timer survives a gone host session. An integrity pause holds the fallback transition until the pause ends; `pm-mcp operator abort` and `delete-plan` close every open record `cancelled`.
+* *Resolution outcomes*: Each class has a closed outcome set, which a question clause must route exactly (Rule 2):
++
+[cols="1,2,3"]
 |===
-|Link |`rel` |`form` |Semantics
+|Class |Outcomes |Expiry fallback (compiled)
 
-|`wait:decision:<decision_id>`
-|`wait`
-|`wait`
-|Bounded wait (`PM-IMPL-4`) on the pending decision record. Once the operator resolves the decision through `pm-mcp operator`, the condition is cleared, the escalate link's outcome transition for that resolution is taken from the current state, and the next state's representation is returned; when the wait bound expires, the unchanged representation with its `blocked` condition is returned.
+|`init`
+|`answered`, `assumed`, `returned`
+|The classifier's `recommended` option as a recorded assumption (`assumed`); `returned` where the classifier declares no safe default.
+
+|`clarification`
+|`answered`, `assumed`
+|The envelope's `default_assumption`, recorded as an assumption amendment.
+
+|`review`
+|`approve`, `revise`, `returned`
+|`returned` (a review that was asked for and not given never starts execution).
+
+|`task`
+|`answered`
+|The parent model answers through `answer_questions` (`channel: model`); no assumption is taken.
+
+|`setup`
+|`answered`, `assumed`
+|The `recommended` option.
+
+|`ask`
+|`answered`, `assumed`
+|The question's `default_assumption`; the model then decides on its own judgment.
 |===
+* *Answer validation*: Every channel passes the same validation: an unknown `branch_key` is rejected with `invalid_link_args`, a second answer with `already_answered`, an answer after the deadline with `question_expired`. A model-relayed answer is accepted for content questions only, never for an override (`PM-WF-12`).
+* *Awaited events*: A question state awaits `QUESTION_ANSWER` (an answer on any channel) and `TIME` (the deadline) (Rule 11b, xref:05-primitives.adoc#primitive-spi-contract[`Primitive<P, R>` SPI Contract]).
+* *Continuation*: With `session` delivery a question state is a stop point under every continuation policy; with `elicitation` or `web` delivery the model may long-poll `wait:question:<question_id>`.
 
-The `wait:decision:` identifier prefix is reserved for this implicit link; a DSL link whose identifier pattern collides with it fails validation.
+[#waivers-and-integrity]
+== Waivers, Waiver Requests & the Integrity Pause
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
+_Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-18[PM-WATCH-DSL-18]_
 
-[#decision-registry]
-== Decision Registry & Typed Escalation Outcomes
-_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+_See Requirement link:../../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
 
-Escalation decisions are typed like primitives. Every decision kind named by an `escalate <decision>` link action is registered server-side in the `DecisionRegistry` (`pm-mcp-core`, beside the primitive registry) as a `DecisionSpec`: the closed outcome enumeration of the decision kind, one `DecisionOutcomeClass` per outcome (as every `Primitive<P, R>` outcome declares an `OutcomeClass`, xref:05-primitives.adoc#primitive-outcome-classes[Outcome Classes & Step Records]), and, for every approving outcome, the primitive that performs the approved action. A decision kind that is not registered fails validation (Rule 2 in xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]). The operator's resolution, by elicitation or `pm-mcp operator` (the generic `decide` verb or a dedicated verb), is accepted only when it names a declared outcome of the pending decision's kind and its parameters validate against the kind's `escalateParams`; `pending_decision.resolution` (link:../store-schemas.adoc[Store Schemas Specification]) never holds any other value.
+The process enforces itself: no state of any unit waits for an operator decision, and the DSL has no decision construct (no decision registry, no escalation action or form, no pending decision). Every blocking condition gets a bounded self-remedy, mostly a remediation policy unit (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]), and then a defined fallback end. The operator influences a running plan only through records written on the operator channel, which primitives read:
 
-[source,java]
-----
-package de.cuioss.pm.mcp.core.workflow.spi;
-
-import java.util.Map;
-import java.util.Set;
-
-public enum DecisionOutcomeClass { APPROVED, DENIED, ABORTED }
-
-public record DecisionSpec(
-    String decisionKind,                          // e.g. "loop_limit_extension"
-    Set<String> outcomes,                         // closed outcome enumeration, e.g. {"extended", "aborted"}
-    Map<String, DecisionOutcomeClass> classes,    // exactly one class per outcome
-    Map<String, String> approvedActions,          // APPROVED outcome -> primitive id performing the approved action
-    List<ParamSpec> escalateParams                // free parameters of every escalate link of this kind (possibly empty)
-) {}
-----
-
-* *`APPROVED`*: The operator authorizes an action. The outcome names the primitive that performs it (`approvedActions`), and its transition must enter an `auto` state running that primitive (Rule 10).
-* *`DENIED`*: The operator declines the action. The transition leads to a state that does not perform it (a retry or alternative state of the same unit, or the unit's `aborted` terminal state) and never records the step `done` (Rule 9).
-* *`ABORTED`*: The operator stops the scope. The transition leads to the unit's `aborted` terminal state: `plan.aborted` in the plan workflow, `epic.aborted` in the epic workflow, and in a sub-workflow the terminal state with outcome `aborted`, which returns to the caller (xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar for the Workflow DSL], Abort model).
-
-The registered decision kinds (of the reference excerpts and of the State Catalogue, link:../state-catalogue.adoc[State Catalogue]):
-
-[cols="2,2,2,3"]
-|===
-|Decision kind |Outcomes (class) |Approved action |Rule 10 status
-
-|[[decision-abort-plan]]`abort-plan`
-|`aborted` (`ABORTED`) -> `plan.aborted`; `resumed` (`DENIED`) -> the state that offered the request (a self-transition). `escalateParams`: `reason: text[1..500]`.
-|None (no `APPROVED` outcome)
-|Conforms. Requested by the link `abort` (rel `escalate`) of every plan state whose routine answers include ending the plan (`<phase>.qgate-exhausted`, `init.lesson-premise` `close`, `init.sibling-collision`, `refine.hypothesis-refuted`, `land.verification-feedback`, `<phase>.commit-aborted`, the merge-path link states `finalize.merge-lease-interrupted`, `finalize.merge-sync-escalate`, `finalize.merge-remote-moved`, `finalize.merge-refused`, `finalize.merge-queue-exit`, and `finalize.merge-gap`, `finalize.adopt-blocked`, and the other states the State Catalogue names).
-
-|[[decision-abort-epic]]`abort-epic`
-|`aborted` (`ABORTED`) -> `epic.aborted`; `resumed` (`DENIED`) -> `epic.active`. `escalateParams`: `reason: text[1..500]`.
-|None (no `APPROVED` outcome)
-|Conforms. Requested by the link `abort` (rel `escalate`) of `epic.active`.
-
-|[[decision-land-verification-failed]]`land-verification-failed`
-|`recapture` (`APPROVED`), `abort-plan` (`ABORTED`) -> `plan.aborted`. `escalateParams`: `reason: text[1..500]`.
-|`land.recapture-changes`
-|Conforms: `recapture -> land.recapture` (`auto land.recapture-changes`). The `ABORTED` outcome enters `plan.aborted` directly, because the decision is already the operator's.
-
-|[[decision-archive-with-open-pr]]`archive-with-open-pr`
-|`close-pr-and-archive` (`APPROVED`), `hand-back` (`APPROVED`), `keep` (`DENIED`) -> `finalize.archive-held`. Requested by the only link of `finalize.archive-held`, `escalate` (declared in the unit, never raised by the engine), which the `pr_open_unmerged` outcome of `finalize.archive-plan` and the `keep` links of `finalize.close-pr-failed` and `finalize.hand-back-failed` enter. `escalateParams`: none (empty). The operator is offered `close-pr-and-archive` and `keep` for a plan of every source except `pr`, and `hand-back` and `keep` for a plan of source `pr` (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]), whose pull request is never closed by the plan.
-|`close-pr-and-archive`: `finalize.close-pr-and-archive`; `hand-back`: `finalize.hand-back-and-archive`
-|Conforms: `close-pr-and-archive -> finalize.close-pr-and-archive` (`auto finalize.close-pr-and-archive`: re-observes the pull request, closes it with a comment and archives, link:../state-catalogue/04-plan-finalize-terminal.adoc#state-finalize.close-pr-and-archive[State Catalogue]); `hand-back -> finalize.hand-back-and-archive` (`auto finalize.hand-back-and-archive`: re-observes the pull request, posts a summary comment, leaves it open and archives). Every comment either action posts is idempotent: it carries a hidden marker naming the `plan_id`, and a retry looks for an existing comment with that marker before posting, so no comment is posted twice (as for every comment the plan posts, including the grant comments).
-
-|[[decision-wind-down-unmerged]]`wind-down-unmerged`
-|`approved` (`APPROVED`), `denied` (`DENIED`) -> the `link` state that raised it (a self-transition). Requested by the `wind_down` link (rel `escalate`) of `finalize.merge-refused`, `finalize.merge-queue-exit`, and `finalize.merge-gap`. `escalateParams`: `reason: text[1..500]`.
-|`finalize.wind-down`: ends the merge path without a merge; completes `default:branch-cleanup` as `failed`, records `merge_outcome` from the observed pull request (link:../store-schemas/02-workflow-state-store.adoc#merge-outcome-mapping[Store Schemas Specification, Merge Outcome Mapping]: `declined` when it is closed, `dequeued` when it was ejected, `enqueued_not_landed` with the owed item `post_merge_cleanup` when it is still queued), and continues in the post-run band (metrics, landing, archive)
-|Conforms: `approved -> finalize.wind-down` (`auto finalize.wind-down`). An unmerged plan leaves the merge path only through this decision or `abort-plan`.
-
-|`loop_limit_extension`
-|`extended` (`APPROVED`), `aborted` (`ABORTED`)
-|`plan.allocate-remediation-tasks`
-|Conforms: `extended -> finalize.allocate-after-extension` (xref:07-loop-back-diagrams-verification.adoc#loop-back-bounds[Worktree-Constrained Loop-Back & Iteration Bounds]).
-
-|[[decision-grant-mapping]]`review_barrier_gap`, `ci_failure_override`, `wait_cancelled_override`, `finalize_spend_overrun`, `merge_action`, `red_ci_gate`, `rereview_timeout`
-|`approved` (`APPROVED`), `denied` (`DENIED`). Requested by the `escalate` links of `finalize.ci-failed` (`ci_failure_override`), `finalize.review-escalate` (`review_barrier_gap`), `finalize.wait-cancelled` (`wait_cancelled_override`), `finalize.spend-escalate` (`finalize_spend_overrun`), whose `denied` enters `plan.aborted`, and of `finalize.merge-gap`, whose one `escalate` link raises the kind named by the active gap class (`review_barrier_gap`, `merge_action`, `red_ci_gate`, `rereview_timeout`) and whose `denied` returns to `finalize.merge-gap` (a denied gap never aborts the plan). `escalateParams`: `reason: text[1..500]`.
-|`merge.gate-entry`, the entry primitive of `finalize.merge-gate`: records what the approval grants, runs the finalize spend check and Phase-Exit Completeness, and reads the recorded grants and acknowledgements that the merge path evaluates. What an approval records: `ci_failure_override` a grant of the gap class `red_ci_gate` (HEAD-bound); `finalize_spend_overrun` a spend acknowledgement only, no grant; `wait_cancelled_override` an acknowledgement only, no grant (evidence still missing at the barrier raises its own gap through `finalize.merge-gap`); `review_barrier_gap` (from `finalize.review-escalate` or `finalize.merge-gap`), `merge_action`, `red_ci_gate`, and `rereview_timeout` a grant of that class (HEAD-bound)
-|Conforms: `approved -> finalize.merge-gate` (`auto merge.gate-entry`), which records the grant (HEAD-bound, one gap class) or the acknowledgement and re-runs the merge path from its entry (link:../state-catalogue/04-plan-finalize-terminal.adoc#state-finalize.merge-gate[State Catalogue]). The `approved` transitions of `review_barrier_gap` (from `finalize.review-escalate`), `ci_failure_override`, and `wait_cancelled_override` complete the wait-region steps `default:ci-verify`, `plan-marshall:automatic-review`, and `default:sonar-roundtrip` as `skipped_by_operator`, referencing the decision (Rule 9); the barrier predicates and the `red_ci_gate` check still guard the merge.
-
-|`landing_delivery_failure`
-|`approved` (`APPROVED`), `denied` (`DENIED`)
-|`finalize.retry-landing-delivery`: repeats the landing delivery once more and completes the `emit-landing` step, with `landing_delivery: pending` when the repeated delivery fails again
-|Conforms: `approved -> finalize.retry-landing-delivery` (`auto finalize.retry-landing-delivery`).
-
-|`gitignore_oracle_failure`
-|`approved` (`APPROVED`), `denied` (`DENIED`) -> `git.done-aborted`, which returns `aborted` to the caller. Requested by the `escalate` link of `git.artifact-escalate`. `escalateParams`: `reason: text[1..500]`.
-|`git.apply-oracle-override`: records a HEAD-bound override naming the paths the `.gitignore` oracle could not classify
-|Conforms: `approved -> git.stage-under-oracle-override` (`auto git.apply-oracle-override`); the following `git.stage-and-commit` stages under that override (xref:06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Six-Stage Execution Contract of `git.commit_and_push`], Stage 2).
-
-|`force_stale_push`
-|`approved` (`APPROVED`), `denied` (`DENIED`) -> `git.done-aborted`. Requested by the `escalate` link of `git.freshness-blocked`. `escalateParams`: `reason: text[1..500]`.
-|`git.push` under an override record bound to `HEAD` and to the rendered `stale_reason`
-|Conforms: `approved -> git.push-under-freshness-override` (`auto git.push`).
-
-|`force_push_with_lease`
-|`approved` (`APPROVED`), `denied` (`DENIED`) -> `git.done-aborted`. Requested by the `escalate` link of `git.sync-required`. `escalateParams`: `reason: text[1..500]`.
-|`git.push` with an explicit lease: the expected remote SHA (Stage 6)
-|Conforms: `approved -> git.push-with-lease` (`auto git.push`).
-|===
-
-A failing repository hook and a rebase conflict are not operator decisions: a hook failure is fixed in `git.commit-fix` (no bypass exists, and a bounded number of attempts returns `aborted` to the caller), and a conflict is resolved by the model in `git.resolve-conflicts`, whose abort path returns to `git.sync-escalate` (xref:06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Declarative DSL Definition (`classpath:/workflows/git-commit-and-push.pmwf`)]).
+* *Waiver record*: `pm-mcp operator waive <plan> <gate> --reason …` declares a waivable gate met (`mode: met`), `waive <plan> --raise <budget>=N --reason …` raises a budget ceiling (`mode: raise`), and `unwaive` revokes an unconsumed waiver (link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-record[Store Schemas Specification, Waiver Record]; link:../cli-and-security.adoc[CLI, Coordination & Security Specification]). The gate identifiers form a closed list: `review_evidence[:<bot_kind>]`, `ci_check:<check_name>`, `analysis_gate:<provider>`, `findings:<class>` and `findings:<provider>`, `qgate_findings:<phase>`; the raisable budgets are `fix_budget:<policy>`, `retry_budget:<policy>`, and `spend`. A waiver is plan-scoped, settable at any time before its gate is evaluated, and too late once the fallback was taken (`plan_ended`). Every waiver line composes a new plan instance version (event `waiver`), which marks the gate waived with the waiver id or carries the raised ceiling with its source.
+* *Reading a waiver*: A waivable gate admits a failure only through `waiver.lookup(gate)` (read-only in `WorkflowExecutionContext`), which appends a consumption naming `HEAD` and the covered items; the PR comment and the landing record list every consumption. A primitive may look up only the gate identifiers it declares in `waivableGates()` (xref:05-primitives.adoc#primitive-spi-contract[`Primitive<P, R>` SPI Contract]), and no primitive can write a waiver (`INV-GEN-2`, xref:04-ast-node-model.adoc#project-owned-units[Compiled Invariants]). In the DSL a waived path is visible only as the `waived` terminal of a remediation unit.
+* *Waiver requests*: The model's `request_waiver (rationale: text[1..2000])` link (rel `escalate`, form `submit`) in a remediation unit's `decide` state, and an exhausted budget with `waiver_wait_seconds > 0`, file a request record (`waiver_requests[]`, announced through the operator channels and an idempotent PR comment). It is an ordinary `submit` link: nothing waits for an answer except the bounded waiver wait of the unit, a `composite_job` (`remediation.await-waiver`) that awaits `OPERATOR_WAIVER` or `TIME` and ends `raised`, `waived`, or `expired`. The shipped `waiver_wait_seconds` is `0`, so by default a request goes into the hand-back report.
+* *Operator-initiated ends*: `pm-mcp operator abort <plan|epic> <id> --reason` and `delete-plan` are engine-owned, scope-wide transitions into `plan.aborted` or `epic.aborted` in the next transaction, under the on-entry rule (every begun, unsettled step recorded `failed`); they close open question records `cancelled` and pending waiver requests `expired`. They need no DSL construct: no unit declares a transition into an abort terminal (xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar], Ends of a scope).
+* *Integrity pause*: The only pause of a plan is the condition overlay `integrity_breach {kind: store_tampered | enrolment_tampered, store, recorded_digest, current_digest}` (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]). It offers no link, every `pm_do` of the paused scope is rejected with `integrity_paused`, and `facts.operator_command` names the two resolutions: `pm-mcp operator accept-edit …`, after which the engine re-verifies the digests before it clears the condition, and `pm-mcp operator abort …`. It has no bound and no fallback, because a tampered store cannot be trusted to write a hand-back; the deadlines of a pending question or waiver request of the paused scope are held until it ends.

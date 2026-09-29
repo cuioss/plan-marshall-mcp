@@ -96,8 +96,8 @@ Operator posture and machine-local bindings of one project, written only through
 
 Two keys are per project only, outside `$defs/settings`, with neither a machine-wide default nor a compiled default:
 
-* `integrations.<integration>.variant` (`native` or `cli`) for the integrations `git`, `github`, and `gitlab`: the operator's explicit choice of `setup.select-integration-variants` (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]). One value holds for every operation of the integration; there is no per-operation or per-family override. An absent entry means undecided, and every operation of that integration refuses with `integration_variant_unset`; it never resolves to `native`. A `cli` value requires the integration's host tool (`git`, `gh`, `glab`) in the project's enrolment (xref:11-enrolment-store.adoc#enrolment-store[Project Enrolment Store (`<PM_MCP_BASE>/enrolments/<project_id>.json`)]), otherwise the finding `cli_tool_not_enrolled`. Sonar has no entry: it has only the native variant. The effective value carries `source: operator` and enters `config_hash`; it is served on demand by the operator surfaces (`pm-mcp operator config --project <project_id>`, `pm-mcp status`, `pm://project/config`) and never pushed into a representation or tool result (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
-* `commit_identity {name, email}`: the author of every server commit (the operator, who is responsible for the change), captured in `setup.select-integration-variants`; the committer is the agent identity resolved from the provider credential (derived fact `agent_identity`), else the fixed `plan-marshall-mcp` noreply identity (link:../domain-extensions/04-setup-state-machine.adoc#setup-verify-credentials[Domain Extensions Specification, Credential Verification]). While it is absent, a commit refuses with `identity_missing`. The `commit_trailer` below stays a separate key.
+* `integrations.<integration>.variant` (`native` or `cli`) for the integrations `git`, `github`, and `gitlab`, set in `setup.select-integration-variants` (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]). The setup applies `native` without asking unless the derived fact `git_native_capability` finds a feature the project uses that the native variant cannot serve; only then is the choice required, and it is taken through the operator channel only (elicitation where the connection supports it, otherwise `pm-mcp operator config --project <project_id>`, named in the state's `facts`), never as a question record and never from a model-relayed answer. One value holds for every operation of the integration; there is no per-operation or per-family override. An entry that is absent while the choice is required means undecided, and every operation of that integration refuses with `integration_variant_unset`. A `cli` value requires the integration's host tool (`git`, `gh`, `glab`) in the project's enrolment (xref:11-enrolment-store.adoc#enrolment-store[Project Enrolment Store (`<PM_MCP_BASE>/enrolments/<project_id>.json`)]), otherwise the finding `cli_tool_not_enrolled`. Sonar has no entry: it has only the native variant. The effective value carries `source: operator` and enters `config_hash`; it is served on demand by the operator surfaces (`pm-mcp operator config --project <project_id>`, `pm-mcp status`, `pm://project/config`) and never pushed into a representation or tool result (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+* `commit_identity {name, email}`: the author of every server commit (the operator, who is responsible for the change), captured in `setup.select-integration-variants` through the operator channel only, like the variant choice; the committer is the agent identity resolved from the provider credential (derived fact `agent_identity`), else the fixed `plan-marshall-mcp` noreply identity (link:../domain-extensions/04-setup-state-machine.adoc#setup-verify-credentials[Domain Extensions Specification, Credential Verification]). While it is absent, a commit refuses with `identity_missing`. The `commit_trailer` below stays a separate key.
 
 [source,json]
 ----
@@ -112,7 +112,7 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
     "integrations": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Per-project integration variant, chosen explicitly by the operator in setup.select-integration-variants; no machine-wide or compiled default; absent means undecided (integration_variant_unset).",
+      "description": "Per-project integration variant, written by setup.select-integration-variants (native applied unless git_native_capability requires an operator-channel choice); no machine-wide default; absent while the choice is required means undecided (integration_variant_unset).",
       "properties": {
         "git":    { "$ref": "#/$defs/integration" },
         "github": { "$ref": "#/$defs/integration" },
@@ -133,6 +133,12 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
   "allOf": [ { "$ref": "#/$defs/settings" } ],
   "unevaluatedProperties": false,
   "$defs": {
+    "question_mode": {
+      "type": "string",
+      "enum": ["operator", "model", "none", "auto"],
+      "default": "auto",
+      "description": "operator: delivered to a human, waits without deadline (awaiting_user, listed by stalled-plan detection); model: the model's self-answer is accepted at or above the compiled refine confidence threshold 95, otherwise auto; none: the recommended option or default_assumption is applied at once as an assumption; auto: delivery per questions.delivery, wait questions.wait_seconds, then the compiled class fallback."
+    },
     "integration": {
       "type": "object",
       "required": ["variant"],
@@ -162,8 +168,8 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
           "properties": {
             "auto_merge": {
               "type": "boolean",
-              "default": false,
-              "description": "Standing merge consent: satisfies the merge_action gap class only; never bypasses a barrier predicate or any other gap class."
+              "default": true,
+              "description": "Operator merge policy: when true the plan performs the merge itself once every barrier predicate holds; when false the plan-instance composition prunes the merge execution (prune reason auto_merge_off), and a plan whose pre-merge barrier passes takes finalize.hand-back with a ready (non-draft) pull request and ends outcome handed_back, merge_outcome awaiting_human_merge. Never bypasses a barrier predicate or a gate; not a waiver."
             }
           }
         },
@@ -175,6 +181,45 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
               "type": "boolean",
               "default": true,
               "description": "Auto-route to the top recipe at or above the compiled threshold 0.6, or ask in init.recipe-candidate."
+            }
+          }
+        },
+        "questions": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Delivery and handling of content questions (question records, Store Schemas, Question Record); never applies to overrides or to choices that write operator configuration.",
+          "properties": {
+            "delivery": {
+              "type": "string",
+              "enum": ["session", "elicitation", "web"],
+              "default": "elicitation",
+              "description": "Resolved per question at creation and recorded as the answer's channel: elicitation only where the current connection declared elicitation support, web only with a paired device; otherwise session (the model relays the question in the host chat and submits the answer)."
+            },
+            "mode": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Question mode per project (default) with optional overrides per question class.",
+              "properties": {
+                "default": { "$ref": "#/$defs/question_mode" },
+                "init": { "$ref": "#/$defs/question_mode" },
+                "clarification": { "$ref": "#/$defs/question_mode" },
+                "review": { "$ref": "#/$defs/question_mode" },
+                "task": { "$ref": "#/$defs/question_mode" },
+                "setup": { "$ref": "#/$defs/question_mode" },
+                "ask": { "$ref": "#/$defs/question_mode" }
+              }
+            },
+            "wait_seconds": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 1800,
+              "description": "Question wait in mode auto (timeouts.adoc, Question Wait); 0 resolves every question at once through its class fallback."
+            },
+            "outline_review": {
+              "type": "string",
+              "enum": ["none", "ask"],
+              "default": "none",
+              "description": "ask: outline.gate files an optional review question (approve / revise) before plan.derive-tasks; also requested per plan by pm_start(review_outline: true)."
             }
           }
         },
@@ -253,3 +298,5 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
   }
 }
 ----
+
+*Remediation Budgets Are Not Configuration*: `retry_budget`, `fix_budget`, `waiver_wait_seconds`, and the allowed `decide` actions of a remediation policy are call arguments of the project-owned phase units (`.marshall/config/*.pmwf`, link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification, Project-Owned Workflow Units]), bound with their source in the plan instance (xref:14-plan-instance-waivers-questions.adoc#plan-instance[Plan Instance]) and capped by the compiled hard limits (link:../timeouts/01-job-budgets-and-waits.adoc#remediation-budgets[Timeouts & Budgets Specification, Remediation Budgets]); no JSON configuration file holds them, and the operator raises one only by a `raise` waiver for one plan. The `reader` keys are unchanged.

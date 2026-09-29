@@ -1,4 +1,4 @@
-= Store Schemas Specification: Task, References & Execution Manifest Records
+= Store Schemas Specification: Task & References Records
 :toc: left
 :toclevels: 3
 :toc-title: Table of Contents
@@ -6,9 +6,9 @@
 :source-highlighter: highlight.js
 :nofooter:
 
-link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Task, References & Execution Manifest Records
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Task & References Records
 
-== Task Record (`tasks/TASK-NNN.json`), References Record (`references.json`) & Execution Manifest (`execution-manifest.json`)
+== Task Record (`tasks/TASK-NNN.json`) & References Record (`references.json`)
 
 === Task Record Schema (`tasks/TASK-NNN.json`)
 _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-12[PM-WATCH-STORE-12]_
@@ -38,7 +38,7 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
     "deliverable_id": { "type": "string", "pattern": "^D[0-9]+$" },
     "title": { "type": "string", "minLength": 1 },
     "profile": { "type": "string", "enum": ["implementation", "module_testing", "integration_testing", "documentation", "verification"] },
-    "status": { "type": "string", "enum": ["pending", "in_progress", "blocked", "completed", "skipped", "infeasible", "removed"] },
+    "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "infeasible", "removed"] },
     "depends_on": {
       "type": "array",
       "items": { "type": "string", "pattern": "^TASK-[0-9]{3,}$" },
@@ -48,14 +48,13 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
     },
     "disposition": {
       "type": ["object", "null"],
-      "description": "Required when status is skipped, infeasible, or removed; null otherwise.",
+      "description": "Required when status is infeasible or removed; null otherwise.",
       "required": ["by", "reason", "recorded_at"],
       "additionalProperties": false,
       "properties": {
-        "by": { "type": "string", "enum": ["operator", "sub_agent", "outline_gate", "split"] },
+        "by": { "type": "string", "enum": ["sub_agent", "outline_gate", "model"] },
         "reason": { "type": "string", "minLength": 1 },
         "evidence": { "type": ["string", "null"], "description": "infeasible only: the sub-agent's evidence submitted with infeasible:TASK-NNN." },
-        "decision_id": { "type": ["string", "null"], "description": "Operator decision or audit record that authorized the disposition." },
         "recorded_at": { "type": "string", "format": "date-time" }
       }
     },
@@ -93,16 +92,15 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
 }
 ----
 
-*Task Status*: `pending` (not yet dispatched), `in_progress` (yielded to a dispatched sub-agent), and `blocked` (a submitted scope deviation awaits the operator's decision) are open; a task whose dependencies are not yet satisfied stays `pending`. `completed`, `skipped`, `infeasible`, and `removed` are terminal:
+*Task Status*: `pending` (not yet dispatched) and `in_progress` (yielded to a dispatched sub-agent) are open; a change beyond the declared footprint never blocks a task (it is recorded as an unplanned change, <<_references_footprint_store_schema_references_json>>); a task whose dependencies are not yet satisfied stays `pending`. `completed`, `infeasible`, and `removed` are terminal; no task status `skipped` exists, and no verb skips a task:
 
 * `completed`: the server's independent verification of `submit:TASK-NNN` passed (link:../phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows Specification]).
-* `skipped`: set by the operator only, with a recorded reason (`disposition.by: operator`); never offered to the model.
 * `infeasible`: set by the sub-agent's `infeasible:TASK-NNN` with its evidence (`disposition.by: sub_agent`, `disposition.evidence`).
-* `removed`: the task's deliverable was removed by the outline gate, by a `split`, or by the operator after an `infeasible` (`disposition.by` names which).
+* `removed`: the task's deliverable was removed by the outline gate or by the model's `remove_deliverable:<deliverable_id>` in `execute.infeasible-review` (`disposition.by: model`, with the model's reason); `disposition.by` names which.
 
-A task in `skipped`, `infeasible`, or `removed` carries a non-null `disposition`; a task in any other status carries none. Step status is `pending`, `completed`, `skipped`, or `failed`.
+A task in `infeasible` or `removed` carries a non-null `disposition`; a task in any other status carries none. Step status is `pending`, `completed`, `skipped`, or `failed`.
 
-*Dependencies (`depends_on`)*: Phase 4 writes the task graph into `depends_on` (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#_deterministic_task_derivation_dag_cycle_detection[Phase Workflows Specification]). At every task creation or amendment the server checks that every referenced task exists in the plan and that the graph stays acyclic; otherwise the write is refused (`invalid_link_args`, `detail` `task_dependency_unresolved` or `task_dependency_cycle`, naming the tasks) and no task file is written. A dependency is satisfied only by a task in status `completed` or `skipped`.
+*Dependencies (`depends_on`)*: Phase 4 writes the task graph into `depends_on` (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#_deterministic_task_derivation_dag_cycle_detection[Phase Workflows Specification]). At every task creation or amendment the server checks that every referenced task exists in the plan and that the graph stays acyclic; otherwise the write is refused (`invalid_link_args`, `detail` `task_dependency_unresolved` or `task_dependency_cycle`, naming the tasks) and no task file is written. A dependency is satisfied only by a task in status `completed`.
 
 A deliverable may declare several verification command and criterion pairs; the task carries them all in `verification`. A task with profile `implementation`, `module_testing`, or `integration_testing` requires at least one command and at least one criterion. An empty or truncated criterion rejects task creation; it is never downgraded to a warning.
 
@@ -136,19 +134,20 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
         "read_only_references": { "type": "array", "items": { "type": "string" } }
       }
     },
-    "approved_widening": {
+    "unplanned_changes": {
       "type": "array",
+      "description": "Paths of realized_files \\ declared_files, recorded by the server with provenance when a task submit or a loop-back commit changed them; accepted and recorded, never reviewed and never blocking. Listed in the PR body and the landing record; for an epic plan an overlap with a sibling plan's declared surface is noted in the landing record only. Boundary breaches (outside the worktree, the main checkout, protected paths) are refused by the non-waivable guards and never recorded here.",
       "items": {
         "type": "object",
-        "required": ["path", "provenance", "approved_via", "phase", "approved_at"],
+        "required": ["path", "provenance", "phase", "recorded_at"],
         "additionalProperties": false,
         "properties": {
           "path": { "type": "string" },
-          "provenance": { "type": "string", "enum": ["deviation", "observed"], "description": "deviation: admitted by an accepted scope deviation; observed: realized path absorbed by the operator in the batched loop-back review." },
-          "deviation_task_id": { "type": ["string", "null"], "description": "Null for provenance observed." },
-          "approved_via": { "type": "string", "enum": ["elicitation", "operator_cli"] },
+          "provenance": { "type": "string", "enum": ["task", "loop_back", "finalize"] },
+          "task_id": { "type": ["string", "null"], "pattern": "^TASK-[0-9]{3,}$", "description": "provenance task: the task whose verified submit changed the path." },
+          "loop_back_iteration": { "type": ["integer", "null"], "minimum": 1 },
           "phase": { "type": "string" },
-          "approved_at": { "type": "string", "format": "date-time" }
+          "recorded_at": { "type": "string", "format": "date-time" }
         }
       }
     },
@@ -177,7 +176,7 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
     "lessons_consulted": { "type": "array", "items": { "type": "string" } },
     "captured_changes": {
       "type": ["object", "null"],
-      "description": "local_changes plans only (land lane, phase-workflows.adoc): the change set of the main checkout captured by pm_start and re-derived by each recapture; declared_files is the union of its paths and the paths changed by its commits_ahead. Null for every other source.",
+      "description": "local_changes plans only (land lane, phase-workflows.adoc): the change set of the main checkout captured once by pm_start and never re-captured; declared_files is the union of its paths and the paths changed by its commits_ahead. Null for every other source.",
       "required": ["captured_at", "snapshot_sha", "base_ref", "paths", "commits_ahead"],
       "additionalProperties": false,
       "properties": {
@@ -197,95 +196,13 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
             }
           }
         },
-        "commits_ahead": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{40}$" }, "description": "Commits of the main checkout's branch ahead of base_ref, oldest first." },
-        "recapture_count": { "type": "integer", "minimum": 0, "default": 0 }
+        "commits_ahead": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{40}$" }, "description": "Commits of the main checkout's branch ahead of base_ref, oldest first." }
       }
     }
   }
 }
 ----
 
-=== Execution Manifest Store Schema (`execution-manifest.json`)
+=== Plan Instance (formerly the Execution Manifest)
 
-Composed deterministically in-process by `ExecutionManifestResolver` during Phase 4 (`plan`). Records both the active Phase 5/Phase 6 step lists and the structured `dropped_steps` audit list so prune decisions are inspectable directly from JSON without scraping free-text logs.
-
-[source,json]
-----
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/execution-manifest.json",
-  "title": "ExecutionManifestRecord",
-  "type": "object",
-  "required": [
-    "format_version",
-    "posture",
-    "phase_5",
-    "phase_6",
-    "composed_at"
-  ],
-  "additionalProperties": false,
-  "properties": {
-    "format_version": { "type": "integer", "const": 1 },
-    "posture": { "type": "string", "enum": ["minimal", "standard", "full"] },
-    "phase_5": {
-      "type": "object",
-      "required": ["verification_steps"],
-      "additionalProperties": false,
-      "properties": {
-        "verification_steps": { "type": "array", "items": { "type": "string" } }
-      }
-    },
-    "phase_6": {
-      "type": "object",
-      "required": ["steps", "dropped_steps"],
-      "additionalProperties": false,
-      "properties": {
-        "steps": { "type": "array", "items": { "type": "string" } },
-        "composed_inputs": {
-          "type": "object",
-          "description": "Inputs the manifest was composed from, including the bound configuration snapshot (config_hash over the effective configuration: compiled defaults, derived facts, team files, operator file, and process DSL units, read from the plan's worktree while worktree_path is set, else from the main checkout; Project Configuration item 6). Re-computed at every phase handshake and at Phase 6 entry: a differing config_hash yields a candidate that is adopted only when identical, else the config_drift condition (adopt / keep); a differing plan input re-composes the manifest; an input that cannot be re-derived is reported unchecked (domain-extensions.adoc, Three-Surface Synchronization).",
-          "required": ["config_hash"],
-          "additionalProperties": false,
-          "properties": {
-            "config_hash": { "type": "string" },
-            "realized_footprint_digest": { "type": ["string", "null"] },
-            "change_type": { "type": ["string", "null"] },
-            "providers_digest": { "type": "string" }
-          }
-        },
-        "dropped_steps": {
-          "type": "array",
-          "description": "Structured record of conditional steps omitted by prune predicates or posture selection.",
-          "items": {
-            "type": "object",
-            "required": ["step_id", "gate", "reason"],
-            "additionalProperties": false,
-            "properties": {
-              "step_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9-]{0,63}$" },
-              "gate": { "type": "string", "enum": ["posture", "provider_unconfigured", "footprint_disjoint", "change_type_exempt", "recipe_override", "local_only"] },
-              "reason": { "type": "string" }
-            }
-          }
-        }
-      }
-    },
-    "composed_at": { "type": "string", "format": "date-time" },
-    "adoptions": {
-      "type": "array",
-      "description": "Audited config-drift decisions: every candidate composed after a config_hash change and what was done with it.",
-      "items": {
-        "type": "object",
-        "required": ["at", "phase", "from_config_hash", "to_config_hash", "decision"],
-        "additionalProperties": false,
-        "properties": {
-          "at": { "type": "string", "format": "date-time" },
-          "phase": { "type": "string" },
-          "from_config_hash": { "type": "string" },
-          "to_config_hash": { "type": "string" },
-          "decision": { "type": "string", "enum": ["identical_adopted", "adopted", "kept"] }
-        }
-      }
-    }
-  }
-}
-----
+The former `execution-manifest.json` does not exist: the Phase 5 and Phase 6 step lists, the pruned steps with their reasons (the prune-reason enum replaces the former `dropped_steps.gate`), the composition inputs with `config_hash`, and the audited configuration adoptions are carried by the plan instance and its composition log (xref:14-plan-instance-waivers-questions.adoc#plan-instance[Plan Instance (`instance/plan.v<N>.pmwf`, `instance/composition.jsonl`)]).

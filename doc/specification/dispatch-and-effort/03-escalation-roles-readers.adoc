@@ -1,4 +1,4 @@
-= Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification: Question Batching, Roles & Reader Agents
+= Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification: Question Records, Roles & Reader Agents
 :toc: left
 :toclevels: 3
 :toc-title: Table of Contents
@@ -6,28 +6,32 @@
 :source-highlighter: highlight.js
 :nofooter:
 
-link:../../Specification.adoc[Specification] » link:../dispatch-and-effort.adoc[Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification] » Question Batching, Roles & Reader Agents
+link:../../Specification.adoc[Specification] » link:../dispatch-and-effort.adoc[Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification] » Question Records, Roles & Reader Agents
 
-== Sub-Agent Question Batching & Non-Blocking Escalation
+[#question-records]
+== Question Records
 _See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-14[PM-WATCH-TOOL-14]_
 
-Sub-agents operating at `scope = "entity"` are strictly forbidden from directly prompting the human operator or blocking in an interactive wait loop.
+Every content question of a plan (an init classifier's question, a refine or outline clarification, the optional outline review, a Phase 5 task question, a question the model asks before a judgment) is a server-owned *question record*. A question is never an operator decision: overrides (waivers, `abort`, the integrity resolutions) use only the operator channel, and a waiver request is its own record, never a question record. Sub-agents at `scope = "entity"` never prompt a human and never wait for an answer.
 
 === Architectural Rationale
 
-1. *Turn and Lock Conservation*: A sub-agent blocked waiting for human input holds an active host sub-session and prevents parallel sibling sub-agents from completing their fan-out batch.
-2. *Host Elicitation Limitations*: Agent hosts (Claude Code, OpenCode, Antigravity) do not reliably route MCP elicitation requests or interactive user-question modals originating from inside background/child sub-agents to the top-level terminal UI.
-3. *Single Bounded Escalation Guarantee*: Collecting ambiguities across all sub-agents in a phase allows the parent session to present a single, consolidated question batch to the operator rather than interrupting the user piecemeal.
+1. *Turn and Lock Conservation*: A sub-agent waiting for human input would hold an active host sub-session and the plan's one envelope dispatch slot; a question therefore ends the asking entity at once.
+2. *Host Elicitation Limitations*: Agent hosts (Claude Code, OpenCode, Antigravity) do not reliably route MCP elicitation requests or interactive user-question modals originating from inside background/child sub-agents to the top-level terminal UI; the server, not the sub-agent, delivers the question.
+3. *Bounded, Resumable Questions*: A record lives in the plan store, so a question survives `/clear`, compaction, and a gone host session; every question is bounded by a server-side question wait and ends in a defined fallback, except where the operator chose `questions.mode: operator`.
 
-=== Prompt Envelopes & Entity Escalation Protocol
+[#question-record-creation]
+=== Record, Store & Creation
 
-When a sub-agent encounters an ambiguity or requires an operator decision during `phase-2-refine`, `phase-3-outline`, or `phase-5-execute`, it follows one of two non-blocking paths:
+Question records are appended to `questions.jsonl` of the scope's store (plan, epic, or workspace; link:../store-schemas.adoc[Store Schemas Specification]): the envelope below, `asked_at`, the resolved `delivery`, the engine-owned deadline, answer events `{branch_key, text?, channel, answered_at}` with `channel: user_relayed | elicitation | web | assumption | model`, and the closure `answered | assumed | cancelled`. They are created in three ways:
 
-1. *Best-Judgment Completion with Attached Prompt Envelopes (`refine_prompt`, `outline_prompt`)*: In planning and outline states (`refine`, `outline`), the sub-agent completes its draft artifact using its best engineering judgment and includes structured open questions in the `questions` array of its `submit` link payload (free parameter `questions:list<schema[question-envelope]>?`, link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]). Each question conforms to the `BatchedQuestionEnvelope` schema below, where every selectable option carries a canonical `branch_key` enum value bound to a downstream workflow transition.
-2. *Immediate Entity-Scoped `escalate` (`escalate_ask`, `status: "blocked"`)*: In execution states (`execute`) where a task cannot safely proceed without an authoritative decision (e.g., an undeclared scope deviation or contradictory interface contract), the sub-agent invokes `pm_do(scope="entity", link="escalate:<task_id>", args={"question": {"question_text": "...", "options": [...]}})` (free parameter `question:schema[question-envelope]`). The server persists the pending question as a `BatchedQuestionEnvelope` with `prompt_kind: escalate_ask` in the plan store, records the pending decision, and raises the `blocked` condition on the entity scope (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, Conditions]): the entity stays in `envelope.task.active` and renders only `wait:decision:<decision_id>`. The sub-agent returns `status: "blocked"` to the parent session and never waits on the decision itself. This is the only question path of Phase 5: there is no parent answers state, and `execute.dispatch-ready` keeps dispatching the envelopes that do not depend on the blocked task. The operator answers through elicitation or `pm-mcp operator decide plan <plan_id> <decision_id> <outcome>`, which the condition's `facts.operator_command` renders; the resolution clears the condition, records the answer as the task's guidance (an intent amendment when it changes intent), and the envelope is offered again as `dispatch:envelope-M` with a fresh `dispatch_id`, whose sub-agent resumes the task with the answer in `facts`.
+1. *The `ask` link*: a state that declares it offers `ask` (`question:schema[question-envelope]`, link:../hypermedia-format/01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Hypermedia Format Specification, Question, Waiver-Request & Exit Links]); the model asks before it takes a judgment (for example which of `remove_deliverable` and `loop_back_outline` to follow), and the state enters its question wait.
+2. *A sub-agent's submission*: a refine or outline authoring entity completes its draft on best judgment and carries its open questions in the `questions` list of its one `submit` (`questions:list<schema[question-envelope]>?`), each item becoming a record (class `clarification`); a task envelope's `ask:TASK-NNN` creates one record (class `task`) and ends the entity (<<task-questions>>).
+3. *A server primitive*: init classifiers, the optional outline review, and the workspace setup choices that write team configuration raise records with server-owned options (`origin: server`, classes `init`, `review`, and `setup`). Setup choices that write operator configuration are never question records: they use the operator channel.
 
 [#question-envelope-schema]
-*Server-Owned Fields*: `question_id` and `source_entity` are assigned by the server when it persists a question, never by the sub-agent. `question_id` is the next value of a scope-wide counter of the plan or epic (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), never reused; `source_entity` is the `entity` of the entity-scoped call that carried the question, or the call's `dispatch_id` when it names no entity. `prompt_kind` follows from the carrying link (`escalate_ask` for `escalate:<task_id>`, `refine_prompt` or `outline_prompt` for the `submit` link of a refine or outline entity). The model therefore supplies a question without these three fields: the free schema of the `escalate:<task_id>` link and the item schema of the `questions` array of a `submit` payload are the `BatchedQuestionEnvelope` minus `question_id`, `prompt_kind`, and `source_entity` (that is `question_text`, `default_assumption`, and `options`, each option an object `{branch_key, label, description, recommended?}`), and a payload that carries a server-owned field is rejected with `invalid_link_args`. This model-supplied subset is registered as the named parameter schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]): the free parameter `question:schema[question-envelope]` of `escalate:<task_id>` and `questions:list<schema[question-envelope]>?` of the `submit` link of a refine or outline entity. It is the schema below with `question_id`, `prompt_kind`, and `source_entity` removed from `properties` and `required`, closed with `additionalProperties: false`.
+*Server-Owned Fields*: `question_id`, `class`, `origin`, and `source_entity` are assigned by the server when it persists a question, never by the model. `question_id` is the next value of a scope-wide counter of the plan, epic, or workspace (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), never reused; `source_entity` is the `entity` of the entity-scoped call that carried the question, the call's `dispatch_id` when it names no entity, or the creating state of a server-raised question. The model supplies a question without these four fields: the free schema of `ask` and `ask:TASK-NNN` and the item schema of the `questions` list are the `BatchedQuestionEnvelope` minus `question_id`, `class`, `origin`, and `source_entity` (that is `question_text`, `default_assumption`, and `options`, each option an object `{branch_key, label, description, recommended?}`), and a payload that carries a server-owned field is rejected with `invalid_link_args`. This model-supplied subset is registered as the named parameter schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]). It is the schema below with the four server-owned members removed from `properties` and `required`, closed with `additionalProperties: false`.
 
 [source,json]
 ----
@@ -36,7 +40,7 @@ When a sub-agent encounters an ambiguity or requires an operator decision during
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/batched-question-envelope-v1.json",
   "title": "BatchedQuestionEnvelope",
   "type": "object",
-  "required": ["question_id", "prompt_kind", "source_entity", "question_text", "options"],
+  "required": ["question_id", "class", "origin", "source_entity", "question_text", "options"],
   "additionalProperties": false,
   "properties": {
     "question_id": {
@@ -44,14 +48,19 @@ When a sub-agent encounters an ambiguity or requires an operator decision during
       "pattern": "^Q-[0-9]{3,6}$",
       "description": "Server-owned: next value of the scope-wide question counter."
     },
-    "prompt_kind": {
+    "class": {
       "type": "string",
-      "enum": ["refine_prompt", "outline_prompt", "escalate_ask"],
-      "description": "Server-owned: derived from the link that carried the question."
+      "enum": ["init", "clarification", "review", "task", "setup", "ask"],
+      "description": "Server-owned: derived from the creating link or primitive."
+    },
+    "origin": {
+      "type": "string",
+      "enum": ["model", "server"],
+      "description": "Server-owned: model (ask, ask:TASK-NNN, a submit's questions list) or server (a classifier or gate primitive)."
     },
     "source_entity": {
       "type": "string",
-      "description": "Server-owned: the entity of the carrying call, or its dispatch_id when it names no entity."
+      "description": "Server-owned: the entity of the carrying call, its dispatch_id when it names no entity, or the creating state for a server-raised question."
     },
     "question_text": {
       "type": "string",
@@ -60,7 +69,7 @@ When a sub-agent encounters an ambiguity or requires an operator decision during
     },
     "default_assumption": {
       "type": ["string", "null"],
-      "description": "Best-judgment assumption applied by the sub-agent if the operator accepts defaults."
+      "description": "Best-judgment assumption recorded when the question closes without an answer (questions.mode none, or the class fallback on expiry)."
     },
     "options": {
       "type": "array",
@@ -97,13 +106,69 @@ When a sub-agent encounters an ambiguity or requires an operator decision during
 }
 ----
 
-=== Parent Session Aggregation (`*.awaiting_answers`)
+=== Mode, Delivery & the Question Wait
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-29[PM-WATCH-DISP-29]_
 
-When the parent session processes `returned:<dispatch_id>` for all dispatches in the current state and the plan store contains one or more unresolved `BatchedQuestionEnvelope` records:
+How a record is answered is operator configuration in `local-config.json` (operator channel only, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), per project with optional overrides per class (`init`, `clarification`, `review`, `task`; `setup` and `ask` follow the project value):
 
-1. The engine transitions the parent plan to `<phase>.awaiting_answers` (`refine.awaiting_answers` or `outline.awaiting_answers`; the batched `refine_prompt` and `outline_prompt` questions exist only in Phases 2 and 3, and a Phase 5 question is the entity escalation `escalate:<task_id>` of <<_prompt_envelopes_entity_escalation_protocol>> item 2, never an answers state).
-2. The representation exposes the consolidated questions in `facts.pending_questions` and offers an `answer_questions` link (accepting a map of `question_id -> branch_key` via MCP elicitation or model-relayed user answers for non-authorizing clarifications, as governed by `PM-SEC-3`).
-3. Submitting `answer_questions` resolves the batched questions in one transition and advances the plan.
+[cols="1,5"]
+|===
+|`questions.mode` |Effect
+
+|`auto` (default)
+|Delivered per `questions.delivery`, bounded by `questions.wait_seconds` (shipped `1800`); on expiry the class fallback below applies.
+
+|`operator`
+|Delivered to a human per `questions.delivery` without a deadline: an operator-chosen exception to the bounded waits. The state is derived `awaiting_user` and a long wait is listed by the stalled-plan detection.
+
+|`model`
+|The model answers itself through `answer_questions` with a `confidence` (`0..100`); the server accepts it at or above the compiled refine confidence threshold (`95`) with `channel: model`, otherwise the record falls through to `auto`.
+
+|`none`
+|No wait: the `recommended` option, else the `default_assumption`, is applied at once and recorded with `channel: assumption`.
+|===
+
+`questions.delivery` defaults to `elicitation` where the connection declared elicitation support, else `session`; `web` (a paired web device, with notification) is opt-in. The delivery is resolved per record at creation and recorded as the answer's `channel`. With `session` delivery the model relays the question in the host chat and submits the answer through `answer_questions` (`channel: user_relayed`), and the question state is a continuation stop point; with `elicitation` or `web` the server asks the human itself and the model may long-poll `wait:question:<question_id>`. There is no CLI answer command. The question wait is a link state with an engine-owned deadline processed by the job runtime's timer, which takes the fallback transition without a model call and survives a gone host session; its awaited events are `QUESTION_ANSWER` (any channel) and `TIME` (expiry).
+
+*Expiry Fallback per Class* (compiled):
+
+[cols="1,4"]
+|===
+|Class |On expiry
+
+|`init`
+|The classifier's server-computed `recommended` option as a recorded assumption; where the classifier declares no safe default (an obsolete lesson premise), the `returned` route.
+
+|`clarification`
+|The envelope's `default_assumption`, recorded as an assumption amendment.
+
+|`review`
+|The `returned` route (a review that was asked for and not given does not start execution).
+
+|`task`
+|The parent model's answer (<<task-questions>>).
+
+|`setup`
+|The setup state's `recommended` option as a recorded assumption.
+
+|`ask`
+|The record closes `assumed` with its `default_assumption`; the state's links stay offered for the model's own judgment.
+|===
+
+*Answers & Amendments*: `answer_questions` takes `answers:list<schema[question-answer]>` (`question_id`, `branch_key`, optional `text`, `confidence` only in `model` mode); elicitation and web answers pass the same validation. An unknown `branch_key` is refused `invalid_link_args`, a second answer `already_answered`, an answer after the expiry fallback `question_expired`. A model-relayed answer is accepted only for content questions, never for an override (`PM-WF-12`). An answer creates an `amendments[]` entry (with its `question_id`) only when it changes the plan's intent; refine answers still go into `request.md`. The amendment `source` is `user` (a human answer on any channel), `model` (a parent model's or self-answer), `assumption` (a fallback or `none`), or `refutation` (a refuted lesson premise); answered questions and amendments are listed in the pull-request body, the landing record, and the retrospective.
+
+*Lifecycle Rules*: A plan scope has at most one question state at a time (phases are serial), and a waiver request arises only inside a remediation unit, which is never entered while a question state is current, so a question wait and a waiver wait never overlap. The `integrity_breach` pause holds a record's expiry until the pause ends. Operator `abort` and `delete-plan` close every open record `cancelled`.
+
+[#parent-question-states]
+=== Parent Question States (`refine.awaiting_answers`, `outline.awaiting_answers`)
+
+When the parent session processes `returned:<dispatch_id>` of a refine or outline authoring entity and the entity's submission created open records, the return evaluation enters the phase's question state (`refine.awaiting_answers` or `outline.awaiting_answers`), which serves the records per their mode and delivery and advances once every record is closed. A Q-Gate remediation pass of `refine.analyze` never opens a new question round: its questions and a below-threshold confidence are recorded as `low_confidence_manual_review`.
+
+[#task-questions]
+=== Task Questions (Phase 5)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-28[PM-WATCH-DISP-28]_
+
+A task question is an ordinary question record of class `task`. The envelope's sub-agent follows `ask:TASK-NNN` (`question:schema[question-envelope]`) on `envelope.task.active` when a task cannot proceed without an answer (for example a contradictory interface contract); the server persists the record with `source_entity` the envelope and the task id, ends the entity (xref:01-task-envelopes.adoc#envelope-early-end[Early End of the Entity]), and the sub-agent returns. The plan's return evaluation yields `question_pending` and enters `execute.task-question` on the plan scope, which serves the record per the `task` class's mode and delivery. When the question wait expires, the parent model answers it through `answer_questions` (`channel: model`) instead of a recorded assumption; with a wait of `0` the parent answers at once. In every case the server validates the `branch_key` against the stored options, records the answer as an `amendments[]` entry (`source: user` or `model`), lists it in the pull-request body and the landing record, and offers the envelope again as `dispatch:envelope-M` with a fresh `dispatch_id`, whose sub-agent resumes the task with the answer in `facts`. No further envelope is dispatched while the record is open.
 
 == Role Registry, Effort Level Ladder (Levels 1–7) & Variant Installation
 _See Requirements link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution], link:../../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
@@ -126,15 +191,15 @@ Configured values are the strings `level-1` .. `level-7` or `inherit`; any other
 
 |`plan.phase-2-refine.effort`
 |`default`
-|The phase's dispatches (refine body, issue-body reader ingestion, q-gate validation).
+|The phase's dispatches (refine body, issue-body reader ingestion, the Q-Gate validation worker `dispatch:qgate`).
 
 |`plan.phase-3-outline.effort`
 |`default`
-|Outline dispatches, including the collapsed light-lane envelope (`outline.light`, which folds the light plan's refine work; link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#planning-lanes[Phase Workflows Specification, Planning Lanes]), as in `plan-marshall`, which resolves the light envelope under the `phase-3-outline` role. The setup dispatches of the workspace scope (architecture enrichment of `project-setup`) resolve with this group as their lookup key, although the workspace scope has no phase.
+|Outline dispatches, including the collapsed light-lane envelope (`outline.light`, which folds the light plan's refine work; link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#planning-lanes[Phase Workflows Specification, Planning Lanes]), as in `plan-marshall`, which resolves the light envelope under the `phase-3-outline` role, and the outline Q-Gate validation worker (`dispatch:qgate`). The setup dispatches of the workspace scope (architecture enrichment of `project-setup`) resolve with this group as their lookup key, although the workspace scope has no phase.
 
 |`plan.phase-4-plan.effort`
 |`default`
-|Task planning dispatches.
+|Task planning dispatches and the plan Q-Gate validation worker (`dispatch:qgate`). A Q-Gate worker is a read-only `execution-context` worker: it submits assessments and findings on its entity scope and never writes an artifact; the verdict is the server's (xref:02-dispatch-observability-and-spend.adoc#return-evaluation[Return Evaluation]).
 
 |`plan.phase-5-execute.effort`
 |`default`, `verification-feedback`
@@ -142,7 +207,7 @@ Configured values are the strings `level-1` .. `level-7` or `inherit`; any other
 
 |`plan.phase-6-finalize.effort`
 |`default`, `verification-feedback`, `post-run-review`
-|`default`: finalize dispatches such as create-pr and pre-submission self-review; `verification-feedback`: Sonar, review-bot, and plugin-doctor finding triage; `post-run-review`: lessons capture (the plan retrospective is computed in-process and dispatches nothing).
+|`default`: finalize dispatches such as create-pr and pre-submission self-review; `verification-feedback`: analysis-provider, review-bot, and plugin-doctor finding triage; `post-run-review`: lessons capture (the plan retrospective is computed in-process and dispatches nothing).
 
 |`orchestrator.effort`
 |`analyze`, `decompose`, `reader` (plus `default` slot and `max` ceiling)
@@ -201,7 +266,7 @@ Because agent hosts such as Claude Code and OpenCode load sub-agent definitions 
 ** Return `{status, display_detail}` to the caller (the dispatching session adds host-reported `token_usage` on `returned:<dispatch_id>`) without asking the user questions or spawning sub-agents.
 * **Persona & Execution Lane Flattening**:
 ** *Personas*: The server resolves persona DAGs (`composes:` and `profiles:` with cycle rejection) at representation-build time, flattening them into `skills[]` URIs (`skill://pm/core/SKILL.md` + `skill://pm/domain/...`). The legacy 1,500-line `persona-plan-marshall-agent` is stripped of Bash/CLI hygiene rules (roughly two-thirds of its volume) and distilled into `skill://pm/core/SKILL.md`.
-** *Execution Lanes*: Execution postures (`minimal ⊏ standard ⊏ full`, selected at `phase-1-init`) prune optional workflow elements server-side while enforcing **floor immunity** (a lane override of `off` on core or derived-state elements is ignored and noted in diagnostics; an unresolved `ask` element is dropped only when its external provider is absent).
+** *Execution Lanes*: Execution postures (`minimal ⊏ standard ⊏ full`, taken from `pm_start(posture)` or, when omitted, the server's projection; a plan fact whose effect the plan instance carries as steps pruned with reason `posture`) prune optional workflow elements server-side while enforcing **floor immunity** (a lane override of `off` on core or derived-state elements is ignored and noted in diagnostics; an unresolved `ask` element is dropped only when its external provider is absent).
 
 == Reader Agent Family (`execution-context-reader`)
 _See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_

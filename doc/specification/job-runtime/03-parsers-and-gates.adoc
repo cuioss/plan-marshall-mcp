@@ -74,7 +74,7 @@ If a build exits with a non-zero exit code but the output parser cannot extract 
 
 * The job outcome is classified as `failed_unparsed` (never folded into normal `failed`).
 * The full raw log is preserved at `<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.log`, next to the job record.
-* The representation embeds the bounded raw-log tail (last 50 lines, capped at 4 KB, secrets redacted) and the resource URI `pm://plan/{plan_id}/builds/{job_id}/log`, plus an `escalate` link, preventing the model from hallucinating non-existent compiler errors.
+* The failure is gathered as one failure envelope of class `build` and kind `unparsed` (<<evidence-gathering>>) whose excerpt is the bounded raw-log tail (last 50 lines, capped at 4 KB, secrets redacted), with the resource URI `pm://plan/{plan_id}/builds/{job_id}/log` for the full log; the representation carries no invented diagnostic, preventing the model from hallucinating non-existent compiler errors, and the gate's caller routes the failure to its build remediation policy (no `escalate` link exists).
 
 == Adaptive Build Timeouts, Coverage Parsers & Gate Honesty (`PM-EXEC-6`)
 
@@ -103,7 +103,7 @@ The build runtime parses coverage artifacts natively after test execution to eva
 * *Istanbul (`coverage-summary.json`)*: Jackson streaming reader extracting the `pct` of `lines`, `statements`, `functions`, and `branches` from `total` and per file. Threshold metrics: overall `line` (`lines.pct`), per-file `line`.
 
 === Gate Honesty Verification
-_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-2[PM-WATCH-GEN-2], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-8[PM-WATCH-JOB-8], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-17[PM-WATCH-JOB-17]_
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-2[PM-WATCH-GEN-2], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-8[PM-WATCH-JOB-8], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-17[PM-WATCH-JOB-17], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-25[PM-WATCH-JOB-25]_
 
 Before marking a module or pre-push quality gate as `fresh` in `change-ledger.jsonl` (`PM-SVC-1`), the runtime applies four honesty checks:
 
@@ -116,7 +116,51 @@ Before marking a module or pre-push quality gate as `fresh` in `change-ledger.js
 +
 All four are persisted in the gate's job record (`gate_facts`, link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas Specification, Job Record]) and step record. The representation of a gate result renders only what the model acts on: `gate_coverage` with, for `PARTIAL`, the degraded dimensions and their reasons, and `uncovered`, so a clean exit is never reported as a full pass. `structural_limits` (a static, registered property of each analysis kind) and `parity_population` (local-versus-CI parity evidence for metrics and the quality report) are never rendered (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 3. *Test-Scope Divergence Detection*: Detects and rejects runs where test filtering flags or skipped-test properties excluded tests belonging to modified modules.
-4. *Baseline Separation*: A failing whole-tree gate (`quality-gate`, `verify`, `coverage`) is re-run on the plan's merge base (`merge-base(HEAD, origin/<base_branch>)`) in the plan's baseline scratch worktree before any routing. The baseline worktree is a detached worktree at the merge base, created natively with `git.worktree-add` at `.marshall/local/worktrees/baseline-<plan_id>-<sha12>` (`<sha12>` the first 12 hex digits of the merge-base SHA), never the primary checkout and never the plan's worktree; it is reused by every base run of the plan while the merge base is unchanged, replaced (the old one removed, a new one created) when the merge base moves, and removed when the plan leaves `finalize`, is archived, or is aborted; the recovery sweep removes one whose plan is gone or terminal (link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). Before each reuse it must be clean (`git.status` empty); a dirty baseline worktree is replaced, never used. Located diagnostics present on both sides are `baseline` and never become plan findings; for coverage, a threshold failure in a module whose main sources the plan did not change is `baseline_debt` (one non-blocking finding of severity `info` per module, never fanned out into build-error or Q-Gate findings). A gate red only through baseline diagnostics yields the gate verdict `baseline_red` (a verdict of the gate step, not a job outcome; both build jobs keep their own outcomes), which routes to `<phase>.baseline-red` (escalate only; the plan never remediates it) and is recorded with the merge-base SHA; the remaining diagnostics route to `triage_required`. A base run that cannot be executed or parsed leaves every diagnostic attributed to the plan (fail-closed) and says so in `facts`. A quality-gate or format job run in the baseline scratch worktree (or any fresh worktree of the base) must leave `git.status` empty; a job that rewrites committed files there is reported as dirtying the base, never silently accepted, and the worktree is replaced before the next base run.
+4. *Baseline Separation*: A red gate is checked for failures already present on the base before any routing, as a server rule (no model judgment, no operator decision, no `<phase>.baseline-red` state). The failures are compared by their fingerprints (<<evidence-gathering>>):
+** *Primary proof, the provider's CI result on the base*: For a CI check, and for a local gate that CI also runs, the proof is the provider's result of the same check on the base: on the merge base (`merge-base(HEAD, origin/<base_branch>)`), or on the latest base-branch commit that contains it and has a result. `remediation.ci-failure`'s gathering job fetches this base result in the same job, so a baseline-only red never reaches the unit's `decide`.
+** *Fallback, a local build of the merge base*: For a local gate CI does not run (for example the pre-push quality gate) or when the provider has no result for the base, the gate is re-run on the merge base in the plan's baseline scratch worktree. The baseline worktree is a detached worktree at the merge base, created natively with `git.worktree-add` at `.marshall/local/worktrees/baseline-<plan_id>-<sha12>` (`<sha12>` the first 12 hex digits of the merge-base SHA), never the primary checkout and never the plan's worktree; it is reused by every base run of the plan while the merge base is unchanged, replaced (the old one removed, a new one created) when the merge base moves, and removed when the plan leaves `finalize`, is archived, or is aborted; the recovery sweep removes one whose plan is gone or terminal (link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). Before each reuse it must be clean (`git.status` empty); a dirty baseline worktree is replaced, never used. A quality-gate or format job run there (or in any fresh worktree of the base) must leave `git.status` empty; a job that rewrites committed files there is reported as dirtying the base, never silently accepted, and the worktree is replaced before the next base run.
+** *Verdict*: Located diagnostics present on both sides are `baseline` and never become plan findings; for coverage, a threshold failure in a module whose main sources the plan did not change is `baseline_debt` (one non-blocking finding of severity `info` per module, never fanned out into build-error or Q-Gate findings). When every failure of the gate is baseline-only, the server writes a `baseline_red` row into `change-ledger.jsonl`, bound to the gate's `worktree_sha`, the merge base, the base commit and proof source, and the digest of the accepted diagnostics (link:../store-schemas/04-epic-and-change-ledger.adoc#_change_ledger_record_change_ledger_jsonl[Store Schemas Specification, Change Ledger Record]); the freshness gate accepts that row as passing for the same `worktree_sha` only, the gate step completes `done` with `assurance_verdict: degraded`, and the PR body and the landing record list the baseline failures. Both build jobs keep their own outcomes. A red that is not provably baseline-only is plan-caused: its failures (the remaining diagnostics) go to the build or CI remediation policy. A base run or base result that cannot be obtained or parsed leaves every diagnostic attributed to the plan (fail-closed) and says so in `facts`.
+
+[#evidence-gathering]
+=== Evidence Gathering per Failure Class
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-26[PM-WATCH-JOB-26]_
+
+Every remediation unit starts with a gather state: one server-side gathering job per failure class, which hands the model structured failures and never raw logs (`PM-SEC-1`). The model receives the failures as failure envelopes (`{failure_id, class, kind, source, file?, line?, message, fingerprint, excerpt_uri?}`, link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory & Failure Envelope]); logs and excerpts are stored in the plan's evidence directory as untrusted, redacted resources (`pm://plan/{plan_id}/evidence/{evidence_id}`) and never inlined beyond `message`.
+
+[cols="1,3,2"]
+|===
+|Class |Gathering job |Kinds
+
+|`ci`
+|Fetches the failed checks' logs through the provider module (a `ci` job), parses each with the domain's `log_parser` worker (a `project_script` of worker kind `log_parser`, link:../domain-extensions/05-recipes-and-extension-points.adoc#_out_of_process_project_script_jobs_project_script_domain_workers[Domain Extensions Specification, Project Script Jobs & Domain Workers]) or the native build output parsers, else a generic tail parser yielding `unknown`; fetches the base result of the same checks for the baseline proof in the same job.
+|`compile`, `test`, `lint`, `infra`, `timeout`, `unknown`
+
+|`build`
+|Reads the failed build's ledger row and parsed diagnostics (`errors[N]{file,line,message,category}`); a `failed_unparsed` build yields one `unparsed` envelope with the log tail as excerpt.
+|`compile`, `test`, `quality_gate`, `arch_gate`, `unparsed`
+
+|`review`
+|Reads the open findings of the ledger, including the barrier re-fetch, and the review evidence state of the required bots.
+|`finding`, `evidence_missing`
+
+|`analysis`
+|Reads each configured analysis provider's gate conditions and new-code issues through `pm-mcp-analysis`, tagged by provider.
+|`gate_condition`, `issue`, `undecidable`
+
+|`merge_conflict`
+|Lists the conflicting paths and hunks with the base commits that touched them.
+|`conflict`
+
+|`qgate`
+|Reads the phase's blocking Q-Gate findings.
+|`finding`
+
+|`spend`
+|Renders the spend report of the plan.
+|`overrun`
+|===
+
+The `fingerprint` (class, kind, file, normalized message) lets the server recognise a repeated failure (`retry_not_applicable`) and the baseline proof. Every envelope states whether its gate is waivable and names the gate; a non-waivable failure (a security finding, a footprint breach) is marked `waivable: false`. Untrusted content (CI logs, bot comments, analysis messages) passes the deterministic ingestion validator before it is stored.
 
 [#worktree-sha]
 == Working-Tree Hash (`worktree_sha`, `PM-SVC-1`)

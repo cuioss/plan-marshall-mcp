@@ -24,10 +24,17 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-public enum OutcomeClass { SUCCESS, SKIP, FAILURE, INDETERMINATE, UNSETTLED, ABORTED }
+public enum OutcomeClass { SUCCESS, SKIP, FAILURE, INDETERMINATE, UNSETTLED, STEPPED_OUT }
 
-/** The external event a primitive waits for before its outcome can change (Rule 11). */
-public enum AwaitedEvent { NONE, JOB_SETTLED, OPERATOR_DECISION, MODEL_SUBMIT, HEAD_CHANGE, TIME }
+/**
+ * The external event a primitive waits for before its outcome can change (Rule 11b).
+ * OPERATOR_WAIVER: an operator-written waiver record (the waiver wait, an integrity resolution);
+ * EXTERNAL_STATE: a re-observation of a provider, a remote, or the checkout;
+ * QUESTION_ANSWER: an answer to a question record on any delivery channel.
+ */
+public enum AwaitedEvent {
+    NONE, JOB_SETTLED, OPERATOR_WAIVER, MODEL_SUBMIT, HEAD_CHANGE, TIME, EXTERNAL_STATE, QUESTION_ANSWER
+}
 
 public interface PrimitiveOutcome {
     String wireName();
@@ -77,10 +84,19 @@ public interface Primitive<P extends Record, R extends Enum<R> & PrimitiveOutcom
     default Set<String> requiredArtifacts() { return Set.of(); }
 
     /**
-     * External event this primitive waits for (Rule 11); NONE for a primitive whose outcome
-     * depends only on state it reads in the same transaction.
+     * External event this primitive waits for (Rule 11b); NONE for a primitive whose outcome
+     * depends only on state it reads in the same transaction, EXTERNAL_STATE for one that
+     * re-observes a provider, a remote, or the checkout (e.g. ci.pr-observe, finalize.archive-plan,
+     * finalize.retry-emit-landing, finalize.adopt-pr, merge.sync-base).
      */
     AwaitedEvent awaitedEvent();
+
+    /**
+     * Closed gate identifiers (waiver record, e.g. "ci_check:*", "analysis_gate:*") this primitive may
+     * pass to the read-only WorkflowExecutionContext.waiver().lookup(gate), which appends a consumption.
+     * Every declared identifier must be on the closed gate list (INV-GEN-2); no primitive can write a waiver.
+     */
+    default Set<String> waivableGates() { return Set.of(); }
 
     /**
      * True for a primitive that enqueues a job for the following job state and returns its id
@@ -99,8 +115,10 @@ Every outcome constant declares one `OutcomeClass`, and the engine derives the s
 * *`SUCCESS`*: The step completed with its work; the engine records `done`.
 * *`SKIP`*: The step had nothing to do. A primitive with an optional input declares a `skipped_<reason>` outcome of this class for the absent-input case; the step record stores `skipped`, `work_performed: false`, and the reason, and downstream steps treat it as neither a failure nor produced content.
 * *`FAILURE`* and *`INDETERMINATE`*: The step record stores `failed` or `indeterminate`; neither is ever recorded as `done`, and `INDETERMINATE` is never folded into success or failure (`PM-EXEC-4`).
-* *`UNSETTLED`*: Outcomes that hand the step back without settling it (`loop_back`, defer). The engine writes no completion record, so a re-fired step never produces two completions.
-* *`ABORTED`*: A flow was left by a model-followed `abort` link or a denied escalation inside it (the sub-workflow terminal `git.done-aborted`, outcome `aborted`). Like `UNSETTLED` it writes no completion record: the caller routes the outcome back to a decision state or to an escalation (xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar for the Workflow DSL], Abort model), never to a state that continues the flow as if the operation had succeeded, and never completes a step `done` or `skipped` on it.
+* *`UNSETTLED`*: Outcomes that hand the step back without settling it (`loop_back`, a remediation unit's `fix_requested`, defer). The engine writes no completion record, so a re-fired step never produces two completions.
+* *`STEPPED_OUT`*: The control outcome `stepped_out` of a sub-workflow: the model followed the implicit `step_out` of one of its link states, or the unit stepped out by itself (a terminal of class `stepped_out`, for example after exhausted commit attempts), or the engine unwound the frame after a condition's self-remedy budget was spent. Like `UNSETTLED` it writes no completion record: the caller routes the outcome once (Rule 6), typically to the phase's fallback, whose entry records the open firing `failed`, never to a state that continues the flow as if the operation had succeeded, and never completes a step `done`, `skipped`, or `waived` on it (xref:01-module-boundary-and-grammar.adoc#sub-workflow-exits[Sub-Workflow Exit Contract]).
+
+A remediation unit's `waived` outcome has class `SUCCESS`, but only its transition may complete a step `waived` (Rule 9).
 
 === Concrete Primitive Example (`GitStageAndCommitPrimitive`)
 
@@ -151,8 +169,8 @@ When `pm_do(scope_id, link, args, dispatch_id)` arrives, the workflow engine exe
 
 1. *Load Authoritative State*: Read `mcp/status.json` for `scope_id` (applying any `migrate` mapping if `status.json` references a renamed released state) and resolve the active `StateNode` (within the top `CallFrame.subWorkflowId()` if `call_stack` is non-empty, or the root workflow otherwise).
 2. *Verify Dispatch Claim (if `dispatch_id` present)*: If `dispatch_id` is superseded (a `dispatch_id` has no time-based expiry), reject immediately with `reason: "stale_dispatch_id"`.
-3. *Re-Compute Active Links & Guards*: Evaluate all `LinkSpec` entries on `StateNode`, expanding entity placeholders (`triage:<finding_id>`) against current persisted stores (`findings.jsonl`, `tasks/TASK-*.json`) and evaluating each link's `GuardExpr` to a `GuardResult` (xref:04-ast-node-model.adoc#guard-results[Three-Valued Guard Results]): only `HELD` links are active, and a `COULD_NOT_EVALUATE` result raises the `guard_indeterminate` condition instead of dropping the link. While `pending_condition` is set, the active set is only the condition's links (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]).
-4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set, return `isError: false` with the current representation and a `rejected.reason` from the closed enumeration (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[MCP Tool & Resource Surface Specification]): `operator_only` for an operator transition, which is never offered to the model; `stale_entity` for an entity-addressed link whose entity is no longer in an accepting state; `link_not_available` for any other identifier, including invented or paraphrased ones.
+3. *Re-Compute Active Links & Guards*: Evaluate all `LinkSpec` entries on `StateNode` of the plan instance version in force, add the state's implicit links (xref:02-units-jobs-decisions.adoc#implicit-job-links[Implicit Links]), expand entity placeholders (`triage:<finding_id>`) against current persisted stores (`findings.jsonl`, `tasks/TASK-*.json`), and evaluate each link's `GuardExpr` to a `GuardResult` (xref:04-ast-node-model.adoc#guard-results[Three-Valued Guard Results]): only `HELD` links are active, and a `COULD_NOT_EVALUATE` result raises the `guard_indeterminate` condition instead of dropping the link. While `pending_condition` is set, the active set is only the condition's links (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]); while it is an `integrity_breach`, every `pm_do` of the scope is rejected with `integrity_paused` before any other step.
+4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set, return `isError: false` with the current representation and a `rejected.reason` from the closed enumeration (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[MCP Tool & Resource Surface Specification]): `operator_only` for an operator verb (waivers, `abort`, integrity resolutions), which is never offered to the model; `stale_entity` for an entity-addressed link whose entity is no longer in an accepting state; `link_not_available` for any other identifier, including invented or paraphrased ones.
 5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges) and execute any attached content validator (`OutlineValidator`, `AsciiDocValidator`, `ConventionalCommitValidator`) in-process on submitted text payloads. If validation fails, return `isError: false` with the current representation and `rejected.reason` `undeclared_param` (a key the link does not declare), `missing_param` (a required key is absent), or `invalid_link_args` (type, range, or content-validator violation); `detail` names the offending parameter.
-6. *Verify Task Footprint (`submit:TASK-*` only)*: For a task `submit:<task_id>` link, verify the task's contribution: that no files outside the plan's worktree were dirtied by host tools and that no enrolled wrapper's `pinned_files` (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Verify-Not-Resolve]) changed inside it; on violation, the link's primitive is not executed and the `footprint_violation` condition is raised on the current state (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]), naming the offending files; `state` and `call_stack` are unchanged. Commits are not checked here: every commit, whatever its caller and whichever link or state leads to it, is guarded by the footprint check that `git.stage-and-commit` runs as its first step (xref:06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Six-Stage Execution Contract of `git.commit_and_push`], Stage 4).
-7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions`, persist the new `state` (and updated `call_stack` if entering or exiting a `SubWorkflowCall`) in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` and `call` steps until an interactive link state, async job state, or root terminal state is reached).
+6. *Verify Task Footprint (`submit:TASK-*` only)*: For a task `submit:<task_id>` link, verify the task's contribution against the boundary: that no files outside the plan's worktree (the main checkout included) were dirtied by host tools and that no enrolled wrapper's `pinned_files` (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Verify-Not-Resolve]) changed inside it. Paths inside the worktree beyond the declared footprint are accepted and recorded as unplanned changes with the task as provenance (listed in the PR body and the landing record), never refused. On a boundary violation, the link's primitive is not executed and the `footprint_violation` condition is raised on the current state (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]), naming the offending files; `state` and `call_stack` are unchanged. Commits are not checked here: every commit, whatever its caller and whichever link or state leads to it, is guarded by the footprint check that `git.stage-and-commit` runs as its first step (xref:06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Six-Stage Execution Contract of `git.commit_and_push`], Stage 4).
+7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions` (for a call return, the transition whose result guard holds), persist the new `state` (and updated `call_stack` if entering or exiting a `SubWorkflowCall`) in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` and `call` steps until an interactive link state, a question state, an async job state, or a root terminal state is reached). An instance version composed in this transaction (a server composition event, xref:09-plan-instance.adoc#plan-instance[Plan Instance]) takes effect from the next transition; the chaining of this transaction continues on the version it started with.

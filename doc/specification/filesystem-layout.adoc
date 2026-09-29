@@ -192,11 +192,11 @@ The runtime creates every file under `<PM_MCP_BASE>` with mode `0600` and every 
 
 |`<PM_MCP_BASE>/credentials/`
 |`0700` (`drwx------`)
-|Strict user-only read/write directory (`PM-CRED-3`). Checked when a credential is resolved, not at runtime start: if group/others have read, write, or execute permissions, the runtime reads no credential from it and the step needing the credential raises the `blocked` condition on its current state with the repairing `pm-mcp operator credentials` command (`PM-CRED-4`).
+|Strict user-only read/write directory (`PM-CRED-3`). Checked when a credential is resolved, not at runtime start: if group/others have read, write, or execute permissions, the runtime reads no credential from it and the step needing the credential raises the `precondition_unmet` condition on its current state with the repairing `pm-mcp operator credentials` command and a bounded `retry` (`PM-CRED-4`).
 
 |`<PM_MCP_BASE>/credentials/<credential_key>.json` and `<project>/<credential_key>.json`
 |`0600` (`-rw-------`)
-|Strict user-only access (`PM-CRED-3`). The runtime refuses to read any credential file whose permissions are broader than `0600`; only the step needing that credential is blocked (`credentials_file_insecure`, `PM-CRED-4`).
+|Strict user-only access (`PM-CRED-3`). The runtime refuses to read any credential file whose permissions are broader than `0600`; only the step needing that credential is held (`precondition_unmet` with `credentials_file_insecure`, `PM-CRED-4`).
 
 |`<PM_MCP_BASE>/enrolments/`
 |`0700` (`drwx------`)
@@ -247,7 +247,11 @@ All server-owned state of one project lives in its per-project machine store `<P
 │   └── <plan_id>/
 │       ├── request.md
 │       ├── outline.md
-│       ├── execution-manifest.json
+│       ├── instance/                    # Plan instance: immutable plan.v<N>.pmwf versions and composition.jsonl
+│       ├── waivers.jsonl                # Append-only operator waivers (written only by the operator verbs)
+│       ├── waiver-consumptions.jsonl    # Append-only waiver consumptions (written only by waiver.lookup)
+│       ├── questions.jsonl              # Append-only question records of the plan scope
+│       ├── evidence/                    # failures.jsonl (failure envelopes) and <evidence_id>.log excerpts (untrusted)
 │       ├── tasks/
 │       │   ├── TASK-001.json
 │       │   └── TASK-002.json
@@ -262,9 +266,9 @@ All server-owned state of one project lives in its per-project machine store `<P
 │       └── mcp/
 │           ├── digests.json             # Store size/SHA-256 sidecar (out-of-band edit detection)
 │           ├── mailbox.jsonl            # Append-only event log: messages from the parent epic (own leaf lock)
-│           ├── status.json              # Hypermedia FSM state, worktree_path & iteration counters
+│           ├── status.json              # Hypermedia FSM state, worktree_path, instance version, policy counters, gaps
 │           ├── transaction-journal.json # Transaction journal while a write is in flight
-│           └── units/                   # The plan's bound copy of the verified workflow units (Workflow DSL)
+│           └── units/                   # Bound copies of the verified sub-units the plan instance calls, by digest
 │
 ├── archive/                            # Archived plans (archive-plan, step 1100)
 │   └── <plan_id>/                       # Same layout as a plan directory; read-only, resolvable by plan_id
@@ -277,6 +281,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 ├── workspace/                           # Workspace scope home
 │   ├── change-ledger.jsonl              # Ledger rows of plan-less service calls (pm_build with plan_id NO_PLAN)
 │   ├── findings.jsonl                   # Findings of plan-less builds
+│   ├── questions.jsonl                  # Question records of the workspace scope (setup choices of team configuration)
 │   ├── sessions.jsonl                   # Session log of the workspace scope (same append exception)
 │   └── mcp/
 │       ├── digests.json                 # Store size/SHA-256 sidecar
@@ -286,6 +291,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 ├── epics/                               # Non-tracked state of the epics (the ledger itself is git-tracked)
 │   └── <epic_id>/
 │       ├── digests.json                 # Store size/SHA-256 sidecar
+│       ├── questions.jsonl              # Question records of the epic scope
 │       ├── sessions.jsonl               # Session log of the epic scope (same append exception)
 │       ├── status.json                  # FSM orchestrator state
 │       └── transaction-journal.json     # Transaction journal while a write is in flight
@@ -324,7 +330,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 Every enrolled project has exactly one workspace scope (`PM-ARCH-4`), addressed in a tool call as `plan_id: NO_PLAN` (link:identifiers/01-general-rules-and-registry.adoc#id-no-plan[Identifier Registry, `NO_PLAN`]) and resolved from the `PM-MCP-Workspace` header of the request (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata). Its home is `workspace/` in the project's machine store:
 
 * *No Worktree, No Archive*: The workspace scope has no worktree and no archive; its home stays in the machine store for the life of the enrolment.
-* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup`, link:domain-extensions.adoc[Domain Extensions Specification]), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), and `findings.jsonl` (the findings of plan-less builds). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status` and `pm://workspace/findings` project the two stores (link:mcp-tools.adoc[MCP Tools Specification]).
+* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup`, link:domain-extensions.adoc[Domain Extensions Specification]), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), `findings.jsonl` (the findings of plan-less builds), and `questions.jsonl` (the question records of team-configuration setup choices). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status` and `pm://workspace/findings` project the two stores (link:mcp-tools.adoc[MCP Tools Specification]).
 * *Lock*: Every write to the workspace home takes `locks/workspace.lock` of the project's machine store, the first lock of the one total order (workspace -> plan locks -> epic locks -> `epics-worktree` -> `lessons` -> `local-config` -> `build-timings` -> machine store locks -> leaf locks, link:store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]), and runs as a journaled transaction (`mcp/transaction-journal.json`, link:store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]).
 
 [#archives]

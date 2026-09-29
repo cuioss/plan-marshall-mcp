@@ -40,12 +40,12 @@ The epic inbox (`.marshall/orchestrator/<epic_id>/inbox.jsonl`, plan → epic an
     },
     "kind": {
       "type": "string",
-      "enum": ["scope_deviation", "blocker_report", "process_finding", "landing_notification", "transfer_offer", "intake_confirmed", "surface_overlap_detected", "hypothesis_refuted", "advisory", "spec_amendment", "coordination"],
-      "description": "message events only. Inbox kinds: the first four from plans, transfer_offer and intake_confirmed from epics, surface_overlap_detected appended by the server (sender: the plan whose accepted scope deviation widened its surface; never offered to outbox:send). Mailbox kinds: advisory, spec_amendment, coordination."
+      "enum": ["scope_deviation", "blocker_report", "process_finding", "landing_notification", "transfer_offer", "intake_confirmed", "hypothesis_refuted", "advisory", "spec_amendment", "coordination"],
+      "description": "message events only. Inbox kinds: the first four from plans, transfer_offer and intake_confirmed from epics (an overlap of a plan's unplanned changes with a sibling's declared surface is noted in the plan's landing record, never an inbox message). Mailbox kinds: advisory, spec_amendment, coordination."
     },
     "summary": { "type": "string", "minLength": 1, "maxLength": 200 },
     "body": { "type": "string", "maxLength": 16384 },
-    "payload": { "type": "object", "description": "Kind-specific structured payload (the landing envelope for landing_notification; source_epic, source_plan_id, source_location for transfer_offer; plans[] and paths[] for surface_overlap_detected, see dispatch-and-effort.adoc, Staging-Time Surface Disjointness)." },
+    "payload": { "type": "object", "description": "Kind-specific structured payload (the landing envelope for landing_notification; source_epic, source_plan_id, source_location for transfer_offer)." },
     "by": { "type": "string", "description": "claimed, processed, consumed, annotation: the scope id that appended the event." },
     "outcome": { "type": "string", "description": "processed only: what the consumer did (for example the landing record id or the queue row changed)." },
     "note": { "type": "string", "maxLength": 2000, "description": "annotation only: a correction referencing the original message, which is never rewritten." }
@@ -218,7 +218,7 @@ Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine st
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "entry_id": { "type": "string", "format": "uuid" },
-    "kind": { "type": "string", "enum": ["build", "change", "job", "task_diff"] },
+    "kind": { "type": "string", "enum": ["build", "change", "job", "task_diff", "baseline_red"] },
     "worktree_sha": {
       "type": "string",
       "pattern": "^([0-9a-f]{64}|unavailable)$",
@@ -266,6 +266,20 @@ Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine st
       "enum": ["expected_red", "expected_red_went_green", null],
       "description": "For kind == 'build' with expect == 'red': expected_red when the run failed (the result's expectation: met), expected_red_went_green when it succeeded (expectation: violated); null otherwise."
     },
+    "baseline": {
+      "type": ["object", "null"],
+      "description": "Required (non-null) iff kind == 'baseline_red'; null otherwise. The server's proof that a red gate at this worktree_sha is red only through failures already present on the base (Job Runtime, Baseline Separation).",
+      "required": ["gate_kind", "merge_base", "base_commit", "proof_source", "diagnostics_digest", "fingerprints"],
+      "additionalProperties": false,
+      "properties": {
+        "gate_kind": { "type": "string", "description": "The red gate: a CI check name (ci_check:<name>) or a local gate verb (quality-gate, verify, coverage)." },
+        "merge_base": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "base_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "The base commit whose result proved the failures: the merge base, or the latest base-branch commit containing it that has a provider result." },
+        "proof_source": { "type": "string", "enum": ["ci_base_result", "local_merge_base_build"], "description": "ci_base_result: the provider's CI result of the same check on base_commit (primary); local_merge_base_build: a build of the merge base in the baseline scratch worktree (fallback for local gates or when the provider has no result for the base)." },
+        "diagnostics_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 over the sorted failure fingerprints accepted as baseline-only." },
+        "fingerprints": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+      }
+    },
     "deliverable_id": { "type": ["string", "null"] },
     "task_id": { "type": ["string", "null"], "description": "Required for kind == 'task_diff'; written only by the submit:TASK-NNN verification." },
     "recorded_at": { "type": "string", "format": "date-time" }
@@ -274,4 +288,5 @@ Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine st
 ----
 
 * *Per-Task Attribution*: `kind: "task_diff"` rows are appended by the server when `submit:TASK-NNN` passes independent verification (link:../phase-workflows.adoc[Phase Workflows Specification], Task Envelope Execution): `task_id`, `changed_paths` since the previous task's snapshot (present, possibly empty), and `commit_sha: null`. They are the only producer of `task_id` in this ledger.
+* *Baseline-Red Rows*: A `baseline_red` row is written by the server only, in the transaction that proves a red gate baseline-only (every failing fingerprint present on the base); it is bound to its `worktree_sha`, merge base, and diagnostics digest. A freshness gate accepts it as passing for the same `worktree_sha` (and hash version) only, never for another tree, so the exit barrier does not reject the same tree as `last_build_failed`. The gate step completes `done` with `assurance_verdict: degraded`, and the PR body and the landing record list the baseline failures. A red gate that is not provably baseline-only never produces the row; it calls the build or CI remediation policy.
 * *Attribution State*: Every per-task consumer first reads `change_attribution`, which the server derives: `measured` when every completed task has a `task_diff` row, otherwise `unavailable` (for example when a task snapshot could not be taken). Under `unavailable` the dependent per-task keys are absent, never empty or zero.

@@ -33,30 +33,35 @@ A foundational invariant of PM-MCP is that *domain failures and transition rejec
 |Next state's TOON representation (`state`, `facts`, `links`).
 |Follow one of the new `links`.
 
-|Build fails, tests fail, or quality gate turns red
+|Build fails, tests fail, CI or an analysis gate turns red, or review evidence is missing
 |`isError: false`
-|TOON representation in a remediation state (e.g., `execute.verification-feedback`, `finalize.ci-failed`; link:../state-catalogue.adoc[State Catalogue]) with structured failure facts and `fix`, `retry`, `loop_back`, or `escalate` links.
-|Inspect failure facts (or `log_uri`), apply code fixes, and follow `fix` / `retry` / `loop_back`.
+|TOON representation of the `decide` state of the class's remediation policy unit (`remediation.build-failure`, `remediation.ci-failure`, `remediation.analysis`, `remediation.review-findings`; link:../state-catalogue.adoc[State Catalogue]) with the failure envelopes in `facts` (excerpts as `pm://plan/{plan_id}/evidence/{evidence_id}` resources) and the budget-guarded links `retry`, `fix`, and, where the gate is waivable and a waiver wait is configured, `request_waiver`, beside the implicit `step_out`.
+|Inspect the failure envelopes (and their excerpts), then follow one remedy; an exhausted budget or a `step_out` takes the phase's fallback route (`handed_back` or `returned`).
 
 |Git push rejected (non-fast-forward) or merge conflict
 |`isError: false`
-|TOON representation in `git.sync-required` or `git.sync-escalate` (inside the `git.commit_and_push` sub-workflow) with `sync_rebase` (rel `fix`) / `escalate` links.
-|Follow the offered `sync_rebase` or `escalate` link.
+|TOON representation in `git.sync-required` (inside the `git.commit_and_push` sub-workflow) with `sync_rebase` (rel `fix`), beside the implicit `step_out`; a rebase conflict enters `git.resolve-conflicts`, a rebase that cannot start ends the call with the server step-out (`cause: rebase_failed`); a merge conflict on the merge path calls `remediation.merge-conflict`.
+|Follow the offered remedy, or `step_out` to return the sub-process to its caller.
 
 |Host tool modifies files outside the plan's worktree
 |`isError: false`
-|TOON representation of the unchanged current state with `condition: footprint_violation` (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-footprint_violation[State Catalogue, Conditions]), naming the offending files and offering only `fix` and `escalate` links.
-|Inspect the named files; revert only changes this plan made, never baseline dirt (`facts.baseline_dirty`) or foreign changes, and follow `fix`, or `escalate` to the operator.
+|TOON representation of the unchanged current state with `condition: footprint_violation` (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-footprint_violation[State Catalogue, Conditions]), naming the offending files and offering only the bounded `fix` link.
+|Inspect the named files; revert only changes this plan made, never baseline dirt (`facts.baseline_dirty`) or foreign changes, and follow `fix`; when the condition's budget is spent, the engine takes the phase's fallback route with the violation recorded as the gap.
 
 |Stale link followed, entity no longer in accepting state, or `args` fails link parameter validation
 |`isError: false`
 |Authoritative *current* TOON representation plus a top-level `rejected` block (`reason` from the closed set in <<rejection-reasons>>, `link`, `detail`).
 |Read the current representation and follow one of its valid `links` with corrected `args`.
 
-|Operator approval required or loop-back limit reached
+|A remediation budget is exhausted, or the model hands the plan back
 |`isError: false`
-|TOON representation of the unchanged current state with `condition: blocked` (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, Conditions]) offering only `wait:decision:<decision_id>` (a bounded wait on the pending operator decision record), or `finalize.loop-limit-reached` offering `escalate`.
-|Follow `escalate`, or `wait:decision:<decision_id>` until the operator resolves the decision.
+|TOON representation of the next state on the phase's fallback route (`plan.return` or `finalize.hand-back`, then the post-run band), which ends the plan `returned` or `handed_back`; with a positive `waiver_wait_seconds`, the unit's waiver wait comes first, rendering the waiver hint in `facts.operator_command`.
+|Follow the offered links of the fallback route; relay a waiver hint to the operator as information, never answer it.
+
+|A digest-protected store or an enrolment file was changed outside the runtime
+|`isError: false`
+|TOON representation of the unchanged current state with `condition: integrity_breach` (link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-conditions[State Catalogue, Conditions]), `links[0]`, and `facts.operator_command` naming `pm-mcp operator accept-edit …` and `pm-mcp operator abort …`; every `pm_do` on the scope is rejected with `integrity_paused` until the operator resolves the pause.
+|Relay the operator command and stop; the pause has no time bound and no model link.
 
 |Malformed JSON-RPC or unknown tool name
 |JSON-RPC error
@@ -107,18 +112,19 @@ rejected:
   reason: invalid_link_args
   detail: "parameter 'message' length 0 is below minimum 1"
 facts:
+  call_path[1]: finalize.push-barrier
   changed_files: 2
   continuation_policy: stop_at_phase_boundary
   module_scope: http
   suggested_type: fix
 links[2]{rel,link,form,free}:
   next,commit,submit,"message:text[1..2000]"
-  abort,abort,noop,""
+  abort,step_out,submit,"reason:text[1..2000]"
 ----
 
 [#rejection-reasons]
 ==== Closed Rejection Reasons & Failure Classes
-_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-2[PM-WATCH-TOOL-2], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-11[PM-WATCH-TOOL-11]_
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-2[PM-WATCH-TOOL-2], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-11[PM-WATCH-TOOL-11], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-14[PM-WATCH-TOOL-14]_
 
 `rejected.reason` is a closed enumeration. This table is its single definition; a specification that introduces a new rejection reason extends it here:
 
@@ -135,6 +141,9 @@ _Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-T
 |`operator_only`
 |The link names an operator transition, which is never offered to the model (`PM-SEC-3`).
 
+|`integrity_paused`
+|The addressed scope is paused by the `integrity_breach` condition (a tampered plan or epic store, or a tampered enrolment file of the project); every `pm_do` on it, `report_bypass` included, is refused until the operator resolves the pause with `accept-edit` or `abort` (link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-conditions[State Catalogue, Conditions]). The rejection carries the unchanged paused representation.
+
 |`undeclared_param`
 |`args` contains a key the link does not declare.
 
@@ -142,10 +151,22 @@ _Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-T
 |A required free parameter is absent.
 
 |`invalid_link_args`
-|A free parameter violates its type, enum, length, or range constraint, or an attached content validator refuses the payload.
+|A free parameter violates its type, enum, length, or range constraint, or an attached content validator refuses the payload (including an answer whose `branch_key` is not an option of its question record).
+
+|`already_answered`
+|An `answer_questions` item names a question record that is already closed (answered, assumed, or cancelled); nothing is written for that record (link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-records[Dispatch & Effort Specification, Question Records]).
+
+|`question_expired`
+|An `answer_questions` item arrives after its record's question wait expired and its class fallback was applied; the recorded assumption or `returned` route stands.
+
+|`retry_not_applicable`
+|The `retry` of a remediation policy's `decide` state names the same failure fingerprints that already failed after a retry with the same `reason`; a retry cannot change them (link:../workflow-dsl/08-remediation-units.adoc#remediation-units[Workflow DSL Specification, Remediation Policy Units]).
+
+|`fix_unchanged`
+|The `fix` of a remediation policy (or a re-submitted artifact of a Q-Gate remediation pass) produced no change: an empty commit or an artifact identical to the one the failing verification saw. The attempt is not charged against the fix budget.
 
 |`stale_dispatch_id`
-|The supplied `dispatch_id` is superseded (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification]; a `dispatch_id` has no time-based expiry, link:../timeouts/02-runtime-leases-operator-web.adoc#operator-decisions[Timeouts & Budgets Specification]).
+|The supplied `dispatch_id` is superseded (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification]; a `dispatch_id` has no time-based expiry, link:../timeouts/02-runtime-leases-operator-web.adoc#operator-waivers-questions[Timeouts & Budgets Specification]).
 
 |`phase_closed`
 |A finding submission is addressed to a phase the plan has already left (for example a `phase-3-outline` Q-Gate finding after the plan entered `phase-4-plan`, link:../phase-workflows.adoc[Phase Workflows Specification], Blocking Findings Guard); the finding is not written.
@@ -154,13 +175,13 @@ _Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-T
 |`pm_start` would create a plan whose `plan_id` equals a `launched` queue row of an epic while the consumed pending entry record's `from_epic` is absent or names another epic (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification], Single Epic Pointer).
 
 |`no_local_changes`
-|`pm_start` with `local_changes`, or the `recapture` link of a `land` plan, found an empty change set in the main checkout: no dirty or staged path and no commit ahead of the base branch (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane]).
+|`pm_start` with `local_changes` found an empty change set in the main checkout: no dirty or staged path and no commit ahead of the base branch (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane]).
 
 |`capability_missing`
 |`pm_start` with `pr_number` names a pull request whose head branch the agent identity cannot push to (`detail` names `reason: head_not_writable`, for example the head of a fork without push access; link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]). The same reason refuses a native git operation that needs a repository capability the native variant lacks (derived fact `git_native_capability`; `detail` names the feature and the `pm-mcp operator` command that selects the CLI variant; link:../cli-and-security/02-credentials-and-operator.adoc#native-confinement[CLI & Security Specification, Native Operation Confinement]); there it is the transport outcome of the operation's job record, never a fallback.
 
 |`integration_variant_unset`
-|`pm_start`, or a git or provider primitive, found no valid operator choice of the integration variant (`native` or `cli`) for an integration it needs; `detail` names the integration and the project setup state `setup.select-integration-variants` that decides it (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]). No git or provider operation runs before the decision.
+|`pm_start`, or a git or provider primitive, found no valid operator choice of the integration variant for an integration whose used features the `native` variant cannot serve (derived fact `git_native_capability`; otherwise `native` applies without a choice); `detail` names the integration and the project setup state `setup.select-integration-variants`, where the operator chooses through the operator channel (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]). No git or provider operation runs before the decision.
 
 |`config_dirty`
 |`pm_start` found a file under `.marshall/config/` (a team configuration file or a workflow unit) already modified, staged, or untracked in the main checkout; no plan starts on an uncommitted configuration, and the operator commits or restores the file first. A `local_changes` start is exempt: the file is then part of the captured change set, verified and landed like every other captured path (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#_planning_transition_guards_real_world_invariants[Phase Workflows Specification, Planning Transition Guards]).
@@ -176,6 +197,9 @@ _Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-T
 
 |`recipe_params_invalid`
 |`pm_start` with `recipe_id` carries `recipe_params` that violate the recipe's `parameters_schema`, or non-empty `recipe_params` for a recipe without a schema (link:../domain-extensions.adoc[Domain Extensions Specification], Declarative Recipe Descriptor Schema); `detail` names the offending parameter.
+
+|`issue_unavailable`
+|`pm_start` with `issue_number` could not read the issue in its bounded provider read; `detail` names the reason `not_found`, `not_readable` (unreadable, or refused by the untrusted-ingestion validator), or `provider_unavailable`. No plan is created (xref:01-core-workflow-tools.adoc#pm-start-refusal[`pm_start` Refusals]).
 
 |`plan_id_taken`
 |The `plan_id` derived by `pm_start` already names a live or archived plan (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); an archived `plan_id` is never reused.
@@ -193,7 +217,7 @@ _Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-T
 |A repository path in `args` escapes the workspace: a `..` segment, an absolute path, or a symlink resolving outside the plan's worktree (`PM-SEC-2`). Job requests carry the same reason with the job outcome `refused` (link:../job-runtime.adoc[Job Runtime Specification]).
 |===
 
-A content validator that refuses a payload answers `invalid_link_args` and names its specific cause in `detail` (for example `non_resolving_package_key`, link:../domain-extensions.adoc[Domain Extensions Specification]); such causes are `detail` codes, not reasons. Outcome, state, condition, and finding tokens (a job's `refused`, the `store_tampered` condition, finding types such as `unknown_config_key`) are never `rejected.reason` values.
+A content validator that refuses a payload answers `invalid_link_args` and names its specific cause in `detail` (for example `non_resolving_package_key`, link:../domain-extensions.adoc[Domain Extensions Specification]); such causes are `detail` codes, not reasons. Outcome, state, condition, and finding tokens (a job's `refused`, the `integrity_breach` condition, finding types such as `unknown_config_key`) are never `rejected.reason` values; `integrity_paused` names the refusal, not the condition.
 
 A job that exceeds its budget is a job outcome (`timed_out`), never a rejection. Every rejection belongs to the failure class `caller_drift` (the call did not match the offered contract); a tool execution error (`isError: true`) belongs to the class `server_fault`. The two classes are counted separately per plan (link:../phase-workflows.adoc[Phase Workflows Specification], `record-metrics`), each with its population.
 

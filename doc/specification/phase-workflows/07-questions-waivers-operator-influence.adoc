@@ -1,0 +1,131 @@
+= Phase Workflows & Finalize Specification: Questions, Waivers & Operator Influence
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../phase-workflows.adoc[Phase Workflows & Finalize Specification] » Questions, Waivers & Operator Influence
+
+[#questions-waivers-operator-influence]
+== Questions, Waivers & Operator Influence
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
+
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-69[PM-WATCH-PHASE-69], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-87[PM-WATCH-PHASE-87]_
+
+`PM-MCP` keeps two kinds of human input apart. A *content question* (a request clarification, an init classifier question, the optional outline review, a task question) is a server-owned question record that any configured delivery may answer, including a model relay. An *override* (a waiver, an operator abort, an integrity resolution, and every choice that writes operator configuration) is never a content question: it is taken only through the authenticated operator channel (`pm-mcp operator …`, or MCP elicitation where a verb offers it), and a value relayed by the model is never accepted for it.
+
+=== Question Records
+
+* *One Mechanism*: Every content question is a record in the scope's append-only `questions.jsonl` (plan, epic, or workspace store): the question envelope (<<phase-question-envelope>>) plus `origin: model | server`, `class: init | clarification | review | task | ask`, `asked_at`, `expires_at`, `delivery`, the answer event `{branch_key, text?, channel: user_relayed | elicitation | web | assumption | model, answered_at}`, and the closure `answered | assumed | cancelled`. Records survive `/clear` and a gone host session; answered records are listed in the pull-request body, the landing record, and the retrospective.
+* *Creation*: The model creates a question through the `ask` link (form `submit`, `question:schema[question-envelope]`) of a state that declares it, a task envelope through `ask:TASK-NNN` (which records the question and ends the entity), and the refine and outline authoring sub-agents through the `questions` list of their `submit` (each item becomes a record). Server-raised questions (the init classifiers, the outline review) are created by their primitive with server-owned options.
+* *Answer Validation*: Every delivery passes the same check: an unknown `branch_key` is refused with `invalid_link_args`, a second answer with `already_answered`, an answer after expiry with `question_expired`. With `session` delivery the model submits the user's answer through `answer_questions` (`answers:list<schema[question-answer]>`, each `{question_id, branch_key, text?}`, `channel: user_relayed`).
+* *Waiting State*: The state that waits for a question is a link state with an engine-owned deadline (catalogue kind `awaiting_user`); its awaited event is `QUESTION_ANSWER` from any channel, and the job runtime's timer takes the expiry fallback without a model call. With `session` delivery a question state is a stop point under both continuation policies; with `elicitation` or `web` the model may long-poll `wait:question:<question_id>` (bounded). A question state and a waiver wait never overlap in one plan, the integrity pause holds a pending expiry, and operator `abort` or `delete-plan` closes the record `cancelled`. No content-answer command exists in the CLI.
+
+=== Question Mode, Delivery & Wait
+
+The operator decides per project in `local-config.json` how questions are handled (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]):
+
+[cols="1,5"]
+|===
+|`questions.mode` |Behaviour
+
+|`auto` (default)
+|The question is delivered per `questions.delivery`; after `questions.wait_seconds` (default `1800`) without an answer the class fallback below applies.
+
+|`operator`
+|The question is delivered to a human and waits without a deadline: the deliberate, operator-chosen exception to the bounded waits (the state is `awaiting_user` and listed by the stalled-plan detection).
+
+|`model`
+|The model answers itself with a confidence score; the server accepts the answer at or above the compiled threshold `95` (the refine confidence threshold, `channel: model`), otherwise the question proceeds as in `auto`.
+
+|`none`
+|The `recommended` option or the envelope's `default_assumption` is applied at once and recorded as an assumption (`channel: assumption`).
+|===
+
+`questions.mode` may be overridden per question class (`init`, `clarification`, `review`, `task`, `setup`, `ask`). `questions.delivery` defaults to `elicitation` where the connection declared elicitation support and to `session` otherwise, resolved per question and recorded as the answer's `channel`; `web` delivers to a paired web device with a notification. `questions.outline_review` (`none` default, or `ask`) switches the optional outline review question on (xref:02-planning-lanes-phases-3-4.adoc#outline-gate[Server Outline Gate]). The expiry fallback per class is compiled:
+
+[cols="2,5"]
+|===
+|Question class |Fallback at expiry
+
+|Init classifier questions (`init`)
+|The classifier's server-computed `recommended` option, recorded as an assumption (domain choice with a unique top score, `skip_recipe`, sibling collision `proceed`); `returned` where no safe default exists (an obsolete lesson premise).
+
+|Refine and outline clarifications (`clarification`)
+|The envelope's `default_assumption`, recorded as an assumption amendment; the routing treats the question as answered.
+
+|Outline review (`review`)
+|`returned`: a review that was asked for and not given never starts execution.
+
+|Phase 5 task question (`task`)
+|The parent model's answer (`channel: model`), validated like any answer.
+
+|Model-initiated `ask` (for example before an infeasible review choice)
+|The model's own judgment with the stated default.
+
+|Team setup choice of the workspace scope (`setup`)
+|The question state's declared fallback, recorded as an assumption: `skip` for the merge queue, `keep_build_map` for a build-map reseed, no change for an offered unit (link:../domain-extensions/04-setup-state-machine.adoc#setup-questions[Domain Extensions Specification, Setup Choices by Owner]).
+|===
+
+=== Waivers & Operator Verbs
+
+A *waiver* declares a waivable gate met or raises a budget. It is written only by the operator verb `pm-mcp operator waive <plan_id> <gate> --reason "…"` (or `--raise <budget>=N`), stored in the plan's append-only `waivers.jsonl` (`waiver_id`, `gate`, `mode: met | raise`, `value`, mandatory `reason`, operator identity and channel, `created_at`, `revoked_at?`; mirrored to `audit.jsonl`), and composed into a new plan instance version (composition event `waiver`). A waiver is plan-scoped, not bound to `HEAD`: it may be set at plan start or at any time before the gate is evaluated, and it is too late once the fallback was taken (`plan_ended`). A gate admits a failure only through a waiver lookup at evaluation time, which logs a consumption (`HEAD`, covered items such as check names or finding ids); the consumptions are listed in a pull-request comment and in the landing record. `--raise` sets an absolute ceiling below the compiled hard cap. `waive` refuses a gate outside the list (`not_waivable`), `unwaive` refuses a consumed waiver (`already_consumed`).
+
+[cols="2,4"]
+|===
+|Gate identifier |Waives
+
+|`review_evidence` or `review_evidence:<bot_kind>`
+|Missing review evidence of the required bots (Predicate 2 of the pre-merge barrier); the merge records `review_state: unreviewed_by_waiver`.
+
+|`ci_check:<check_name>`
+|A named failing CI check.
+
+|`analysis_gate:<provider>`
+|The quality gate of a code analysis provider (for example `analysis_gate:sonar`).
+
+|`findings:<class>`, `findings:<provider>`
+|Open findings of a class, or of an analysis provider, after triage.
+
+|`qgate_findings:<phase>` (`refine`, `outline`, `plan`)
+|Blocking Q-Gate findings of the phase; they are dispositioned accepted-by-waiver.
+
+|`--raise fix_budget:<policy>=N`, `--raise retry_budget:<policy>=N`, `--raise spend=N`
+|Raises a policy budget or the spend ceiling.
+|===
+
+Never waivable: integrity breaches, the footprint and Clean Main Checkout guards, job confinement, credentials, security findings, a provider refusal of the merge action, and the operator boundary itself.
+
+*Waiver Requests*: A remediation unit's `request_waiver` files a record in `waiver_requests[]` of the plan status (`request_id`, `gate`, `rationale`, `evidence_uri`, `requested_at`, `expires_at`, `outcome?`), announced as an MCP log notification, posted as an idempotent pull-request comment with the label `pm-mcp:waiver-requested` when a pull request exists, and listed by `pm-mcp operator waivers <plan_id> --pending`, `pm-mcp status`, and the web app. A waiver request is never a question record: the model may relay the announcement, but only the operator's `waive` answers it.
+
+*Operator Verbs*: `waive`, `unwaive`, `waivers`, and `abort` act on a running plan; `delete-plan`, `accept-edit`, `credentials`, `config`, and `continuation-policy` are unchanged (link:../cli-and-security/02-credentials-and-operator.adoc[CLI & Security Specification]). *Deliberate change vs. `plan-marshall`* and the earlier design: no in-run operator decision exists. Outline approval is a server gate, scope deviations are recorded (xref:03-q-gate-and-execute.adoc#unplanned-changes[Unplanned Changes]), infeasible deliverables and refuted hypotheses are model judgments, baseline-only red is a server rule, and merge authorization is the waiver lookup; the verbs `decide`, `authorize-merge`, and `force-gate`, the artifact-gate bypass `--allow-bare-transition`, the handshake and baseline drift override, the pre-rebase overlap override, the `continuation-policy` escalation link, and the escalation beside a timed-out `retry` do not exist.
+
+*Intent Amendments*: Phase 2 answers are written into `request.md` (`## Clarifications`). Every later answer or judgment that changes the plan's intent (an answered or assumed question in Phases 3–6, an answered task question, a narrowed scope after a refuted hypothesis, a removed deliverable, or a refuted premise) is persisted as an entry of `mcp/status.json -> amendments[]` (`at`, `phase`, `source: user | model | assumption | refutation`, `question_id?`, `text`, `supersedes`). Every later representation that renders the request (outline, `create-pr`, landing envelope) includes the amendments, so a superseded statement of the request never reaches a later phase unmarked.
+
+[#phase-question-envelope]
+=== Question Envelope Schema
+
+Sub-agents in leaf `execution-context` scopes never prompt the user in-leaf and never wait on a question. A refine or outline sub-agent completes its pass on best judgment and includes a batched question list in its `submit` payload (`refine_prompt` or `outline_prompt`) as the free parameter `questions:list<schema[question-envelope]>?`; a task envelope asks through `ask:TASK-NNN`. Both are validated against the named schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-envelope-schema[Dispatch & Effort Specification, Prompt Envelopes & Entity Escalation Protocol]). Each persisted question renders as:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.dialogue;
+
+import java.util.List;
+
+public record QuestionRecord(
+    String questionId,           // Q-NNN, server-owned
+    String header,
+    String question,
+    List<QuestionOption> options,
+    String defaultAssumption,
+    boolean allowFreeText
+) {
+    /** One option; {@code branchKey} names the workflow branch it selects. */
+    public record QuestionOption(String branchKey, String label, String description, boolean recommended) {}
+}
+----
+
+Every option is authored as a two-sided contract whose label names the workflow branch selected when chosen, with the `recommended` option listed first.

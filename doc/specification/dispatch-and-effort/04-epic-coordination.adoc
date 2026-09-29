@@ -16,7 +16,7 @@ An orchestrator epic (`scope = "epic"`) decomposes a multi-plan initiative into 
 [#epic-workflow]
 === Epic Workflow (`epic.pmwf`)
 
-The epic workflow is the DSL unit `epic.pmwf` (`scope epic`); its states carry the prefix `epic.` and the phase value `orchestrator` (short form `orchestrate`), and its terminal states are `epic.archived` (phase value `completed`) and `epic.aborted` (phase value `aborted`). `epic.entry` routes by the ledger's state; `epic.active` is the resting state that offers the epic's work; every ledger write commits through `epic.commit-ledger`; `land-ledger` runs the epic landing (<<epic-landing>>). Ending the epic is the operator decision `abort-epic` (link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Workflow DSL Specification, Decision Registry]). Excerpt (`emit:<plan_id>` and the ledger-writing links other than `stage` and `ingest`, which all continue to `epic.commit-ledger`, and the landing's git internals are abbreviated):
+The epic workflow is the DSL unit `epic.pmwf` (`scope epic`); its states carry the prefix `epic.` and the phase value `orchestrator` (short form `orchestrate`), and its terminal states are `epic.archived` (phase value `completed`) and `epic.aborted` (phase value `aborted`). `epic.entry` routes by the ledger's state; `epic.active` is the resting state that offers the epic's work; every ledger write commits through `epic.commit-ledger`; `land-ledger` runs the epic landing (<<epic-landing>>). No link ends the epic: the operator verb `pm-mcp operator abort epic <epic_id> --reason …` moves it to `epic.aborted` in its next transaction, an engine-owned scope-wide transition under the on-entry rule (link:../cli-and-security.adoc[CLI, Coordination & Security Specification]); an unreadable ledger keeps its condition with a bounded `retry` and ends the same way. Excerpt (`emit:<plan_id>` and the ledger-writing links other than `stage` and `ingest`, which all continue to `epic.commit-ledger`, and the landing's git internals are abbreviated):
 
 [source,text]
 ----
@@ -45,20 +45,12 @@ state epic.active
   link next archive [noop] ()
     do epic.archive-ledger
       archived          -> epic.archived
-  link escalate abort [escalate] (reason: text[1..500])
-    escalate abort-epic
-      aborted           -> epic.aborted
-      resumed           -> epic.active
 
 state epic.commit-ledger
   phase orchestrate
   call git.commit_and_push (message_mode=step_or_fallback, push_mode=never)
-    committed_local      -> epic.active
-    committed_and_pushed -> epic.active
-    pushed_clean         -> epic.active
-    in_sync              -> epic.active
-    clean                -> epic.active
-    aborted              -> epic.active
+    done                 -> epic.active   # result {commit?, pushed, clean}
+    stepped_out          -> epic.active   # the ledger write stays uncommitted
 
 state epic.landing
   phase orchestrate
@@ -74,7 +66,7 @@ state epic.landing
 state epic.archived terminal archived success
   phase completed
 
-state epic.aborted terminal aborted failure
+state epic.aborted terminal aborted failure    # entered only by operator abort or the integrity resolution
   phase aborted
 ----
 
@@ -111,8 +103,8 @@ Disjointness of plan surfaces is an invariant the epic establishes when it cuts 
 1. *Declared Surface*: Every staged plan declares its expected surface in its queue row (`declared_surface: {paths: [...], modules: [...]}`, <<_git_distributed_epic_ledger_per_file_store_layout_adr_024>>). Paths may be files, directories (prefix-matched) or globs (expanded); every entry must name a git-tracked path or glob inside the workspace, and modules are resolved to their directories through module discovery (the derived fact `module_discovery` of the project's `derived-facts.json`, link:../domain-extensions.adoc[Domain Extensions Specification]). A plan whose surface cannot be declared (an empty surface, an entry under a git-ignored tree such as `.marshall/local/**` or outside the workspace, or an entry that cannot be evaluated) is refused with `surface_undeclared` naming the offending entries. There is no `indeterminate` path: a surface is either declared and comparable, or the staging is refused.
 2. *Staging Check*: When the epic writes a queue row (staging a plan with its specification, or amending the declared surface or `prerequisites[]` of a `staged` row), the server compares the declared surface under the epic lock against the declared surface of every other non-terminal row of the same epic (every `live` state, `parked` included). An overlap is admitted only when the two rows are ordered through prerequisites: one depends, transitively over `prerequisites[]`, on the other, so it can only be emitted after the other reached `terminal.shipped`. An unordered overlap refuses the write with `surface_overlap`, naming the overlapping plans and paths; the epic re-cuts the plans or declares the ordering. The queue row is written only when the check passes.
 3. *Emission*: `emit:<plan_id>` checks only prerequisites (`terminal.shipped`); it performs no surface comparison, because the invariant already holds for every staged row.
-4. *Scope*: The check covers one epic. There is no cross-epic comparison and no comparison against plans started without an epic; conflicts with those surface at rebase or merge (a rebase conflict in `sync-baseline` or `finalize.merge-sync`, or a pull request the provider refuses to merge) and are the operator's responsibility.
-5. *Runtime Drift Is Reported, Never Blocking*: When the operator accepts a scope deviation of a running plan of the epic (`execute.deviation-review` `accept`, link:../phase-workflows/03-q-gate-and-execute.adoc#_scope_deviation_contract[Phase Workflows Specification, Scope-Deviation Contract]) and the plan's effective surface (declared surface plus the accepted `approved_widening` paths) now overlaps the declared surface of another non-terminal row of the same epic that is not ordered with it, the server appends a `surface_overlap_detected` event to the epic inbox (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-inbox-record[Store Schemas Specification, Epic Inbox & Plan Mailbox Records]) naming the plans and paths. The event never blocks the plan, the deviation, or any emission; the epic decides whether to re-order or re-cut the affected staged rows.
+4. *Scope*: The check covers one epic. There is no cross-epic comparison and no comparison against plans started without an epic; conflicts with those surface at rebase or merge: a rebase conflict in `sync-baseline` or `finalize.merge-sync` calls the plan's `remediation.merge-conflict` policy, and a pull request the provider refuses to merge ends the plan `handed_back`.
+5. *Runtime Drift Is Recorded, Never Blocking*: A running plan of the epic may change files beyond its declared surface inside its worktree; the server records `realized − declared` as unplanned changes with their provenance (link:../phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows Specification, Task Envelope Execution]). When unplanned paths overlap the declared surface of another non-terminal row of the same epic that is not ordered with it, the overlap is only noted in the plan's landing record, naming the plans and paths; the epic's landing reconciliation handles it. The overlap never blocks the plan or any emission; the epic decides whether to re-order or re-cut the affected staged rows.
 
 === Git-Distributed Epic Ledger & Per-File Store Layout (ADR-024)
 _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-13[PM-WATCH-DISP-13], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-14[PM-WATCH-DISP-14], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-15[PM-WATCH-DISP-15], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-16[PM-WATCH-DISP-16], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-30[PM-WATCH-STORE-30]_
@@ -133,7 +125,7 @@ To allow epic state to merge cleanly across worktrees and machines via Git witho
 
 |`inbox.jsonl`
 |Strictly append-only event log (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-inbox-record[Store Schemas Specification, Epic Inbox & Plan Mailbox Records]), appended under the epic lock by the plan-scope outbox link (<<plan-scope-outbox-link>>), by `default:emit-landing`, by other epics (<<cross-epic-transfer>>), and by the owning epic's own claim and processing transitions; no line is ever rewritten.
-|Structured cross-scope messages from executing child plans (scope deviations, blocker reports, process findings, landing notifications) from other epics (`transfer_offer`, `intake_confirmed`), and from the server (`surface_overlap_detected`, <<epic-surface-disjointness>>). Each `message` event carries a store-assigned, never-reused `message_id` (`msg-NNNN`); `claimed` and `processed` events reference it, and a message's current state (`pending`, `claimed`, `processed`) is the fold of its events. Distinguishes the three empty states (`no_file`, `empty_file`, `all_processed`) from `unreadable` (reported with the failing line), which is never read as empty. Plan-side writes resolve through the epic ledger resolution seam to the shared epic worktree copy, never the primary checkout.
+|Structured cross-scope messages from executing child plans (scope deviations, blocker reports, process findings, landing notifications) and from other epics (`transfer_offer`, `intake_confirmed`); an overlap of a plan's unplanned changes with a sibling's surface arrives with the plan's landing notification (<<epic-surface-disjointness>>). Each `message` event carries a store-assigned, never-reused `message_id` (`msg-NNNN`); `claimed` and `processed` events reference it, and a message's current state (`pending`, `claimed`, `processed`) is the fold of its events. Distinguishes the three empty states (`no_file`, `empty_file`, `all_processed`) from `unreadable` (reported with the failing line), which is never read as empty. Plan-side writes resolve through the epic ledger resolution seam to the shared epic worktree copy, never the primary checkout.
 
 |`landings.jsonl`
 |Append-only under epic lock when a landing notification is reconciled.

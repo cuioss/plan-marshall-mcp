@@ -1,4 +1,4 @@
-= State Catalogue: Setup, Epic & Other Workflow Units
+= State Catalogue: Setup, Epic & Entity Units
 :toc: left
 :toclevels: 3
 :toc-title: Table of Contents
@@ -6,12 +6,12 @@
 :source-highlighter: highlight.js
 :nofooter:
 
-link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[State Catalogue] » Setup, Epic & Other Workflow Units
+link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[State Catalogue] » Setup, Epic & Entity Units
 
 [#state-catalogue-setup]
 == Project Setup: `setup` (workspace)
 
-Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's workspace scope; phase value `workspace`. The single start state `setup.entry` routes every run by server facts: a first run to `setup.prepare-workspace`, a reconcile run to `setup.reconcile-config`. The unit has no terminal state: the workspace scope lives as long as the project's enrolment and rests in `setup.completed` between runs, whose `reconcile` link starts the next run. Enrolment (`pm-mcp operator enrol`) creates the workspace scope and is not a state of it; the first run creates `.marshall/` and `.marshall/config/` with the default workflow units, with no legacy input. `project-setup.pmwf` is compiled into the binary and never project-owned.
+Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's workspace scope; phase value `workspace`. The single start state `setup.entry` records `setup_run: first_run | reconcile` and routes every run by it. The unit has no terminal state: the workspace scope lives as long as the project's enrolment and rests in `setup.completed` between runs, whose `reconcile` link starts the next run. Enrolment (`pm-mcp operator enrol`) creates the workspace scope and is not a state of it; the first run creates `.marshall/` and `.marshall/config/` with the default workflow units, with no legacy input. `project-setup.pmwf` is compiled into the binary and never project-owned. A setup choice is taken on the channel of the store it writes: operator configuration (integration variant, commit identity, operator posture) only through the operator channel, team configuration as a workspace-scope question record (class `setup`). Every question state is preceded by an `auto` probe state that enters it only when something needs an answer. Every setup failure enters `setup.needs-repair`, never a condition (link:../domain-extensions/04-setup-state-machine.adoc#setup-probe-states[Domain Extensions Specification, Probe States]; link:../domain-extensions/04-setup-state-machine.adoc#setup-questions[Setup Choices by Owner]).
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -21,8 +21,8 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |`workspace`
 |`auto`
 |Creation of the workspace scope by `pm-mcp operator enrol` (the unit's single start state); `setup.completed` (`reconcile`).
-|Routes by server facts, never by a model choice: no `.marshall/config/` in the primary checkout is a first run; otherwise (configured project) a reconcile run; a legacy `.plan/marshal.json` is never read (`PM-MIG-2`).
-|`first_run` -> `setup.prepare-workspace`; `configured` -> `setup.reconcile-config`.
+|Records `setup_run` from server facts, never from a model choice: no `.marshall/config/` in the primary checkout is `first_run`, otherwise `reconcile`; a legacy `.plan/marshal.json` is never read (`PM-MIG-2`). An interrupted first run keeps its recorded `setup_run`.
+|`first_run` -> `setup.prepare-workspace`; `reconcile` -> `setup.reconcile-config`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_architecture_enrichment_judgment_links_project_setup_state_machine[Domain Extensions Specification, Project Setup State Machine]
 
 |[[state-setup.prepare-workspace]]`setup.prepare-workspace`
@@ -36,33 +36,41 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |[[state-setup.effort-ladder]]`setup.effort-ladder`
 |`workspace`
 |`auto`
-|`setup.prepare-workspace`.
+|`setup.prepare-workspace`; `setup.needs-repair` (`retry`).
 |Validates the operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, including its effort ladder; fails closed on a malformed file; seeds nothing.
-|`setup.select-integration-variants`; malformed file _(to be specified)_.
+|`valid` -> `setup.probe-integration-variants`; `malformed` -> `setup.needs-repair` (`facts` name `pm-mcp operator config --project <project_id>`).
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Steward Wizard Step Mapping (Step 5b)]
+
+|[[state-setup.probe-integration-variants]]`setup.probe-integration-variants`
+|`workspace`
+|`auto`
+|`setup.effort-ladder` (first run); `setup.reconcile-config` (reconcile run); `setup.select-integration-variants` (`retry`); `setup.verify-credentials` (a refreshed fact invalidates an effective `native` variant).
+|`native` applies to every checked integration unless the derived fact `git_native_capability` reports a used feature native cannot serve, or a stored `cli` choice lacks its enrolled host tool; `commit_identity` must be set.
+|`current` -> `setup.verify-credentials`; `needs_answer` -> `setup.select-integration-variants`.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]
 
 |[[state-setup.select-integration-variants]]`setup.select-integration-variants`
 |`workspace`
 |`link`
-|`setup.effort-ladder` (first run); `setup.reconcile-config` (reconcile run); `setup.verify-credentials` (refreshed facts invalidate a stored `native` choice).
-|Passes without a link when every asked integration (`git`, and the CI provider integration `github` or `gitlab` once known) has a stored, still valid variant choice. Otherwise `select_variants` (rel `next`) opens the operator-channel elicitation (native recommended, the `git_native_capability` findings, the ambient-identity notice for `cli`; captures `commit_identity` while unset) and writes `local-config.json` `integrations.<integration>.variant`; without elicitation support, the `blocked` condition (xref:01-conventions-generic-conditions.adoc#condition-blocked[Condition blocked]). `facts` name only the undecided integrations.
-|`setup.verify-credentials`.
+|`setup.probe-integration-variants` (`needs_answer`).
+|Operator channel only, never a question record: `select_variants` (rel `next`) opens the elicitation where the connection declared support (the `git_native_capability` findings, the ambient-identity notice for `cli`; captures `commit_identity` while unset) and writes `local-config.json`; without elicitation support the `facts` name `pm-mcp operator config --project <project_id>`. `retry` re-enters the probe. `facts` name only the integrations that need a choice.
+|`selected` -> `setup.verify-credentials`; `retry` -> `setup.probe-integration-variants`.
 |link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]
 
 |[[state-setup.verify-credentials]]`setup.verify-credentials`
 |`workspace`
 |`auto`
-|`setup.select-integration-variants`.
-|Checks per decided integration that the chosen variant can act (native: the token-lane credential, installation-token minting or `ci.whoami`, the remote-origin check; CLI: the enrolled host tool, `identity: operator_ambient`), resolves the committer identity, and refreshes the network derived facts; a missing credential or failing check raises the `blocked` condition with the `pm-mcp operator credentials` command.
-|First run -> `setup.project-settings`; reconcile run -> `setup.detect-domains`; a refreshed fact invalidating a stored `native` choice -> `setup.select-integration-variants`.
+|`setup.probe-integration-variants` (`current`), `setup.select-integration-variants` (`selected`); `setup.needs-repair` (`retry`).
+|Checks per checked integration that the effective variant can act (native: the token-lane credential, installation-token minting or `ci.whoami`, the remote-origin check; CLI: the enrolled host tool, `identity: operator_ambient`), resolves the committer identity, and refreshes the network derived facts.
+|`first_run` -> `setup.project-settings`; `reconcile` -> `setup.detect-domains`; `variant_invalidated` -> `setup.probe-integration-variants`; a missing credential or failing check -> `setup.needs-repair` (`facts` name `pm-mcp operator credentials`).
 |link:../domain-extensions/04-setup-state-machine.adoc#setup-verify-credentials[Domain Extensions Specification, Credential Verification]
 
 |[[state-setup.project-settings]]`setup.project-settings`
 |`workspace`
 |`link`
 |`setup.verify-credentials` (first run).
-|`configure_project`: sparse team keys (`project.json` `base_branch`, `branch_prefix`; `workflow.json` `minimum_lane`, `compatibility`, `simplicity`), written only where they deviate from the derived or compiled default. Operator posture (interaction mode, continuation default, language) is offered only as an operator-channel elicitation writing `local-config.json`, never as a model-relayed link.
-|`setup.detect-domains`.
+|`configure_project`: sparse team keys (`project.json` `base_branch`, `branch_prefix`; `workflow.json` `minimum_lane`, `compatibility`, `simplicity`), written only where they deviate from the derived or compiled default; `ask` where the team's choice is needed. The operator posture is set only through the operator channel.
+|`configured` -> `setup.detect-domains`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Steps 6, 6b, 10, 12]
 
 |[[state-setup.detect-domains]]`setup.detect-domains`
@@ -76,80 +84,120 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |[[state-setup.discover-modules]]`setup.discover-modules`
 |`workspace`
 |`job`
-|`setup.detect-domains` (both runs).
-|Descriptor parsers and enrolled discovery templates; on the reconcile path rediscovery plus the `pm://architecture/drift` regression report.
-|First run -> `setup.seed-build-map`; reconcile run -> `setup.reseed-build-map`; failure outcomes _(to be specified)_.
+|`setup.detect-domains`; `setup.needs-repair` (`retry`).
+|Descriptor parsers and enrolled discovery templates; on the reconcile path rediscovery plus the `pm://architecture/drift` regression report. A per-descriptor parse failure is a finding of a succeeded discovery, never a job failure.
+|`succeeded` by `setup_run`: `first_run`, or `reconcile` without `build-map.json` -> `setup.seed-build-map`; `reconcile` with `build-map.json` -> `setup.probe-build-map`. `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate` -> `setup.needs-repair`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_architecture_enrichment_judgment_links_project_setup_state_machine[Domain Extensions Specification, Project Setup State Machine]
 
 |[[state-setup.seed-build-map]]`setup.seed-build-map`
 |`workspace`
 |`link`
-|`setup.discover-modules` (first run).
+|`setup.discover-modules` (`first_run`, or `reconcile` without `build-map.json`).
 |`confirm_build_map`, `customize_routes` (edits the seeded block). Write-once seed from Axis B.
-|`setup.select-providers`.
+|By `setup_run`: `first_run` -> `setup.select-providers`; `reconcile` -> `setup.probe-new-steps`.
 |link:../domain-extensions/03-module-discovery.adoc#_build_map_deterministic_derive_verification_adr_004[Domain Extensions Specification, Build Map]
 
 |[[state-setup.select-providers]]`setup.select-providers`
 |`workspace`
 |`link`
-|`setup.seed-build-map`.
-|`configure_providers`: shows the derived CI provider (`ci_provider` override only for self-hosted remotes), Sonar coordinates (`integrations.sonar`), and the review bots (`review.required_bots`, `review.optional_bots`) in `project.json`; the VCS provider is always `git`.
-|`setup.configure-finalize`.
+|`setup.seed-build-map` (first run).
+|`configure_providers`: shows the derived CI provider (`ci_provider` override only for self-hosted remotes), the analysis providers, and the review bots (`review.required_bots`, `review.optional_bots`) in `project.json`; the VCS provider is always `git`.
+|`configured` -> `setup.configure-finalize`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Steps 7, 13]
 
 |[[state-setup.configure-finalize]]`setup.configure-finalize`
 |`workspace`
 |`link`
 |`setup.select-providers`.
-|`configure_finalize` (per-deliverable verbs, final verification, lanes and parameters of the optional finalize steps the project's `finalize.pmwf` contains, project step descriptors; mandatory steps are not offered); does not advance while a `lane: ask` element is unanswered.
-|`setup.merge-queue`.
+|`configure_finalize` (per-deliverable verbs, final verification, lanes and parameters of the optional finalize steps the project's `finalize.pmwf` contains, project step descriptors; mandatory steps are not offered); refused while a `lane: ask` element is unanswered.
+|`configured` -> `setup.probe-merge-queue`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Steps 11, 11b]
+
+|[[state-setup.probe-merge-queue]]`setup.probe-merge-queue`
+|`workspace`
+|`auto`
+|`setup.configure-finalize`; `setup.merge-queue` (`recheck`).
+|Reads the derived network fact `merge_queue_enforced` (with the queue's check-response timeout) for the base branch; raises the question record when the queue is not enforced and the project is eligible.
+|`not_needed` (enforced, or not eligible) -> `setup.probe-enrichment`; `needs_answer` -> `setup.merge-queue`.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-merge-queue[Domain Extensions Specification, Merge-Queue Probe]
 
 |[[state-setup.merge-queue]]`setup.merge-queue`
 |`workspace`
-|`link`
-|`setup.configure-finalize`.
-|Probe only: reports the derived network fact `merge_queue_enforced` (with the queue's check-response timeout) and passes without a link when the queue is enforced or the project is not eligible; otherwise names the provider setting that enables the queue and offers `recheck_merge_queue` (re-derives the fact) and `skip_merge_queue`. The server never changes the setting and persists no key.
-|`recheck_merge_queue` -> this state; `skip_merge_queue`, pass -> `setup.enrich-architecture`.
+|`awaiting_user`
+|`setup.probe-merge-queue` (`needs_answer`).
+|The question record names the provider setting that enables the queue; options `recheck` and `skip` (the expiry fallback). The server never changes the setting and persists no key.
+|`recheck` -> `setup.probe-merge-queue`; `skip` -> `setup.probe-enrichment`.
 |link:../domain-extensions/04-setup-state-machine.adoc#setup-merge-queue[Domain Extensions Specification, Merge-Queue Probe]
 
 |[[state-setup.reconcile-config]]`setup.reconcile-config`
 |`workspace`
 |`auto`
-|`setup.entry` (`configured`).
-|`config.validate`: validates the team files, `local-config.json`, and the project's workflow units (Rules 1–12 and the compiled invariants) and refreshes the network derived facts; no migration and no default sync. A file refused by format (`format_outdated`, `format_newer`) is shown with the release-note keys, and for a team JSON file the state offers `rewrite_config` (a server-rendered rewrite at the current format, dropped keys named, shown as a diff) _(links to be specified)_.
-|`setup.select-integration-variants`.
+|`setup.entry` (`reconcile`); `setup.needs-repair` (`retry`, `rewrite_config`).
+|`config.validate`: validates the team files, `local-config.json`, and the project's workflow units (Rules 1–12 and the compiled invariants) and refreshes the network derived facts; no migration and no default sync.
+|`valid` -> `setup.probe-integration-variants`; `invalid`, `format_refused` (`format_outdated`, `format_newer`, with the release-note keys) -> `setup.needs-repair`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Upgrade Stage 2]
+
+|[[state-setup.needs-repair]]`setup.needs-repair`
+|`workspace`
+|`link`
+|`setup.effort-ladder` (`malformed`), `setup.reconcile-config` (`invalid`, `format_refused`), `setup.verify-credentials` (a missing credential or failing check), `setup.discover-modules` (every fate but `succeeded`).
+|`facts`: the failed state, the file, the finding, and for an operator repair the command (`pm-mcp operator config --project <project_id>`, `pm-mcp operator credentials`). `retry` (rel `next`); `rewrite_config:<file>` (rel `fix`), offered for a team JSON file refused by format: writes the server-rendered rewrite at the current format (valid keys carried over, dropped keys named, shown as a diff). The operator file is never rewritten by a link.
+|`retry` -> the failed state; `rewrite_config` -> `setup.reconcile-config`.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-needs-repair[Domain Extensions Specification, Setup Repair]
+
+|[[state-setup.probe-build-map]]`setup.probe-build-map`
+|`workspace`
+|`auto`
+|`setup.discover-modules` (`reconcile` with `build-map.json`).
+|Compares the persisted build-map block with the live derivation.
+|`in_sync` -> `setup.probe-new-steps`; `drift` -> `setup.reseed-build-map`.
+|link:../domain-extensions/03-module-discovery.adoc#_build_map_deterministic_derive_verification_adr_004[Domain Extensions Specification, Explicit Reseed Only]
 
 |[[state-setup.reseed-build-map]]`setup.reseed-build-map`
 |`workspace`
-|`link`
-|`setup.discover-modules` (reconcile run, `build-map.json` exists).
-|Passes silently when the persisted block equals the live derivation; on drift offers `reseed_build_map` and `keep_build_map` and always waits for the answer.
-|`setup.offer-new-steps`.
+|`awaiting_user`
+|`setup.probe-build-map` (`drift`).
+|The question record carries the drift; options `reseed_build_map` and `keep_build_map` (the expiry fallback: a hand edit is never discarded without an answer).
+|Every answer -> `setup.probe-new-steps`.
 |link:../domain-extensions/03-module-discovery.adoc#_build_map_deterministic_derive_verification_adr_004[Domain Extensions Specification, Explicit Reseed Only]
+
+|[[state-setup.probe-new-steps]]`setup.probe-new-steps`
+|`workspace`
+|`auto`
+|`setup.probe-build-map` (`in_sync`), `setup.reseed-build-map`, `setup.seed-build-map` (`reconcile`).
+|Finds the project workflow units whose `derived_from` default revision is older than the binary's default revision.
+|`current` -> `setup.probe-enrichment`; `changed` -> `setup.offer-new-steps`.
+|link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Configuration Validation & Upgrades Before 1.0]
 
 |[[state-setup.offer-new-steps]]`setup.offer-new-steps`
 |`workspace`
 |`awaiting_user`
-|`setup.reseed-build-map` (reconcile run).
-|`answer_questions` or elicitation: one question per project workflow unit whose `derived_from` default revision is older than the binary's default revision, carrying the three-way diff (hunks between the two default revisions, applied to the project unit); `adopt` applies the hunks and advances `derived_from`, `decline` advances `derived_from` only. Passes without a question when every unit is current. A declined change is never re-offered, and a step the team removed is never restored.
-|`setup.enrich-architecture`.
+|`setup.probe-new-steps` (`changed`).
+|One question record per changed unit, carrying the three-way diff (hunks between the two default revisions, applied to the project unit): `adopt` applies the hunks and advances `derived_from`, `decline` advances `derived_from` only; on expiry nothing changes, so the offer repeats on the next reconcile run. A declined change is never re-offered, and a step the team removed is never restored.
+|Every question closed -> `setup.probe-enrichment`.
 |link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Configuration Validation & Upgrades Before 1.0 (Upgrade Path)]
+
+|[[state-setup.probe-enrichment]]`setup.probe-enrichment`
+|`workspace`
+|`auto`
+|`setup.probe-merge-queue` (`not_needed`), `setup.merge-queue` (`skip`) (first run); `setup.probe-new-steps` (`current`), `setup.offer-new-steps` (reconcile run).
+|Computes the modules to enrich (first run: every module without a `responsibility`; reconcile run: the modules in `changed[]` of `pm://architecture/drift`, never one in `indeterminate[]`).
+|`nothing_to_enrich` -> `setup.commit-changes`; `enrich` -> `setup.enrich-architecture`.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-probe-states[Domain Extensions Specification, Probe States]
 
 |[[state-setup.enrich-architecture]]`setup.enrich-architecture`
 |`workspace`
 |`link`
-|`setup.merge-queue` (first run); `setup.offer-new-steps` (reconcile run).
-|Concurrent `dispatch:enrich-<module_id>` per module to enrich (first run: every unenriched module; reconcile run: only the modules in `changed[]` of `pm://architecture/drift`, passing without a dispatch when it is empty), or `enrich:<module_id>` (`submit`) for single-module repositories (`responsibility`, `purpose`, `key_packages`, reasoning fields); guard `every_module_enriched`.
-|`setup.commit-changes` (guard satisfied); missing submission -> the `dispatch_incomplete` condition on this state (xref:01-conventions-generic-conditions.adoc#condition-dispatch_incomplete[Condition dispatch incomplete]).
+|`setup.probe-enrichment` (`enrich`).
+|Concurrent `dispatch:enrich-<module_id>` per module to enrich, or `enrich:<module_id>` (`submit`) for single-module repositories (`responsibility`, `purpose`, `key_packages`, reasoning fields). The primitive evaluating each return or submission reports `all_enriched` once every module of the set has a `responsibility`; until then the state stays current with the remaining modules.
+|`all_enriched` -> `setup.commit-changes`; missing submission -> the `dispatch_incomplete` condition on this state (xref:01-conventions-generic-conditions.adoc#condition-dispatch_incomplete[Condition dispatch incomplete]).
 |link:../domain-extensions/04-setup-state-machine.adoc#_architecture_enrichment_judgment_links_project_setup_state_machine[Domain Extensions Specification, Enrichment Parameters]
 
 |[[state-setup.commit-changes]]`setup.commit-changes`
 |`workspace`
 |`link`
-|`setup.enrich-architecture` (both runs); `setup.land-changes` (`aborted`).
-|`land` (rel `next`, `noop`), `leave` (rel `alt`, `noop`): the routine decision whether to land the setup changes. `facts`: the changed paths of the setup staging set.
+|`setup.probe-enrichment` (`nothing_to_enrich`), `setup.enrich-architecture` (`all_enriched`); `setup.land-changes` (`stepped_out`).
+|`land` (rel `next`, `noop`), `leave` (rel `alt`, `noop`): whether to land the setup changes. `facts`: the changed paths of the setup staging set.
 |`land` -> `setup.land-changes`; `leave` -> `setup.completed` (the changes stay uncommitted in the primary checkout).
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Step 16]
 
@@ -158,13 +206,13 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |`call`
 |`setup.commit-changes` (`land`).
 |`call git.commit_and_push (message_mode=step_or_fallback, push_mode=if_push_remote)` on the primary checkout; staging set `.marshall/config/**`, `.gitignore`, `.marshall/project-architecture/**`.
-|`committed_local`, `committed_and_pushed`, `pushed_clean`, `in_sync`, `clean` -> `setup.completed`; `aborted` -> `setup.commit-changes`.
+|`done` -> `setup.completed`; `stepped_out` -> `setup.commit-changes` (the changes stay uncommitted).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_site_reuse_matrix_across_workflows[Workflow DSL Specification, Call-Site Reuse Matrix]; link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Step 16]
 
 |[[state-setup.completed]]`setup.completed`
 |`workspace`
 |`link`
-|`setup.land-changes` (every outcome but `aborted`); `setup.commit-changes` (`leave`).
+|`setup.land-changes` (`done`); `setup.commit-changes` (`leave`).
 |The workspace scope's resting state: `reconcile` (rel `next`, `noop`); the facts carry the setup summary (wizard Step 15).
 |`reconcile` -> `setup.entry`.
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Step 15]
@@ -173,7 +221,7 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 [#state-catalogue-epic]
 == Epic Workflow: `epic`
 
-Declared in `epic.pmwf` (`scope epic`, start `epic.entry`); phase value `orchestrator` (DSL `phase orchestrate`) for every non-terminal state. The DSL excerpt is in link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Dispatch & Effort Specification, Epic Workflow (`epic.pmwf`)].
+Declared in `epic.pmwf` (`scope epic`, start `epic.entry`); phase value `orchestrator` (DSL `phase orchestrate`) for every non-terminal state. The DSL excerpt is in link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Dispatch & Effort Specification, Epic Workflow (`epic.pmwf`)]. No epic state waits for an operator decision; the operator stops an epic with `pm-mcp operator abort epic <epic_id> --reason`.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -183,16 +231,16 @@ Declared in `epic.pmwf` (`scope epic`, start `epic.entry`); phase value `orchest
 |`orchestrator`
 |`auto`
 |`pm_start` of an epic (the unit's start state).
-|`auto epic.inspect-ledger`: routes by the state of the epic ledger `.marshall/orchestrator/<epic_id>/` in the shared epic worktree, never by a model choice.
-|`initialized` (no ledger: the ledger header is created) -> `epic.active`; `resumed` (a readable ledger) -> `epic.active`; an unreadable ledger _(to be specified)_.
+|`auto epic.inspect-ledger`: routes by the state of the epic ledger `.marshall/orchestrator/<epic_id>/` in the shared epic worktree, never by a model choice. An unreadable ledger or row raises the `precondition_unmet` condition (`reason: ledger_unreadable`, naming the unreadable files and the parse diagnostic) with `retry` (xref:01-conventions-generic-conditions.adoc#condition-precondition_unmet[Condition precondition unmet]), which ends only when the ledger reads or by the operator's `abort`.
+|`initialized` (no ledger: the ledger header is created) -> `epic.active`; `resumed` (a readable ledger) -> `epic.active`.
 |link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Dispatch & Effort Specification, Epic Workflow]
 
 |[[state-epic.active]]`epic.active`
 |`orchestrator`
 |`link`
-|`epic.entry`; `epic.commit-ledger` (every outcome); `epic.landing` (every outcome); itself (`abort-epic` `resumed`).
-|The epic's resting state: `stage` (`submit`, a scope-wide link without entity: stages a plan as a queue row from `plan_slug` (becomes the `plan_id`; same grammar and phantom checks), `spec_section` (the anchor of a section in `spec.md`, `text[1..128]`), `surface_paths`, `surface_modules?`, `prerequisites?` (`plan_id` list), and `workstream_id?`; the server assigns the row's `ordinal`; refusals `surface_overlap`, `surface_undeclared`); `emit:<plan_id>` (`emit`, `submit`) for `staged` rows whose prerequisites are all `terminal.shipped`; `ingest:<message_id>` (`submit` with `kind: enum[transferred\|re-scoped\|left_alone]` and `note: text[1..2000]?`: claims and processes an inbox message, including intake of a transfer offer and the source disposition); `land-ledger` (`next`, `noop`: the epic landing); `archive` (`next`, `noop`). Beside these, the epic links specified in the Dispatch & Effort Specification: `submit_landing:<plan_id>`, `reconcile_landing:<plan_id>`, `transfer_offer:<plan_id>`, `mailbox_send:<plan_id>`, spec re-grounding dispatches (read-only entity scope, draft `submit` only) or the inline fallback; and `abort` (rel `escalate`, the request `abort-epic`). Observes `launched` -> `running` from the child's entry record.
-|A ledger write (`stage`, `emit`, `ingest`, `submit_landing`, `reconcile_landing`, `transfer_offer`) -> `epic.commit-ledger`; `land-ledger` -> `epic.landing`; `archive` -> `epic.archived`; `abort-epic` `aborted` -> `epic.aborted`, `resumed` -> this state.
+|`epic.entry`; `epic.commit-ledger` (every outcome); `epic.landing` (every outcome).
+|The epic's resting state: `stage` (`submit`, a scope-wide link without entity: stages a plan as a queue row from `plan_slug` (becomes the `plan_id`; same grammar and phantom checks), `spec_section` (the anchor of a section in `spec.md`, `text[1..128]`), `surface_paths`, `surface_modules?`, `prerequisites?` (`plan_id` list), and `workstream_id?`; the server assigns the row's `ordinal`; refusals `surface_overlap`, `surface_undeclared`); `emit:<plan_id>` (`emit`, `submit`) for `staged` rows whose prerequisites are all `terminal.shipped`; `ingest:<message_id>` (`submit` with `kind: enum[transferred\|re-scoped\|left_alone]` and `note: text[1..2000]?`: claims and processes an inbox message, including intake of a transfer offer and the source disposition); `land-ledger` (`next`, `noop`: the epic landing); `archive` (`next`, `noop`). Beside these, the epic links specified in the Dispatch & Effort Specification: `submit_landing:<plan_id>`, `reconcile_landing:<plan_id>`, `transfer_offer:<plan_id>`, `mailbox_send:<plan_id>`, spec re-grounding dispatches (read-only entity scope, draft `submit` only) or the inline fallback. Observes `launched` -> `running` from the child's entry record; a landing whose unplanned paths overlap a sibling's declared surface is only noted for the landing reconciliation.
+|A ledger write (`stage`, `emit`, `ingest`, `submit_landing`, `reconcile_landing`, `transfer_offer`) -> `epic.commit-ledger`; `land-ledger` -> `epic.landing`; `archive` -> `epic.archived`.
 |link:../dispatch-and-effort/04-epic-coordination.adoc#_why_epics_emit_plans_rather_than_dispatching_sub_agents[Dispatch & Effort Specification, Epic Plan Emission]; link:../dispatch-and-effort/04-epic-coordination.adoc#epic-surface-disjointness[Staging-Time Surface Disjointness]; link:../dispatch-and-effort/04-epic-coordination.adoc#cross-epic-transfer[Cross-Epic Intake & Transfer]; link:../dispatch-and-effort/04-epic-coordination.adoc#_server_derived_landing_facts_spec_re_grounding_cross_plan_locks[Server-Derived Landing Facts]
 
 |[[state-epic.commit-ledger]]`epic.commit-ledger`
@@ -200,7 +248,7 @@ Declared in `epic.pmwf` (`scope epic`, start `epic.entry`); phase value `orchest
 |`call`
 |`epic.active` (a ledger write).
 |`call git.commit_and_push (message_mode=step_or_fallback, push_mode=never)` in the shared epic worktree on the fixed epic branch, staging only `.marshall/orchestrator/**`.
-|`committed_local`, `committed_and_pushed`, `pushed_clean`, `in_sync`, `clean` -> `epic.active`; `aborted` -> `epic.active` (the write stays uncommitted and is committed with the next ledger write).
+|`done` -> `epic.active`; `stepped_out` -> `epic.active` (the write stays uncommitted and is committed with the next ledger write).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_site_reuse_matrix_across_workflows[Workflow DSL Specification, Call-Site Reuse Matrix]
 
 |[[state-epic.landing]]`epic.landing`
@@ -222,37 +270,53 @@ Declared in `epic.pmwf` (`scope epic`, start `epic.entry`); phase value `orchest
 |[[state-epic.aborted]]`epic.aborted`
 |`aborted`
 |`terminal`
-|`epic.active` (`abort-epic`: `aborted`); the `ABORTED` outcome of an engine-raised decision on the epic scope (xref:01-conventions-generic-conditions.adoc#condition-blocked[Condition blocked]).
+|From every epic state, only by the operator, as an engine-owned transition in the next transaction: `pm-mcp operator abort epic <epic_id> --reason`, or the `abort` resolution of an `integrity_breach` on the epic scope (xref:01-conventions-generic-conditions.adoc#condition-integrity_breach[Condition integrity breach]).
 |`links[0]`. Declared `state epic.aborted terminal aborted failure`.
 |—
-|link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Workflow DSL Specification, Decision Registry (`abort-epic`)]
+|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Dispatch & Effort Specification, Epic Workflow]
 |===
 
 [#state-catalogue-other]
-== Other Workflow Units
+== Entity Units
+
+Every dispatched sub-agent runs on an entity scope in a state of an entity unit; every entity unit declares `phase inherit`. No entity state waits on a question: a question leaves the entity at once and is answered on the plan scope. The entity terminal feeds the return-evaluation primitive of the parent's `returned:<dispatch_id>` link, which settles the dispatch `RETURNED` only when the entity reached its terminal (otherwise `INCOMPLETE_SUBMISSION`).
 
 [cols="2,1,1,2,3,2,2"]
 |===
 |State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
 
-|[[state-envelope.task.active]]`envelope.task.active`
-|— (entity scope)
+|[[state-entity.active]]`entity.active`
+|inherit (entity scope)
 |`link`
-|The first entity-scoped `pm_state` of `envelope-N` (dispatch `ALLOCATED` -> `CLAIMED`); itself after each `submit:TASK-i` with `i < k`.
-|`submit:TASK-NNN`, `escalate:TASK-NNN`; `deviate:TASK-NNN`, `infeasible:TASK-NNN`, `yield:envelope-M` (`budget_yield`). `facts.task_id` names the current task.
-|Next task -> `envelope.task.active`; last task -> `envelope.completed`; `escalate:TASK-NNN` raises the `blocked` condition on the entity scope (xref:01-conventions-generic-conditions.adoc#condition-blocked[Condition blocked]) and the sub-agent returns `status: blocked`; the state stays `envelope.task.active`; `yield` -> the remaining tasks move to `envelope-(M+1)` _(entity state after yield to be specified)_.
-|link:../dispatch-and-effort/01-task-envelopes.adoc#_sequential_task_yield_within_an_envelope[Dispatch & Effort Specification, Sequential Task Yield]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#_prompt_envelopes_entity_escalation_protocol[Entity Escalation Protocol]
+|The first entity-scoped `pm_state` of a single-submit dispatch (dispatch `ALLOCATED` -> `CLAIMED`): refine and outline authoring, Q-Gate validation (`qgate`), enrichment (`enrich-<module_id>`), simplify, security audit, lessons, spec re-grounding.
+|The dispatch kind's one `submit` link. Refine and outline authoring carry their open `questions` inside the `submit`; the parent turns them into question records.
+|`submitted` -> `entity.completed`.
+|link:../dispatch-and-effort/01-task-envelopes.adoc[Dispatch & Effort Specification, Task Envelopes]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-record-creation[Entity Question Protocol]
+
+|[[state-entity.completed]]`entity.completed`
+|inherit (entity scope)
+|`terminal`
+|`entity.active` (`submitted`).
+|`links[0]`. Declared `state entity.completed terminal submitted success`.
+|—
+|link:../dispatch-and-effort/01-task-envelopes.adoc[Dispatch & Effort Specification, Task Envelopes]
+
+|[[state-envelope.task.active]]`envelope.task.active`
+|inherit (entity scope)
+|`link`
+|The first entity-scoped `pm_state` of `envelope-N` (dispatch `ALLOCATED` -> `CLAIMED`); itself after each `submit:TASK-i` that is neither the last task nor a chain tail.
+|`submit:TASK-NNN`; `ask:TASK-NNN` (`question:schema[question-envelope]`: records a question record of class `task` and ends the entity); `infeasible:TASK-NNN`; `yield:envelope-M` (`budget_yield`). `facts.task_id` names the current task.
+|Next task -> this state; the last task, a chain-tail task (the remaining tasks move to `envelope-(M+1)`), `ask`, or `yield` (the remaining tasks move to `envelope-(M+1)`) -> `envelope.completed`.
+|link:../dispatch-and-effort/01-task-envelopes.adoc#_sequential_task_yield_within_an_envelope[Dispatch & Effort Specification, Sequential Task Yield]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-record-creation[Entity Question Protocol]
 
 |[[state-envelope.completed]]`envelope.completed`
-|— (entity scope)
+|inherit (entity scope)
 |`terminal`
-|`envelope.task.active` (last task submitted).
-|`links[0]`; the parent's `returned:<dispatch_id>` with `status: success` settles the dispatch `RETURNED` only in this state (otherwise `INCOMPLETE_SUBMISSION`).
+|`envelope.task.active` (last task, chain tail, `ask`, `yield`).
+|`links[0]`. Declared `state envelope.completed terminal submitted success`; the parent's `returned:<dispatch_id>` evaluates the envelope (`execute.evaluate-envelope-return`).
 |—
 |link:../dispatch-and-effort/01-task-envelopes.adoc#_sequential_task_yield_within_an_envelope[Dispatch & Effort Specification, Sequential Task Yield item 3]
 |===
-
-The entity states of the other dispatched entities (triage findings `F-n`, enrichment `enrich-<module_id>`, verify-feedback, refine and outline authoring, spec re-grounding) are _(to be specified)_.
 
 [#state-catalogue-migrated]
 == Migrated and Non-Conforming Identifiers
@@ -263,37 +327,65 @@ Identifiers that appear in the documents but are not catalogue states. None of t
 |===
 |Identifier |Where used |Catalogue state
 
-|`execute.verify.running`
-|Former Hypermedia Format Specification `state` field example (replaced by `execute.verify-sweep`)
-|Not a state: the running representation of the job state `execute.verify-sweep`
+|`execute.verify.running`, `*.running`
+|Former `state` field example and former wording of the `wait` form and `PM-WF-8`
+|Not a state: the running representation of a `job` or `composite_job` state (`execute.verify-sweep`)
 
-|`execute.verify.failed`
-|Former MCP Tools Specification classification matrix example (replaced by `execute.verification-feedback`)
-|`execute.verification-feedback`
+|`execute.verify.failed`, `execute.verification-feedback`, `land.verification-feedback`, `land.recapture`
+|Former verification-failure states and the land recapture
+|`<phase>.remediate-build` (`execute.remediate-build`, `land.remediate-build`); a land plan is never recaptured
 
-|`*.running`
-|Former wording of the Hypermedia Format Specification `wait` form and of `PM-WF-8` (replaced by "the running representation of a job state")
-|Not a state: the updated representation of a running `job` or `composite_job` state
+|`finalize.aborted`, `abort` links, the decisions `abort-plan` / `abort-epic`
+|Former abort terminal and abort requests
+|`plan.aborted` / `epic.aborted` (operator `abort` only); the model's exit is `hand_back` or `step_out`
 
-|`finalize.aborted`
-|Former Phase 6 abort terminal (one abort terminal per scope type)
-|`plan.aborted`
+|`init.awaiting_user`, `<phase>.awaiting_user`, `execute.awaiting_answers`
+|Former question-state names
+|The closed `awaiting_user` states named by their question (xref:01-conventions-generic-conditions.adoc#_state_kinds[State Kinds]); the task question is `execute.task-question`
 
-|`init.awaiting_user`, `<phase>.awaiting_user`
-|Former routine question states (`awaiting_user` is a kind, never a state-id suffix)
-|`init.lesson-premise`, `init.sibling-collision`, `init.domain-choice`, `init.posture-choice`; Phase 3–6 questions: states named by their question _(to be specified)_
+|`envelope.blocked`, `escalate:TASK-NNN`, condition `blocked`, `wait:decision:<decision_id>`
+|Former task question and operator-decision wait
+|`ask:TASK-NNN` and `execute.task-question`; the engine-raised part of `blocked` is `precondition_unmet`
 
-|`execute.awaiting_answers`
-|Former Phase 5 answers state
-|None: a task question is `escalate:TASK-NNN`, which raises the `blocked` condition on the entity scope
-
-|`envelope.blocked`
-|Former entity terminal state of a task question
-|None: the `blocked` condition on `envelope.task.active`
+|`init.posture-choice`
+|Former posture question
+|None: `pm_start(posture)` or the projection, a plan fact composed into the instance
 
 |`outline.validate`
 |Former Phase 3 validation state
 |Not a state: validation is part of the `submit:outline` primitive of `outline.deep` and `outline.light` (`invalid_link_args` on rejection)
+
+|`<phase>.qgate-exhausted`, `<phase>.qgate-forced`
+|Former Q-Gate exhaustion states
+|`<phase>.remediate-qgate` (`remediation.qgate-findings`)
+
+|`<phase>.baseline-red`, `<phase>.baseline-accepted`
+|Former baseline-red decision states
+|None: the baseline-red server rule of the gate's verification state
+
+|`<phase>.commit-aborted`, `finalize.commit-aborted`, `execute.commit-aborted`
+|Former states after an aborted commit
+|None: the caller routes `stepped_out` of `git.commit_and_push`
+
+|`execute.deviation-review`, `execute.awaiting-infeasible-decision`
+|Former Phase 5 operator decisions
+|None: unplanned changes are recorded; `execute.infeasible-review`
+
+|`finalize.triage`, `finalize.ci-failed`, `finalize.review-escalate`, `finalize.loop-limit-reached`, `finalize.allocate-after-extension`, `finalize.spend-escalate`, `finalize.merge-gap`, `finalize.merge-conflict`, `finalize.merge-sync-escalate`, `finalize.merge-remote-moved`
+|Former finalize remediation and escalation states
+|The remediation calls `finalize.remediate-review`, `finalize.remediate-ci`, `finalize.remediate-spend`, `finalize.remediate-barrier`, `finalize.remediate-merge-conflict`, `finalize.remediate-settle-findings`; `finalize.allocate-remediation`
+
+|`finalize.wait-cancelled`, `finalize.review-structural`, `finalize.baseline-red`, `finalize.simplify-review`, `finalize.retry-landing-delivery`
+|Former finalize link and approved-action states
+|`finalize.restart-watch`; `finalize.remediate-review` (a structural refusal is triaged as a finding); the baseline-red server rule; `finalize.simplify`; `finalize.emit-landing-failed`
+
+|`finalize.wind-down`, `finalize.archive-held`, `finalize.close-pr-and-archive`, `finalize.close-pr-failed`, `finalize.hand-back-and-archive`, `finalize.hand-back-failed`
+|Former unmerged endings
+|`finalize.hand-back`, then `finalize.archive-plan` -> `handed_back`
+
+|`git.done-committed-local`, `git.done-committed-and-pushed`, `git.done-pushed-clean`, `git.done-in-sync`, `git.done-clean`, `git.done-aborted`, `git.sync-escalate`, `git.stage-under-oracle-override`, `git.push-under-freshness-override`
+|Former `git.commit_and_push` terminals and override states
+|`git.done` (result record), `git.stepped-out`; no override state
 
 |`orchestrate.*`, `orchestrator.pmwf`
 |Former epic unit prefix and file name

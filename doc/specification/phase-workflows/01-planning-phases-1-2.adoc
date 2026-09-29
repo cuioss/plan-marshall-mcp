@@ -15,13 +15,13 @@ _See Requirement link:../../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Serve
 
 _See Requirement link:../../Requirements.adoc#PM-WF-10[PM-WF-10: Phase 1–4 Planning Invariants, Lane Ratchet & Artifact Gates]_
 
-_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
 
 _See Requirement link:../../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
 
 === Lifecycle Topology (Phases 1–4)
 
-The planning lifecycle is a server-enforced state machine spanning `phase-1-init`, `phase-2-refine`, `phase-3-outline`, and `phase-4-plan`. Sub-states that previously lived only in the orchestrating model's conversation context (`refine.awaiting_answers`, `outline.review`, Q-Gate iteration counters, and re-dispatch counters) are persisted in `mcp/status.json` so that any session restart or `/clear` resumes at the exact sub-state via `pm_state(plan_id)`.
+The planning lifecycle is a server-enforced state machine spanning `phase-1-init`, `phase-2-refine`, `phase-3-outline`, and `phase-4-plan`. Sub-states that previously lived only in the orchestrating model's conversation context (open questions, the Q-Gate remediation budgets, and re-dispatch counters) are persisted in the plan store (question records in `questions.jsonl`, the per-plan policy counters and the current state in `mcp/status.json`) so that any session restart or `/clear` resumes at the exact sub-state via `pm_state(plan_id)`. The process a plan runs is its own composed plan instance (xref:02-planning-lanes-phases-3-4.adoc#plan-instance-composition[Plan Instance Composition]); every blocking condition of a planning phase ends in a bounded self-remedy and, when that is spent, in the `returned` fallback (<<plan-outcomes>>).
 
 Every state of Phases 1–4 is catalogued in the State Catalogue (link:../state-catalogue/02-plan-phases-1-3.adoc#state-catalogue-init[`init`], link:../state-catalogue/02-plan-phases-1-3.adoc#state-catalogue-refine[`refine`], link:../state-catalogue/02-plan-phases-1-3.adoc#state-catalogue-outline[`outline`], link:../state-catalogue/03-plan-phases-4-5-land.adoc#state-catalogue-plan[`plan`]; generic per-phase states in link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-generic[Generic Per-Phase States]; condition overlays in link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-conditions[Conditions]).
 
@@ -29,7 +29,7 @@ Every state of Phases 1–4 is catalogued in the State Catalogue (link:../state-
 ----
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │ Phase 1: init (pm_start)                                                         │
-│  init.classify -> [init.<question> states] -> init.ready                         │
+│  init.classify <-> [init question records] -> init.ready                         │
 │  (Plan source resolution, phantom-ID guard, recipe match, initial lane routing)  │
 │  -> [init.light-gate (light only, server): |A| + |neighbours| > 25 | |A| > 8 |   │
 │     neighbours unresolved | baseline content conflict -> ratchet to deep]        ├──┐
@@ -40,7 +40,8 @@ Every state of Phases 1–4 is catalogued in the State Catalogue (link:../state-
 ┌──────────────────────────────────────────────────────────────────────────────────┐  │
 │ Phase 2: refine (deep lane only)                                                 │  │
 │  refine.baseline-reconcile -> refine.analyze -> [refine.awaiting_answers (<=1x)] │  │
-│  -> [refine.qgate (<=3x, lesson-derived plans only)] -> refine.ready             │  │
+│  -> [refine.qgate (lesson-derived plans only; remediation.qgate-findings)]       │  │
+│  -> refine.ready                                                                 │  │
 │  (5 quality dimensions + module mapping, widen-only domains, pr_title authored)  │  │
 └────────────────────────────────────────┬─────────────────────────────────────────┘  │
                                          │ (artifact gate: clarified_request          │
@@ -54,31 +55,152 @@ Every state of Phases 1–4 is catalogued in the State Catalogue (link:../state-
 │    on acceptance the server records phase-2-refine done                          │
 │  outline.light --(escalate_to_deep: premise | ripple | public symbol deletion)   │
 │    --> refine.baseline-reconcile (planning_lane = deep, one-way)                 │
-│  submit:outline validates (intent markers, file-type buckets, narrow domains     │
-│    once; refusal = invalid_link_args) -> [outline.qgate (<=3x, deep lane only)]  │
-│  -> outline.review (Approval); light-lane revision -> outline.light-regate       │
+│  submit:outline validates (intent markers, file-type buckets, derivation         │
+│    dry-run; refusal = invalid_link_args) -> [outline.qgate (deep lane only)]     │
+│  -> outline.gate (server) -> [outline.review question (opt-in)]                  │
+│  light-lane revision -> outline.light-regate                                     │
 │  recipe shortcut: outline.recipe-entry -> outline.recipe-confirm                 │
-│    -> outline.review                                                             │
+│    -> outline.gate; empty harvest -> outline.empty-harvest (post-run only)       │
 └────────────────────────────────────────┬─────────────────────────────────────────┘
                                          │ (artifact gate: validated outline.md
-                                         │  + operator approval via elicitation/CLI)
+                                         │  + outline.gate passed)
                                          ▼
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │ Phase 4: plan                                                                    │
 │  plan.derive-tasks (DAG cycle check, profile mapping, skill resolution)          │
-│  -> plan.describe-tasks (+ server-side cost sizing, envelope packing & manifest) │
-│  -> [plan.qgate (<=3x)] -> execute.worktree-init                                 │
+│  -> plan.describe-tasks (+ server-side cost sizing, envelope packing and         │
+│     plan instance composition)                                                   │
+│  -> [plan.qgate (fix -> plan.revise-tasks)] -> execute.worktree-init             │
 └──────────────────────────────────────────────────────────────────────────────────┘
+  Any phase 1-4: exhausted remediation, step_out or hand_back -> plan.return
+  (outcome returned, through the post-run band and finalize.archive-plan)
 ----
 
 A plan started from the `local_changes` source does not traverse Phases 2–4: it runs in the `land` lane (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)]) from `init.ready` through `land.*` verification states directly into Phase 6. A plan started from the `pr` source does not traverse Phases 2–5: it runs in the `adopt` lane (xref:02-planning-lanes-phases-3-4.adoc#adopt-lane[Adopt Lane (`pr`)]), `init.ready` enters `finalize.adopt-pr`, which adopts the pull request's head branch, and the plan runs Phase 6 (<<_plan_source_contracts>>).
 
 A plan in the `light` planning lane does not traverse the Phase 2 states (`refine.baseline-reconcile`, `refine.analyze`, the confidence loop, `refine.qgate`): after the server-side light gate (`init.light-gate`) it enters Phase 3 and runs one collapsed light envelope (`outline.light`) that folds refine without the loop, the Simple outline, and deliverable derivation together, mirroring `plan-marshall`'s light lane. The deep lane keeps the full refine loop -> outline -> plan pipeline. The phase enum is unchanged; how the light envelope satisfies the Phase 2 and Phase 3 artifact gates is specified in xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)].
 
+[#plan-outcomes]
+=== Plan Outcomes, Fallback Routes & Remediation Policies
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-90[PM-WATCH-PHASE-90], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-75[PM-WATCH-PHASE-75]_
+
+The process enforces itself: a plan asks the operator nothing while it runs, and its gates are process conformance, not security. Every blocking condition has a bounded self-remedy and, when that is spent, a defined fallback to one of the fallback outcomes `handed_back` and `returned`. The operator influences a running plan only through waivers and the operator verbs (xref:07-questions-waivers-operator-influence.adoc#questions-waivers-operator-influence[Questions, Waivers & Operator Influence]); the only pause is a critical integrity breach.
+
+[cols="1,1,4"]
+|===
+|Outcome |Terminal state |Meaning
+
+|`merged`
+|`completed`
+|The plan's pull request merged (`merge_outcome: merged`).
+
+|`handed_back`
+|`handed_back`
+|The work is delivered as an open pull request (a draft after a fallback, ready for review when the operator's merge policy `merge.auto_merge` is `false` and the pre-merge barrier passed, `merge_outcome: awaiting_human_merge`) or, without a push remote or pull request, as a branch; the gaps are documented in an idempotent pull-request comment and the label `pm-mcp:handed-back`.
+
+|`returned`
+|`returned`
+|Only the planning result exists; nothing was implemented, no branch and no pull request are left behind, and the planning artifacts are archived.
+
+|`no_change`
+|`completed`
+|A recipe run whose harvest yielded no targets: nothing to change, no commit and no pull request (`merge_outcome: no_pr`, fact `empty_harvest`); not a fallback.
+|===
+
+*Deliberate change vs. the earlier design*: an empty harvest no longer reports the outcome `merged`; `no_change` keeps "nothing merged" distinct from a merge in the landing and the metrics.
+
+The landing record carries `outcome: merged | handed_back | returned | no_change | aborted` beside the `merge_outcome`; `aborted` is reached only by the operator (below). Every outcome other than `aborted` is reached only through `finalize.archive-plan` after the post-run band, so metrics, the landing, and the archive run for every ending.
+
+*Fallback Route per Position*:
+
+[cols="2,2,5"]
+|===
+|Where the fallback is taken |Outcome |Route
+
+|Phases 1–4 (no worktree)
+|`returned`
+|`auto plan.return`: records the gap and composes a post-run-only plan instance version (composition event `fallback`; every step below order `900` pruned with reason `returned`) -> `finalize.next-step` -> post-run band -> `finalize.archive-plan`.
+
+|Phase 5, the `land` lane before the pull request, finalize before `create-pr`
+|`handed_back`, or `returned` when the plan branch has no commit beyond the base
+|`auto finalize.hand-back`: settles uncommitted work (commit only, footprint-checked), pushes the branch when a push remote exists, and opens the pull request as a *draft* with the gap comment and the label `pm-mcp:handed-back`; removes the worktree; composes the post-run-only instance version (prune reason `handed_back`) -> post-run band -> archive (xref:06-finalize-re-entry-and-merge.adoc#merge-path[Merge Path], Hand-Back).
+
+|Finalize after `create-pr`, before the merge (order < `70`)
+|`handed_back`
+|`finalize.hand-back`: idempotent gap comment and label on the existing pull request, which stays open; worktree removed.
+
+|Merge policy off (`merge.auto_merge: false`), after the pre-merge barrier passed (order `70`)
+|`handed_back` by design (`merge_outcome: awaiting_human_merge`)
+|`finalize.hand-back` in its ready form: the plan instance has no merge execution (prune reason `auto_merge_off`), so the passed barrier completes `default:branch-cleanup` as `done` and hands the pull request, marked ready for review, to a human merge (xref:06-finalize-re-entry-and-merge.adoc#merge-path[Merge Path], item 8).
+
+|After the merge (order > `70`)
+|`merged`
+|No fallback: a failing post-merge step is retried within its budget and otherwise recorded as an owed item.
+
+|Local-only project (no push remote)
+|`handed_back` by design (`merge_outcome: local_only`)
+|`finalize.hand-back` in its local form: the plan branch is the product (xref:02-planning-lanes-phases-3-4.adoc#plan-instance-composition[Plan Instance Composition], Local-Only Runs).
+|===
+
+* *Begun Steps*: The transaction that enters `plan.return`, `finalize.hand-back`, or `plan.aborted` records every begun, unsettled step `failed`.
+* *Gap Record*: A fallback records its gap (gate, policy, evidence summary, and `cause`: `exhausted` with the spent budget, `stepped_out` or `hand_back` with the model's reason, or the condition that ran out of self-remedy); the landing record and the hand-back comment render it, and the hand-back comment names every waiver request that expired unanswered.
+* *The Model's Exit (`hand_back`)*: Every plan-scope link state at which the plan can end offers `hand_back (reason: text[1..2000])` (rel `abort`, form `submit`), which takes the fallback of the current position at once. Inside a sub-process (a remediation unit, `git.commit_and_push`) the model's exit is the implicit `step_out (reason)` instead: each frame returns `stepped_out`, its caller routes it once, and a phase-level caller routes it to the same fallback as `exhausted`. A step-out consumes no budget and writes no waiver.
+* *Operator Abort*: `pm-mcp operator abort plan <plan_id> --reason` moves the plan to `plan.aborted` in its next transaction. `plan.aborted` is entered only by operator `abort`, by `delete-plan`, and by the `abort` resolution of an integrity breach; pending question records close `cancelled` and pending waiver requests `expired`.
+* *Integrity Pause*: A tampered plan or epic store, or a tampered enrolment (every running plan of the project), raises the condition overlay `integrity_breach` (`kind: store_tampered | enrolment_tampered`, the store, recorded and current digest; link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-conditions[State Catalogue, Conditions]). The representation offers no link, every `pm_do` is rejected with `integrity_paused`, and `facts.operator_command` names `pm-mcp operator accept-edit` and `pm-mcp operator abort`. The pause is unbounded and has no fallback; it holds the expiry of a pending question or waiver request until it ends. `accept-edit` re-baselines, and the engine re-verifies before clearing the condition.
+* *Other Conditions*: Every other engine-raised condition offers its existing self-remedy links, bounded by a compiled per-condition-instance budget (default `3`); the operator may remove the cause at any time (a missing credential keeps its bounded `retry`, whose `facts` name the operator command). A spent budget takes the fallback of the current position with the condition as the gap; where the fallback itself lacks what is missing (no push credential), `handed_back` degrades to the local branch with the gap stated in the landing record.
+
+==== Remediation Policy Calls
+
+The self-remedy of a failure class is an ordinary sub-workflow unit per class (link:../workflow-dsl/08-remediation-units.adoc#remediation-units[Workflow DSL Specification, Remediation Policy Units]): the server gathers the evidence as structured failures (`{failure_id, class, kind, source, file?, line?, message, fingerprint, excerpt_uri?}`; logs and excerpts stay behind untrusted resources `pm://plans/{plan_id}/evidence/{id}`), and the model chooses in `decide` from the closed actions `retry` (reason `enum[flaky|infra|timeout]`), `fix`, and `request_waiver` (rationale), each validated by the server and bounded by its budget. A unit ends with a reachable subset of the domain outcomes `resolved`, `waived`, `exhausted`, `fix_requested`, plus the control outcome `stepped_out`. Every caller routes `resolved` to its continuation, `waived` to the continuation completing the begun step `waived`, `exhausted` and `stepped_out` to the fallback of its position, and `fix_requested` (only where the fix runs in the caller) to its authoring or allocation state, which calls the unit again after the next verification.
+
+[cols="3,2,2,2"]
+|===
+|Caller (state) |Unit |Defaults (retry / fix / waiver wait s) |Fallback on `exhausted` or `stepped_out`
+
+|`refine.qgate`, `outline.qgate`, `plan.qgate`
+|`remediation.qgate-findings`
+|0 / 3 / 0
+|`returned`
+
+|`execute.deliverable-build`, `execute.verify-sweep`, `land.verify-sweep`, `finalize.pre-push-quality-gate`
+|`remediation.build-failure`
+|1 / 3 / 0 (land: 1 / 0 / 0)
+|`handed_back` (`returned` without commits)
+
+|`finalize.concurrent-wait` `ci_failed`, and every other CI red at the merge path
+|`remediation.ci-failure`
+|2 / 3 / 0
+|`handed_back`
+
+|`finalize.concurrent-wait` analysis outcomes (every configured analysis provider)
+|`remediation.analysis`
+|1 / 3 / 0
+|`handed_back`
+
+|`finalize.concurrent-wait` `findings_open`, review evidence `unproven`, barrier `findings_untriaged`, self-review and security-audit findings
+|`remediation.review-findings`
+|1 / 3 / 0
+|`handed_back`
+
+|`finalize.sync-baseline` and `finalize.merge-sync` conflicts, a moved remote branch
+|`remediation.merge-conflict`
+|0 / 2 / 0
+|`handed_back`
+
+|`merge.gate-entry` spend overrun
+|`remediation.spend` (no `retry`, no `fix`: the spend report, then the waiver wait)
+|0 / 0 / 0
+|`handed_back`
+|===
+
+* *Budgets*: The defaults are call arguments of the project-owned phase units (team-adaptable), bounded by the compiled hard caps (`retry` 5, `fix` 5, waiver wait 86400 s). The plan instance carries the effective ceiling per policy with its source (the unit file's call argument, or the `raise` waiver that lifted it). The consumed budget is a per-plan, per-class counter of the plan status, persisted and never reset: re-entering a unit, a new `HEAD`, or a re-composed instance continues the same count. These counters replace the former Q-Gate iteration counter and the finalize loop-back ceiling.
+* *Server Checks in `decide`*: `retry` is refused with `retry_not_applicable` when the same failure fingerprints already failed after a retry with the same reason; `fix` is charged only when its commit or revised artifact exists, and an unchanged artifact or an empty commit is refused with `fix_unchanged`; `request_waiver` is offered only when the unit's waiver wait is positive and the failing gate is waivable (non-waivable failures carry `waivable: false` in the evidence). With the shipped waiver wait `0`, a waiver the model would request goes into the hand-back report instead.
+* *Land Lane*: For a `land` plan the composition binds every policy call with `actions: [retry]`, so `decide` offers `retry` and `step_out` only (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)]).
+
 === Phase 1 (`init`): Plan Sources, Phantom-ID Refusal & Classifiers
 
 ==== Plan Source Contracts
-_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-76[PM-WATCH-PHASE-76]_
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-76[PM-WATCH-PHASE-76], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-88[PM-WATCH-PHASE-88]_
 
 `pm_start` initializes the plan directory (`<PM_MCP_BASE>/projects/<project_id>/plans/<plan_id>/`, link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), `request.md`, `references.json`, and `mcp/status.json` from exactly one of six closed plan sources (`PlanSource`):
 
@@ -92,23 +214,23 @@ _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-W
 
 |`issue`
 |`issue_number`, optional `plan_slug`, `base_branch`
-|Spawns an enrolled CI provider job to fetch the issue title and body into `request.md` (passing untrusted external content through the deterministic ingestion validator), records `issue_number` in `references.json`, and schedules asynchronous CI mirror jobs to post clarified requirements and the approved outline back to the issue after Phase 2 and Phase 3 transitions.
+|Fetches the issue title and body inside `pm_start`, before any plan exists, through a bounded `ci.issue-view` call of the enrolled CI provider, passes the untrusted content through the deterministic ingestion validator, and writes it into `request.md`. An issue that cannot be read creates no plan: `pm_start` is refused scope-less with `issue_unavailable` (`reason: not_found | not_readable | provider_unavailable`, link:../mcp-tools/01-core-workflow-tools.adoc#pm-start-refusal[MCP Tools Specification, `pm_start` Refusals]), so no state waits for the fetch and no failure path exists inside the plan. Records `issue_number` in `references.json` and schedules asynchronous CI mirror jobs to post clarified requirements and the approved outline back to the issue after Phase 2 and Phase 3 transitions.
 
 |`lesson`
 |`lesson_id`, optional `plan_slug`, `base_branch`
-|Resolves the lesson in the main-anchored lesson store (`manage-lessons`), executes a deterministic *source premise check* verifying that cited files and symbols in the lesson still exist in the current tree (transitioning to `init.lesson-premise` with obsolescence options if the premise is already resolved or invalid), and claims the lesson for the new plan in the plan initialization transaction (`claim{plan_id, claimed_at}` in its front matter; the lesson file stays in the lesson store and is never moved into the plan). A lesson that is already claimed, retired, or not resolvable is refused (`lesson_unavailable`). The claim ends with the plan: completion with a merge retires the lesson (verdict `applied`), closing it as obsolete in `init.lesson-premise` retires it (verdict `obsolete`), and an abort or `delete-plan` releases the claim, leaving the lesson `active` (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]). There is no carry-back and no deletion veto.
+|Resolves the lesson in the main-anchored lesson store (`manage-lessons`), executes a deterministic *source premise check* verifying that cited files and symbols in the lesson still exist in the current tree (transitioning to `init.lesson-premise` with obsolescence options if the premise is already resolved or invalid), and claims the lesson for the new plan in the plan initialization transaction (`claim{plan_id, claimed_at}` in its front matter; the lesson file stays in the lesson store and is never moved into the plan). A lesson that is already claimed, retired, or not resolvable is refused (`lesson_unavailable`). The claim ends with the plan: completion with a merge retires the lesson (verdict `applied`), the obsolete answer of `init.lesson-premise` retires it (verdict `obsolete`; the plan ends `returned`), and every other ending (`handed_back`, any other `returned`, operator `abort`, `delete-plan`) releases the claim, leaving the lesson `active` (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]). There is no carry-back and no deletion veto.
 
 |`recipe`
 |`recipe_id`, optional `recipe_params`, `base_branch`
-|Binds the plan to a registered recipe definition (`skill://pm/recipe/<name>/SKILL.md`), derives `plan_id` as `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC; see link:../domain-extensions/05-recipes-and-extension-points.adoc#recipe-plan-id[Domain Extensions Specification]) to prevent git branch and worktree collisions across repeated runs of the same recipe, sets `confidence = 100` and `planning_lane = deep` (`track = complex`), renders `status.metadata.pr_title` at `init.recipe-selected` from the recipe's required `pr_title_template` with the bound `recipe_params` substituted (link:../domain-extensions.adoc[Domain Extensions Specification], Declarative Recipe Descriptor Schema), so the recipe shortcut reaches Phase 3 with a title and no model work, and skips Phase 2 quality analysis and Phase 3 change-type/Q-Gate steps: its Phase 3 entry is `outline.recipe-entry` (an `auto` state deriving the deliverables from the harvest, or from the request for a `request_scoped` recipe), followed by `outline.recipe-confirm` (link `confirm_recipe_targets`) and `outline.review`. `recipe_params` are validated against the recipe's own input schema (`parameters_schema`). An empty harvest is a no-op: the plan ends `completed` with `merge_outcome: no_pr` and the fact `empty_harvest`, never with an empty pull request (link:../domain-extensions/05-recipes-and-extension-points.adoc#_tier_1_init_routing_deterministic_deliverable_generation[Domain Extensions Specification, Tier-1 Init Routing item 7]).
+|Binds the plan to a registered recipe definition (`skill://pm/recipe/<name>/SKILL.md`), derives `plan_id` as `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC; see link:../domain-extensions/05-recipes-and-extension-points.adoc#recipe-plan-id[Domain Extensions Specification]) to prevent git branch and worktree collisions across repeated runs of the same recipe, sets `confidence = 100` and `planning_lane = deep` (`track = complex`), renders `status.metadata.pr_title` at `init.recipe-selected` from the recipe's required `pr_title_template` with the bound `recipe_params` substituted (link:../domain-extensions.adoc[Domain Extensions Specification], Declarative Recipe Descriptor Schema), so the recipe shortcut reaches Phase 3 with a title and no model work, and skips Phase 2 quality analysis and Phase 3 change-type/Q-Gate steps: its Phase 3 entry is `outline.recipe-entry` (an `auto` state deriving the deliverables from the harvest, or from the request for a `request_scoped` recipe), followed by `outline.recipe-confirm` (link `confirm_recipe_targets`) and `outline.gate`. `recipe_params` are validated against the recipe's own input schema (`parameters_schema`). An empty harvest is a no-op: `init.recipe-selected` and `outline.recipe-confirm` route `empty_harvest` to the `auto` state `outline.empty-harvest`, which composes a post-run-only plan instance version (composition event `empty_harvest`, every step below order `900` pruned with reason `empty_harvest`) and enters `finalize.next-step`; the post-run band runs and `finalize.archive-plan` ends the plan `completed` with `merge_outcome: no_pr` and the fact `empty_harvest`, never with an empty pull request (link:../domain-extensions/05-recipes-and-extension-points.adoc#_tier_1_init_routing_deterministic_deliverable_generation[Domain Extensions Specification, Tier-1 Init Routing item 7]).
 
 |`local_changes`
 |`local_changes: true`, optional `summary`, `plan_slug`, `base_branch`
-|Captures the user's own current changes of the main checkout: every dirty and staged path with its porcelain code and content digest, plus the commits of the checked-out branch ahead of `origin/<base_branch>`. The capture is recorded as `references.json` `captured_changes`, its paths (including those changed by the commits ahead) become `declared_files`, the plan's declared footprint, and `request.md` records the change set together with the `summary`. An empty change set creates no plan and is refused with `no_local_changes` (a scope-less `pm_start` refusal, link:../mcp-tools/01-core-workflow-tools.adoc#pm-start-refusal[MCP Tools Specification]). Sets `planning_lane = land` and routes the plan into the land lane (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)]). *Capture mechanic*: the capture writes a snapshot commit object whose parent is the main checkout's `HEAD` and whose tree is the main checkout's staged, unstaged, and untracked (not ignored) state, without touching the main checkout's index or refs; the snapshot is pinned by the ref `refs/pm-mcp/captures/<plan_id>` (a recovery point for the operator, retained as in xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)], item 6) and recorded as `captured_changes.snapshot_sha`. `land.worktree-init` creates the plan's branch at the snapshot and then restores the main checkout's captured paths, untracked ones included, to `HEAD`, each only where its content digest still equals the captured digest; a path edited after the capture is left as it is and listed in `facts`. `entry_baseline` is re-recorded from the main checkout this leaves, so the restored paths are no footprint violation and the post-capture edits are baseline dirt. After a squash landing, the main checkout's local commits that the plan carried (its `commits_ahead`) are recognised by tree equality with the landed base, and `switch-and-pull` moves the main checkout to the remote base instead of diverging. *Deliberate change vs. `plan-marshall`*: no stash is used.
+|Captures the user's own current changes of the main checkout: every dirty and staged path with its porcelain code and content digest, plus the commits of the checked-out branch ahead of `origin/<base_branch>`. The capture is recorded as `references.json` `captured_changes`, its paths (including those changed by the commits ahead) become `declared_files`, the plan's declared footprint, and `request.md` records the change set together with the `summary`. An empty change set creates no plan and is refused with `no_local_changes` (a scope-less `pm_start` refusal, link:../mcp-tools/01-core-workflow-tools.adoc#pm-start-refusal[MCP Tools Specification]). Sets `planning_lane = land` and routes the plan into the land lane (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)]). *Capture mechanic*: the capture writes a snapshot commit object whose parent is the main checkout's `HEAD` and whose tree is the main checkout's staged, unstaged, and untracked (not ignored) state, without touching the main checkout's index or refs; the snapshot is pinned by the ref `refs/pm-mcp/captures/<plan_id>` (a recovery point for the operator, retained as in xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)], item 5) and recorded as `captured_changes.snapshot_sha`. `land.worktree-init` creates the plan's branch at the snapshot and then restores the main checkout's captured paths, untracked ones included, to `HEAD`, each only where its content digest still equals the captured digest; a path edited after the capture is left as it is and listed in `facts`. `entry_baseline` is re-recorded from the main checkout this leaves, so the restored paths are no footprint violation and the post-capture edits are baseline dirt. The capture is one-shot: it is never repeated during the plan, and nothing is carried from the main checkout onto the plan branch after `land.worktree-init`. The server never moves the main checkout: after a squash landing, local commits that the plan carried (its `commits_ahead`) are left on the user's branch and written as an owed `cleanup` item naming the operator command (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)], item 5). *Deliberate change vs. `plan-marshall`*: no stash is used.
 
 |`pr`
 |`pr_number`, optional `plan_slug`
-|Adopts an existing, open pull request of the project's repository for repair ("fix an existing PR"): the plan's branch is the pull request's head branch and its base is the pull request's base branch. `pm_start` observes the pull request (`ci.pr-view`) and refuses with `capability_missing` (`reason: head_not_writable`, a scope-less `pm_start` refusal) when the agent identity cannot push to the head branch, for example the head of a fork without push access. The pull request's changed paths (merge base to head) become `declared_files`; they take part in the sibling collision detection of `init.classify` like the declared footprint of every other source, and an overlap is resolved in `init.sibling-collision` as there. `request.md` records the pull request's title and body, passed through the deterministic ingestion validator as for `issue`, and `status.metadata.pr_title` is the pull request's title. Sets `planning_lane = adopt` (xref:02-planning-lanes-phases-3-4.adoc#adopt-lane[Adopt Lane (`pr`)]). The plan skips `phase-2-refine` through `phase-5-execute`: `init.ready` routes by the lane alone into `finalize.adopt-pr`, which re-observes the pull request, creates the plan's worktree on the head branch, and records `pr_number`, `head_sha`, and `branch_pushed_at`, and the plan runs the finalize pipeline like every other plan (same states, gates, budgets, merge path, and landing envelope); `create-pr` is completed `skipped`, and fixes are re-pushed through `git.commit_and_push`. The outcomes `pr_not_open` (`state: closed | merged | absent`), `head_not_writable`, and `checkout_failed` of `finalize.adopt-pr` enter the link state `finalize.adopt-blocked` (`facts.reason`), which offers `retry` (re-runs `finalize.adopt-pr`, re-observing first) and `abort` (the request `abort-plan`); a credential failure raises the `blocked` condition instead (link:../../Requirements.adoc#PM-CRED-3[PM-CRED-3]). At `archive-plan` an open pull request is never closed by the plan: `archive-with-open-pr` offers `hand-back` instead of `close-pr-and-archive` (Step Catalogue row `1100`). *Deliberate change vs. `plan-marshall`*: `plan-marshall`'s separate pull-request repair workflow (`pr-doctor`) does not exist.
+|Adopts an existing, open pull request of the project's repository for repair ("fix an existing PR"): the plan's branch is the pull request's head branch and its base is the pull request's base branch. `pm_start` observes the pull request (`ci.pr-view`) and refuses with `capability_missing` (`reason: head_not_writable`, a scope-less `pm_start` refusal) when the agent identity cannot push to the head branch, for example the head of a fork without push access. The pull request's changed paths (merge base to head) become `declared_files`; they take part in the sibling collision detection of `init.classify` like the declared footprint of every other source, and an overlap is resolved in `init.sibling-collision` as there. `request.md` records the pull request's title and body, passed through the deterministic ingestion validator as for `issue`, and `status.metadata.pr_title` is the pull request's title. Sets `planning_lane = adopt` (xref:02-planning-lanes-phases-3-4.adoc#adopt-lane[Adopt Lane (`pr`)]). The plan skips `phase-2-refine` through `phase-5-execute`: `init.ready` routes by the lane alone into `finalize.adopt-pr`, which re-observes the pull request, creates the plan's worktree on the head branch, and records `pr_number`, `head_sha`, and `branch_pushed_at`, and the plan runs the finalize pipeline like every other plan (same states, gates, budgets, merge path, and landing envelope); `create-pr` is completed `skipped`, and fixes are re-pushed through `git.commit_and_push`. The outcomes `pr_not_open` (`state: closed | merged | absent`), `head_not_writable`, and `checkout_failed` of `finalize.adopt-pr` enter the link state `finalize.adopt-blocked` (`facts.reason`), which offers `retry` (re-runs `finalize.adopt-pr`, re-observing first; bounded by the compiled condition budget) and `hand_back`; the spent budget takes the `handed_back` fallback (<<plan-outcomes>>). A missing credential keeps the bounded `retry` of its condition, whose `facts` name the operator command (link:../../Requirements.adoc#PM-CRED-3[PM-CRED-3]). The plan never closes the pull request: every ending without a merge is `handed_back` through `finalize.hand-back`, which leaves it open (Step Catalogue row `1100`). *Deliberate change vs. `plan-marshall`*: `plan-marshall`'s separate pull-request repair workflow (`pr-doctor`) does not exist.
 |===
 
 ==== Plan ID Derivation & Phantom-ID Refusal Guard
@@ -122,61 +244,15 @@ The server derives or validates `plan_id` against a strict lexical grammar befor
 ==== Deterministic Init Classifiers & Workflow Settings
 _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-1[PM-WATCH-PHASE-1]_
 
-During `init.classify`, the engine executes pure, model-free classifiers in a fixed order:
+During `init.classify`, the engine executes pure, model-free classifiers in a fixed order. A classifier that needs an answer raises a *server-raised question record* (xref:07-questions-waivers-operator-influence.adoc#questions-waivers-operator-influence[Questions, Waivers & Operator Influence]) with server-owned options and a declared expiry fallback; `init.classify` is re-entrant: every init answer (including `use_recipe` and `skip_recipe`) records the answer and returns to `init.classify`, which raises the next unanswered question in the fixed order lesson premise, recipe candidate, sibling collision, domain choice, never re-asks an answered question, never rewrites a write-once output, and exits to `init.ready` only when no init question is open. Answers that formerly requested ending the plan (the obsolete-premise answer of `init.lesson-premise`, the stop answer of `init.sibling-collision`) are ordinary options whose effect is the `returned` route (`plan.return`, <<plan-outcomes>>). The lesson-premise answer `continue` records the premise-check evidence as an `amendments[]` entry with `source: refutation`. *Deliberate change vs. `plan-marshall`*: its `rename` answer (delete the plan and restart init) does not exist; `hand_back` followed by a new `pm_start` covers it.
 
 1. *Recipe Match before Lane Routing*: For every source other than `recipe` (`request`, `issue`, `lesson`; `local_changes` and `pr` are not scored), the registry-wide recipe scorer evaluates the request narrative first; scoring always runs, and the operator's `recipes.auto_route` (`local-config.json`) only chooses between auto-routing (when `true` and the top confidence reaches the compiled auto-route threshold `0.6`, `plan-marshall`'s default, not configurable) and asking in `init.recipe-candidate` (link:../domain-extensions/05-recipes-and-extension-points.adoc#_tier_1_init_routing_deterministic_deliverable_generation[Domain Extensions Specification, Tier-1 Init Routing]). In the same step the server computes the Tier-1 request-aspect classification (`status.metadata.request_aspect`) and, for source `lesson`, the doc-shaped predicate that routes a doc-shaped lesson to the `lesson-cleanup` recipe (items 9 and 10 there). An explicit `recipe` source selection is never overridden by the scorer.
 2. *Initial Planning-Lane Router*: Computes the initial `planning_lane` (`light` or `deep`) from the request with zero discovery (`deep` for every plan when the team's `workflow.json` `plan.phase-1-init.minimum_lane` is `deep`, xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)]), and the pre-route `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`). `scope_estimate` is derived from expected-modification paths only; read-only references never raise it. The pre-route value is persisted immutably as `scope_estimate_pre_route`; every later update of `scope_estimate` (Phase 2 or Phase 3) records its own provenance under `scope_estimate_provenance[]` instead of overwriting the pre-route evidence.
-3. *Sibling Collision Detector*: Scans live plans for overlapping target modules or affected file paths; if an overlap is found, transitions to `init.sibling-collision` to resolve the collision (`proceed`, `rename`, or the request `abort`, which raises the operator decision `abort-plan`).
-4. *Workflow Settings Resolution*: Reads the project's effective configuration (link:../store-schemas/07-project-configuration.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]): the team's `minimum_lane` (xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)]), `compatibility`, and `simplicity`, and the operator's `recipes.auto_route`; computes the execution posture (`minimal | standard | full`) for the preview; and copies the operator's `continuation.default_policy` into the plan's `continuation_policy` (`mcp/status.json`). The per-plan `continuation_policy` (`stop_at_phase_boundary` or `stop_on_issue_only`, changed only through the operator channel) is the only autonomy setting: it decides whether the session continues across a phase boundary or stops there. *Deliberate change vs. `plan-marshall`*: the five auto-continue flags (`init_`, `plan_`, `execute_`, `finalize_`, `loop_back_without_asking`) and the `lane_selection` prompt switch do not exist; no setting turns an operator-authorizing decision (outline approval, the merge gates) into an automatic transition. The refine confidence threshold (`95`), the recipe auto-route threshold (`0.6`), the lane prune thresholds, and the iteration caps are compiled constants.
-5. *Base Stamp*: Stamps `main_sha` in `mcp/status.json` from `git rev-parse origin/<base_branch>`. It is written once here and re-stamped only by the `sync-baseline` and `branch-cleanup` rebases; the Outside-World Invariants guard reads it as the producer of the baseline-drift check.
+3. *Sibling Collision Detector*: Scans live plans for overlapping target modules or affected file paths; if an overlap is found, it raises the `init.sibling-collision` question (`proceed`, or stop, which ends the plan `returned`); its expiry fallback is `proceed`.
+4. *Workflow Settings Resolution*: Reads the project's effective configuration (link:../store-schemas/07-project-configuration.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]): the team's `minimum_lane` (xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)]), `compatibility`, and `simplicity`, and the operator's `recipes.auto_route`, `merge.auto_merge` (whose `false` the plan instance carries as the merge execution pruned with reason `auto_merge_off`), and `questions.*` keys; resolves the execution posture (`minimal | standard | full`) from the optional `pm_start` parameter `posture`, otherwise from the server projection; and copies the operator's `continuation.default_policy` into the plan's `continuation_policy` (`mcp/status.json`). The posture is a plan fact, never a question: its effect, the steps pruned with reason `posture`, is composed into the plan instance with its provenance, and the posture preview is the diagram of instance version 1 (xref:02-planning-lanes-phases-3-4.adoc#plan-instance-composition[Plan Instance Composition]); floor immunity keeps every mandatory step whatever the value. The per-plan `continuation_policy` (`stop_at_phase_boundary` or `stop_on_issue_only`, changed only through the operator channel) decides whether the session continues across a phase boundary or stops there; it never changes what the process enforces. *Deliberate change vs. `plan-marshall`*: the five auto-continue flags (`init_`, `plan_`, `execute_`, `finalize_`, `loop_back_without_asking`), the `lane_selection` prompt switch, and the posture question do not exist. The refine confidence threshold (`95`), the recipe auto-route threshold (`0.6`), the lane prune thresholds, and the hard caps of the remediation budgets are compiled constants.
+5. *Base Stamp*: Stamps `main_sha` in `mcp/status.json` from `git rev-parse origin/<base_branch>`. It is written once here and re-stamped only by the `sync-baseline` and `branch-cleanup` rebases. Before Phase 5 a drift of `main_sha` is informational only (rendered in `facts`, never refusing); from Phase 5 on the exit-barrier freshness gate and the merge-path rebase act on the base.
 
 At `phase-4-plan` entry the lane predicate is re-evaluated with the settled inputs (declared deliverables and their expected modifications) and the result is logged as `lane_reevaluation` in `audit.jsonl`; the re-evaluation never re-routes the plan (see xref:02-planning-lanes-phases-3-4.adoc#_lane_ratchet_rules[Lane Ratchet Rules]).
-
-=== Routine User Interaction vs Operator-Authorizing Decisions
-_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
-
-_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-69[PM-WATCH-PHASE-69]_
-
-`PM-MCP` separates interactive questions into two security classes with distinct transport rules:
-
-[cols="2,2,2,3"]
-|===
-|Interaction Class |Target States & Decisions |Permitted Channels |Fallback & Audit Semantics
-
-|*Routine User Dialogue* (Non-Authorizing)
-|Obsolete lesson premise (`init.lesson-premise`: `continue`, or `close`), recipe selection (in its own state `init.recipe-candidate`), ambiguous domain selection (`init.domain-choice`), sibling plan collision (`init.sibling-collision`), execution posture choice (`init.posture-choice`: `minimal`, `standard`, `full`), Phase 2 request clarifications (`refine.awaiting_answers`), Phase 3 design clarifications (`outline.awaiting_answers`), Q-Gate iteration exhaustion (`*.qgate-exhausted`: `edit` or `abort` only). A routine answer that would end the plan (`close`, `abort`) is only a request: the link `abort` (rel `escalate`) raises the operator-authorizing decision `abort-plan` (next row).
-|Host MCP Elicitation (preferred), or model-relayed `submit` link (`answer_questions`) when host elicitation is unsupported or unavailable.
-|The plan persists a state of kind `awaiting_user`, named by its question (link:../state-catalogue/01-conventions-generic-conditions.adoc#_state_kinds[State Catalogue, State Kinds]), carrying a typed `questions` schema in `facts`. When answered via the model-relayed `submit` link, the transition succeeds and records `channel: "model_relayed"` in `audit.jsonl`.
-
-|*Operator-Authorizing Decisions* (Gate-Forcing / Privileged)
-|Solution outline approval (`outline.review` -> `phase-4-plan`), scope-deviation `accept` (`execute.deviation-review`), handshake or baseline drift override, bare-transition artifact-gate exemption (`--allow-bare-transition`), pre-rebase overlap override, merge-authorization grants for every gap class of the roster (`review_barrier_gap`, `merge_action`, `red_ci_gate`, `rereview_timeout`, `find_step_completion`, the last one being the `automatic-review` force-done), Q-Gate override on exhaustion (`force-gate` with its `exemption_class`), the decision on a hypothesis refuted twice (`refine.hypothesis-refuted`: continue narrowed, or abort for re-staging through `abort-plan`), the resolution of `execute.awaiting-infeasible-decision` after an `infeasible` task (`remove-deliverable` or `loop-back-outline`, xref:03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Task Envelope Execution & Independent Server Verification]), an operator task skip (`skip-task` with its mandatory reason), ending the plan from any phase (`abort-plan`: `aborted` enters `plan.aborted`, `resumed` returns to the requesting state), ending an epic (`abort-epic`: `aborted` enters `epic.aborted`, `resumed` returns to `epic.active`), a failed land-lane verification (`land-verification-failed`: `recapture` or `abort-plan`), archiving over an open, unmerged pull request (`archive-with-open-pr`: `close-pr-and-archive`, `hand-back` for a plan of source `pr`, or `keep`), ending a plan at the merge path without a merge (`wind-down-unmerged`), and plan deletion (`delete-plan`). The decision kinds and their outcome classes are registered in the link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Workflow DSL Specification, Decision Registry].
-|Host MCP Elicitation, or Authenticated Operator CLI (`pm-mcp operator ...`).
-|*Strict Link Omission (`PM-WF-3`)*: No model-invocable `submit` or `noop` link is ever emitted to approve or force these gates. If the host does not support MCP elicitation, the engine raises the `blocked` condition on the current state (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, Conditions]; the state and `call_stack` stay unchanged), emits the exact `pm-mcp operator` command in `facts.operator_command` (the generic `decide` invocation unless the decision kind has a dedicated verb, link:../workflow-dsl/02-units-jobs-decisions.adoc#escalation-decision-wait[Workflow DSL Specification, Escalation Without Elicitation]), and offers only the link `wait:decision:<decision_id>` (rel `wait`), a bounded wait on the pending operator decision record, until the operator acts; the resolution is routed as an outcome of that state.
-|===
-
-*Intent Amendments*: Phase 2 answers are written into `request.md` (`## Clarifications`). Every later answer that changes the plan's intent (an answer in a state of kind `awaiting_user` in Phases 3–6, an answered task question of Phase 5, deviation guidance, or a refuted premise) is persisted as an entry of `mcp/status.json -> amendments[]` (`at`, `phase`, `source: operator | refutation`, `text`, `supersedes`). Every later representation that renders the request (outline, `create-pr`, landing envelope) includes the amendments, so a superseded statement of the request never reaches a later phase unmarked.
-
-==== Typed Question Envelope Schema (`awaiting_user`)
-
-Sub-agents operating in leaf `execution-context` scopes are forbidden from prompting the user in-leaf or blocking on `escalate`. Instead, a sub-agent completes its analysis pass using its best judgment and includes a batched question list in its `submit` payload (`refine_prompt` or `outline_prompt`) as the free parameter `questions:list<schema[question-envelope]>?`, validated by the server against the named schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-envelope-schema[Dispatch & Effort Specification, Prompt Envelopes & Entity Escalation Protocol]). Each persisted question is rendered to the operator in the following Java record and TOON tabular structure:
-
-[source,java]
-----
-package de.cuioss.pm.mcp.core.workflow.dialogue;
-
-import java.util.List;
-
-public record UserQuestion(
-    String id,
-    String header,
-    String question,
-    List<String> options,
-    String recommended,
-    boolean allowFreeText
-) {}
-----
-
-Every option string in `options` is authored as a two-sided contract whose label explicitly names the workflow branch selected when chosen, with the `recommended` option listed first.
 
 === Phase 2 (`refine`): Quality Aggregation, Domain Widening & Bounded Re-Dispatch
 
@@ -193,7 +269,7 @@ At `phase-2-refine` entry, the engine caches loop-invariant inputs (`request.md`
 
 * *Probe Variants*: The probe is one operation of the git contract with both variants (link:../../discussions/git-provider-modules.adoc[Git and Provider Modules]). The native variant merges in memory with JGit's `ResolveMerger` and takes the conflicted paths from its merge result; nothing is written to the object database or the worktree. The CLI variant runs `git merge-tree --write-tree --name-only -z` with `LC_ALL=C` and reads only the conflicted-file section; informational and message lines are never paths, and the locale pin applies to this probe only. In both variants the conflict count is the number of distinct conflicted paths.
 * *Overlap Population*: Overlap is computed between the upstream changed paths and the plan's declared ∪ derived footprint known at that point, never only the in-flight diff (which is empty before execution), so a first Phase 5 entry never reports `conflict_count: 0` merely because nothing was written yet.
-* *Drift Routing*: Content overlap (`overlap_with_content_conflict`) is the only drift routed to refinement. A `main_sha` ancestry drift is cleared only by a sync or rebase transition (`sync_rebase`) or by operator escalation; a refine re-dispatch is never offered as its remedy.
+* *Drift Routing*: Content overlap (`overlap_with_content_conflict`) is the only drift routed to refinement. A `main_sha` ancestry drift is informational before Phase 5 and is cleared only by a sync or rebase transition; a refine re-dispatch is never offered as its remedy, and no operator override exists.
 
 ==== Five Quality Dimensions & Fixed-Weight Confidence Aggregation
 _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-6[PM-WATCH-PHASE-6], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-68[PM-WATCH-PHASE-68]_
@@ -201,7 +277,7 @@ _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-W
 During `refine.analyze`, the dispatched refine sub-agent executes source-premise verification (checking cited files, flags, and APIs against the codebase) and proposed-fix verification (constructing a semantic probe to verify whether a proposed fix resolves the stated symptom), maps affected modules, estimates scope (`none`, `surgical`, `single_module`, `multi_module`, `broad`), authors a conventional-commit `pr_title` ($\le 72$ characters, distinct from the human plan `title`), and submits raw scores (`0..100`) for the five quality dimensions plus architectural module mapping.
 
 * *Premise Verdicts*: Source-premise verification records each premise with the verdict record of epic Spec Re-Grounding (link:../dispatch-and-effort/04-epic-coordination.adoc#_server_derived_landing_facts_spec_re_grounding_cross_plan_locks[Dispatch & Effort Specification, Verdict Record]): label `observed` or `hypothesis`, verdict `corroborated | contradicted | partially_exercised | unverifiable`, and `scope_change` (`none | rescoped`); no second vocabulary exists. A command flag mandated by the request is a premise and must name a module of the command's actual reactor that the flag affects.
-* *Open Hypotheses of Emitted Plans*: For a plan emitted from an epic (`from_epic`), every `hypothesis`-labelled claim of its spec section is surfaced in `facts.open_hypotheses`. `submit:refine` must carry a verdict per claim (`confirmed` or `refuted`, citing the named artifact), and any `refuted` claim routes to `refine.awaiting_answers` for re-scoping instead of `refine.ready`; that pass counts as the one refine re-dispatch. A claim refuted again in the second pass routes to `refine.hypothesis-refuted`: the server appends a `hypothesis_refuted` event (claim, evidence, plan) to the epic inbox, and the plan waits on an operator-authorizing decision, either continuing with a narrowed scope (recorded as an intent amendment) or aborting through the decision `abort-plan` (`plan.aborted`) so the epic re-stages the plan with a corrected premise. There is never a third refine pass.
+* *Open Hypotheses of Emitted Plans*: For a plan emitted from an epic (`from_epic`), every `hypothesis`-labelled claim of its spec section is surfaced in `facts.open_hypotheses`. `submit:refine` must carry a verdict per claim (`confirmed` or `refuted`, citing the named artifact), and any `refuted` claim routes to `refine.awaiting_answers` for re-scoping instead of `refine.ready`; that pass counts as the one refine re-dispatch. A claim refuted again in the second pass routes to `refine.hypothesis-refuted`: the server appends a `hypothesis_refuted` event (claim, evidence, plan) to the epic inbox, and the model judges in that link state: `continue_narrowed` (`narrowed_scope: text[1..2000]`) enters the `auto` state `refine.apply-narrowing`, whose primitive writes the intent amendment (`source: model`, listed in the pull-request body and the landing record) and continues to `refine.ready`; `hand_back` ends the plan `returned`, so the epic re-stages it with a corrected premise. There is never a third refine pass.
 
 The server-side `ConfidenceAggregator` computes the overall confidence deterministically using fixed weights (zero LLM arithmetic):
 
@@ -237,7 +313,7 @@ The server-side `ConfidenceAggregator` computes the overall confidence determini
 $$\text{confidence} = \lfloor 0.20 \cdot S_{\text{corr}} + 0.20 \cdot S_{\text{comp}} + 0.20 \cdot S_{\text{cons}} + 0.10 \cdot S_{\text{nondup}} + 0.20 \cdot S_{\text{ambig}} + 0.10 \cdot S_{\text{mod}} \rfloor$$
 
 * All six dimensions are required parameters of `submit:refine`; a submission omitting one is rejected with `invalid_link_args`, so no absent score is ever folded into the aggregate as `0`. *Deliberate change vs. `plan-marshall`*: `plan-marshall` scores the dimensions discretely (`100` on pass and `0` on an issue; completeness `100`/`50`/`0`; non-duplication `100`/`80`); `PM-MCP` accepts each dimension as `int[0..100]`.
-* *Evidence Class*: `submit:refine` carries `evidence_class` (`self_assessment`, `operator_answered`, or `downstream_reproduced`), persisted beside the score and shown in `facts`. The server checks it against its records: `operator_answered` is refused (`invalid_link_args`) unless an answered `refine.awaiting_answers` round exists in this plan, and `downstream_reproduced` requires an `evidence_ref` naming the reproducing artifact (a build job, test run, or re-grounding verdict). No heuristic fires on an all-100 score by itself: only `self_assessment` with every dimension at `100` on a plan without `from_epic` adds the advisory fact `self_assessed_full_confidence` (never blocking, never a link change), while an all-100 score on an emitted plan's pre-verified specification is expected and adds nothing.
+* *Evidence Class*: `submit:refine` carries `evidence_class` (`self_assessment`, `operator_answered`, or `downstream_reproduced`), persisted beside the score and shown in `facts`. The server checks it against its records: `operator_answered` is refused (`invalid_link_args`) unless a `refine.awaiting_answers` round of this plan has at least one answer given through a human channel (`user_relayed`, `elicitation`, or `web`; an `assumption` or `model` answer does not count), and `downstream_reproduced` requires an `evidence_ref` naming the reproducing artifact (a build job, test run, or re-grounding verdict). No heuristic fires on an all-100 score by itself: only `self_assessment` with every dimension at `100` on a plan without `from_epic` adds the advisory fact `self_assessed_full_confidence` (never blocking, never a link change), while an all-100 score on an emitted plan's pre-verified specification is expected and adds nothing.
 * The aggregated score is persisted to `status.metadata.confidence` and compared against `confidence_threshold`, the compiled constant `95` (not configurable: lowering it would only admit less-clarified requests). *Deliberate change vs. `plan-marshall`*: its `confidence_threshold` is a project setting (default `95`).
 * The server also validates that `compatibility` (`breaking | deprecation | smart_and_ask`, compiled default `breaking`) and `simplicity` (`lean | pragmatic | defensive`, compiled default `lean`) are resolved from the effective configuration and persisted in the plan.
 
@@ -255,7 +331,8 @@ $$\text{domains}_{\text{new}} = \text{domains}_{\text{cached}} \cup \text{detect
 
 If $\text{confidence} < \text{confidence\_threshold}$:
 
-1. The sub-agent submits its best-judgment `clarified_request` alongside a single batched `refine_prompt` (`questions:list<schema[question-envelope]>?`, <<_typed_question_envelope_schema_awaiting_user>>) containing at most 4 clarification questions prioritized by `Correctness > Consistency > Completeness > Ambiguity > Non-Duplication`.
-2. The engine persists the questions in `mcp/status.json`, transitions to `refine.awaiting_answers`, and collects the user's answers in one batch.
-3. Upon receiving the answers, the engine writes the `## Clarifications` and `## Clarified Request` sections, increments `refine_redispatch_count` in `mcp/status.json`, and re-dispatches `refine.analyze` **at most once** (`refine_redispatch_count <= 1`).
-4. If the second pass still yields $\text{confidence} < \text{confidence\_threshold}$, the engine does **not** loop again (a hypothesis refuted again goes to `refine.hypothesis-refuted` instead, see Open Hypotheses of Emitted Plans); it flags `low_confidence_manual_review: true` in `facts` and advances to `outline` (where `outline.review` gates progression before task creation).
+1. The sub-agent submits its best-judgment `clarified_request` alongside a single batched `refine_prompt` (`questions:list<schema[question-envelope]>?`, xref:07-questions-waivers-operator-influence.adoc#phase-question-envelope[Question Envelope Schema]) containing at most 4 clarification questions prioritized by `Correctness > Consistency > Completeness > Ambiguity > Non-Duplication`.
+2. The engine records each question as a question record (class `clarification`, xref:07-questions-waivers-operator-influence.adoc#questions-waivers-operator-influence[Questions, Waivers & Operator Influence]), transitions to `refine.awaiting_answers`, and waits for the batch per the plan's question mode; a question still open at expiry is recorded with its `default_assumption`.
+3. When every question of the batch is answered or assumed, the engine writes the `## Clarifications` and `## Clarified Request` sections, increments `refine_redispatch_count` in `mcp/status.json`, and re-dispatches `refine.analyze` **at most once** (`refine_redispatch_count <= 1`).
+4. If the second pass still yields $\text{confidence} < \text{confidence\_threshold}$, the engine does **not** loop again (a hypothesis refuted again goes to `refine.hypothesis-refuted` instead, see Open Hypotheses of Emitted Plans); it flags `low_confidence_manual_review: true` in `facts` and advances to `refine.qgate` for a lesson-derived plan, otherwise to `refine.ready`.
+5. A remediation pass of `refine.analyze` requested by the Q-Gate policy (`fix_requested` of `remediation.qgate-findings`, xref:03-q-gate-and-execute.adoc#_q_gate_validation_loop[Q-Gate Validation Loop]) is never counted by `refine_redispatch_count` and never opens a new `refine.awaiting_answers` round; its questions and a below-threshold score are recorded as `low_confidence_manual_review`.

@@ -1,0 +1,229 @@
+= State Catalogue: Plan Workflow: Finalize Merge Path & Post-Run Band
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[State Catalogue] » Plan Workflow: Finalize Merge Path & Post-Run Band
+
+[#state-catalogue-finalize-merge]
+== Phase 6: `finalize` (Merge Path & Post-Run Band)
+
+Continues xref:04-plan-finalize-terminal.adoc#state-catalogue-finalize[Phase 6: `finalize`] with the post-push ADR step (order `62`), the branch-cleanup step (order `70`), the post-run band (`900..999`), the landing (`1000`), and the archive (`1100`). The branch-cleanup step runs as the merge path `finalize.merge-gate` -> `finalize.merge-lease` -> `finalize.merge-sync` -> `finalize.merge-evidence-wait` / `finalize.merge-barrier` -> `finalize.merge-dispatch` -> `finalize.merge-queue-wait`. No merge-path state holds the merge lease while it waits or offers a link; an unmerged plan leaves the path only through `finalize.hand-back`, and no link or waiver merges over a provider refusal. After the merge no fallback exists (link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path]).
+
+[cols="2,1,1,2,3,2,2"]
+|===
+|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
+
+|[[state-finalize.adr-propose]]`finalize.adr-propose`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:adr-propose`, order `62`).
+|Deterministic signal gate: were architectural decisions made that no ADR records?
+|`no_signal` -> `finalize.next-step` (`completes … as skipped`); `signal` -> `finalize.adr-author`.
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `62`]
+
+|[[state-finalize.adr-author]]`finalize.adr-author`
+|`phase-6-finalize`
+|`link`
+|`finalize.adr-propose` (`signal`).
+|`adr` (`submit`, the ADR authored or updated directly in `args`); `decline` (rel `alt`, `noop`); `hand_back`. Skill `pm/finalize/adr-propose`; `facts`: `finalize.adr-signal`.
+|`recorded` -> `finalize.settle-commit` (`completes default:adr-propose as done`); `declined` -> `finalize.next-step` (`completes … as done`, `work_performed=false`); `hand_back` -> `finalize.hand-back`.
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `62`]
+
+|[[state-finalize.merge-gate]]`finalize.merge-gate`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:branch-cleanup`, order `70`); `finalize.concurrent-wait`, `finalize.merge-evidence-wait` (`all_green`); `finalize.merge-dispatch` (`head_moved`); `finalize.merge-lease-interrupted`, `finalize.merge-queue-exit` (`retry`); `finalize.merge-refused` (`re_enter`); `finalize.remediate-merge-conflict`, `finalize.remediate-barrier` (`resolved`, `waived`), `finalize.remediate-spend` (`resolved`); `finalize.self-review` (terminus mode).
+|`auto merge.gate-entry`, the entry of the merge path: re-sends every finding whose `transmit_outcome` is `not_sent`, `partial`, or `sent_unresolved` (idempotent per finding and disposition), runs the finalize spend check and Phase-Exit Completeness (the evaluator it shares with `finalize.next-step`), and detects a plan without push remote and a `HEAD` that no bot reviewed under a consumed `review_evidence` waiver.
+|`ready` -> `finalize.merge-lease`; `spend_overrun` -> `finalize.remediate-spend`; `incomplete{missing_steps}` -> `finalize.next-step`, where the lowest-order unmet step re-fires; `local_only` -> `finalize.hand-back` (local form); `terminus_review_owed` -> `finalize.self-review` (terminus mode).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path]
+
+|[[state-finalize.remediate-spend]]`finalize.remediate-spend`
+|`phase-6-finalize`
+|`call`
+|`finalize.merge-gate` (`spend_overrun`: cumulative finalize spend above the error column of the budget anchor).
+|`call remediation.spend (waiver_wait_seconds=0)` (xref:08-remediation-units.adoc#state-catalogue-remediation-spend[`remediation.spend`]): only an operator `--raise spend=N` lifts the ceiling.
+|`resolved` -> `finalize.merge-gate`; `exhausted`, `stepped_out` -> `finalize.hand-back`.
+|link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification, Spend Accounting]
+
+|[[state-finalize.merge-lease]]`finalize.merge-lease`
+|`phase-6-finalize`
+|`job`
+|`finalize.merge-gate` (`ready`).
+|`merge.acquire-lease`: FIFO admission to the Cross-Plan Merge Mutex (idempotent enqueue per `plan_id`, reentrant holder); rests until the plan holds the lease. Implicit `wait:` / `cancel:` links.
+|`succeeded` (holder) -> `finalize.merge-sync`; `failed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate` -> `finalize.merge-lease-interrupted`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex items 1–4]
+
+|[[state-finalize.merge-lease-interrupted]]`finalize.merge-lease-interrupted`
+|`phase-6-finalize`
+|`link`
+|`finalize.merge-lease` (every fate but `succeeded`).
+|No lease is held. `retry` (`noop`): the enqueue is idempotent per `plan_id`, so the plan keeps its FIFO position, except after `cancelled`, which left the queue and rejoins at its tail; `hand_back`. `facts`: the job outcome (`timed_out` rendered as `no_verdict`) and the FIFO position.
+|`retry` -> `finalize.merge-gate`; `hand_back` -> `finalize.hand-back`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex]
+
+|[[state-finalize.merge-sync]]`finalize.merge-sync`
+|`phase-6-finalize`
+|`auto`
+|`finalize.merge-lease` (`succeeded`), holding the lease.
+|`merge.sync-base`: fetches the base and rebases the plan branch onto `origin/<base_branch>`, then pushes it with an explicit lease (the last recorded push), only when the derived fact `branch_up_to_date_required` holds (an `indeterminate` fact counts as holding) or the base changed a path of the plan's realized footprint since the merge base; a base that is already an ancestor of `HEAD` is never rebased. Independently of a rebase, it pushes with the explicit lease whenever the local `HEAD` differs from the last recorded push. A rebase re-stamps `main_sha`. Every outcome other than success releases the lease first; on `rejected_lease` the branch is reset to its pre-rebase `HEAD`.
+|`not_required` -> `finalize.merge-barrier`; `rebased`, `pushed` -> `finalize.merge-evidence-wait`; `conflict`, `rejected_lease` (the remote branch moved) -> `finalize.remediate-merge-conflict`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path item 3]
+
+|[[state-finalize.remediate-merge-conflict]]`finalize.remediate-merge-conflict`
+|`phase-6-finalize`
+|`call`
+|`finalize.merge-sync` (`conflict`, `rejected_lease`; lease released).
+|`call remediation.merge-conflict (retry_budget=0, fix_budget=2, waiver_wait_seconds=0, actions=[fix])` (xref:08-remediation-units.adoc#state-catalogue-remediation-merge[`remediation.merge-conflict`]); a moved remote is integrated by a server rebase onto the observed remote head, never by a forced push over the foreign commits.
+|`resolved` -> `finalize.merge-gate` (the next `finalize.merge-sync` pushes the rebased branch with the lease); `exhausted`, `stepped_out` -> `finalize.hand-back`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path]
+
+|[[state-finalize.merge-evidence-wait]]`finalize.merge-evidence-wait`
+|`phase-6-finalize`
+|`composite_job`
+|`finalize.merge-sync` (`rebased`, `pushed`); `finalize.restart-watch` (`started`).
+|A beginning state of the wait-region steps (cause `input_changed`): `finalize.watch-ci-and-bots` over the rebased `HEAD`; the merge lease is released on entry and the plan keeps its FIFO position. Implicit `wait:` / `cancel:` links.
+|`all_green` -> `finalize.merge-gate`; every other outcome as the same outcome of `finalize.concurrent-wait` (`finalize.remediate-ci`, `finalize.remediate-analysis`, `finalize.remediate-review`, `finalize.review-window-wait`, `finalize.review-full-trigger`, `finalize.restart-watch`).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path item 4]
+
+|[[state-finalize.merge-barrier]]`finalize.merge-barrier`
+|`phase-6-finalize`
+|`auto`
+|`finalize.merge-sync` (`not_required`).
+|`merge.evaluate-barrier` under the held lease: Dependency Delta Check and the Pre-Merge Review Barrier (Predicates 1 and 2) against `HEAD`, admitting a failure only through `waiver.lookup` (a consumption is logged).
+|`pass` -> `finalize.merge-dispatch`; `pass` while the plan instance prunes the merge execution (the operator's `merge.auto_merge: false`, prune reason `auto_merge_off`) -> `finalize.hand-back` in its ready form (`completes default:branch-cleanup as done`; gap `cause: auto_merge_off`); `findings_untriaged` (findings without a terminal disposition) and `evidence_missing` (required review evidence absent at `HEAD`) -> `finalize.remediate-barrier` (the lease released).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_two_fail_closed_barrier_predicates[Phase Workflows Specification, Two Fail-Closed Barrier Predicates]; link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#dependency-delta[Dependency Delta Check]
+
+|[[state-finalize.remediate-barrier]]`finalize.remediate-barrier`
+|`phase-6-finalize`
+|`call`
+|`finalize.merge-barrier` (`findings_untriaged`, `evidence_missing`).
+|`call remediation.review-findings (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix])`; terminus findings are fix-free, dependency-delta findings `FIX`-only.
+|`resolved`, `waived` -> `finalize.merge-gate`; `exhausted`, `stepped_out` -> `finalize.hand-back`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_two_fail_closed_barrier_predicates[Phase Workflows Specification, Two Fail-Closed Barrier Predicates]
+
+|[[state-finalize.merge-dispatch]]`finalize.merge-dispatch`
+|`phase-6-finalize`
+|`auto`
+|`finalize.merge-barrier` (`pass`). Pruned with reason `auto_merge_off` when the operator's `merge.auto_merge` is `false`, together with `finalize.merge-queue-wait` and `finalize.merge-queue-exit`.
+|`merge.dispatch`: `ci.merge` (safe-merge with the `merge_method`) or, when the derived fact `merge_queue_enforced` holds, `ci.enqueue`, both bound to the expected head SHA, the `HEAD` the barrier evaluated. `merged` counts only from `ci.pr-observe`, an enqueue only from the observed `ci.queue-membership`. On `merged`: realized footprint capture, worktree removal with `worktree_path` cleared, branch removal per ref, lease released; for a `land` plan the `declared_files` tree at the capture snapshot is compared with the merged plan head (ignoring base-changed paths): equal removes the capture ref, otherwise `capture_ref_retained` is owed; squash-landed local commits on the main checkout's branch become a `cleanup` owed item naming the operator command (the main checkout is never moved). On `not_mergeable` and `enqueued_indeterminate` the lease is released. *Deliberate change vs. `plan-marshall`*: `plan-marshall` can merge with `--admin`.
+|`merged` -> `finalize.next-step` (`completes default:branch-cleanup as done`); `enqueued`, `enqueued_indeterminate` -> `finalize.merge-queue-wait`; `head_moved` -> `finalize.merge-gate`; `not_mergeable{reason}` -> `finalize.merge-refused`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex item 5]
+
+|[[state-finalize.merge-refused]]`finalize.merge-refused`
+|`phase-6-finalize`
+|`auto`
+|`finalize.merge-dispatch` (`not_mergeable`, lease released).
+|`merge.route-refusal`: routes by `facts.reason`, a closed class: `conflict`, `behind`, `checks_pending`, `checks_failed`, `review_required`, `blocked`, `draft`, `method_not_allowed`, `unknown`. `behind` and `conflict` mark the derived fact `branch_up_to_date_required` stale, so the next `finalize.merge-sync` rebases; `checks_pending` and `checks_failed` re-enter the gate, whose evidence wait and barrier observe the checks. These re-entries are bounded by a compiled retry budget. `review_required`, `blocked`, `draft`, `method_not_allowed`, and `unknown` are a refusal by the provider's protection rules, which is not waivable and not retried. No link is offered.
+|`re_enter` (`behind`, `conflict`, `checks_pending`, `checks_failed`, budget left) -> `finalize.merge-gate`; `provider_refused` (`review_required`, `blocked`, `draft`, `method_not_allowed`, `unknown`) and `retry_spent` (the retry budget spent) -> `finalize.hand-back` (gap `cause: provider_refused`).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex]
+
+|[[state-finalize.merge-queue-wait]]`finalize.merge-queue-wait`
+|`phase-6-finalize`
+|`composite_job`
+|`finalize.merge-dispatch` (`enqueued`, `enqueued_indeterminate`; lease released); `finalize.merge-queue-exit` (`resume_wait`).
+|Waits for a terminal queue outcome: `merged`, `ejected`, `closed`, `timed_out`; `merged` only from `ci.pr-observe` or `ci.queue-membership`. The bound is stall-based: every observed progress (a change of queue position or entry state) restarts the clock, and `timed_out` is reached only after no progress for twice the queue's check-response timeout (from `merge_queue_enforced`), else the compiled fallback `3600` s. After `enqueued_indeterminate` the observation settles the wait. A constituent `killed`, `timed_out`, or `indeterminate` fate maps to `interrupted`. On `merged` the post-merge actions of `finalize.merge-dispatch` run. Implicit `wait:` / `cancel:` links.
+|`merged` -> `finalize.next-step` (`completes default:branch-cleanup as done`); `ejected`, `closed`, `timed_out`, `interrupted`, `cancelled` -> `finalize.merge-queue-exit`.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex item 5]; link:../timeouts/01-job-budgets-and-waits.adoc#merge-queue-wait[Timeouts & Budgets Specification, Merge-Queue Landing Wait]
+
+|[[state-finalize.merge-queue-exit]]`finalize.merge-queue-exit`
+|`phase-6-finalize`
+|`link`
+|`finalize.merge-queue-wait` (every outcome but `merged`).
+|Links guarded by the fresh observation of the pull request and the queue: `retry` (`noop`, only while the pull request is open and not queued); `resume_wait` (`noop`, only while it is still queued); `hand_back`. `facts`: the exit outcome (`timed_out` rendered as `no_verdict`), the observed pull-request and queue state, the ejection reason.
+|`retry` -> `finalize.merge-gate`; `resume_wait` -> `finalize.merge-queue-wait`; `hand_back` -> `finalize.hand-back` (a still-queued pull request owes `post_merge_cleanup`).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex]; link:../timeouts/01-job-budgets-and-waits.adoc#merge-queue-wait[Timeouts & Budgets Specification, Merge-Queue Landing Wait]
+|===
+
+[#state-catalogue-post-run]
+=== Post-Run Band, Landing & Archive
+
+Every plan passes these states, whatever its outcome; after a fallback or an empty harvest the plan instance in force contains only them. Degraded inputs are recorded as `indeterminate`, a floor, or `unmeasured`, never refused; a store I/O failure of an `auto` post-run step is a transaction failure, not a workflow outcome.
+
+[cols="2,1,1,2,3,2,2"]
+|===
+|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
+
+|[[state-finalize.lessons-capture]]`finalize.lessons-capture`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:lessons-capture`, order `991`).
+|Signal gate: deviations, rework, findings, gaps, or a recurring exemption.
+|`no_signal` -> `finalize.next-step` (`completes … as skipped`); `signal` -> `finalize.lessons-author`.
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `991`]
+
+|[[state-finalize.lessons-author]]`finalize.lessons-author`
+|`phase-6-finalize`
+|`link`
+|`finalize.lessons-capture` (`signal`).
+|Lesson dispatch paired with `returned:<dispatch_id>` (entity `submit` of the lesson candidates).
+|`submitted` -> `finalize.next-step` (`done`); missing submission -> the `dispatch_incomplete` condition.
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `991`]
+
+|[[state-finalize.preference-emitter]]`finalize.preference-emitter`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:finalize-step-preference-emitter`, order `992`).
+|Aggregates `(module, finding-class, disposition)` recurrences and records the cleared patterns as owed items.
+|`recorded` -> `finalize.next-step` (`done`).
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `992`]
+
+|[[state-finalize.plan-retrospective]]`finalize.plan-retrospective`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `plan-marshall:plan-retrospective`, order `995`).
+|Computes the deterministic post-run quality report (`quality-report.json`); step admission is read from the plan instance version in force when the step would have fired.
+|`recorded` -> `finalize.next-step` (`done`).
+|link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_post_run_quality_report_plan_retrospective[Phase Workflows Specification, Post-Run Quality Report]
+
+|[[state-finalize.record-metrics]]`finalize.record-metrics`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:record-metrics`, order `998`).
+|Aggregates phase durations and sub-agent token usage into the population-stamped aggregates.
+|`recorded` -> `finalize.next-step` (`done`).
+|link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_metric_aggregates_record_metrics[Phase Workflows Specification, Metric Aggregates]
+
+|[[state-finalize.print-phase-breakdown]]`finalize.print-phase-breakdown`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:finalize-step-print-phase-breakdown`, order `999`).
+|Renders the per-phase duration and token breakdown from the recorded metrics.
+|`recorded` -> `finalize.next-step` (`done`).
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `999`]
+
+|[[state-finalize.emit-landing]]`finalize.emit-landing`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:emit-landing`, order `1000`).
+|Writes the landing envelope (with `outcome: merged | handed_back | returned | no_change`, the waiver consumptions, gaps, amendments, and unplanned changes) to the parent epic's inbox, reads it back, and validates it.
+|`delivered`, `not_orchestrated` -> `finalize.next-step` (`done`); `append_failed` -> `finalize.emit-landing-failed`.
+|link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_landing_envelope_emit_landing[Phase Workflows Specification, Landing Envelope]
+
+|[[state-finalize.emit-landing-failed]]`finalize.emit-landing-failed`
+|`phase-6-finalize`
+|`link`
+|`finalize.emit-landing` (`append_failed`); itself (`failed`).
+|`retry` (`noop`, `finalize.retry-emit-landing`: append, read back, validate), bounded by the compiled retry budget `2`, then `pending`. `facts`: `finalize.landing-status`. Never refuses or strands the plan.
+|`verified` -> `finalize.next-step` (`done`); `failed` (budget left) -> this state; `pending` (budget spent: `landing_delivery: pending`, the envelope kept in the plan directory for the epic's shipped-without-landing reconciliation) -> `finalize.next-step` (`completes default:emit-landing as done`).
+|link:../workflow-dsl/03-reference-excerpt.adoc#_reference_workflow_dsl_excerpt_finalize_pmwf[Workflow DSL Specification, Landing Delivery Failure]
+
+|[[state-finalize.archive-plan]]`finalize.archive-plan`
+|`phase-6-finalize`
+|`auto`
+|`finalize.next-step` (step `default:archive-plan`, order `1100`); `finalize.archive-unobserved` (`retry`).
+|`auto finalize.archive-plan`: observes the plan's pull request, if it has one (`ci.pr-observe`), then moves the plan to `archive/<plan_id>/` with `merge_outcome` and `merge_state` from the observation (link:../store-schemas/02-workflow-state-store.adoc#merge-outcome-mapping[Store Schemas Specification, Merge Outcome Mapping]) and enters the terminal of the recorded plan `outcome`. A failed observation archives nothing. The pull request of a handed-back plan stays open.
+|`merged`, `no_change` -> `completed`; `handed_back` -> `handed_back`; `returned` -> `returned` (each `completes default:archive-plan as done`); `observation_failed` -> `finalize.archive-unobserved`.
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `1100`]
+
+|[[state-finalize.archive-unobserved]]`finalize.archive-unobserved`
+|`phase-6-finalize`
+|`link`
+|`finalize.archive-plan` (`observation_failed`).
+|`retry` (`noop`) only. `facts`: the failed observation. Nothing is archived and no `merge_state` is written while the pull request cannot be observed.
+|`retry` -> `finalize.archive-plan`.
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `1100`]
+|===
