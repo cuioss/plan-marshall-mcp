@@ -1,0 +1,179 @@
+= Timeouts & Budgets Specification: Retention, Host Integration & Configuration
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts & Budgets Specification] » Retention, Host Integration & Configuration
+
+[#retention]
+== Retention & Rotation
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[audit-rotation-age]]Audit log rotation age
+|`30` days since the first record of the current `audit.jsonl` (rotation also on `max_bytes`, whichever comes first).
+|`audit_rotation.max_days` in `machine-config.json`
+|minimum `1` day
+|`<PM_MCP_BASE>/logs/audit.jsonl`
+|Checkpoint record, rename to `audit-<first_event_id>.jsonl`, index entry.
+|link:../cli-and-security.adoc[CLI & Security] (Security Audit Trail); link:../store-schemas/12-machine-stores.adoc#audit-log[Store Schemas, Audit Log]
+
+|[[retention-days]]Project retention periods
+|Compiled defaults: `job_logs_days` `5`, `archived_plans_days` `5`, `superseded_lessons_days` `0`, `arch_constraint_quiet_days` `90`. The governed stores are machine-local, so retention is operator posture, never team configuration.
+|`retention.{job_logs_days, archived_plans_days, superseded_lessons_days, arch_constraint_quiet_days}` in `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, machine-wide defaults in `machine-config.json` `project_defaults.retention`
+|minimum `0`
+|job logs and job records (`job_logs_days`), archived plans (`archived_plans_days`), superseded lesson bodies (`superseded_lessons_days`), quiet-window retirement of `arch-constraint` lessons (`arch_constraint_quiet_days`)
+|Eligible for the evidence-based removal sweep `pm-mcp operator sweep`, which lists the candidates with their evidence and removes them only with `--apply` (one audit record each); nothing is removed automatically.
+|link:../store-schemas/13-leases-integrity-testing.adoc#evidence-based-removal-sweeps[Store Schemas, Evidence-Based Removal Sweeps]; link:../store-schemas.adoc[Store Schemas] (Lesson Store); link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas, Operator Local Configuration]
+
+|Rotated audit files
+|Removed only as whole files by a retention purge; their index entries are never removed.
+|—
+|—
+|`logs/audit-*.jsonl`
+|—
+|link:../cli-and-security.adoc[CLI & Security] (Security Audit Trail)
+|===
+
+[#host-integration]
+== Host Integration
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[host-idle-timeout]]Host tool-call idle timeout
+|Per host, compiled into its client profile (_provisional_ until verified in Milestone 1: per-host tool-call timeout thresholds and whether `notifications/progress` resets them, `PM-IMPL-4`).
+|`connection.idle_timeout_seconds` of the client profile; operator override in `<PM_MCP_BASE>/conf/profiles/<client_id>.json`
+|`45`..`7200`
+|every host tool call
+|Host-side: the host abandons the call; the runtime completes and persists the transition anyway (only the response is lost).
+|link:../client-profiles/01-profile-schema.adoc#_normative_client_profile_json_schema[Client Profiles, Normative Schema]; link:../runtime-model.adoc#_failure_semantics[Runtime Model, Failure Semantics]
+
+|Progress resets the host timer
+|Capability flag per host, not a duration; selects xref:01-job-budgets-and-waits.adoc#progress-wait[Progress wait] over xref:01-job-budgets-and-waits.adoc#bounded-wait[Bounded wait].
+|`connection.progress_resets_timeout` of the client profile
+|—
+|waits
+|—
+|link:../client-profiles/01-profile-schema.adoc#_normative_client_profile_json_schema[Client Profiles, Normative Schema]
+
+|[[host-build-probe-timeout]]Host build probe timeout
+|`5` for the version probe of the declared client that `pm-mcp enter` runs.
+|fixed
+|—
+|the host version probe of `pm-mcp enter`
+|The probe is terminated and the session row records `client_build: null`.
+|link:../client-profiles/02-placeholders-and-detection.adoc#host-identity-probes[Client Profiles, Host Identity Probes]; link:../cli-and-security.adoc[CLI & Security] (`pm-mcp enter`, Host Build Probe)
+
+|Outbound HTTPS and upstream MCP call timeouts
+|Connect `10`, read `60` for every `cui-http` call (Sonar REST, credential verification, remote upstream MCP servers) and read `60` per request for `stdio` upstream servers. Requests of native `git` and `ci` operations use the same values as the xref:01-job-budgets-and-waits.adoc#http-request-timeout[Http request timeout].
+|Per upstream server in `<PM_MCP_BASE>/conf/upstream-mcp.json` (`connect_timeout_seconds`, `read_timeout_seconds`); fixed for Sonar and credential verification
+|minimum `1`
+|outbound calls
+|A Sonar step records the call as `indeterminate` (never clean); an upstream tool call returns `isError: true` with `error_code: upstream_timeout`; a credential verification reports `unverified`.
+|link:../cli-and-security.adoc[CLI & Security] (Outbound HTTPS Security); link:../mcp-tools.adoc[MCP Tools] (Upstream MCP Proxy)
+
+|[[github-app-jwt-window]]GitHub App JWT validity window
+|`iat` back-dated `60` against clock skew; `exp` at most `600` after signing.
+|fixed
+|`exp` ≤ `600` (GitHub's maximum)
+|RS256 JWTs signed for a `github_app` credential entry to mint installation tokens
+|A JWT is signed per mint and never reused; GitHub refuses an expired one, and the next mint signs a new one.
+|link:../cli-and-security/02-credentials-and-operator.adoc#agent-credentials[CLI & Security, Agent Credentials] (Installation tokens)
+
+|[[derived-token-reuse-margin]]Derived token reuse margin
+|An installation token (validity set by GitHub, one hour) is reused until `300` before its `expires_at`.
+|fixed
+|—
+|in-memory GitHub App installation tokens, keyed by installation and permission set
+|Within the margin the token is no longer used; a new one is minted for the next request.
+|link:../cli-and-security/02-credentials-and-operator.adoc#derived-tokens[CLI & Security, Short-Lived Derived Tokens]
+|===
+
+[#derived-fact-validity]
+== Derived Facts
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|Local derivation currency
+|No time bound: a local derivation (inputs read from the repository or the machine) is recomputed whenever its `input_digest` changes.
+|fixed
+|—
+|`PS/derived-facts.json` entries of local kinds
+|—
+|link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas, Derived Facts Store]
+
+|[[network-derivation-validity]]Network derivation validity period
+|`86400` since `derived_at`; additionally refreshed by the project-setup reconcile and by `pm-mcp enter`. The network kinds are `merge_methods_allowed`, `merge_queue_enforced`, `branch_up_to_date_required`, `required_checks`, `signed_commits_required`, `checks_visible`, and `agent_identity`, plus `ci_provider` and `base_branch_default` in the entries a provider probe or confirmation contributed to (link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas, Derived Facts Store]).
+|fixed
+|—
+|`PS/derived-facts.json` entries of network kinds
+|The next read that needs the fact refreshes it; a failed refresh keeps the last value with `state: stale`, and every gate that depends on the fact evaluates `indeterminate`, never pass.
+|link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas, Derived Facts Store]
+|===
+
+[#configuration-keys]
+== Configuration Keys
+
+The configurable values above, by store:
+
+* `machine-config.json` (operator CLI, link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas, Machine Configuration Store]): `drain_timeout_seconds`, `escalation_cap_seconds`, `progress_wait_max_seconds`, `lsp_idle_timeout_seconds`, `lsp_start_timeout_seconds`, `lsp_request_timeout_seconds`, `audit_rotation.max_days`, and `project_defaults.retention.*` (machine-wide defaults of the per-project retention keys).
+* `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (operator CLI, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas, Operator Local Configuration]): `retention.*`.
+* `enrolments/<project_id>.json` (operator CLI, link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas, Project Enrolment Store]): `command_budgets` (operator budgets per budget key), `project_scripts.<project_script_id>.max_timeout_seconds`.
+* Client profile (compiled, operator override in `<PM_MCP_BASE>/conf/profiles/`): `connection.bounded_wait_seconds`, `connection.idle_timeout_seconds`, `connection.progress_resets_timeout`.
+* `<PM_MCP_BASE>/conf/upstream-mcp.json` (operator CLI, per upstream server, link:../mcp-tools.adoc[MCP Tools Specification, Upstream MCP Proxy]): `connect_timeout_seconds`, `read_timeout_seconds` (<<host-integration>>, Outbound HTTPS and upstream MCP call timeouts).
+
+No team configuration file (`.marshall/config/*.json`) holds a timeout, wait, threshold, or retention value. Tuning values that calibrate server algorithms are compiled constants (`fixed` above, and in the owning specification: the recipe auto-route threshold `0.6`, the lane prune thresholds, the refine confidence threshold `95`, the iteration caps, the step wait timeouts, the preference recurrence threshold, the untrusted raw-input byte cap, the review rate-window floor `3600`, the re-review completion allowance `600`, the default review attempt ceiling `6`, the provider re-poll cadence `30`, the merge-queue stall fallback `3600`, the native request timeouts, the `git.commit-fix` cap of `3` failed commit attempts per identical staged change set: staged tree id plus message, reset when either changes, CLI variant only, exhaustion ends `attempts_exhausted` in `git.done-aborted` and the caller's `<phase>.commit-aborted`); per-project tuning would make metrics incomparable across projects (`PM-MIG-5` triggers).
+
+A value outside its floor or cap is never used: the runtime clamps it to the bound and reports the configured value, the used value, and the source (`machine_config`, `local_config`, `enrolment`, `profile_override`, `compiled_default`, `invalid`, or `unreadable`) in `pm-mcp status` and in the record of the affected job (`clamped_values`, link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas, Job Record]) or wait, never in its facts: the model cannot change an operator value.
+
+[#resolved-divergences]
+== Resolved Divergences
+
+The definitions that existed before this document, and how they were resolved:
+
+[cols="2,4"]
+|===
+|Item |Divergence and resolution
+
+|No-verdict rule
+|`PM-EXEC-6` and Adaptive Timeout Learning made only a `timed_out` job with a `floor_default` or `escalated` budget no-verdict, while Process Termination counted every `timed_out` as `no_verdict`. Every `timed_out` is now `no_verdict`; the derivation selects only the retry offer (xref:01-job-budgets-and-waits.adoc#no-verdict-rule[Timed-Out Outcomes Are No-Verdict]).
+
+|Escalation
+|$E = \min(2 \times t, 1800)$ lowered the budget when $t > 1800$ (for example after an operator budget above the cap). Now $E = \max(t, \min(2 \times t, C))$ with the configurable cap $C$.
+
+|Operator budget vs floors
+|Job Runtime let an operator per-command budget "win over every derivation", while Domain Extensions said floors are "never violated, even if an explicit bound is configured". An operator budget may exceed the cap but is clamped up to the engine floor ($\max(F, O)$), as `plan-marshall`'s explicit bound is.
+
+|Python floor
+|Job Runtime and `PM-EXEC-6` put the `330` floor on "pytest", Domain Extensions on "pyproject". `plan-marshall` applies `PYTEST_OUTER_FLOOR_SECONDS` to every pyproject command; the floor is keyed by build system (`pyproject`).
+
+|Progress notification interval
+|Job Runtime emitted frames every 5 s, `PM-IMPL-4` required "at least every 60 seconds", and the Hypermedia Format described "60s MCP progress notifications". The interval is `5`; `60` is the ceiling between two frames.
+
+|LSP idle key
+|MCP Tools named the eviction key `idle_timeout_seconds`, which is the client profile's host idle timeout; the key is `lsp_idle_timeout_seconds` in `machine-config.json`.
+
+|Drain timeout key
+|Runtime Model referenced `drain_timeout_seconds` in `machine-config.json`, which the schema did not define; the key is now in the schema.
+
+|Git, CI and script budgets
+|Undefined; a watch fixture recorded a 60 s git budget firing twice. Defined per operation class with floors (xref:01-job-budgets-and-waits.adoc#job-budgets[Job Budgets & Escalation]); `project_script` uses the enrolled maximum, which the enrolment schema did not carry. The classes apply unchanged to the in-process operations of the native variant (xref:01-job-budgets-and-waits.adoc#in-process-operations[In-Process Operations of the Native Variant]).
+
+|Review-bot window floor and attempt ceiling
+|This document and Phase Workflows registered different rate-window floors, and the registry's default `attempt_ceiling` had no source. The floor is `3600` and the default ceiling `6`, `plan-marshall`'s window default and attempt cap (xref:01-job-budgets-and-waits.adoc#review-bot-windows[Review bot windows]).
+
+|Bounded wait vs host idle timeout
+|"Safely below the host's idle timeout" had no rule; profile validation now rejects `bounded_wait_seconds` above `idle_timeout_seconds − 30`.
+
+|`dispatch_id` expiry
+|MCP Tools and the Workflow DSL rejected a `dispatch_id` that is "superseded or expired", but the dispatch lifecycle defines no expiry; a `dispatch_id` is stale only when superseded.
+|===

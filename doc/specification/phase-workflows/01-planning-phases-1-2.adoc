@@ -1,0 +1,261 @@
+= Phase Workflows & Finalize Specification: Planning Phases 1–2
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../phase-workflows.adoc[Phase Workflows & Finalize Specification] » Planning Phases 1–2
+
+== Phase 1–4 Planning State Machines & Guards
+_See Requirement link:../../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-10[PM-WF-10: Phase 1–4 Planning Invariants, Lane Ratchet & Artifact Gates]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+
+_See Requirement link:../../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
+
+=== Lifecycle Topology (Phases 1–4)
+
+The planning lifecycle is a server-enforced state machine spanning `phase-1-init`, `phase-2-refine`, `phase-3-outline`, and `phase-4-plan`. Sub-states that previously lived only in the orchestrating model's conversation context (`refine.awaiting_answers`, `outline.review`, Q-Gate iteration counters, and re-dispatch counters) are persisted in `mcp/status.json` so that any session restart or `/clear` resumes at the exact sub-state via `pm_state(plan_id)`.
+
+Every state of Phases 1–4 is catalogued in the State Catalogue (link:../state-catalogue/02-plan-phases-1-3.adoc#state-catalogue-init[`init`], link:../state-catalogue/02-plan-phases-1-3.adoc#state-catalogue-refine[`refine`], link:../state-catalogue/02-plan-phases-1-3.adoc#state-catalogue-outline[`outline`], link:../state-catalogue/03-plan-phases-4-5-land.adoc#state-catalogue-plan[`plan`]; generic per-phase states in link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-generic[Generic Per-Phase States]; condition overlays in link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-conditions[Conditions]).
+
+[source,text]
+----
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 1: init (pm_start)                                                         │
+│  init.classify -> [init.<question> states] -> init.ready                         │
+│  (Plan source resolution, phantom-ID guard, recipe match, initial lane routing)  │
+│  -> [init.light-gate (light only, server): |A| + |neighbours| > 25 | |A| > 8 |   │
+│     neighbours unresolved | baseline content conflict -> ratchet to deep]        ├──┐
+└────────────────────────────────────────┬─────────────────────────────────────────┘  │ light
+                                         │ deep (clean-tree guard;                    │
+                                         │ recipe shortcut -> Phase 3)                │
+                                         ▼                                            │
+┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│ Phase 2: refine (deep lane only)                                                 │  │
+│  refine.baseline-reconcile -> refine.analyze -> [refine.awaiting_answers (<=1x)] │  │
+│  -> [refine.qgate (<=3x, lesson-derived plans only)] -> refine.ready             │  │
+│  (5 quality dimensions + module mapping, widen-only domains, pr_title authored)  │  │
+└────────────────────────────────────────┬─────────────────────────────────────────┘  │
+                                         │ (artifact gate: clarified_request          │
+                                         │  + pr_title)                               │
+                                         ▼                                            │
+┌──────────────────────────────────────────────────────────────────────────────────┐  │
+│ Phase 3: outline                                                                 ◄──┘
+│  outline.detect-change-type -> { outline.deep | outline.light }                  │
+│  outline.light: ONE collapsed light envelope (refine without loop + Simple       │
+│    outline + deliverables); submits clarified_request, pr_title and outline;     │
+│    on acceptance the server records phase-2-refine done                          │
+│  outline.light --(escalate_to_deep: premise | ripple | public symbol deletion)   │
+│    --> refine.baseline-reconcile (planning_lane = deep, one-way)                 │
+│  submit:outline validates (intent markers, file-type buckets, narrow domains     │
+│    once; refusal = invalid_link_args) -> [outline.qgate (<=3x, deep lane only)]  │
+│  -> outline.review (Approval); light-lane revision -> outline.light-regate       │
+│  recipe shortcut: outline.recipe-entry -> outline.recipe-confirm                 │
+│    -> outline.review                                                             │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │ (artifact gate: validated outline.md
+                                         │  + operator approval via elicitation/CLI)
+                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 4: plan                                                                    │
+│  plan.derive-tasks (DAG cycle check, profile mapping, skill resolution)          │
+│  -> plan.describe-tasks (+ server-side cost sizing, envelope packing & manifest) │
+│  -> [plan.qgate (<=3x)] -> execute.worktree-init                                 │
+└──────────────────────────────────────────────────────────────────────────────────┘
+----
+
+A plan started from the `local_changes` source does not traverse Phases 2–4: it runs in the `land` lane (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)]) from `init.ready` through `land.*` verification states directly into Phase 6. A plan started from the `pr` source does not traverse Phases 2–5: it runs in the `adopt` lane (xref:02-planning-lanes-phases-3-4.adoc#adopt-lane[Adopt Lane (`pr`)]), `init.ready` enters `finalize.adopt-pr`, which adopts the pull request's head branch, and the plan runs Phase 6 (<<_plan_source_contracts>>).
+
+A plan in the `light` planning lane does not traverse the Phase 2 states (`refine.baseline-reconcile`, `refine.analyze`, the confidence loop, `refine.qgate`): after the server-side light gate (`init.light-gate`) it enters Phase 3 and runs one collapsed light envelope (`outline.light`) that folds refine without the loop, the Simple outline, and deliverable derivation together, mirroring `plan-marshall`'s light lane. The deep lane keeps the full refine loop -> outline -> plan pipeline. The phase enum is unchanged; how the light envelope satisfies the Phase 2 and Phase 3 artifact gates is specified in xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)].
+
+=== Phase 1 (`init`): Plan Sources, Phantom-ID Refusal & Classifiers
+
+==== Plan Source Contracts
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-76[PM-WATCH-PHASE-76]_
+
+`pm_start` initializes the plan directory (`<PM_MCP_BASE>/projects/<project_id>/plans/<plan_id>/`, link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), `request.md`, `references.json`, and `mcp/status.json` from exactly one of six closed plan sources (`PlanSource`):
+
+[cols="1,2,4"]
+|===
+|Source (`plan_source`) |Input Parameters |Server Initialization & Verification Behavior
+
+|`request`
+|`description` (or `request`), optional `plan_slug`, `base_branch`
+|Writes `original_input` to `request.md`, runs the deterministic recipe scorer ahead of the planning-lane router (as for `issue` and `lesson`; the operator's `recipes.auto_route` decides auto-route vs ask), detects initial domains from narrative path tokens, and checks for sibling plan collisions.
+
+|`issue`
+|`issue_number`, optional `plan_slug`, `base_branch`
+|Spawns an enrolled CI provider job to fetch the issue title and body into `request.md` (passing untrusted external content through the deterministic ingestion validator), records `issue_number` in `references.json`, and schedules asynchronous CI mirror jobs to post clarified requirements and the approved outline back to the issue after Phase 2 and Phase 3 transitions.
+
+|`lesson`
+|`lesson_id`, optional `plan_slug`, `base_branch`
+|Resolves the lesson in the main-anchored lesson store (`manage-lessons`), executes a deterministic *source premise check* verifying that cited files and symbols in the lesson still exist in the current tree (transitioning to `init.lesson-premise` with obsolescence options if the premise is already resolved or invalid), and claims the lesson for the new plan in the plan initialization transaction (`claim{plan_id, claimed_at}` in its front matter; the lesson file stays in the lesson store and is never moved into the plan). A lesson that is already claimed, retired, or not resolvable is refused (`lesson_unavailable`). The claim ends with the plan: completion with a merge retires the lesson (verdict `applied`), closing it as obsolete in `init.lesson-premise` retires it (verdict `obsolete`), and an abort or `delete-plan` releases the claim, leaving the lesson `active` (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]). There is no carry-back and no deletion veto.
+
+|`recipe`
+|`recipe_id`, optional `recipe_params`, `base_branch`
+|Binds the plan to a registered recipe definition (`skill://pm/recipe/<name>/SKILL.md`), derives `plan_id` as `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC; see link:../domain-extensions/05-recipes-and-extension-points.adoc#recipe-plan-id[Domain Extensions Specification]) to prevent git branch and worktree collisions across repeated runs of the same recipe, sets `confidence = 100` and `planning_lane = deep` (`track = complex`), renders `status.metadata.pr_title` at `init.recipe-selected` from the recipe's required `pr_title_template` with the bound `recipe_params` substituted (link:../domain-extensions.adoc[Domain Extensions Specification], Declarative Recipe Descriptor Schema), so the recipe shortcut reaches Phase 3 with a title and no model work, and skips Phase 2 quality analysis and Phase 3 change-type/Q-Gate steps: its Phase 3 entry is `outline.recipe-entry` (an `auto` state deriving the deliverables from the harvest, or from the request for a `request_scoped` recipe), followed by `outline.recipe-confirm` (link `confirm_recipe_targets`) and `outline.review`. `recipe_params` are validated against the recipe's own input schema (`parameters_schema`). An empty harvest is a no-op: the plan ends `completed` with `merge_outcome: no_pr` and the fact `empty_harvest`, never with an empty pull request (link:../domain-extensions/05-recipes-and-extension-points.adoc#_tier_1_init_routing_deterministic_deliverable_generation[Domain Extensions Specification, Tier-1 Init Routing item 7]).
+
+|`local_changes`
+|`local_changes: true`, optional `summary`, `plan_slug`, `base_branch`
+|Captures the user's own current changes of the main checkout: every dirty and staged path with its porcelain code and content digest, plus the commits of the checked-out branch ahead of `origin/<base_branch>`. The capture is recorded as `references.json` `captured_changes`, its paths (including those changed by the commits ahead) become `declared_files`, the plan's declared footprint, and `request.md` records the change set together with the `summary`. An empty change set creates no plan and is refused with `no_local_changes` (a scope-less `pm_start` refusal, link:../mcp-tools/01-core-workflow-tools.adoc#pm-start-refusal[MCP Tools Specification]). Sets `planning_lane = land` and routes the plan into the land lane (xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)]). *Capture mechanic*: the capture writes a snapshot commit object whose parent is the main checkout's `HEAD` and whose tree is the main checkout's staged, unstaged, and untracked (not ignored) state, without touching the main checkout's index or refs; the snapshot is pinned by the ref `refs/pm-mcp/captures/<plan_id>` (a recovery point for the operator, retained as in xref:02-planning-lanes-phases-3-4.adoc#land-lane[Land Lane (`local_changes`)], item 6) and recorded as `captured_changes.snapshot_sha`. `land.worktree-init` creates the plan's branch at the snapshot and then restores the main checkout's captured paths, untracked ones included, to `HEAD`, each only where its content digest still equals the captured digest; a path edited after the capture is left as it is and listed in `facts`. `entry_baseline` is re-recorded from the main checkout this leaves, so the restored paths are no footprint violation and the post-capture edits are baseline dirt. After a squash landing, the main checkout's local commits that the plan carried (its `commits_ahead`) are recognised by tree equality with the landed base, and `switch-and-pull` moves the main checkout to the remote base instead of diverging. *Deliberate change vs. `plan-marshall`*: no stash is used.
+
+|`pr`
+|`pr_number`, optional `plan_slug`
+|Adopts an existing, open pull request of the project's repository for repair ("fix an existing PR"): the plan's branch is the pull request's head branch and its base is the pull request's base branch. `pm_start` observes the pull request (`ci.pr-view`) and refuses with `capability_missing` (`reason: head_not_writable`, a scope-less `pm_start` refusal) when the agent identity cannot push to the head branch, for example the head of a fork without push access. The pull request's changed paths (merge base to head) become `declared_files`; they take part in the sibling collision detection of `init.classify` like the declared footprint of every other source, and an overlap is resolved in `init.sibling-collision` as there. `request.md` records the pull request's title and body, passed through the deterministic ingestion validator as for `issue`, and `status.metadata.pr_title` is the pull request's title. Sets `planning_lane = adopt` (xref:02-planning-lanes-phases-3-4.adoc#adopt-lane[Adopt Lane (`pr`)]). The plan skips `phase-2-refine` through `phase-5-execute`: `init.ready` routes by the lane alone into `finalize.adopt-pr`, which re-observes the pull request, creates the plan's worktree on the head branch, and records `pr_number`, `head_sha`, and `branch_pushed_at`, and the plan runs the finalize pipeline like every other plan (same states, gates, budgets, merge path, and landing envelope); `create-pr` is completed `skipped`, and fixes are re-pushed through `git.commit_and_push`. The outcomes `pr_not_open` (`state: closed | merged | absent`), `head_not_writable`, and `checkout_failed` of `finalize.adopt-pr` enter the link state `finalize.adopt-blocked` (`facts.reason`), which offers `retry` (re-runs `finalize.adopt-pr`, re-observing first) and `abort` (the request `abort-plan`); a credential failure raises the `blocked` condition instead (link:../../Requirements.adoc#PM-CRED-3[PM-CRED-3]). At `archive-plan` an open pull request is never closed by the plan: `archive-with-open-pr` offers `hand-back` instead of `close-pr-and-archive` (Step Catalogue row `1100`). *Deliberate change vs. `plan-marshall`*: `plan-marshall`'s separate pull-request repair workflow (`pr-doctor`) does not exist.
+|===
+
+==== Plan ID Derivation & Phantom-ID Refusal Guard
+
+The server derives or validates `plan_id` against a strict lexical grammar before creating any directory on disk:
+
+1. *Canonical Grammar*: A `plan_id` matches the link:../identifiers/01-general-rules-and-registry.adoc#id-plan-id[`plan_id` grammar] of the Identifier Registry, the single definition of the plan ID grammar; every schema that restates it (`plan_id` tool properties, `scope_id`, queue rows) matches it exactly. A `plan_slug` (link:../identifiers/01-general-rules-and-registry.adoc#id-plan-slug[registry]) becomes the `plan_id` verbatim; without a slug the server derives one from the plan source. Recipe plans are `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (link:../domain-extensions/05-recipes-and-extension-points.adoc#recipe-plan-id[Recipe Plan ID]), which the length bound admits because a `recipe_key` has at most 37 characters (link:../identifiers/01-general-rules-and-registry.adoc#id-recipe-plan-id[registry]). Epic IDs use the same grammar (mirroring `plan-marshall`, which validates the epic slug with its plan-id validator).
+2. *Phantom-ID Refusal*: The validator explicitly rejects any candidate `plan_id` or `plan_slug` matching either the link:../identifiers/02-registry-stores-to-web.adoc#id-lesson-id[`lesson_id` grammar] or a UUID / hex-digest pattern (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`, a bare hex string of 12 or more characters `^[0-9a-fA-F]{12,}$`, or a token beginning case-insensitively with `execution-context` or `agent-`). Rejecting these shapes prevents callers from accidentally passing a lesson ID or dispatch/session UUID into `plan_id` and creating a phantom plan directory. A supplied or derived `plan_id` beginning with the reserved prefix `baseline-` is refused as well (link:../identifiers/01-general-rules-and-registry.adoc#id-plan-id[Identifier Registry, `plan_id`]), so no plan worktree can collide with a baseline scratch worktree `baseline-<plan_id>-<sha12>`.
+3. *Never-Reused IDs*: A candidate `plan_id` that already names a live plan (`plans/<plan_id>/` of the project's machine store) or an archived plan (`archive/<plan_id>/`, link:../filesystem-layout.adoc#archives[Filesystem Layout Specification, Plan & Epic Archives]) is refused with `plan_id_taken`, naming where it exists. The refusal is the collision dialogue: it is a scope-less `pm_start` refusal (link:../mcp-tools/01-core-workflow-tools.adoc#pm-start-refusal[MCP Tools Specification, `pm_start` Refusals]) that keeps the pending entry record and names the existing `plan_id` and a free alternative slug; resuming is `pm_state` on the existing plan, renaming is a new `pm_start` with another `plan_slug`, and replacing an existing plan is operator deletion (`delete-plan`) followed by a new `pm_start`. Because the archive path carries no date, this refusal is what keeps every archived plan addressable by its `plan_id` alone.
+
+==== Deterministic Init Classifiers & Workflow Settings
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-1[PM-WATCH-PHASE-1]_
+
+During `init.classify`, the engine executes pure, model-free classifiers in a fixed order:
+
+1. *Recipe Match before Lane Routing*: For every source other than `recipe` (`request`, `issue`, `lesson`; `local_changes` and `pr` are not scored), the registry-wide recipe scorer evaluates the request narrative first; scoring always runs, and the operator's `recipes.auto_route` (`local-config.json`) only chooses between auto-routing (when `true` and the top confidence reaches the compiled auto-route threshold `0.6`, `plan-marshall`'s default, not configurable) and asking in `init.recipe-candidate` (link:../domain-extensions/05-recipes-and-extension-points.adoc#_tier_1_init_routing_deterministic_deliverable_generation[Domain Extensions Specification, Tier-1 Init Routing]). In the same step the server computes the Tier-1 request-aspect classification (`status.metadata.request_aspect`) and, for source `lesson`, the doc-shaped predicate that routes a doc-shaped lesson to the `lesson-cleanup` recipe (items 9 and 10 there). An explicit `recipe` source selection is never overridden by the scorer.
+2. *Initial Planning-Lane Router*: Computes the initial `planning_lane` (`light` or `deep`) from the request with zero discovery (`deep` for every plan when the team's `workflow.json` `plan.phase-1-init.minimum_lane` is `deep`, xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)]), and the pre-route `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`). `scope_estimate` is derived from expected-modification paths only; read-only references never raise it. The pre-route value is persisted immutably as `scope_estimate_pre_route`; every later update of `scope_estimate` (Phase 2 or Phase 3) records its own provenance under `scope_estimate_provenance[]` instead of overwriting the pre-route evidence.
+3. *Sibling Collision Detector*: Scans live plans for overlapping target modules or affected file paths; if an overlap is found, transitions to `init.sibling-collision` to resolve the collision (`proceed`, `rename`, or the request `abort`, which raises the operator decision `abort-plan`).
+4. *Workflow Settings Resolution*: Reads the project's effective configuration (link:../store-schemas/07-project-configuration.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]): the team's `minimum_lane` (xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)]), `compatibility`, and `simplicity`, and the operator's `recipes.auto_route`; computes the execution posture (`minimal | standard | full`) for the preview; and copies the operator's `continuation.default_policy` into the plan's `continuation_policy` (`mcp/status.json`). The per-plan `continuation_policy` (`stop_at_phase_boundary` or `stop_on_issue_only`, changed only through the operator channel) is the only autonomy setting: it decides whether the session continues across a phase boundary or stops there. *Deliberate change vs. `plan-marshall`*: the five auto-continue flags (`init_`, `plan_`, `execute_`, `finalize_`, `loop_back_without_asking`) and the `lane_selection` prompt switch do not exist; no setting turns an operator-authorizing decision (outline approval, the merge gates) into an automatic transition. The refine confidence threshold (`95`), the recipe auto-route threshold (`0.6`), the lane prune thresholds, and the iteration caps are compiled constants.
+5. *Base Stamp*: Stamps `main_sha` in `mcp/status.json` from `git rev-parse origin/<base_branch>`. It is written once here and re-stamped only by the `sync-baseline` and `branch-cleanup` rebases; the Outside-World Invariants guard reads it as the producer of the baseline-drift check.
+
+At `phase-4-plan` entry the lane predicate is re-evaluated with the settled inputs (declared deliverables and their expected modifications) and the result is logged as `lane_reevaluation` in `audit.jsonl`; the re-evaluation never re-routes the plan (see xref:02-planning-lanes-phases-3-4.adoc#_lane_ratchet_rules[Lane Ratchet Rules]).
+
+=== Routine User Interaction vs Operator-Authorizing Decisions
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-69[PM-WATCH-PHASE-69]_
+
+`PM-MCP` separates interactive questions into two security classes with distinct transport rules:
+
+[cols="2,2,2,3"]
+|===
+|Interaction Class |Target States & Decisions |Permitted Channels |Fallback & Audit Semantics
+
+|*Routine User Dialogue* (Non-Authorizing)
+|Obsolete lesson premise (`init.lesson-premise`: `continue`, or `close`), recipe selection (in its own state `init.recipe-candidate`), ambiguous domain selection (`init.domain-choice`), sibling plan collision (`init.sibling-collision`), execution posture choice (`init.posture-choice`: `minimal`, `standard`, `full`), Phase 2 request clarifications (`refine.awaiting_answers`), Phase 3 design clarifications (`outline.awaiting_answers`), Q-Gate iteration exhaustion (`*.qgate-exhausted`: `edit` or `abort` only). A routine answer that would end the plan (`close`, `abort`) is only a request: the link `abort` (rel `escalate`) raises the operator-authorizing decision `abort-plan` (next row).
+|Host MCP Elicitation (preferred), or model-relayed `submit` link (`answer_questions`) when host elicitation is unsupported or unavailable.
+|The plan persists a state of kind `awaiting_user`, named by its question (link:../state-catalogue/01-conventions-generic-conditions.adoc#_state_kinds[State Catalogue, State Kinds]), carrying a typed `questions` schema in `facts`. When answered via the model-relayed `submit` link, the transition succeeds and records `channel: "model_relayed"` in `audit.jsonl`.
+
+|*Operator-Authorizing Decisions* (Gate-Forcing / Privileged)
+|Solution outline approval (`outline.review` -> `phase-4-plan`), scope-deviation `accept` (`execute.deviation-review`), handshake or baseline drift override, bare-transition artifact-gate exemption (`--allow-bare-transition`), pre-rebase overlap override, merge-authorization grants for every gap class of the roster (`review_barrier_gap`, `merge_action`, `red_ci_gate`, `rereview_timeout`, `find_step_completion`, the last one being the `automatic-review` force-done), Q-Gate override on exhaustion (`force-gate` with its `exemption_class`), the decision on a hypothesis refuted twice (`refine.hypothesis-refuted`: continue narrowed, or abort for re-staging through `abort-plan`), the resolution of `execute.awaiting-infeasible-decision` after an `infeasible` task (`remove-deliverable` or `loop-back-outline`, xref:03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Task Envelope Execution & Independent Server Verification]), an operator task skip (`skip-task` with its mandatory reason), ending the plan from any phase (`abort-plan`: `aborted` enters `plan.aborted`, `resumed` returns to the requesting state), ending an epic (`abort-epic`: `aborted` enters `epic.aborted`, `resumed` returns to `epic.active`), a failed land-lane verification (`land-verification-failed`: `recapture` or `abort-plan`), archiving over an open, unmerged pull request (`archive-with-open-pr`: `close-pr-and-archive`, `hand-back` for a plan of source `pr`, or `keep`), ending a plan at the merge path without a merge (`wind-down-unmerged`), and plan deletion (`delete-plan`). The decision kinds and their outcome classes are registered in the link:../workflow-dsl/02-units-jobs-decisions.adoc#decision-registry[Workflow DSL Specification, Decision Registry].
+|Host MCP Elicitation, or Authenticated Operator CLI (`pm-mcp operator ...`).
+|*Strict Link Omission (`PM-WF-3`)*: No model-invocable `submit` or `noop` link is ever emitted to approve or force these gates. If the host does not support MCP elicitation, the engine raises the `blocked` condition on the current state (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, Conditions]; the state and `call_stack` stay unchanged), emits the exact `pm-mcp operator` command in `facts.operator_command` (the generic `decide` invocation unless the decision kind has a dedicated verb, link:../workflow-dsl/02-units-jobs-decisions.adoc#escalation-decision-wait[Workflow DSL Specification, Escalation Without Elicitation]), and offers only the link `wait:decision:<decision_id>` (rel `wait`), a bounded wait on the pending operator decision record, until the operator acts; the resolution is routed as an outcome of that state.
+|===
+
+*Intent Amendments*: Phase 2 answers are written into `request.md` (`## Clarifications`). Every later answer that changes the plan's intent (an answer in a state of kind `awaiting_user` in Phases 3–6, an answered task question of Phase 5, deviation guidance, or a refuted premise) is persisted as an entry of `mcp/status.json -> amendments[]` (`at`, `phase`, `source: operator | refutation`, `text`, `supersedes`). Every later representation that renders the request (outline, `create-pr`, landing envelope) includes the amendments, so a superseded statement of the request never reaches a later phase unmarked.
+
+==== Typed Question Envelope Schema (`awaiting_user`)
+
+Sub-agents operating in leaf `execution-context` scopes are forbidden from prompting the user in-leaf or blocking on `escalate`. Instead, a sub-agent completes its analysis pass using its best judgment and includes a batched question list in its `submit` payload (`refine_prompt` or `outline_prompt`) as the free parameter `questions:list<schema[question-envelope]>?`, validated by the server against the named schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-envelope-schema[Dispatch & Effort Specification, Prompt Envelopes & Entity Escalation Protocol]). Each persisted question is rendered to the operator in the following Java record and TOON tabular structure:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.dialogue;
+
+import java.util.List;
+
+public record UserQuestion(
+    String id,
+    String header,
+    String question,
+    List<String> options,
+    String recommended,
+    boolean allowFreeText
+) {}
+----
+
+Every option string in `options` is authored as a two-sided contract whose label explicitly names the workflow branch selected when chosen, with the `recommended` option listed first.
+
+=== Phase 2 (`refine`): Quality Aggregation, Domain Widening & Bounded Re-Dispatch
+
+The Phase 2 states run for `deep`-lane plans only (including a plan ratcheted from `light` to `deep`). A `light`-lane plan never enters `refine.analyze` or its confidence loop; its refine work is folded into the collapsed light envelope (xref:02-planning-lanes-phases-3-4.adoc#planning-lanes[Planning Lanes & One-Way Ratchet (`light` -> `deep`)]).
+
+==== Phase Entry & Baseline Reconciliation
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-2[PM-WATCH-PHASE-2], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-86[PM-WATCH-PHASE-86]_
+
+At `phase-2-refine` entry, the engine caches loop-invariant inputs (`request.md`, `references.json`, `module_mapping.json`, and the architecture overview) so they are read once per phase rather than re-read inside the confidence loop. When a base branch is configured, `refine.baseline-reconcile` runs a non-mutating merge-conflict probe against upstream and classifies drift into three outcomes:
+
+* `no_overlap`: Upstream commits touch disjoint files; advances directly to `refine.analyze`.
+* `overlap_no_content_conflict`: Overlapping files merge cleanly; records `auto_reconcilable: true` without mutating the tree (deferring the actual rebase to Phase 5/6) and advances to `refine.analyze`.
+* `overlap_with_content_conflict`: Content conflicts exist; emits blocking Q-Gate findings so the conflict is absorbed during request refinement.
+
+* *Probe Variants*: The probe is one operation of the git contract with both variants (link:../../discussions/git-provider-modules.adoc[Git and Provider Modules]). The native variant merges in memory with JGit's `ResolveMerger` and takes the conflicted paths from its merge result; nothing is written to the object database or the worktree. The CLI variant runs `git merge-tree --write-tree --name-only -z` with `LC_ALL=C` and reads only the conflicted-file section; informational and message lines are never paths, and the locale pin applies to this probe only. In both variants the conflict count is the number of distinct conflicted paths.
+* *Overlap Population*: Overlap is computed between the upstream changed paths and the plan's declared ∪ derived footprint known at that point, never only the in-flight diff (which is empty before execution), so a first Phase 5 entry never reports `conflict_count: 0` merely because nothing was written yet.
+* *Drift Routing*: Content overlap (`overlap_with_content_conflict`) is the only drift routed to refinement. A `main_sha` ancestry drift is cleared only by a sync or rebase transition (`sync_rebase`) or by operator escalation; a refine re-dispatch is never offered as its remedy.
+
+==== Five Quality Dimensions & Fixed-Weight Confidence Aggregation
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-6[PM-WATCH-PHASE-6], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-68[PM-WATCH-PHASE-68]_
+
+During `refine.analyze`, the dispatched refine sub-agent executes source-premise verification (checking cited files, flags, and APIs against the codebase) and proposed-fix verification (constructing a semantic probe to verify whether a proposed fix resolves the stated symptom), maps affected modules, estimates scope (`none`, `surgical`, `single_module`, `multi_module`, `broad`), authors a conventional-commit `pr_title` ($\le 72$ characters, distinct from the human plan `title`), and submits raw scores (`0..100`) for the five quality dimensions plus architectural module mapping.
+
+* *Premise Verdicts*: Source-premise verification records each premise with the verdict record of epic Spec Re-Grounding (link:../dispatch-and-effort/04-epic-coordination.adoc#_server_derived_landing_facts_spec_re_grounding_cross_plan_locks[Dispatch & Effort Specification, Verdict Record]): label `observed` or `hypothesis`, verdict `corroborated | contradicted | partially_exercised | unverifiable`, and `scope_change` (`none | rescoped`); no second vocabulary exists. A command flag mandated by the request is a premise and must name a module of the command's actual reactor that the flag affects.
+* *Open Hypotheses of Emitted Plans*: For a plan emitted from an epic (`from_epic`), every `hypothesis`-labelled claim of its spec section is surfaced in `facts.open_hypotheses`. `submit:refine` must carry a verdict per claim (`confirmed` or `refuted`, citing the named artifact), and any `refuted` claim routes to `refine.awaiting_answers` for re-scoping instead of `refine.ready`; that pass counts as the one refine re-dispatch. A claim refuted again in the second pass routes to `refine.hypothesis-refuted`: the server appends a `hypothesis_refuted` event (claim, evidence, plan) to the epic inbox, and the plan waits on an operator-authorizing decision, either continuing with a narrowed scope (recorded as an intent amendment) or aborting through the decision `abort-plan` (`plan.aborted`) so the epic re-stages the plan with a corrected premise. There is never a third refine pass.
+
+The server-side `ConfidenceAggregator` computes the overall confidence deterministically using fixed weights (zero LLM arithmetic):
+
+[cols="2,1,4"]
+|===
+|Dimension |Fixed Weight |Verification Criteria
+
+|`correctness`
+|20%
+|Technical validity of referenced modules, APIs, flags, source premises, and proposed fixes against the live architecture.
+
+|`completeness`
+|20%
+|Presence of clear scope boundaries, acceptance criteria, test expectations, and cross-module dependencies.
+
+|`consistency`
+|20%
+|Absence of internal contradictions or conflicting constraints across request sections and architecture rules.
+
+|`non_duplication`
+|10%
+|Absence of redundant or overlapping requirement statements.
+
+|`ambiguity`
+|20%
+|Single unambiguous interpretation of terminology, target scope, and measurable outcomes (`100` = unambiguous).
+
+|`module_mapping`
+|10%
+|Confidence in mapping the request to concrete project modules and dependency directions.
+|===
+
+$$\text{confidence} = \lfloor 0.20 \cdot S_{\text{corr}} + 0.20 \cdot S_{\text{comp}} + 0.20 \cdot S_{\text{cons}} + 0.10 \cdot S_{\text{nondup}} + 0.20 \cdot S_{\text{ambig}} + 0.10 \cdot S_{\text{mod}} \rfloor$$
+
+* All six dimensions are required parameters of `submit:refine`; a submission omitting one is rejected with `invalid_link_args`, so no absent score is ever folded into the aggregate as `0`. *Deliberate change vs. `plan-marshall`*: `plan-marshall` scores the dimensions discretely (`100` on pass and `0` on an issue; completeness `100`/`50`/`0`; non-duplication `100`/`80`); `PM-MCP` accepts each dimension as `int[0..100]`.
+* *Evidence Class*: `submit:refine` carries `evidence_class` (`self_assessment`, `operator_answered`, or `downstream_reproduced`), persisted beside the score and shown in `facts`. The server checks it against its records: `operator_answered` is refused (`invalid_link_args`) unless an answered `refine.awaiting_answers` round exists in this plan, and `downstream_reproduced` requires an `evidence_ref` naming the reproducing artifact (a build job, test run, or re-grounding verdict). No heuristic fires on an all-100 score by itself: only `self_assessment` with every dimension at `100` on a plan without `from_epic` adds the advisory fact `self_assessed_full_confidence` (never blocking, never a link change), while an all-100 score on an emitted plan's pre-verified specification is expected and adds nothing.
+* The aggregated score is persisted to `status.metadata.confidence` and compared against `confidence_threshold`, the compiled constant `95` (not configurable: lowering it would only admit less-clarified requests). *Deliberate change vs. `plan-marshall`*: its `confidence_threshold` is a project setting (default `95`).
+* The server also validates that `compatibility` (`breaking | deprecation | smart_and_ask`, compiled default `breaking`) and `simplicity` (`lean | pragmatic | defensive`, compiled default `lean`) are resolved from the effective configuration and persisted in the plan.
+
+==== Widen-Only Domain Re-Merge
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-67[PM-WATCH-PHASE-67]_
+
+Once concrete `affected_files` are identified in `refine.analyze` (for a `light`-lane plan: on acceptance of the light envelope's submission, before the single narrowing pass of Phase 3), the server runs `domain-detect` over those file paths (`file_globs` and `always_on` inclusion legs) and computes the set union with the existing `references.domains`:
+
+$$\text{domains}_{\text{new}} = \text{domains}_{\text{cached}} \cup \text{detect}(\text{affected\_files})$$
+
+* *Monotonic Widening Invariant*: Phase 2 may **only widen** `references.domains`, never narrow it, ensuring convergence across refine iterations. If `affected_files` produce zero narrative or glob matches, `domain-detect` returns all offerable domains under `reason = "over_provisioned_resolve"`; that temporary over-provisioning is narrowed exactly once in Phase 3 after deliverables are declared.
+* *Match Provenance*: `domain-detect` returns, per domain, its `source` (`always_on`, `glob`, or `narrative`) and `matches: N`, rendered in `facts`. A result resting only on `always_on` legs with zero matches is reported `floor_only`, never as a confident single-domain answer.
+
+==== Single-Batch Clarification & Re-Dispatch Ceiling
+
+If $\text{confidence} < \text{confidence\_threshold}$:
+
+1. The sub-agent submits its best-judgment `clarified_request` alongside a single batched `refine_prompt` (`questions:list<schema[question-envelope]>?`, <<_typed_question_envelope_schema_awaiting_user>>) containing at most 4 clarification questions prioritized by `Correctness > Consistency > Completeness > Ambiguity > Non-Duplication`.
+2. The engine persists the questions in `mcp/status.json`, transitions to `refine.awaiting_answers`, and collects the user's answers in one batch.
+3. Upon receiving the answers, the engine writes the `## Clarifications` and `## Clarified Request` sections, increments `refine_redispatch_count` in `mcp/status.json`, and re-dispatches `refine.analyze` **at most once** (`refine_redispatch_count <= 1`).
+4. If the second pass still yields $\text{confidence} < \text{confidence\_threshold}$, the engine does **not** loop again (a hypothesis refuted again goes to `refine.hypothesis-refuted` instead, see Open Hypotheses of Emitted Plans); it flags `low_confidence_manual_review: true` in `facts` and advances to `outline` (where `outline.review` gates progression before task creation).

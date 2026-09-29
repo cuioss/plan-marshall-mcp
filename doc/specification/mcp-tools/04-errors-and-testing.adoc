@@ -1,0 +1,283 @@
+= MCP Tool & Resource Surface Specification: Errors, Failure States & Protocol Testing
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../mcp-tools.adoc[MCP Tool & Resource Surface Specification] » Errors, Failure States & Protocol Testing
+
+[#protocol-errors-vs-domain-workflow-failure-states]
+== Protocol Errors, Tool Execution Errors (`isError: true`) & Domain Workflow Failure States (`isError: false`)
+_See Requirement link:../../Requirements.adoc#PM-TOOL-4[PM-TOOL-4: Domain Failures as Valid Workflow States]_
+
+_See Requirement link:../../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
+
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-11[PM-WATCH-TOOL-11]_
+
+A foundational invariant of PM-MCP is that *domain failures and transition rejections are workflow states, not MCP protocol errors*. Three response classes are distinguished:
+
+* *JSON-RPC protocol errors*: a JSON-RPC `error` response (no `CallToolResult`) for malformed JSON-RPC (`-32700` parse error, `-32600` invalid request), unknown tool names (`-32602`), and resource read errors (`-32002`, see Resource Contract).
+* *Tool execution errors*: a normal `CallToolResult` with `isError: true` when the arguments violate the tool's input schema or a server-enforced argument rule (`invalid_arguments`, following MCP `2025-11-25`, so the model sees the error and corrects the call) or a valid call cannot be executed (unknown scope, unenrolled project, missing entry record, unhandled server exception).
+* *Domain results*: a normal `CallToolResult` with `isError: false` for every workflow outcome, including failures and rejected transitions (`PM-TOOL-4`).
+
+=== Normative Classification Matrix
+
+[cols="2,1,2,3"]
+|===
+|Condition |MCP Response Class |Response Structure |Model Recovery Path
+
+|Valid transition succeeds (`pm_do`)
+|`isError: false`
+|Next state's TOON representation (`state`, `facts`, `links`).
+|Follow one of the new `links`.
+
+|Build fails, tests fail, or quality gate turns red
+|`isError: false`
+|TOON representation in a remediation state (e.g., `execute.verification-feedback`, `finalize.ci-failed`; link:../state-catalogue.adoc[State Catalogue]) with structured failure facts and `fix`, `retry`, `loop_back`, or `escalate` links.
+|Inspect failure facts (or `log_uri`), apply code fixes, and follow `fix` / `retry` / `loop_back`.
+
+|Git push rejected (non-fast-forward) or merge conflict
+|`isError: false`
+|TOON representation in `git.sync-required` or `git.sync-escalate` (inside the `git.commit_and_push` sub-workflow) with `sync_rebase` (rel `fix`) / `escalate` links.
+|Follow the offered `sync_rebase` or `escalate` link.
+
+|Host tool modifies files outside the plan's worktree
+|`isError: false`
+|TOON representation of the unchanged current state with `condition: footprint_violation` (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-footprint_violation[State Catalogue, Conditions]), naming the offending files and offering only `fix` and `escalate` links.
+|Inspect the named files; revert only changes this plan made, never baseline dirt (`facts.baseline_dirty`) or foreign changes, and follow `fix`, or `escalate` to the operator.
+
+|Stale link followed, entity no longer in accepting state, or `args` fails link parameter validation
+|`isError: false`
+|Authoritative *current* TOON representation plus a top-level `rejected` block (`reason` from the closed set in <<rejection-reasons>>, `link`, `detail`).
+|Read the current representation and follow one of its valid `links` with corrected `args`.
+
+|Operator approval required or loop-back limit reached
+|`isError: false`
+|TOON representation of the unchanged current state with `condition: blocked` (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, Conditions]) offering only `wait:decision:<decision_id>` (a bounded wait on the pending operator decision record), or `finalize.loop-limit-reached` offering `escalate`.
+|Follow `escalate`, or `wait:decision:<decision_id>` until the operator resolves the decision.
+
+|Malformed JSON-RPC or unknown tool name
+|JSON-RPC error
+|JSON-RPC `error` object (`-32700`, `-32600`, or `-32602`) with its fixed message; no `CallToolResult`.
+|Fix the tool invocation.
+
+|Tool arguments violate the input schema or a server-enforced argument rule (type, pattern, unknown property, missing or mutually exclusive scope parameters, alternative plan sources, per-operation required parameters)
+|`isError: true`
+|MCP `CallToolResult` with `isError: true`, `error_code: invalid_arguments`, `parameter`, and `rule`.
+|Correct the named parameter and call again.
+
+|Unknown `plan_id` / `epic_id`, unenrolled workspace, missing pending entry record, or internal server exception
+|`isError: true`
+|MCP `CallToolResult` with `isError: true` and closed `error_code` (`scope_not_found`, `project_not_enrolled`, `entry_record_missing`, `internal_fault`); only `internal_fault` adds `audit_id`.
+|Halt or invoke discovery (`pm_plans` / `pm_epics`), or notify the operator (with `audit_id` for `internal_fault`).
+
+|The addressed project's recovery after a runtime start has not finished within the project recovery wait
+|`isError: true`
+|MCP `CallToolResult` with `isError: true` and `error_code: runtime_recovering`; nothing of the call was executed.
+|Retryable: repeat the same call.
+
+|`pm_lsp` addresses a language server whose restart retries are exhausted
+|`isError: true`
+|MCP `CallToolResult` with `isError: true` and `error_code: lsp_unavailable`.
+|Continue without semantic navigation (search instead); the instance returns after its idle eviction or a runtime restart.
+
+|`pm_skill` / `pm_skill_file` names a section the document does not contain, or a document that cannot be read or rendered
+|`isError: true`
+|MCP `CallToolResult` with `isError: true` and closed `error_code` (`section_not_found` with the available anchors, or `file_unreadable` with `audit_id`).
+|Read the section index and request an existing anchor, or notify the operator with `audit_id`.
+|===
+
+=== Rejected Transition Representation (`isError: false`)
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-2[PM-WATCH-TOOL-2]_
+
+When `pm_do` is called with a stale link or invalid free parameter `args`, the server returns `isError: false` with a `rejected` block inserted into the current authoritative representation at its canonical position (after `skill`, before `facts`; see link:../hypermedia-format/01-representation-and-link-forms.adoc#canonical-top-level-fields[Hypermedia Format Specification]). The example shows the `git.compose-message` state of the `git.commit_and_push` sub-workflow, active while the `finalize.push-barrier` call runs:
+
+[source,toon]
+----
+scope: plan
+plan_id: plan-x
+state: git.compose-message
+phase: finalize
+summary: "push barrier found 2 uncommitted files, commit message required"
+skill: "skill://pm/git/commit-message/SKILL.md"
+rejected:
+  link: commit
+  reason: invalid_link_args
+  detail: "parameter 'message' length 0 is below minimum 1"
+facts:
+  changed_files: 2
+  continuation_policy: stop_at_phase_boundary
+  module_scope: http
+  suggested_type: fix
+links[2]{rel,link,form,free}:
+  next,commit,submit,"message:text[1..2000]"
+  abort,abort,noop,""
+----
+
+[#rejection-reasons]
+==== Closed Rejection Reasons & Failure Classes
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-2[PM-WATCH-TOOL-2], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-11[PM-WATCH-TOOL-11]_
+
+`rejected.reason` is a closed enumeration. This table is its single definition; a specification that introduces a new rejection reason extends it here:
+
+[cols="1,3"]
+|===
+|`reason` |Condition
+
+|`link_not_available`
+|The link identifier is not offered in the current state, including invented or paraphrased identifiers.
+
+|`stale_entity`
+|The entity-addressed link names an entity that is no longer in an accepting state (for example an already triaged finding).
+
+|`operator_only`
+|The link names an operator transition, which is never offered to the model (`PM-SEC-3`).
+
+|`undeclared_param`
+|`args` contains a key the link does not declare.
+
+|`missing_param`
+|A required free parameter is absent.
+
+|`invalid_link_args`
+|A free parameter violates its type, enum, length, or range constraint, or an attached content validator refuses the payload.
+
+|`stale_dispatch_id`
+|The supplied `dispatch_id` is superseded (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification]; a `dispatch_id` has no time-based expiry, link:../timeouts/02-runtime-leases-operator-web.adoc#operator-decisions[Timeouts & Budgets Specification]).
+
+|`phase_closed`
+|A finding submission is addressed to a phase the plan has already left (for example a `phase-3-outline` Q-Gate finding after the plan entered `phase-4-plan`, link:../phase-workflows.adoc[Phase Workflows Specification], Blocking Findings Guard); the finding is not written.
+
+|`epic_pointer_mismatch`
+|`pm_start` would create a plan whose `plan_id` equals a `launched` queue row of an epic while the consumed pending entry record's `from_epic` is absent or names another epic (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification], Single Epic Pointer).
+
+|`no_local_changes`
+|`pm_start` with `local_changes`, or the `recapture` link of a `land` plan, found an empty change set in the main checkout: no dirty or staged path and no commit ahead of the base branch (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane]).
+
+|`capability_missing`
+|`pm_start` with `pr_number` names a pull request whose head branch the agent identity cannot push to (`detail` names `reason: head_not_writable`, for example the head of a fork without push access; link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]). The same reason refuses a native git operation that needs a repository capability the native variant lacks (derived fact `git_native_capability`; `detail` names the feature and the `pm-mcp operator` command that selects the CLI variant; link:../cli-and-security/02-credentials-and-operator.adoc#native-confinement[CLI & Security Specification, Native Operation Confinement]); there it is the transport outcome of the operation's job record, never a fallback.
+
+|`integration_variant_unset`
+|`pm_start`, or a git or provider primitive, found no valid operator choice of the integration variant (`native` or `cli`) for an integration it needs; `detail` names the integration and the project setup state `setup.select-integration-variants` that decides it (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]). No git or provider operation runs before the decision.
+
+|`config_dirty`
+|`pm_start` found a file under `.marshall/config/` (a team configuration file or a workflow unit) already modified, staged, or untracked in the main checkout; no plan starts on an uncommitted configuration, and the operator commits or restores the file first. A `local_changes` start is exempt: the file is then part of the captured change set, verified and landed like every other captured path (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#_planning_transition_guards_real_world_invariants[Phase Workflows Specification, Planning Transition Guards]).
+
+|`config_invalid`
+|`pm_start` or a phase handshake found a team configuration file or a project workflow unit that fails validation: a schema violation or undeclared key of a team file, or a unit violating a static verification rule or a compiled invariant (link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification, Project-Owned Workflow Units & Compiled Invariants]); `detail` names the file and the JSON pointer or line and the violated rule. The same finding is recorded in the workspace scope and published in `pm://project/config`; nothing falls back to a default.
+
+|`format_outdated`, `format_newer`
+|`pm_start` or a phase handshake found a team configuration file or a project workflow unit whose `format_version` (or DSL `format`) is older or newer than the binary accepts (link:../store-schemas/01-format-and-session-log.adoc#format-versioning[Store Schemas Specification, Format Versioning]); `detail` names the file, the found and the current version. The file is never rewritten; the project setup workflow offers the rewrite.
+
+|`lesson_unavailable`
+|`pm_start` with `lesson_id` names a lesson that is already claimed by another plan, retired, or not resolved `found` (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]); `detail` names the lesson state and, for a claim, the claiming `plan_id`.
+
+|`recipe_params_invalid`
+|`pm_start` with `recipe_id` carries `recipe_params` that violate the recipe's `parameters_schema`, or non-empty `recipe_params` for a recipe without a schema (link:../domain-extensions.adoc[Domain Extensions Specification], Declarative Recipe Descriptor Schema); `detail` names the offending parameter.
+
+|`plan_id_taken`
+|The `plan_id` derived by `pm_start` already names a live or archived plan (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); an archived `plan_id` is never reused.
+
+|`target_undeliverable`
+|`mailbox_send:<plan_id>` names a plan that does not exist or is archived (link:../dispatch-and-effort/04-epic-coordination.adoc#plan-mailbox[Dispatch & Effort Specification, Plan Mailbox]); the message is not written.
+
+|`surface_overlap`
+|An epic queue-row write (staging a plan, or amending a `staged` row's `declared_surface` or `prerequisites[]`) would give the row a declared surface overlapping that of another non-terminal row of the same epic that is not ordered with it through prerequisites; `detail` names the overlapping plans and paths, and the row is not written (link:../dispatch-and-effort/04-epic-coordination.adoc#epic-surface-disjointness[Dispatch & Effort Specification, Staging-Time Surface Disjointness]).
+
+|`surface_undeclared`
+|An epic queue-row write stages a plan whose expected surface cannot be declared (empty, an entry that is not a git-tracked path or glob inside the workspace, or an entry that cannot be evaluated); `detail` names the offending entries, and the row is not written (link:../dispatch-and-effort/04-epic-coordination.adoc#epic-surface-disjointness[Dispatch & Effort Specification, Staging-Time Surface Disjointness]).
+
+|`path_traversal_rejected`
+|A repository path in `args` escapes the workspace: a `..` segment, an absolute path, or a symlink resolving outside the plan's worktree (`PM-SEC-2`). Job requests carry the same reason with the job outcome `refused` (link:../job-runtime.adoc[Job Runtime Specification]).
+|===
+
+A content validator that refuses a payload answers `invalid_link_args` and names its specific cause in `detail` (for example `non_resolving_package_key`, link:../domain-extensions.adoc[Domain Extensions Specification]); such causes are `detail` codes, not reasons. Outcome, state, condition, and finding tokens (a job's `refused`, the `store_tampered` condition, finding types such as `unknown_config_key`) are never `rejected.reason` values.
+
+A job that exceeds its budget is a job outcome (`timed_out`), never a rejection. Every rejection belongs to the failure class `caller_drift` (the call did not match the offered contract); a tool execution error (`isError: true`) belongs to the class `server_fault`. The two classes are counted separately per plan (link:../phase-workflows.adoc[Phase Workflows Specification], `record-metrics`), each with its population.
+
+=== Sanitized Tool Execution Error Envelope (`isError: true`)
+
+When a tool call cannot be executed (`isError: true`), the `TextContent` payload is strictly sanitized — stack traces, Java class names, filesystem paths, and credentials are never emitted:
+
+[source,toon]
+----
+error: true
+error_code: scope_not_found
+message: "Plan scope 'plan-unknown' does not exist in the enrolled workspace."
+----
+
+Every tool execution error is written to `audit.jsonl`, but the payload carries `audit_id` only for the codes whose recovery path is an operator look-up, `internal_fault` and `file_unreadable`; for every other code the model corrects the call, retries, or uses discovery, and the identifier would have no operational value for it (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+
+Closed `error_code` enumeration for `isError: true`:
+
+* `invalid_arguments` — The tool arguments violate the tool's input schema or a server-enforced argument rule; the payload adds `parameter` (the offending property, or the set of mutually exclusive properties) and `rule` (one line, as stated in the property's `description`).
+* `scope_not_found` — Referenced `plan_id`, `epic_id`, or `entity` does not exist: the plan is in neither `plans/` nor `archive/` of the project's machine store (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), or the epic or entity is unknown. An archived plan is found and answered read-only with its terminal representation.
+* `project_not_enrolled` — The target repository has no enrolment file in `<PM_MCP_BASE>/enrolments/`, or, for a workspace-addressed request (`PM-ARCH-4`), the `PM-MCP-Workspace` header does not resolve to an enrolled project by the project resolution rule (link:../filesystem-layout.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]) (`pm-mcp operator enrol`, link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]).
+* `entry_record_missing` — `pm_start` was called with an `entry_id` for which no pending entry record `<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json` exists (never written by `pm-mcp enter`, or already consumed).
+* `section_not_found` — `pm_skill` or `pm_skill_file` named a `section` that the document's section index does not contain; the message lists the available anchors.
+* `file_unreadable` — The requested skill document or supporting file exists in the catalogue but cannot be read or rendered.
+* `runtime_recovering` — Retryable. The call addresses a project whose per-project recovery after a runtime start has not finished within the project recovery wait (link:../runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery], link:../timeouts/02-runtime-leases-operator-web.adoc#project-recovery-wait[Timeouts & Budgets Specification]); nothing of the call was executed, recovery continues, and the same call repeated later is served.
+* `lsp_unavailable` — `pm_lsp` addressed a language server pool instance whose restart retries are exhausted (link:../job-runtime.adoc[Job Runtime Specification]); the instance stays unavailable until its idle eviction or a runtime restart, so repeating the call at once returns the same code.
+* `upstream_timeout` — An upstream pass-through tool call (`up_*`) exceeded its connect or read timeout (link:../timeouts.adoc[Timeouts & Budgets Specification]); the call can be retried.
+* `internal_fault` — Unexpected server exception, including a lock acquisition the lock manager refuses as out of order (`lock_order_violation`, link:../store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]); full diagnostics are written exclusively to `audit.jsonl` under `audit_id`.
+
+JSON-RPC protocol errors are sanitized the same way: the `error.message` is a fixed text per code, and `error.data` is present only for resource read errors, carrying the closed `error_code` (`-32002`: `scope_not_found`, `path_traversal_rejected`); the audit record is written, its `audit_id` is not returned.
+
+== Automated MCP Protocol & STDIO Testing with `McpAssured` (`quarkus-mcp-server-test`)
+_See Requirement link:../../Requirements.adoc#PM-TECH-2[PM-TECH-2: Outbound HTTPS Client, LSP Client & McpAssured Testing Libraries]_
+
+_See Requirement link:../../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine Invariant, Property & McpAssured Protocol Verification]_
+
+_See Requirement link:../../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
+
+All MCP tool schemas, resource templates, progress notifications, and STDIO stream hygiene invariants are verified using `io.quarkiverse.mcp:quarkus-mcp-server-test` (`McpAssured` and `McpStdioTestClient`).
+
+=== End-to-End STDIO Integration Testing (`McpStdioTestClient` in `*IT.java`)
+
+Protocol integration tests run at three levels, each in Failsafe `*IT.java` classes under the integration-tests profile (`PM-TEST-3`, `PM-TEST-4`, `PM-TECH-2`):
+
+* *Daemon (`pm-mcp-server`)*: the integration tests exercise the packaged daemon `pm-mcpd` over MCP Streamable HTTP on its Unix socket.
+* *Relay (`pm-mcp-cli`)*: the integration tests exercise the `pm-mcp serve` STDIO relay over real `stdin`/`stdout` with `McpAssured.newStdioClient()`, against a reactor-built `pm-mcpd` staged into a temporary `PM_MCP_HOME/bin`.
+* *Release shape (`pm-mcp-e2e`)*: the module `pm-mcp-e2e` (in `pm-mcp-modules`) stages all four binaries (`pm-mcp`, `pm-mcpd`, `pm-mcp-exec`, `pm-mcp-web`) in the release layout and runs end-to-end scenarios through the whole chain: relay, daemon, and jobs launched by `pm-mcp-exec`.
+
+The relay and release-shape tests spawn `pm-mcp serve` as a real child process:
+
+[source,java]
+----
+// The pending entry record is written first, as the user entry command does: `pm-mcp enter` prints its entry_id.
+String entryId = runPmMcpEnter(pmMcpBinaryPath, tempWorkspaceRoot);
+
+McpStdioTestClient client = McpAssured.newStdioClient()
+    .setCommand(List.of(pmMcpBinaryPath.toString(), "serve"))
+    .setWorkingDirectory(tempWorkspaceRoot)
+    .setEnvironment(Map.of(
+        "PM_MCP_BASE", tempPmMcpBase.toString(),
+        "PM_MCP_HOME", tempPmMcpHome.toString())) // bin/ holds the staged pm-mcpd
+    .setStderrHandler(stderrAuditBuffer::add)
+    .build()
+    .connect();
+
+client.when()
+    .toolsList(page -> {
+        assertThat(page.tools())
+            .extracting(ToolInfo::name)
+            .containsExactlyInAnyOrder(
+                "pm_start", "pm_state", "pm_do", "pm_plans", "pm_epics",
+                "pm_build", "pm_lsp", "pm_skills", "pm_skill", "pm_skill_file");
+    })
+    .toolsCall("pm_start", Map.of("entry_id", entryId, "request", "Add JSpecify null-safety to service layer", "plan_slug", "null-safety"), response -> {
+        assertThat(response.isError()).isFalse();
+        assertThat(response.content().getFirst().asText().text())
+            .contains("scope: plan")
+            .contains("phase: init");
+    })
+    .thenAssertResults();
+----
+
+=== Normative `McpAssured` Verification Requirements
+
+1. *Tool & Resource Schema Conformance*: Every `@Tool` and `@ResourceTemplate` is asserted via `client.when().toolsList(...)` and `client.when().resourcesTemplatesList(...)` to verify closed JSON Schema Draft 2020-12 `inputSchema` definitions (`additionalProperties: false`) and exact URI template registrations. The example asserts the complete, fixed core tool set at every migration stage with an empty upstream allowlist; no legacy script tool is ever registered. A second test with a configured allowlist asserts exactly the core set plus the allowlisted `up_*` tools, and that an upstream tool not on the allowlist, or one added only in a team configuration file under `.marshall/config/`, never appears.
+2. *Domain Failure vs Protocol Error Assertions*: Every `pm_do` rejection and domain failure state is asserted with `assertThat(response.isError()).isFalse()`, unknown scope queries are asserted with `assertThat(response.isError()).isTrue()` and a sanitized `error_code` payload without `audit_id` (present only for `internal_fault` and `file_unreadable`), argument violations (schema and server-enforced rules) are asserted with `assertThat(response.isError()).isTrue()` and `error_code: invalid_arguments`, unknown tools are asserted as JSON-RPC error responses (`-32602`) without a `CallToolResult`, and unknown-scope resource reads as JSON-RPC `-32002` with `scope_not_found` in `data`.
+3. *`stdout` Stream Hygiene & `stderr` Separation*: `setStderrHandler(...)` captures all diagnostic output on `stderr` while `McpStdioTestClient` parses every `stdout` line as a strict JSON-RPC 2.0 frame, proving zero `stdout` pollution across concurrent `pm_build` and `pm_lsp` executions (`PM-SEC-4`, `PM-TEST-5`).

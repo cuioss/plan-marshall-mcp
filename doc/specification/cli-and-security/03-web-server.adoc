@@ -1,0 +1,110 @@
+= CLI, Coordination & Security Specification: Web Server & Pairing
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../cli-and-security.adoc[CLI, Coordination & Security Specification] » Web Server & Pairing
+
+[#web-server]
+== Web Server & Pairing (`pm-mcp-web`, `pm-mcp web`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-7[PM-SEC-7: Optional Web Server, Device Pairing & Browser Channel Hardening]_
+
+_See Requirement link:../../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Elicitation & Operator CLI)]_
+
+_See Requirement link:../../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Zero Network Exposure & Stream Hygiene]_
+
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-3[PM-WATCH-CLI-3]_
+
+The optional web server `pm-mcp-web` (module `pm-mcp-clients/pm-mcp-web-server`, Quarkus native, link:../../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]) gives a paired browser access to the runtime. It is a *client* of the runtime's link:../runtime-model.adoc#local-api[Local API] like the CLI, not a part of the runtime: it owns every browser-facing concern (the TCP listener, TLS, security headers, `Host` validation, the static web app, pairing redemption) and holds no store logic. It depends only on `pm-mcp-api` and `pm-mcp-web-app`. The runtime keeps zero TCP listeners (`PM-SEC-4`); the web device store and the pairing code live in the runtime, the only store writer. The web server is a backend-for-frontend, the placement the later OAuth iteration builds on (link:../../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-server-lifecycle]
+=== Lifecycle (`pm-mcp web enable|disable`)
+
+* *Off by default*: Without an explicit `pm-mcp web enable` (or a first `pm-mcp web pair` / `pm-mcp web open`, which enables the loopback listener) no `pm-mcp-web` process and no TCP listener exist.
+* `pm-mcp web enable [--lan]` is an operator verb (the CLI's operator checks, xref:02-credentials-and-operator.adoc#operator-channel-isolation[Operator Channel Isolation & Privileged CLI (`pm-mcp operator`)]). It starts the runtime on demand, then starts `<PM_MCP_HOME>/bin/pm-mcp-web` by path (never through `PATH`) as a detached process with the chosen listener settings, and reports success only after a round trip on the new listener. The listener uses the compiled port `7420`; an occupied port fails the command, another port is never chosen silently. A running web server with different settings is refused with a notice to run `pm-mcp web disable` first.
+* *Singleton and record*: `pm-mcp-web` holds the process lock `<PM_MCP_BASE>/locks/web.lock` for its lifetime and writes its process record `<PM_MCP_BASE>/run/web.json` (link:../store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]); `pm-mcp status`, `web pair`, `web open`, and `web disable` read it. These are the web server's own process files, not stores; it writes no store.
+* `pm-mcp web disable` (operator verb) sends `SIGTERM` to the recorded process after checking its identity (pid and start instant); the web server ends every open stream, releases the listener, and removes `run/web.json`. Paired devices stay paired; `web enable` later serves them again.
+* *Runtime availability*: The web server never starts the runtime. While the runtime is unreachable it answers every `/api/v1` request with `503` (`runtime_unavailable`), which the web app shows as "runtime not running". It reads the runtime token as every local client does (link:../runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), including the one re-read after a `401`. A runtime of another release version is answered `503` (`version_skew`); `pm-mcp web enable` after the upgrade restarts the web server of the new release.
+
+[#web-listener]
+=== Listener Exposure
+
+* *Loopback (default)*: plain HTTP on `127.0.0.1:<port>` only. Loopback is a secure context for the browser; nothing leaves the machine.
+* *LAN (`--lan`)*: HTTPS only, on all interfaces, with a certificate the web server generates itself on the first `--lan` enable: a self-signed ECDSA P-256 certificate whose subject alternative names are the host name, `<hostname>.local`, the interface addresses at generation, and the loopback addresses. Key and certificate are kept in `<PM_MCP_BASE>/web/tls/` (directory `0700`, key `0600`) and reused on every later `--lan` enable, so paired devices keep a stable fingerprint. Its SHA-256 fingerprint (of the DER certificate) is printed by `pm-mcp web enable --lan`, `pm-mcp web pair`, and `pm-mcp status`, and shown on the pairing page, so the operator compares it with the browser's certificate details before accepting the warning. Plain HTTP is never served on a non-loopback address. A local certificate authority that removes the warning is deferred (link:../../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-security-headers]
+=== Request Validation & Security Headers
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-18[PM-WATCH-CLI-18], link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-19[PM-WATCH-CLI-19]_
+
+* *`Host` validation*: Before routing, the web server accepts a request only when its `Host` header names the listener's own origin: `127.0.0.1:<port>` or `localhost:<port>` in loopback mode, and additionally one of the certificate's names or addresses with `<port>` in LAN mode (Quarkus `quarkus.http.host-validation.*`). Every other `Host` is refused with `403` and never reaches the proxy. This defeats DNS rebinding.
+* *No CORS*: The web server sends no `Access-Control-*` header on any response; a preflight `OPTIONS` request is refused. A state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) whose `Origin` header is present and differs from the listener's own origin is refused with `403`.
+* *Security headers on every response* (static files, API responses, event streams, errors, and `404`s alike):
+** `Content-Security-Policy: default-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'` (as an HTTP header, never a `<meta>` element);
+** `X-Frame-Options: DENY` (anti-framing together with `frame-ancestors 'none'`);
+** `X-Content-Type-Options: nosniff`;
+** `Referrer-Policy: no-referrer`.
+* *Static web app*: The web server serves the `pm-mcp-web-app` resource JAR (`META-INF/resources`) for every `GET` outside `/api/`; a path without a matching file returns the app's fallback page (client-side routing). No server-side rendering exists.
+
+[#web-proxy]
+=== API Proxy & Device Secret Forwarding
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-16[PM-WATCH-CLI-16], link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-20[PM-WATCH-CLI-20], link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-21[PM-WATCH-CLI-21]_
+
+* *Allowlisted prefix*: The web server proxies exactly the path prefix `/api/v1/` to the runtime's Unix socket. `/mcp`, every other `/api/` path, and a path that changes under normalization (encoded `/`, `..`, duplicate `/`) are refused (`404`, `400`) before routing; `/mcp` is never reachable through the web server.
+* *Credential rewrite*: From the browser request the web server removes the `Authorization` header and every `PM-MCP-*` header, then sets `Authorization: Bearer <runtime token>` and `PM-MCP-Device-Secret: <device secret>` (the browser's former Bearer value). A request without a well-formed device secret (link:../identifiers/02-registry-stores-to-web.adoc#id-device-secret[Identifier Registry, device secret]) is answered `401` without contacting the runtime; the only unauthenticated API endpoint is pairing redemption (<<web-pairing>>).
+* *Runtime re-check*: The runtime checks the forwarded device secret against the web device store on every request, without a cache, and ties the request to the device id (link:../runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The web server's own check covers the secret's shape only; it never decides that a device is valid, so no request is trusted on the web server's word alone. A request carrying `PM-MCP-Device-Secret` is web-originated for the runtime: CLI-only endpoints (issuing a pairing code, starting or stopping the web server, entering a credential secret) refuse it with `403` (`cli_only`).
+* *Event streams*: `GET /api/v1/events` and `GET /api/v1/plans/{plan_id}/events` are streamed through unbuffered and uncompressed, with `Last-Event-ID` forwarded; the device is checked by the runtime when the stream connects. When the runtime ends a stream (among others because the device was revoked), the web server ends the browser's stream.
+* *Logging*: Neither process logs a request header. The runtime token and every `pmw_` value are redacted by the `SecretRedactor` (xref:02-credentials-and-operator.adoc#operator-credential-cli[Operator-Only Credential CLI & Runtime Secret Redaction]): the runtime token by value, device secrets by their shape, because the runtime keeps only their hashes.
+
+[#web-pairing]
+=== Pairing Protocol
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-15[PM-WATCH-CLI-15]_
+
+Pairing follows the device-grant pattern: a short one-time code only authorizes; the browser receives a separate per-device secret.
+
+. *Issue*: `pm-mcp web pair [--label <label>]` (operator verb; enables the loopback listener when no web server runs) asks the runtime for a pairing code (`POST /api/v1/web/pairings`, CLI-only). The code has 8 characters of the alphabet `BCDFGHJKLMNPQRSTVWXZ` (about 34.5 bits, link:../identifiers/02-registry-stores-to-web.adoc#id-pairing-code[Identifier Registry, pairing code]), is valid for 5 minutes (link:../timeouts/02-runtime-leases-operator-web.adoc#pairing-code-ttl[Timeouts & Budgets Specification, Pairing Code Lifetime]), single use, and allows 5 failed redemptions (link:../timeouts/02-runtime-leases-operator-web.adoc#pairing-attempt-limit[Timeouts & Budgets Specification, Pairing Failed-Attempt Limit]). At most one pairing is open: a new one invalidates the previous. The runtime keeps only the code's SHA-256, the label, the expiry, and the failure count, in memory (link:../store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]).
+. *Show*: The CLI prints the code as `XXXX-XXXX`, the URL `http(s)://<host>:<port>/pair#code=<code>`, a QR code of that URL (Unicode half blocks, 4-module quiet zone, black on white), the expiry, and in LAN mode the certificate fingerprint. The code travels in the URL fragment, which the browser never sends to a server, so it appears in no request line, log, or `Referer`.
+. *Open on the same machine*: `pm-mcp web open` (operator verb) issues a pairing code and opens the loopback pairing URL in the default browser (`open` on macOS, `xdg-open` on Linux, started with an argument vector, never through a shell).
+. *Redeem*: The web app's pairing page reads the code from the fragment (or from manual input, normalized to upper case without `-` and spaces), removes the fragment with `history.replaceState`, and sends `POST /api/v1/pair` with `{code}`. The web server forwards it without a device header. The runtime compares the SHA-256 in constant time; on success it consumes the code, generates the device secret (`pmw_` plus 256 bits from `SecureRandom`, base64url; link:../identifiers/02-registry-stores-to-web.adoc#id-device-secret[Identifier Registry, device secret]), stores only its SHA-256 with a new `device_id` and the pairing's label (default: the `device_id`), appends the audit record `web_device_paired`, and returns `{device_id, label, device_secret}` once. The secret is opaque: the runtime is issuer and validator, so a self-contained token would add nothing and could not be revoked instantly.
+. *Failure*: A wrong, expired, consumed, or superseded code yields the same `400` (`pairing_invalid`) without saying which, and appends `web_pairing_failed`. The failure that reaches the attempt limit invalidates the open pairing, so a later redemption fails even with the right code. A runtime restart discards the open pairing; the operator runs `pm-mcp web pair` again.
+. *Keep*: The web app stores the device secret in `localStorage` and sends it as `Authorization: Bearer <device secret>` on every API request (<<web-app>>).
+
+[#web-devices]
+=== Paired Devices (`pm-mcp web devices`)
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-17[PM-WATCH-CLI-17]_
+
+* `pm-mcp web devices list` shows `device_id`, label, `created_at`, and `last_used_at` of every paired device; `pm-mcp web devices revoke <device_id>` and `pm-mcp web devices revoke --all` remove devices (`GET /api/v1/web/devices`, `DELETE /api/v1/web/devices/{device_id}`, `DELETE /api/v1/web/devices`, link:../runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). All three are operator verbs; the web app offers the same list and revocation to a paired device.
+* *Immediate revocation*: A revoked device's record is removed from `state/web-devices.json`; the runtime ends the device's open event streams at once and answers its next request `401`, whereupon the web app deletes its stored secret and shows the pairing page. Every revocation appends `web_device_revoked`.
+* *Idle expiry*: A device whose `last_used_at` is older than 90 days (compiled, link:../timeouts/02-runtime-leases-operator-web.adoc#device-idle-expiry[Timeouts & Budgets Specification, Device Idle Expiry]) is expired: its next request is answered `401`, and its record is removed with `web_device_revoked` (`reason: idle_expired`). `last_used_at` is written at most once per minute per device (link:../timeouts/02-runtime-leases-operator-web.adoc#device-last-used-granularity[Timeouts & Budgets Specification]). Rotation and absolute expiry are deferred (link:../../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+* *Store damage*: An unreadable or invalid `state/web-devices.json` authenticates no device (every web-originated request `401`, reported by `pm-mcp status`) and leaves the CLI unaffected; `pm-mcp web devices revoke --all` rewrites an empty store.
+
+[#web-operator-channel]
+=== Every Paired Device Is an Operator Channel
+
+In the first iteration there are no device roles: every paired device may do what the operator verbs do (answer pending operator decisions, grants, gate and merge overrides), except the CLI-only endpoints of <<web-proxy>>. The web app is therefore a third operator channel next to MCP elicitation and the CLI (`PM-SEC-3`); every action through it is audited with channel `web` and the `device_id`. Pairing a device is an operator act for this reason, and every device secret is as powerful as the operator. Roles (`viewer`, `operator`) and step-up before operator actions from a browser are deferred (link:../../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]).
+
+[#web-auth-seam]
+=== Authentication Seam
+
+Both processes use Quarkus Security: one `HttpAuthenticationMechanism` (Bearer) and one `IdentityProvider` per token kind, selected by token shape, and resources annotated only `@Authenticated` (`@RolesAllowed` once roles exist). The runtime has the provider for the runtime token and checks the forwarded device secret against its store; `pm-mcp-web` has the provider for `pmw_` device secrets, which checks the shape and leaves validity to the runtime. The OAuth iteration adds a provider wrapping Token-Sheriff validation for three-part JWTs next to the `pmw_` provider, so paired devices keep working during the switch; `token-sheriff-bom` stays imported for it (link:../../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-app]
+=== Web App (`pm-mcp-web-app`)
+
+* *Build*: SvelteKit 3 (release candidate, pinned; moved to 3.0 final when released) with Svelte 5 and TypeScript, built as a static single-page app (`@sveltejs/adapter-static`, `ssr = false`, fallback page) by `frontend-maven-plugin` with pinned Node and npm (`npm ci` from `package-lock.json`), tested with Vitest, and packaged as a resource JAR (`META-INF/resources`) that `pm-mcp-web` serves. The npm packages are covered by the CycloneDX SBOM. During development the Vite dev server proxies `/api` to a running web server.
+* *Views*: pairing (code from the fragment or typed, the certificate fingerprint in LAN mode), paired devices (list, revoke), runtime status (projects, plans including `stalled` plans, build slots, jobs), the live view of one plan (state, phase, tasks, jobs, findings counts), and pending operator decisions and operator actions.
+* *Live updates*: The app reads the event streams with `fetch()` and a `ReadableStream`, because `EventSource` cannot send an `Authorization` header; a credential never appears in a URL. It reconnects with `Last-Event-ID`.
+* *Browser storage*: The device secret is kept in `localStorage`, so the pairing survives browser restarts; the app never uses cookies. Its exposure to injected script is contained by the security headers (<<web-security-headers>>), Trusted Types, no third-party scripts or origins, no `{@html}` or other raw-HTML sink (all server text is rendered as text), and lockfile-pinned dependencies; revocation and idle expiry are the recovery. Sender-constrained credentials (a non-extractable WebCrypto key, DPoP) are deferred (link:../../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+
+[#web-threats]
+=== Threat Notes
+
+* *Cross-site scripting*: `script-src 'self'` with Trusted Types blocks injected and inline script and raw-HTML sinks; `connect-src 'self'` keeps script from sending the secret to another origin by `fetch`. Accepted residual: script that does run in the app's origin can read `localStorage` and act as the device until it is revoked (link:../../later-improvements.adoc#_l_2_oauth_for_the_web_adapter[Later Improvements, L-2]).
+* *DNS rebinding*: A rebound page carries a foreign `Host` and is refused before routing; it also has no access to the app origin's `localStorage`, and the credential is never ambient.
+* *Cross-site request forgery*: Not applicable: the credential is an explicit `Authorization` header, never a cookie; no CORS is granted.
+* *Framing*: `frame-ancestors 'none'` and `X-Frame-Options: DENY` on every response prevent clickjacking of operator actions.
+* *Code interception*: The pairing code is short-lived, single use, limited to 5 failures, carried in the URL fragment, and on the LAN only over TLS.
+* *Same-user processes*: The web server adds no boundary against processes of the same OS user: any of them can read the runtime token and call the Local API directly, including operator endpoints (link:../../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]). A compromised web server holds the same power and no more; it has no store access by construction.
+* *Model surface*: Nothing of the web server, the pairing, or the device store is reachable through an MCP tool or appears in a model-facing representation (link:../mcp-tools.adoc[MCP Tools Specification], Architectural Constraints; link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).

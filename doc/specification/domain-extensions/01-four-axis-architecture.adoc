@@ -1,0 +1,353 @@
+= Domain Extensions, Build Map & Configuration Split Specification: Four-Axis Domain Architecture
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../domain-extensions.adoc[Domain Extensions, Build Map & Configuration Split Specification] » Four-Axis Domain Architecture
+
+== Four-Axis Domain Architecture (Axes A–D, ADR-004 / ADR-013)
+_See Requirement link:../../Requirements.adoc#PM-EXT-1[PM-EXT-1: Four-Axis Domain Descriptors (Axes A–D)]_
+
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-1[PM-WATCH-EXT-1]_
+
+To comply with the GraalVM native-image closed-world constraint (`PM-TECH-3`), `PM-MCP` eliminates runtime `importlib` plugin loading. Built-in domains (`java`, `java-cui`, `javascript`, `javascript-cui`, `python`, `oci-containers`, `documentation`, `requirements`, `plan-marshall-plugin-dev`, `general-dev`) and organization data packs are represented by declarative JSON descriptors (`classpath:/domains/<domain_id>.json`) bound to four orthogonal, sealed Java interfaces corresponding to Axes A through D (ADR-004, ADR-013). Axis B is the exception: the file-to-build contract is owned by build-system extensions, not by language or content domains (ADR-004), so it is declared by build-system descriptors (`classpath:/build-systems/<build_system_id>.json` for `maven`, `gradle`, `npm`, and `pyproject`), each naming the domain key its routes are filed under in `build.map`.
+
+The axis split mirrors `plan-marshall` (`script-shared/scripts/extension/extension_base.py`: `ExtensionBase` owns Axis A — `get_skill_domains`, `applies_to_module`, `config_defaults`, and the `provides_*` hooks; `BuildExtensionBase` owns Axis B — `classify_globs`, `classify_paths`, `classify_path_specificity`, `classify_build_class`; `DerivationResolverBase` and `PathAttributionBase` own Axes C and D; ADR-004, ADR-013), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+
+=== Core Architectural Invariants
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-23[PM-WATCH-EXT-23]_
+
+1. *Fail-Closed Descriptor Loading (ADR-017)*: A validator derives its contract from the target's own declaration and fails closed when it cannot. Unlike the legacy catch-all that silently ignored broken `extension.py` modules, `PM-MCP` validates every compiled and project-local descriptor against its closed JSON Schema at startup. Any schema violation or unresolvable skill/resolver reference causes an immediate, explicit diagnostic failure rather than silent degradation.
+2. *Null-on-Absent Never Fabricates a Positive (ADR-010)*: When a domain is inactive or does not declare an optional capability (such as an architecture fitness gate or a domain verb like `marker-detect` or `rewrite-log-parse`), that capability is omitted from representations (`null` / absent). Conversely, if an active domain promises a mandatory gate that cannot execute, the engine halts with a diagnosable refusal (`refused`) and **never** records a synthetic pass.
+3. *Security Profile Resolution Constraint*: The `security` profile in `skills_by_profile` resolves focused security vocabulary skills (`skill://pm/domain/<domain>/security`) for implementation, review, and audit states; it **never** generates standalone implementation tasks of its own.
+4. *Technique Preconditions*: A prescriptive section of a domain vocabulary skill may declare a precondition in the descriptor's `technique_preconditions`, using the Axis A `applies_to_module` predicate grammar (build system, packaging, dependency coordinates, module path glob, file existence). The server evaluates it against the project's discovered modules at render time; when no module satisfies it, the renderer emits that section marked "available technique, not adopted in this project" instead of as binding guidance (link:../client-profiles/02-placeholders-and-detection.adoc#_rendering_invariants[Client Profiles Specification, Rendering Invariants]), and the rendered digest (`PM-SKILL-2`) reflects the result. Every section that prescribes the same `technique` declares the same precondition, so the technique's status is identical in every skill that carries it; the descriptor loader refuses a technique with diverging preconditions.
+
+=== Sealed Java Interfaces for Axes A–D
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-3[PM-WATCH-EXT-3], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-4[PM-WATCH-EXT-4]_
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.domain;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * Axis A: Skill loading, domain detection globs, profile-to-skill mapping,
+ * module applicability, write-once config defaults, triage vocabulary,
+ * and architecture gate declarations (ADR-004).
+ */
+public sealed interface SkillLoadingAxis permits DeclarativeDomainAxisA {
+
+    String domainId();
+
+    /** Detection globs (domain-detection glob dialect, distinct from build-map fnmatch). */
+    List<String> providesFileGlobs();
+
+    /** Maps execution profile (core, implementation, module_testing, integration_testing, quality, documentation, security; `core` is merged into every other profile) to its {defaults, optionals} skill:// URIs. */
+    Map<String, ProfileSkills> skillsByProfile();
+
+    /** Parent domain of an additive domain (java-cui -> java, javascript-cui -> javascript); empty for a standalone domain. */
+    Optional<String> additiveTo();
+
+    /** Descriptor default of the always_on inclusion leg. */
+    boolean alwaysOn();
+
+    /**
+     * Evaluates the domain's declarative applicability rules (applies_to_module) against a
+     * discovered module's facts: decides whether the domain applies to the module, which
+     * profiles activate, and which optional skills are promoted. Also gates whether the
+     * routes filed under this domain are seeded into build.map (ADR-004).
+     */
+    ApplicabilityMatch evaluateApplicability(DiscoveredModuleFacts moduleFacts);
+
+    /** Optional domain-specific triage vocabulary skill (e.g. skill://pm/triage/java); falls back to skill://pm/triage/generic. */
+    Optional<String> triageSkillUri();
+
+    /** Optional supporting outline analysis facts and vocabulary URI. */
+    Optional<OutlineExtensionSpec> outlineExtension();
+
+    /** Optional architectural fitness function gate (ArchUnit, import-linter, dependency-cruiser). */
+    Optional<ArchGateDeclaration> archGateDeclaration();
+
+    /** Optional compiled-in domain verbs (marker-detect, invoked as search-markers; rewrite-log-parse, invoked as parse-rewrite-log). */
+    Set<String> domainVerbs();
+}
+
+/**
+ * Axis B: File-to-build classification, owned by build-system extensions
+ * (maven, gradle, npm, pyproject), never by language/content domains (ADR-004).
+ * Classifies changed paths into (role, build_class) build-map routes that
+ * resolve to canonical build commands; it decides no module applicability.
+ */
+public sealed interface BuildRoutingAxis permits DeclarativeBuildSystemAxisB {
+
+    String buildSystemId();
+
+    /** Domain key under which this build system's routes are filed in build.map. */
+    String servedDomainKey();
+
+    /**
+     * Explicit (glob, role) build-map routes (classify_globs); role is production, test,
+     * or config. Globs are single-* fnmatch patterns or bare basenames, never recursive **.
+     */
+    List<BuildMapRoute> classifyGlobs();
+
+    /**
+     * Build class of a claimed (path, role) pair (classify_build_class): production -> compile,
+     * test -> module-tests, config -> verify, any other role -> none, unless the build system
+     * overrides the default for a specific path.
+     */
+    BuildClass classifyBuildClass(String path, BuildMapRole role);
+
+    /**
+     * Classifies changed paths into (role, build_class) routes of this build system, with the
+     * non-wildcard segment count of the matching glob as longest-glob-wins specificity
+     * (classify_paths, classify_path_specificity). Paths matching no route are omitted.
+     */
+    List<ClassifiedPathRoute> classifyPaths(List<String> changedPaths);
+
+    /** Maps canonical verbs (clean..package, module-tests, quality-gate, verify) to argument templates. */
+    Map<CanonicalBuildVerb, ArgumentTemplate> canonicalCommandTemplates();
+
+    /** Maps discovery operations to enrolled argument templates. */
+    Map<String, ArgumentTemplate> discoveryCommandTemplates();
+}
+
+/**
+ * Axis C: Directed module dependency edge derivation with explicit resolver identity (ADR-013, ADR-014).
+ */
+public sealed interface EdgeDerivationAxis
+        permits MavenEdgeResolver, GradleEdgeResolver, NpmEdgeResolver,
+                PyprojectEdgeResolver, PythonImportEdgeResolver,
+                MarkdownCrossRefResolver, DocumentationCrossRefResolver,
+                LspSymbolEdgeResolver, ProjectScriptEdgeResolver {
+
+    /** Stable, unique resolver ID ("maven", "gradle", "npm", "pyproject", "python", "markdown", "documentation", "lsp"). */
+    String resolverId();
+
+    /**
+     * Derives directed inter-module dependency edges; never activated by file pattern, only by explicit resolverId.
+     *
+     * @throws ResolverException when the derivation fails; DerivationMerge.invoke reports it as
+     *         status ERROR and continues with the sibling resolvers
+     */
+    ResolverExecutionResult deriveEdges(WorkspaceDiscoveryContext context) throws ResolverException;
+}
+
+/**
+ * Axis D: Repository subtree path-prefix ownership claims (ADR-013, ADR-014).
+ */
+public sealed interface PathOwnershipAxis permits DeclarativeDomainAxisD {
+
+    /** Stable attributor ID stamped onto every claim's producers and onto its AttributorReport. */
+    String attributorId();
+
+    /**
+     * Returns constant (pathPrefix, targetModuleId) ownership claims plus the attributor's own
+     * notes on claims it suppressed; stateless, no filesystem access.
+     *
+     * @throws AttributorException when the attributor cannot produce its claims; the merge
+     *         reports it and continues with the sibling attributors
+     */
+    PathClaimSet claimPaths() throws AttributorException;
+}
+----
+
+The Axis C resolver IDs mirror `plan-marshall` (`derivation_resolver_id()` of `build-maven`, `build-npm`, `build-pyproject`, `pm-dev-python`, `pm-plugin-development`, `pm-documents`, and `plan-marshall-plugin`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. `pyproject` (declared-dependency join) and `python` (import join) stay distinct IDs so an edge's provenance tells the two derivations apart; `markdown` and `documentation` read overlapping file types over different module corpora, and an edge both find carries both IDs. *Deliberate addition vs. `plan-marshall`*: the `gradle` resolver (`GradleEdgeResolver`) has no `plan-marshall` counterpart (`build-gradle` ships no derivation resolver).
+
+*Machine-local resolver enablement*: Which discovered resolvers run is a machine-local binding, because a resolver's availability and cost depend on locally installed tooling (the `lsp` resolver needs an enrolled language server). The binding `derivation_resolvers.<resolver_id>.enabled` lives in the project's operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (Tier 2, written via `pm-mcp operator config --project <project_id>`, machine-wide default in `machine-config.json` `project_defaults`; link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), keyed by `project_id`, never by a project root path, and mirroring `plan-marshall`'s `derivation_resolvers` section of its `.plan/local/run-configuration.json`. An absent section or absent entry means *enabled*; only an explicit `false` disables a resolver (a malformed entry fails the closed schema of `local-config.json` and is reported, never read as a setting). A disabled resolver is still discovered and reported (status `NOT_DISPATCHED`, reason `DISABLED`, zero edges), never pruned from the report, and is not counted as having run.
+
+=== Declarative Domain Descriptor Schema (`<domain_id>.json`)
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-2[PM-WATCH-EXT-2]_
+
+All constant domain metadata—the profile skill lists (`defaults` and `optionals` per profile, including `core`), the parent domain of an additive domain (`additive_to`), the `always_on` inclusion flag, and the Axis-A `applies_to_module` applicability rules with their `when` predicates (`build_system`, `packaging_equals`, `packaging_not_equals`, `dependency_contains`, `path_matches`, `file_exists`) and `promote_optional_skills_to_default`—is expressed in the domain descriptor JSON Schema:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/domain-descriptor-v1.json",
+  "title": "DomainDescriptor",
+  "type": "object",
+  "required": [
+    "format_version",
+    "domain_id",
+    "display_name",
+    "provides_file_globs",
+    "skills_by_profile",
+    "applicability_rules"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "skillRef": { "type": "string", "pattern": "^skill://pm/domain/[a-z][a-z0-9-]{1,31}/[a-z0-9][a-z0-9-]*$" },
+    "profileSkills": {
+      "type": "object",
+      "required": ["defaults", "optionals"],
+      "additionalProperties": false,
+      "properties": {
+        "defaults": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillRef" } },
+        "optionals": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/skillRef" } }
+      }
+    },
+    "activatableProfile": {
+      "type": "string",
+      "enum": ["implementation", "module_testing", "integration_testing", "quality", "security", "documentation"]
+    },
+    "when": {
+      "type": "object",
+      "description": "AND of every present predicate; an empty object matches every module.",
+      "additionalProperties": false,
+      "properties": {
+        "build_system": { "type": "string", "enum": ["maven", "gradle", "npm", "pyproject", "documentation", "marshall-plugin", "none"] },
+        "packaging_equals": { "type": "string", "minLength": 1 },
+        "packaging_not_equals": { "type": "string", "minLength": 1 },
+        "dependency_contains": { "type": "string", "minLength": 1, "description": "Substring of at least one declared dependency coordinate of the module." },
+        "path_matches": { "type": "string", "minLength": 1, "description": "Domain-detection glob against the module path." },
+        "file_exists": { "type": "string", "minLength": 1, "description": "Module-relative path that must exist." }
+      }
+    }
+  },
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "domain_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,31}$",
+      "description": "identifiers.adoc, domain_id"
+    },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "additive_to": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z][a-z0-9-]{1,31}$",
+      "description": "domain_id of the parent domain this additive domain extends (java-cui -> java, javascript-cui -> javascript); null for a standalone domain."
+    },
+    "always_on": {
+      "type": "boolean",
+      "default": false,
+      "description": "Descriptor default of the always_on inclusion leg: the domain joins every plan's domain set and is exempt from narrowing."
+    },
+    "build_system": {
+      "type": ["string", "null"],
+      "enum": ["maven", "gradle", "npm", "pyproject", null]
+    },
+    "provides_file_globs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Domain-detection globs (distinct from build-map fnmatch globs)."
+    },
+    "skills_by_profile": {
+      "type": "object",
+      "description": "Per profile a {defaults, optionals} pair. core is merged into every profile (its defaults into each profile's defaults, its optionals into each profile's optionals) and is never activated on its own. Every listed profile other than core names at least one skill in defaults or optionals; a profile without skills is absent here and declared in minimal_profiles; the completeness check requires implementation and module_testing to be either listed here or declared minimal.",
+      "additionalProperties": false,
+      "properties": {
+        "core": { "$ref": "#/$defs/profileSkills" },
+        "implementation": { "$ref": "#/$defs/profileSkills" },
+        "module_testing": { "$ref": "#/$defs/profileSkills" },
+        "integration_testing": { "$ref": "#/$defs/profileSkills" },
+        "quality": { "$ref": "#/$defs/profileSkills" },
+        "security": { "$ref": "#/$defs/profileSkills" },
+        "documentation": { "$ref": "#/$defs/profileSkills" }
+      }
+    },
+    "minimal_profiles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/activatableProfile" },
+      "description": "Profiles the domain deliberately ships without skills. A profile listed here must be absent from skills_by_profile; readers (task skill resolution, posture preview, pm_skills) render it as minimal, never as an empty or missing profile."
+    },
+    "triage_skill": {
+      "type": ["string", "null"],
+      "pattern": "^skill://pm/triage/[a-z0-9][a-z0-9-]*$"
+    },
+    "arch_gate": {
+      "type": ["object", "null"],
+      "required": ["engine", "canonical_verb", "finding_category"],
+      "additionalProperties": false,
+      "properties": {
+        "engine": { "type": "string", "enum": ["archunit", "import-linter", "dependency-cruiser"] },
+        "canonical_verb": { "type": "string", "const": "arch-gate" },
+        "finding_category": { "type": "string", "const": "arch-constraint" }
+      }
+    },
+    "applicability_rules": {
+      "type": "array",
+      "description": "Axis-A applicability rules (applies_to_module) evaluated against each discovered module; they decide profile activation and gate which build.map routes filed under this domain are seeded. A module matches the domain when at least one rule matches (OR across rules).",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "when", "activate_profiles"],
+        "additionalProperties": false,
+        "properties": {
+          "rule_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+          "when": { "$ref": "#/$defs/when" },
+          "activate_profiles": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/activatableProfile" }
+          },
+          "promote_optional_skills_to_default": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/skillRef" }
+          }
+        }
+      }
+    },
+    "technique_preconditions": {
+      "type": "array",
+      "description": "Section-level preconditions of prescriptive techniques in this domain's vocabulary skills (Technique Preconditions below); the predicate grammar is the applicability rules' when object.",
+      "items": {
+        "type": "object",
+        "required": ["skill", "section", "technique", "when"],
+        "additionalProperties": false,
+        "properties": {
+          "skill": { "$ref": "#/$defs/skillRef" },
+          "section": { "type": "string", "description": "Section anchor of the skill's section index (mcp-tools.adoc, pm_skill section parameter)." },
+          "technique": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$", "description": "Technique identifier shared by every skill section that prescribes the same technique." },
+          "when": { "$ref": "#/$defs/when" }
+        }
+      }
+    },
+    "edge_resolvers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["maven", "gradle", "npm", "pyproject", "python", "markdown", "documentation", "lsp"]
+      }
+    },
+    "claim_paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path_prefix", "target_module"],
+        "additionalProperties": false,
+        "properties": {
+          "path_prefix": { "type": "string", "minLength": 1 },
+          "target_module": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "domain_verbs": {
+      "type": "array",
+      "description": "Domain verb IDs: marker-detect (invoked via search-markers), rewrite-log-parse (invoked via parse-rewrite-log).",
+      "items": { "type": "string", "enum": ["marker-detect", "rewrite-log-parse"] }
+    }
+  }
+}
+----
+
+The `when.build_system` values are the module `build_systems` facts that `plan-marshall`'s discovery emits (`maven`, `gradle`, `npm`, `documentation` from `pm-documents`, `marshall-plugin` from `pm-plugin-development`), and the domain verb IDs are those `pm-dev-java-cui` declares in `provides_domain_verb()` (`marker-detect` → `search-markers`, `rewrite-log-parse` → `parse-rewrite-log`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. `PM-MCP` names the Python build system `pyproject` throughout, where `plan-marshall`'s discovery records `python`.
+
+*Profile and applicability semantics*:
+
+* *`core` merge*: `core` is not an activatable profile. When the server resolves a profile's skills, it prepends the domain's `core.defaults` to that profile's `defaults` and its `core.optionals` to that profile's `optionals` (duplicates removed, first occurrence kept), mirroring `plan-marshall`'s `core` profile (for example `pm-dev-java-cui` declares `cui-logging` under `core`). A profile that the domain neither lists nor declares minimal still receives `core`.
+* *`verification` tasks*: `verification` is a task profile, not an activatable profile. A `verification` task resolves only the core skills (`skill://pm/core/SKILL.md`) and no domain skills, not even a domain's `core`; its steps are the verification commands, as in `plan-marshall` (`phase-4-plan/SKILL.md`, the `verification` branch of the task creation loop).
+* *`when` predicates*: all predicates present in one rule must hold (AND within a rule); a module matches the domain when any rule matches (OR across rules); an empty `when` (`{}`) matches every module. `packaging_equals` and `packaging_not_equals` compare the module's discovered packaging exactly (a module without a packaging fact satisfies only `packaging_not_equals`), `dependency_contains` is a substring test over the module's declared dependency coordinates, and `file_exists` tests a module-relative path. Disjunction inside one predicate is expressed by a second rule, never by a list value.
+* *`activate_profiles`*: a closed enum of the activatable profiles; a matching rule activates exactly the listed profiles for that module, and `promote_optional_skills_to_default` moves the named skills of those profiles from `optionals` to `defaults` for that module.
+* *`additive_to`*: an additive domain (`java-cui` extends `java`, `javascript-cui` extends `javascript`) applies to a module only where its parent domain applies, and its resolved skills are appended after the parent's for the same profile; a descriptor whose `additive_to` names an unknown domain or forms a cycle fails descriptor loading.
+* *`always_on`*: the descriptor declares the default of the `always_on` inclusion leg (`domain-detect`, phase-workflows.adoc § Widen-Only Domain Re-Merge). The project's override of `always_on` and of `file_globs` (plan-marshall's `skill_domains.<domain>.always_on` / `file_globs` in `marshal.json`) belongs to the team file `.marshall/config/domains.json`, not to the descriptor (link:../store-schemas/08-project-configuration-local.adoc#config-domains-json[Store Schemas Specification, `domains.json`]). *Deliberate change vs. `plan-marshall`*: a descriptor carries no `config_defaults` map; nothing is seeded into a configuration file when a domain is activated, and a domain's defaults are compiled defaults of the effective configuration.

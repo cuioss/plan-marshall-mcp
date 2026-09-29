@@ -1,0 +1,255 @@
+= Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification: Question Batching, Roles & Reader Agents
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../dispatch-and-effort.adoc[Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification] » Question Batching, Roles & Reader Agents
+
+== Sub-Agent Question Batching & Non-Blocking Escalation
+_See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+Sub-agents operating at `scope = "entity"` are strictly forbidden from directly prompting the human operator or blocking in an interactive wait loop.
+
+=== Architectural Rationale
+
+1. *Turn and Lock Conservation*: A sub-agent blocked waiting for human input holds an active host sub-session and prevents parallel sibling sub-agents from completing their fan-out batch.
+2. *Host Elicitation Limitations*: Agent hosts (Claude Code, OpenCode, Antigravity) do not reliably route MCP elicitation requests or interactive user-question modals originating from inside background/child sub-agents to the top-level terminal UI.
+3. *Single Bounded Escalation Guarantee*: Collecting ambiguities across all sub-agents in a phase allows the parent session to present a single, consolidated question batch to the operator rather than interrupting the user piecemeal.
+
+=== Prompt Envelopes & Entity Escalation Protocol
+
+When a sub-agent encounters an ambiguity or requires an operator decision during `phase-2-refine`, `phase-3-outline`, or `phase-5-execute`, it follows one of two non-blocking paths:
+
+1. *Best-Judgment Completion with Attached Prompt Envelopes (`refine_prompt`, `outline_prompt`)*: In planning and outline states (`refine`, `outline`), the sub-agent completes its draft artifact using its best engineering judgment and includes structured open questions in the `questions` array of its `submit` link payload (free parameter `questions:list<schema[question-envelope]>?`, link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]). Each question conforms to the `BatchedQuestionEnvelope` schema below, where every selectable option carries a canonical `branch_key` enum value bound to a downstream workflow transition.
+2. *Immediate Entity-Scoped `escalate` (`escalate_ask`, `status: "blocked"`)*: In execution states (`execute`) where a task cannot safely proceed without an authoritative decision (e.g., an undeclared scope deviation or contradictory interface contract), the sub-agent invokes `pm_do(scope="entity", link="escalate:<task_id>", args={"question": {"question_text": "...", "options": [...]}})` (free parameter `question:schema[question-envelope]`). The server persists the pending question as a `BatchedQuestionEnvelope` with `prompt_kind: escalate_ask` in the plan store, records the pending decision, and raises the `blocked` condition on the entity scope (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, Conditions]): the entity stays in `envelope.task.active` and renders only `wait:decision:<decision_id>`. The sub-agent returns `status: "blocked"` to the parent session and never waits on the decision itself. This is the only question path of Phase 5: there is no parent answers state, and `execute.dispatch-ready` keeps dispatching the envelopes that do not depend on the blocked task. The operator answers through elicitation or `pm-mcp operator decide plan <plan_id> <decision_id> <outcome>`, which the condition's `facts.operator_command` renders; the resolution clears the condition, records the answer as the task's guidance (an intent amendment when it changes intent), and the envelope is offered again as `dispatch:envelope-M` with a fresh `dispatch_id`, whose sub-agent resumes the task with the answer in `facts`.
+
+[#question-envelope-schema]
+*Server-Owned Fields*: `question_id` and `source_entity` are assigned by the server when it persists a question, never by the sub-agent. `question_id` is the next value of a scope-wide counter of the plan or epic (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), never reused; `source_entity` is the `entity` of the entity-scoped call that carried the question, or the call's `dispatch_id` when it names no entity. `prompt_kind` follows from the carrying link (`escalate_ask` for `escalate:<task_id>`, `refine_prompt` or `outline_prompt` for the `submit` link of a refine or outline entity). The model therefore supplies a question without these three fields: the free schema of the `escalate:<task_id>` link and the item schema of the `questions` array of a `submit` payload are the `BatchedQuestionEnvelope` minus `question_id`, `prompt_kind`, and `source_entity` (that is `question_text`, `default_assumption`, and `options`, each option an object `{branch_key, label, description, recommended?}`), and a payload that carries a server-owned field is rejected with `invalid_link_args`. This model-supplied subset is registered as the named parameter schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]): the free parameter `question:schema[question-envelope]` of `escalate:<task_id>` and `questions:list<schema[question-envelope]>?` of the `submit` link of a refine or outline entity. It is the schema below with `question_id`, `prompt_kind`, and `source_entity` removed from `properties` and `required`, closed with `additionalProperties: false`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/batched-question-envelope-v1.json",
+  "title": "BatchedQuestionEnvelope",
+  "type": "object",
+  "required": ["question_id", "prompt_kind", "source_entity", "question_text", "options"],
+  "additionalProperties": false,
+  "properties": {
+    "question_id": {
+      "type": "string",
+      "pattern": "^Q-[0-9]{3,6}$",
+      "description": "Server-owned: next value of the scope-wide question counter."
+    },
+    "prompt_kind": {
+      "type": "string",
+      "enum": ["refine_prompt", "outline_prompt", "escalate_ask"],
+      "description": "Server-owned: derived from the link that carried the question."
+    },
+    "source_entity": {
+      "type": "string",
+      "description": "Server-owned: the entity of the carrying call, or its dispatch_id when it names no entity."
+    },
+    "question_text": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "default_assumption": {
+      "type": ["string", "null"],
+      "description": "Best-judgment assumption applied by the sub-agent if the operator accepts defaults."
+    },
+    "options": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["branch_key", "label", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "branch_key": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,31}$",
+            "description": "Deterministic enum key bound to a state transition or parameter assignment."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 240
+          },
+          "recommended": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    }
+  }
+}
+----
+
+=== Parent Session Aggregation (`*.awaiting_answers`)
+
+When the parent session processes `returned:<dispatch_id>` for all dispatches in the current state and the plan store contains one or more unresolved `BatchedQuestionEnvelope` records:
+
+1. The engine transitions the parent plan to `<phase>.awaiting_answers` (`refine.awaiting_answers` or `outline.awaiting_answers`; the batched `refine_prompt` and `outline_prompt` questions exist only in Phases 2 and 3, and a Phase 5 question is the entity escalation `escalate:<task_id>` of <<_prompt_envelopes_entity_escalation_protocol>> item 2, never an answers state).
+2. The representation exposes the consolidated questions in `facts.pending_questions` and offers an `answer_questions` link (accepting a map of `question_id -> branch_key` via MCP elicitation or model-relayed user answers for non-authorizing clarifications, as governed by `PM-SEC-3`).
+3. Submitting `answer_questions` resolves the batched questions in one transition and advances the plan.
+
+== Role Registry, Effort Level Ladder (Levels 1–7) & Variant Installation
+_See Requirements link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution], link:../../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
+
+`PM-MCP` decouples workflow dispatch states from concrete LLM model identifiers through a two-stage resolution pipeline:
+
+1. **Role Resolution**: Maps a dispatch's role key to an abstract **effort level** (`level-1`..`level-7` or `inherit`).
+2. **Ladder & Variant Resolution**: Maps that level and the scope's current declared `client` (the last row of its session log `sessions.jsonl`, link:../store-schemas/01-format-and-session-log.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]) to an installed per-client agent variant pinning the runtime-specific `model` and `effort`.
+
+The role registry, the level vocabulary, the resolve chain, the ladders, and the variant naming mirror `plan-marshall` (`plan-marshall/standards/effort-roles.md`, `effort-levels.md`, `effort-variants.md`, ADR-021), verified at commit `1d4a1da37`, with two deliberate changes: an unknown effort key is a validation error (<<_role_registry_lookup_hierarchy>>), and a level whose variant is not installed falls back to `inherit` (<<effort-ladders>>, Capability gating). Re-verify against the latest `plan-marshall` version before implementing.
+
+=== Role Registry & Lookup Hierarchy
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-11[PM-WATCH-DISP-11]_
+
+Configured values are the strings `level-1` .. `level-7` or `inherit`; any other value is a hard error on read. Effort keys are validated against the role registry below on the same read: a group the registry does not know (for example `plan.phase-1-init.effort`, or an unknown key under `orchestrator.effort`) or a sub-key its group does not list is a validation error exactly like an invalid value, never skipped with a fallback to the `default` slot. The validation on read of the effective configuration reports it (in `pm://project/config` and in `setup.reconcile-config`, link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Validation on Every Read]) as an `unknown_config_key` finding naming the key path in `workflow.json`, and the server logs `PM_MCP-100` (link:../../LogMessages.adoc[Log Messages]). *Deliberate change vs. `plan-marshall`*: it only warns on an unknown role key and resolves it through the fallback chain (`default` -> `effort` -> `plan.effort` -> `inherit`) so that registry renames do not break saved configurations (`effort-variants.md` § Validation, `manage-config/scripts/_cmd_effort.py`); `PM-MCP` rejects it, because a silently ignored key hides a misconfigured role. There are no mandatory keys and no built-in per-role defaults: an unconfigured role resolves to `inherit`.
+
+[cols="2,2,4"]
+|===
+|Group |Sub-keys |Where the sub-keys fire
+
+|`plan.phase-2-refine.effort`
+|`default`
+|The phase's dispatches (refine body, issue-body reader ingestion, q-gate validation).
+
+|`plan.phase-3-outline.effort`
+|`default`
+|Outline dispatches, including the collapsed light-lane envelope (`outline.light`, which folds the light plan's refine work; link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#planning-lanes[Phase Workflows Specification, Planning Lanes]), as in `plan-marshall`, which resolves the light envelope under the `phase-3-outline` role. The setup dispatches of the workspace scope (architecture enrichment of `project-setup`) resolve with this group as their lookup key, although the workspace scope has no phase.
+
+|`plan.phase-4-plan.effort`
+|`default`
+|Task planning dispatches.
+
+|`plan.phase-5-execute.effort`
+|`default`, `verification-feedback`
+|`default`: task envelopes; `verification-feedback`: per-finding FIX / SUPPRESS / ACCEPT triage of build findings.
+
+|`plan.phase-6-finalize.effort`
+|`default`, `verification-feedback`, `post-run-review`
+|`default`: finalize dispatches such as create-pr and pre-submission self-review; `verification-feedback`: Sonar, review-bot, and plugin-doctor finding triage; `post-run-review`: lessons capture (the plan retrospective is computed in-process and dispatches nothing).
+
+|`orchestrator.effort`
+|`analyze`, `decompose`, `reader` (plus `default` slot and `max` ceiling)
+|`analyze`: epic landing analysis and the re-grounding dispatches of the epic spec review; `decompose`: decomposition; `reader`: untrusted-text ingestion. Resolves under the top-level `orchestrator` block, not under `plan`.
+|===
+
+Phase 1 (`init`) runs inline and has no role. A group may be a plain string (one level for every sub-key) or an object with per-sub-key values and a `default` slot.
+
+==== Deterministic Role Lookup Algorithm
+
+1. **Plan roles**: `plan.<phase>.effort.<subkey>` -> `plan.<phase>.effort.default` -> `plan.<phase>.effort` (string) -> `plan.effort` -> `inherit`.
+2. **Orchestrator roles**: `orchestrator.effort.<surface>` -> `orchestrator.effort.default` (or the plain string) -> `plan.effort` -> `inherit`, then clamped to `orchestrator.effort.max` on the ordinal ladder (`min(resolved, max)`; an unset `max` is a no-op). Before the clamp, a result of `inherit` is resolved to a concrete level: with `max` set it becomes `max` itself, because the session model has no rung the server can order against the ceiling; with `max` unset it stays `inherit`. *Deliberate change vs. `plan-marshall`*: its clamp passes `inherit` through unclamped, so an inheriting surface escaped the ceiling. Orchestrator dispatches always name their surface so the clamp cannot be bypassed.
+3. **Unknown group or sub-key**: A validation error of the effort configuration (see above), reported by the validation on read of the effective configuration and logged as `PM_MCP-100`; the lookup never falls back from an unknown key to the `default` slot.
+
+[#effort-ladders]
+=== Effort Ladders (`effort_ladder` in `<PM_MCP_BASE>/projects/<project_id>/local-config.json`)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-12[PM-WATCH-DISP-12]_
+
+The ladder maps each level to a concrete `model` and `effort` per client runtime. The team file `.marshall/config/workflow.json` carries only the target-neutral levels; model pins are never stored in git-tracked configuration (ADR-021).
+
+* **Machine-local ladder**: The operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json` holds `effort_ladder: {"<client_id>": {"level-N": {"model": <string|null>, "effort": <string|null>}}}` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), with machine-wide defaults in `machine-config.json` `project_defaults.effort_ladder`; `plan-marshall`'s own ladder file is never read. `model: null` means unpinned (the dispatch inherits the session model).
+* **Compiled defaults**: When an entry is absent (the file is sparse), the ladder compiled into the client profile (link:../client-profiles.adoc[Client Profiles Specification]) applies and `pm://project/config` reports the source `compiled_default`; nothing is seeded into the file.
+* **Narrow but never escalate (ADR-021)**: A ladder entry serves only its own level and never provisions a model beyond the capability of the resolved rung. ADR-021 (status *Proposed* in `plan-marshall`) also prescribes an entry-kind discriminator (`local` / `provider`) that `plan-marshall`'s current file format does not yet carry; verify its status before implementing the ladder reader.
+* **Capability gating**: A variant for a `(model, effort)` pair is installed only when the model alias supports that effort (for Claude, `xhigh` and `max` depend on the alias). A level whose variant is not installed dispatches on the canonical `inherit` variant. The resolver never names a variant that is not installed. *Deliberate change vs. `plan-marshall`*: its resolver does not know which variants the emitter skipped, so a dispatch resolved to a skipped `level-6` / `level-7` variant fails at runtime with `Agent type not found` (`effort-variants.md` § Build-Time Alias-Capability Guard).
+
+[cols="1,2,2,2,2"]
+|===
+|Level |Claude Code (`model` / `effort`) |Antigravity (`model` / `effort`) |OpenCode |Codex (*provisional*)
+
+|`level-1` |`haiku` / _(none; Haiku takes no effort)_ |`flash` / `low` |unpinned |`gpt-5.4-codex-mini` / `low`
+|`level-2` |`sonnet` / `medium` |`flash` / `low` |unpinned |`gpt-5.4-codex-mini` / `medium`
+|`level-3` |`sonnet` / `high` |`flash` / `medium` |unpinned |`gpt-5.4-codex` / `low`
+|`level-4` |`opus` / `medium` |`flash` / `medium` |unpinned |`gpt-5.4-codex` / `medium`
+|`level-5` |`opus` / `high` |`flash` / `high` |unpinned |`gpt-5.4-codex` / `high`
+|`level-6` |`opus` / `xhigh` |`pro` / `low` |unpinned |`gpt-5.4-pro` / `high`
+|`level-7` |`fable` / `max` |`pro` / `high` |unpinned |`gpt-5.4-pro` / `max`
+|`inherit` |session model |session model |session model |session model
+|===
+
+The Claude, Antigravity, and OpenCode columns are `plan-marshall`'s defaults. `plan-marshall` has no Codex target, so the Codex column is provisional until verified in Milestone 1.
+
+=== Per-Client Variant Installation (`execution-context`)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-9[PM-WATCH-DISP-9], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-24[PM-WATCH-DISP-24]_
+
+Because agent hosts such as Claude Code and OpenCode load sub-agent definitions from static files at session startup and bind model/effort settings plus allowed tool lists in agent frontmatter, `pm-mcp client install <client>` renders and installs the per-level variant files into the host's agent directory:
+
+* **Worker Family Variants**: `execution-context-level-1` through `execution-context-level-7` (for installed levels) and `execution-context` (the `inherit` variant).
+* **Reader Family Variants**: `execution-context-reader-level-1` through `execution-context-reader-level-7` and `execution-context-reader` (`inherit`), so a reader role resolves at any level like every other role.
+* **Rendered at Install Time**: Variant files are rendered from the templates in the embedded bundle and the effective ladder (`effort_ladder` of `local-config.json`, then `project_defaults`, then the compiled defaults). The bundle manifest marks them `rendered`; the installer verifies the template digest and records the rendered digest in `install-records.json`. A ladder change takes effect after `pm-mcp client update` and a host restart; when `pm-mcp operator config` changes the effort ladder, it prints `pm-mcp client update` as the next step.
+* **Mandatory MCP Tool Inclusion**: Every installed `execution-context` worker variant **must** include the `PM-MCP` tool surface (`mcp__plan-marshall__pm_state`, `mcp__plan-marshall__pm_do`, `mcp__plan-marshall__pm_build`, `mcp__plan-marshall__pm_lsp`, `mcp__plan-marshall__pm_skill`, `mcp__plan-marshall__pm_skill_file` or host-equivalent wildcard `mcp__plan-marshall__*`) alongside host file/shell tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`). Without these MCP tool permissions, a sub-agent cannot execute `start: pm_state(...)` or submit its work via `pm_do`.
+* **Concise Universal Worker Body**: The prompt body of every `execution-context-*` variant is reduced to a deterministic 5-step execution loop:
+** Load `skill://pm/core/SKILL.md` and every URI listed in `skills[]` via `pm_skill` (or `resources/read`); if any load fails or returns no content, stop without performing work and return `status: error` with `display_detail: "skill load failed: <uri>"`.
+** Call the exact `start: pm_state(...)` command from the dispatch prompt.
+** Perform the judgment or code/test authoring required by the returned state representation.
+** Follow `pm_do(scope="entity", link="...", args={...})` until the entity representation reaches a terminal state (`links[0]`).
+** Return `{status, display_detail}` to the caller (the dispatching session adds host-reported `token_usage` on `returned:<dispatch_id>`) without asking the user questions or spawning sub-agents.
+* **Persona & Execution Lane Flattening**:
+** *Personas*: The server resolves persona DAGs (`composes:` and `profiles:` with cycle rejection) at representation-build time, flattening them into `skills[]` URIs (`skill://pm/core/SKILL.md` + `skill://pm/domain/...`). The legacy 1,500-line `persona-plan-marshall-agent` is stripped of Bash/CLI hygiene rules (roughly two-thirds of its volume) and distilled into `skill://pm/core/SKILL.md`.
+** *Execution Lanes*: Execution postures (`minimal ⊏ standard ⊏ full`, selected at `phase-1-init`) prune optional workflow elements server-side while enforcing **floor immunity** (a lane override of `off` on core or derived-state elements is ignored and noted in diagnostics; an unresolved `ask` element is dropped only when its external provider is absent).
+
+== Reader Agent Family (`execution-context-reader`)
+_See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+
+When a workflow ingests untrusted free-form external content—such as external web pages or GitHub/GitLab issue descriptions—`PM-MCP` isolates the untrusted payload inside the **`execution-context-reader`** agent family. Pull request review comments and static-analysis messages are not dispatched to a reader per finding; they pass one batched deterministic validation pass (the same validator as Boundary 2) before triage, as in `plan-marshall` (`plan-marshall/workflow/verification-feedback.md`).
+
+The reader contract mirrors `plan-marshall` (ADR-003, `agents/execution-context-reader.md`, `untrusted-ingestion`), verified at commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing. The containment boundary is the deterministic validator, not the reader's restricted tool surface: the tool surface only bounds the blast radius of a hijacked reader.
+
+=== Two-Boundary Containment Architecture
+
+[source,text]
+----
+Untrusted External Source (Web / Issue / PR Body)
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────────┐
+│ Boundary 1: Reader Sub-Agent (execution-context-reader)  │
+│  • Tools: WebSearch, WebFetch ONLY (no local file tools) │
+│  • Local content arrives in-band in the dispatch prompt  │
+│  • NO MCP Tools (no pm_do, pm_state, pm_build, pm_start) │
+│  • NO Write, Edit, or Bash tools                         │
+│  • Output: Structured candidate JSON/text in response    │
+└─────────────────────────────┬────────────────────────────┘
+                              │ Plain-text response to parent session
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│ Parent Session (dispatching plan or epic)                │
+│  • Treats reader output as opaque untrusted candidate    │
+│  • Calls pm_do(link="ingest_candidates:<dispatch_id>",   │
+│                args={candidates, status, display_detail})│
+└─────────────────────────────┬────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────┐
+│ Boundary 2: Deterministic Server-Side Validator (PM-MCP) │
+│  • Enforces strict JSON schema & length/charset bounds   │
+│  • Rejects/clamps per closed schema (no extra keys)      │
+│  • Optional URL filter (reader.webfetch_domains)         │
+│  • Persists validated records to findings/references     │
+└──────────────────────────────────────────────────────────┘
+----
+
+=== Normative Reader Constraints
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-25[PM-WATCH-DISP-25]_
+
+1. *Strict Host Tool Allowlist*: Installed `execution-context-reader` variants declare exactly `WebSearch` and `WebFetch` (or client-profile equivalents). `Read`, `Grep`, `Write`, `Edit`, `MultiEdit`, `Bash`, and the host sub-agent tool (`Agent`/`task`/`invoke_subagent`/`spawn_agent`) are strictly excluded. Local content the reader must extract from (for example an issue body the server fetched) is passed in-band in the rendered dispatch prompt. *Deliberate change vs. `plan-marshall`*: its reader also holds `Read` and `Grep`.
+2. *Zero MCP Tools*: Reader variants are provisioned with **zero `pm_*` MCP tools**. Unlike worker sub-agents, a reader sub-agent does not call `pm_state` or `pm_do`. Instead, the server embeds the extraction schema and target source locators directly inside the rendered `dispatch` prompt's `reader_contract` block. Even if adversarial prompt injection inside an issue body or web page hijacks the reader sub-agent's instructions, the sub-agent has no tool capable of mutating workflow state, modifying files, or executing shell commands.
+3. *Deterministic Server Validator Seam*: The reader sub-agent returns its extracted candidate records as structured text to the dispatching parent session. The parent session relays that candidate payload into the paired server validation link `ingest_candidates:<dispatch_id>` (rel `submit`, form `submit`), which replaces `returned:<dispatch_id>` for a reader dispatch (the pairing exception of xref:02-dispatch-observability-and-spend.adoc#_dispatch_id_generation_lifecycle_states[`dispatch_id` Generation & Lifecycle States]): its free parameters are the candidate payload plus the return fields of `returned:<dispatch_id>`, and following it records the dispatch's return (`RETURNED`; a reader never claims its dispatch) and runs the compiled deterministic validator before writing any candidate to `references.json` or `findings.jsonl`.
+4. *No Local File Access*: A reader holds untrusted input and outbound fetch, but no local file access, so there is nothing local for a hijacked reader to exfiltrate. An outbound domain list is optional validator hygiene, not a containment boundary: `reader.webfetch_domains` in the operator file `local-config.json` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]); an empty or absent list applies no URL filter. No host permission rule restricts `WebFetch`.
+5. *Validator Duties*: The deterministic validator (a) enforces the extraction schema (`additionalProperties: false`, `maxLength`, `maxItems`, `pattern`) and rejects structural violations, (b) clamps over-long strings and arrays, and (c) when `reader.webfetch_domains` is non-empty, re-checks every URL-bearing field against it, rejecting hosts outside the list. It does not attempt to detect or strip prompt-injection text; only a `status: success` result is persisted.
+6. *Separation from Citations-Only Rule*: Reader containment is a security boundary (`PM-SEC-1`) and must never be conflated with the citations-only context-conservation rule used by trusted read-only worker sub-agents.

@@ -1,0 +1,183 @@
+= Store Schemas Specification: Leases, Integrity Invariants & Script Disposition
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Leases, Integrity Invariants & Script Disposition
+
+[#machine-lease-stores]
+== Machine Lease Stores (`merge-queue.json`, `review-bot-windows.json`, `build-slots.json`)
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-37[PM-WATCH-STORE-37]_
+
+The three lease stores in `<PM_MCP_BASE>/state/` are updated only in short transactions under their machine store locks (<<lock-free-snapshot-reads>>; `PM-IMPL-7`, `PM-WF-15`). Every lease owner has the same shape, and every instant follows the one wire shape (xref:01-format-and-session-log.adoc#format-versioning[Format Versioning & Atomic Write Discipline] item 5), so a lease written by one component and reclaimed by another round-trips byte-identical instants.
+
+*Ownership vs Liveness*: A lease is owned by its scope (`project_id`, `scope_type`, `scope_id`), never by the runtime instance; the project's recovery after a runtime start selects the project's leases by `project_id`; `holder_instance` records only which runtime currently serves it. At runtime start, a lease whose `holder_instance` is no longer alive (PID plus start instant) is not released but marked `orphaned_at`; the next call addressing the owning scope adopts it (sets `holder_instance` to the new runtime, clears `orphaned_at`) under the machine store lock. An orphaned lease is released only on positive evidence of abandonment: the owning scope is terminal, archived, or no longer resolvable; its `lease_expires_at` passed without adoption; or, for a build slot, its job was recorded as `killed` at the restart (a build slot is therefore released at once). For the merge holder, provider-side evidence also counts: when the provider observation of the holder's pull request (`ci.pr-observe`) reports it merged or closed, the next admission transaction releases the holder lease, with an audit record naming the observation, whether or not the lease is orphaned or expired. An unobservable or failed provider observation is no evidence and releases nothing.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/lease-owner.json",
+  "title": "LeaseOwner",
+  "type": "object",
+  "required": ["project_id", "scope_type", "scope_id", "holder_instance"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Enrolment identifier of the owning project (identifiers.adoc, project_id); recovery selects a project's leases by it." },
+    "scope_type": { "type": "string", "enum": ["plan", "epic", "workspace"] },
+    "scope_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "plan_id or epic_id; null for the workspace scope (identifiers.adoc, scope_id)." },
+    "holder_instance": {
+      "type": "object",
+      "description": "Runtime instance currently serving the lease; liveness only, never ownership",
+      "required": ["runtime_pid", "runtime_started_at"],
+      "additionalProperties": false,
+      "properties": {
+        "runtime_pid": { "type": "integer", "minimum": 1 },
+        "runtime_started_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "orphaned_at": { "type": ["string", "null"], "format": "date-time", "description": "Set at runtime start when holder_instance is no longer alive; cleared on adoption" }
+  }
+}
+----
+
+* *`merge-queue.json`*: `{"format_version": 1, "repositories": {"<repository key>": {"holder": <lease> | null, "waiting": [<entry>]}}}`. A `holder` lease carries `owner`, `acquired_at`, `heartbeat_at`, and `lease_expires_at` (heartbeat and expiry rule in link:../timeouts/02-runtime-leases-operator-web.adoc#merge-lease[Timeouts & Budgets Specification, Merge Holder Lease]); a `waiting` entry carries `owner` and `enqueued_at`, in FIFO order.
+* *`build-slots.json`*: `{"format_version": 1, "slots": [<lease>]}`, each lease with `owner`, `job_id`, `acquired_at`, and `lease_expires_at` (link:../timeouts/02-runtime-leases-operator-web.adoc#build-slot-lease[Timeouts & Budgets Specification, Build Slot Lease]); the slot count never exceeds `max_build_slots` (xref:12-machine-stores.adoc#machine-config[Machine Configuration Store (`<PM_MCP_BASE>/machine-config.json`)]).
+* *`review-bot-windows.json`*: `{"format_version": 1, "windows": {"<org>/<bot_kind>": <window>}}`. Rate windows are org-scoped, so a window claim is keyed by organisation and `bot_kind`; attempt counters inside a window are keyed by `(repository, pr_number, bot_kind)`, so one pull request never reports another's attempts. A window stores `owner`, `claimed_at`, the absolute `reset_at` (derived per link:../timeouts/01-job-budgets-and-waits.adoc#review-bot-windows[Timeouts & Budgets Specification, Review-Bot Rate Windows]), `attempts` (bounded by the bot's `attempt_ceiling`, xref:03-findings-and-review-records.adoc#review-bot-registry[Review-Bot Registry Record]), and `answers_trigger_id` (the review request the refusal answered). A wait on a window computes its remainder from `reset_at`, so a killed waiter or a runtime restart resumes the remainder; re-reading the same refusal never restarts a window that has already been waited out. A contended claim returns `reason`, `holder`, and `seconds_remaining`.
+
+== Data Layer Integrity & Concurrency Invariants (`PM-IMPL-7`)
+
+[#store-digest-verification]
+=== Store Digest Verification Against Out-of-Band Edits
+
+[[_store_digest_verification_against_out_of_band_edits]]
+The stores reside in the per-project machine store (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), outside the repository working tree and behind the host deny rules for `<PM_MCP_BASE>/**`, so an out-of-band edit is no longer a working-tree accident; a host shell with filesystem write access can still modify them directly outside the MCP server:
+
+* Digests live in the sidecar `mcp/digests.json` (`{"format_version": 1, "stores": {"<relative path>": {"size": <int>, "sha256": "<hex>"}}}`), never inside a store they protect.
+* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, `metrics.json`, `quality-report.json`, the findings, assessment, review-participation, and change-ledger JSONL files, the session log `sessions.jsonl`, `outline.md`, `request.md`; not the plan mailbox `mcp/mailbox.jsonl`, which is advisory content under its own leaf lock, xref:04-epic-and-change-ledger.adoc#epic-inbox-record[Epic Inbox & Plan Mailbox Records (`inbox.jsonl`, `mcp/mailbox.jsonl`)]), the server records the file's size and SHA-256 in the sidecar under the plan lock; the workspace scope's stores (`mcp/status.json`, `sessions.jsonl`, the findings and change-ledger JSONL files) are recorded the same way in `workspace/mcp/digests.json` under the workspace lock, and an epic scope's stores in `epics/<epic_id>/digests.json` under the epic lock.
+* The digest of a store is updated in the same transaction as the store write, and only through the transaction journal (xref:01-format-and-session-log.adoc#transaction-journal[Transaction Journal (`mcp/transaction-journal.json`)]): a transaction that fails part-way leaves its journal, which recovery rolls forward (runtime start, and lazily on the first call to the scope) before any digest is compared. A store whose content differs from its sidecar entry while a journal of its scope lists it is never reported as tampered; recovery completes the transaction first.
+* On every subsequent read inside a transition, the engine verifies size and SHA-256 against the sidecar. `store_tampered` is decided only by a reader that holds the store's scope lock, after journal recovery: any remaining mismatch immediately raises the `store_tampered` condition on the scope's current state (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-store_tampered[State Catalogue, Conditions]), which replaces any other condition, leaves `state` and `call_stack` unchanged, and requires operator resolution.
+* A lock-free snapshot reader (<<lock-free-snapshot-reads>>) that sees a digest mismatch, or a transaction journal, may observe a transaction in flight. It never reports `store_tampered`; it serves the snapshot with `facts.store_integrity: digest_unverified` naming the store, and the next locked access of the scope decides.
+* An intentional manual edit is accepted with `pm-mcp operator accept-edit plan <plan_id> <store>`, `accept-edit epic <epic_id> <store>`, or `accept-edit workspace <store>` (link:../cli-and-security/02-credentials-and-operator.adoc#operator-accept-edit[CLI, Coordination & Security Specification, Accept-Edit]), which shows the path and the recorded and current size and SHA-256 before confirmation (no diff: the prior content is not kept), re-baselines that store's digest, and records the action in `audit.jsonl`. The resolutions of `store_tampered` are closed: `accept-edit`, or the operator decision `abort-plan` (`abort-epic` for an epic scope).
+* The project's lesson store keeps its own sidecar with the same format and rules, at lesson granularity (xref:10-job-and-lesson-records.adoc#lesson-record[Lesson Record (project lesson store)]): an out-of-band edit or deletion of one lesson blocks only that lesson.
+
+[#three-way-footprint]
+=== Three-Way File Footprint Reconciliation (`references.json`)
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-19[PM-WATCH-PHASE-19], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-21[PM-WATCH-STORE-21], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-22[PM-WATCH-STORE-22], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-23[PM-WATCH-STORE-23], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-24[PM-WATCH-STORE-24], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-33[PM-WATCH-STORE-33], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-36[PM-WATCH-STORE-36]_
+
+[[_three_way_file_footprint_reconciliation_references_json]]
+The `references.json` store tracks three distinct file-footprint sets for a plan:
+
+* *Declared Footprint (`declared_files`)*: Files explicitly listed during refinement/outline. `declared_files` is immutable after `outline.review` approval. A path admitted later by an accepted scope deviation is recorded in `approved_widening[]` with its provenance (deviation task, `approved_via`, phase, time), never appended to `declared_files`. The effective declaration is `declared_files ∪ approved_widening[].path`, and every reconciliation result names which of the two admitted a path.
+* *Structured-Derived Footprint (`derived_files`)*: Re-derived by set union over the solution outline's structured deliverables and partitioned into two disjoint keys:
+** `expected_modifications`: Files the plan intends to create, modify, or delete.
+** `conditional_modifications`: Files declared `(write-conditional)`, edited only if a named gate fires.
+** `read_only_references`: Files inspected for context that must remain unmodified.
+* *Realized Footprint (`realized_files`)*: Captured from the plan's own worktree via `git` jobs as the union of `git diff --name-status -M <base_ref>...HEAD` and `git status --porcelain=v1 -z`. A rename or copy contributes both its old and its new path to `realized_files` and is also recorded as a pair in `realized_renames[]`. *Deliberate change vs. `plan-marshall`*: `compute-footprint` uses `--name-only`, which drops the old path of a rename.
+
+Resolution and capture rules:
+
+* *Base Reference*: `<base_ref>` is `git merge-base HEAD origin/<base_branch>`, computed after the most recent fetch (after `sync-baseline`, the rebased-onto tip). It is never the SHA the plan was created against and never a local `<base_branch>` ref. Every footprint, scope, and self-review diff of the plan reads this one `base_ref`, recorded in `realized_state.base_ref`; after a `sync-baseline` or `branch-cleanup` rebase the realized footprint is re-derived against the new merge-base. When the local `<base_branch>` trails `origin/<base_branch>`, `realized_state.base_commits_behind` records by how many commits, so a stale local ref is visible although it is never used.
+* *Own Tree Only*: The realized footprint resolves only from the plan's own worktree, through one resolver whose tiers (the live diff, then the persisted capture) apply identically to every consumer. A pending or absent worktree yields `realized_state.state: unresolved` with cause `pending` (not yet materialised; plans always execute in a worktree, so no other cause exists), never another tree's measured-empty set; `unresolved` and "measured, both sides empty" stay distinct. A diff-fed step without a resolvable footprint records `indeterminate` with the cause, never a clean `done`.
+* *Only `measured` Reconciles*: `realized_state` is always present; `pm_start` writes it as `not_captured`. The three-way reconciliation, the footprint coverage, the scope-creep check, and every pre-merge or post-merge footprint check compare against `realized_files` only when `realized_state.state == measured`; for `unresolved` and `not_captured` each of them reports `indeterminate` with the state and cause named, never a clean or empty result.
+* *Capture Before Destruction*: `realized_files` is captured and persisted (`realized_state.captured_at`) at the latest before `branch-cleanup` (order 70) removes the worktree. Post-merge consumers read the persisted set; a post-merge git-derived empty set is never evidence of no change, and a missing persisted set (`realized_state.state: not_captured`) makes the consumer report `indeterminate`. Steps that compute the footprint publish its size (`files_total`, `insertions_total`, and a source-vs-data split) as facts.
+* *Consumer Scope and Provenance*: Every consumer that derives a scope from `references.json` names the set it reads. Footprint-scoped consumers (the self-review surfacer, `simplify`, `security-audit`) scope on `declared_files ∪ approved_widening[].path ∪ derived_files.expected_modifications ∪ realized_files`, re-read at each firing, and carry each path's provenance (`declared`, `widened`, `derived`, `realized`); a union is never passed on without it. `derive-verification` keeps reading the realized set only.
+
+Pairwise reconciliation computes the **symmetric difference in both directions** ($A \setminus B$ and $B \setminus A$) across all three sets so that two equal-sized but disjoint file sets are reported as 100% disagreeing rather than matching by count. In addition:
+
+* `derived_files \ realized_files` is reported split by intent: untouched `read_only_references` and untouched `conditional_modifications` are expected, while untouched `expected_modifications` are reported as `modify_shortfall`.
+* *Coverage Populations*: Footprint coverage is $|\text{expected\_modifications} \cap \text{realized\_files}| / |\text{expected\_modifications}|$, published with both populations. Read-only references are a separate population (reported as touched or untouched, never in the coverage ratio), and conditional modifications are reported beside it (touched or not), never in the denominator. An empty `expected_modifications` makes coverage `not_derivable`, never `100%`.
+* *Scope-Creep Allow Set*: A realized path is inside the plan's scope when it is in `declared_files ∪ approved_widening[].path ∪ derived_files.expected_modifications ∪ derived_files.conditional_modifications`; a realized path declared only as a read-only reference is outside it.
+* Paths from change-ledger entries with `change_origin: quality_gate_autofix` are reported separately from deliverable changes.
+* Results are published per deliverable (from the deliverable's `Affected files` and its task and chain-tail change entries) beside the plan-level figures; a plan-level average never replaces them.
+* *Dependency Delta*: The reconciliation also runs the pre-merge Dependency Delta Check over the changed build files of the realized footprint against the outline's approved dependency set (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#dependency-delta[Phase Workflows Specification, Dependency Delta Check]).
+
+[#plan-deletion-lessons]
+=== Plan Deletion and Lesson Claims
+
+When the operator invokes plan deletion (`delete-plan` via elicitation or CLI), no lesson file lives in the plan directory, so nothing is carried back and no veto exists: in one transaction (plan lock, then lesson store lock) the server releases the claim of every lesson whose `claim.plan_id` names the plan (xref:10-job-and-lesson-records.adoc#lesson-record[Lesson Record (project lesson store)], Claim) and deletes the plan directory. Lessons resolved `present_unreadable` during the scan are listed in the deletion result by id, because their claims cannot be read; a claim among them surfaces later as a stale claim, and the deletion proceeds.
+
+[#lock-free-snapshot-reads]
+=== Lock-Free Snapshot Reads, Transaction Locks & Leases (`PM-IMPL-7`)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-26[PM-WATCH-DISP-26]_
+
+[[_lock_free_snapshot_reads_transaction_locks_leases_pm_impl_7]]
+* *Lock-Free Snapshot Reads*: Because every store update uses atomic write-and-rename (`<file>.tmp.<uuid>` -> `<file>`), all read-only operations (`pm_state`, `pm_plans`, `pm_epics`, `pm://` resources) read the current inode snapshot directly without acquiring file locks. A snapshot reader never decides `store_tampered`; it reports `digest_unverified` (<<store-digest-verification>>).
+* *Sibling Lock Files*: Every store that is replaced by atomic rename is guarded by a sibling lock file, never by a lock on the store file itself (a rename replaces the inode, so a lock on the old file excludes nobody). The machine stores and their lock files are:
+** `<PM_MCP_BASE>/locks/build-slots.lock`: `state/build-slots.json`
+** `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock`: `enrolments/<project_id>.json` and its sidecar `enrolments/<project_id>.json.hmac` (one lock per enrolment file)
+** `<PM_MCP_BASE>/locks/install-records.lock`: `state/install-records.json`
+** `<PM_MCP_BASE>/locks/machine-config.lock`: `machine-config.json`
+** `<PM_MCP_BASE>/locks/merge.lock`: `state/merge-queue.json`
+** `<PM_MCP_BASE>/locks/review-bot.lock`: `state/review-bot-windows.json`
+** `<PM_MCP_BASE>/locks/web-devices.lock`: `state/web-devices.json`
++
+The per-project server and operator stores that are not guarded by a scope lock have their own lock files in the per-project machine store: `projects/<project_id>/locks/local-config.lock` guards `local-config.json`, and `projects/<project_id>/locks/build-timings.lock` guards `build-timings.json` (xref:09-derived-facts-and-build-timings.adoc#build-timings-store[Build Timings Store (`<PM_MCP_BASE>/projects/<project_id>/build-timings.json`)]).
++
+The append-only `logs/audit.jsonl` is never replaced by rename (rotation renames it only under its own lock) and may be locked directly; `logs/audit.head` and `logs/audit-index.jsonl` are written under that audit lock. A plan's append-only mailbox `mcp/mailbox.jsonl` is locked directly the same way (xref:04-epic-and-change-ledger.adoc#epic-inbox-record[Epic Inbox & Plan Mailbox Records (`inbox.jsonl`, `mcp/mailbox.jsonl`)]).
+* *Transaction Locks*: Short locks held only for one transaction, all taken by the runtime (the CLI's only lock is the process lock `runtime-start.lock`). They are acquired in one total order, and a transaction that needs several locks acquires them strictly in this order to prevent deadlocks:
+. workspace lock: `<PM_MCP_BASE>/projects/<project_id>/locks/workspace.lock` (the project's one workspace scope)
+. plan locks: `<PM_MCP_BASE>/projects/<project_id>/locks/plan-<plan_id>.lock`, lexicographic by `plan_id`
+. epic locks: `<PM_MCP_BASE>/projects/<project_id>/locks/epic-<epic_id>.lock`, lexicographic by `epic_id`
+. epic worktree lock: `<PM_MCP_BASE>/projects/<project_id>/locks/epics-worktree.lock` (git operations on the shared epic worktree)
+. lesson store lock: `<PM_MCP_BASE>/projects/<project_id>/locks/lessons.lock` (lesson id allocation and every write, claim, release, or retirement in the lesson store)
+. local configuration lock: `<PM_MCP_BASE>/projects/<project_id>/locks/local-config.lock` (`local-config.json`)
+. build timings lock: `<PM_MCP_BASE>/projects/<project_id>/locks/build-timings.lock` (`build-timings.json`)
+. machine store locks: `<PM_MCP_BASE>/locks/{build-slots,enrolments/<project_id>,install-records,machine-config,merge,review-bot,web-devices}.lock`, alphabetical by lock path (several enrolment locks lexicographic by `project_id`)
+. leaf locks: the audit log lock (`<PM_MCP_BASE>/logs/audit.jsonl`), the mailbox lock of a plan (`plans/<plan_id>/mcp/mailbox.jsonl`, taken by an epic transaction under its epic lock and by the plan's consumption events), and the digest sidecar writes; nothing is acquired after a leaf lock
++
+The runtime singleton lock (`locks/runtime.lock`, held for the process lifetime), the on-demand start lock (`locks/runtime-start.lock`, the CLI's only lock, held by a CLI command until its authenticated round trip with the started runtime succeeds or the runtime start timeout expires), and the web server's singleton lock (`locks/web.lock`, held by `pm-mcp-web` for its lifetime) are process locks, not transaction locks, and stay outside this order. Workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings locks live in the per-project machine store outside the directories they protect (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), so archiving a plan directory or editing an epic in a worktree never splits a lock.
+* *Order Assertion*: The lock manager asserts the order on every acquisition against the locks the current transaction already holds (re-entry of a held lock is allowed). An out-of-order acquisition is refused: the call fails with `internal_fault` (link:../mcp-tools.adoc[MCP Tools Specification]), nothing is written, and an audit record `lock_order_violation` (`category: store`, `outcome: refused`, `details{held, requested}`) is appended. A unit test of the lock manager covers an out-of-order acquisition at every level boundary.
+* *Leases*: Long-lived claims (merge holder in `merge-queue.json`, review-bot windows in `review-bot-windows.json`, build slots in `build-slots.json`) are lease records owned by a scope (`project_id`, `scope_type`, `scope_id`), served by a runtime instance (`holder_instance`: PID and start instant), and bounded by an expiry (<<machine-lease-stores>>); a restart orphans a lease instead of releasing it, and the owning scope adopts it on its next call. A lease is claimed or released inside a short transaction on the machine store lock and is never held as an OS lock, so holding a lease while taking a plan lock does not invert the lock order.
+* *Lock Manager*: All acquisitions in the runtime go through one lock manager (link:../runtime-model.adoc#_in_process_lock_manager[Runtime & Interaction Model Specification]).
+
+[#evidence-based-removal-sweeps]
+=== Evidence-Based Removal Sweeps
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-39[PM-WATCH-GEN-39]_
+
+There are two kinds of removal sweep:
+
+* *Retention purges*: job records with their logs, archived plans and superseded lessons under the four retention keys of the operator's `local-config.json` (link:../timeouts/03-retention-host-config.adoc#retention-days[Timeouts & Budgets Specification]). They run only through the operator verb `pm-mcp operator sweep [<project_id>] [--apply]` (link:../cli-and-security/02-credentials-and-operator.adoc#operator-channel-isolation[CLI, Coordination & Security Specification, Operator Channel Isolation]): without `--apply` it lists the purge candidates with their evidence (a dry run on demand); with `--apply` it removes them, one audit record each. There is no automatic dry run and no candidate count in `pm-mcp status`. For a project that `unenrol` left in place (xref:11-enrolment-store.adoc#project-store-identity[Project Store Identity (`<PM_MCP_BASE>/projects/<project_id>/store.json`)]), `sweep <project_id>` applies the same age-based retention with the machine-wide defaults `project_defaults.retention` of `machine-config.json`; the store as such is never a purge candidate. Removing an unenrolled project entirely is a deliberate operator act outside `PM-MCP` (deleting its directory).
+* *Automatic sweeps*: the pending-record sweep, run by the project's recovery after a runtime start (link:../runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]) and periodically by the running runtime (fixed interval, link:../timeouts/02-runtime-leases-operator-web.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]), which removes pending entry records older than the pending entry record maximum age (link:../timeouts/02-runtime-leases-operator-web.adoc#pending-entry-max-age[Timeouts & Budgets Specification]), each with an audit record (`pm_start` does no age check); the baseline worktree sweep of the recovery; and the baseline worktree removal of every plan-worktree enumeration (link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). They run unattended, since their evidence (the compiled maximum age of a pending entry record, a plan that no longer resolves or is terminal) needs no operator judgement.
+
+Every removal sweep:
+
+* removes, if it is a retention purge, only on `pm-mcp operator sweep --apply` and otherwise only lists; an automatic sweep is exempt from this rule only and applies its removals, each with an audit record;
+* reports for every kept item the first keep-rule that fired, and for every removed item the trigger that fired;
+* reports the source (`compiled_default`, `derived`, `team`, or `operator`, xref:07-project-configuration.adoc#project-configuration-store[Project Configuration]) of every configuration value it used;
+* reports an empty population as one of `root_absent`, `root_unreadable`, `nothing_listed`, or `all_kept`, never as a bare zero;
+* never removes an item on absence of evidence: a missing marker, record, or audit tombstone keeps the item and reports it as `skipped_no_evidence`.
+
+== Script Disposition Classification & Differential Equivalence Testing (`PM-TEST-1`, `PM-TEST-2`, `PM-MIG-1`..`PM-MIG-5`)
+
+=== Three-Category Script Disposition Matrix (`PM-TEST-1`)
+
+Every legacy Python script in `plan-marshall` is classified into one of three normative migration dispositions:
+
+[cols="1,2,3"]
+|===
+|Disposition |Target Surface in `PM-MCP` |Verification Strategy
+
+|*Ported (Data Layer, Redesigned Store Format)*
+|Canonical store read/write invariants of `manage-status.py`, `manage-tasks.py`, `manage-findings.py`, `manage-references.py`, `manage-change-ledger.py`, and `manage-lessons.py`; the worktree SHA-256 freshness hash (`worktree_sha`); and the pure output parsers and classifiers of the git and CI integrations (`workflow-integration-{git,github,gitlab,sonar}`)
+|100% differential equivalence testing (`PM-TEST-2`) over fixture corpora before the store is released in a stage (`PM-MIG-4`), comparing the Java result with the Python result mapped through the legacy -> target mapping, which lives in test code only and is not part of this specification (<<differential-harness>>, `PM-TEST-2`). Excludes retired CLI-staging subcommands (`prepare-add`/`commit-add`, `set-body --file`, `drain-dedup --candidates-file`, `--raw-input`, `--files-out`, and the 600s `Bash` timeout ceiling task-command promotion) and the rename-aware realized footprint of `compute-footprint` (a *deliberate change*, <<three-way-footprint>>), which is verified by its own fixtures instead. The worktree SHA-256 freshness hash is compared by equality behaviour, not by bytes: over the same fixture trees, the same tree yields the same digest and any content, path, or `HEAD` change a different one on each side (link:../job-runtime/03-parsers-and-gates.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash], rule 6); its configuration-neutralising git options and its fail-closed `unavailable` value are *deliberate changes*. For `manage-lessons.py` only the storage invariants are ported (id allocation, record and body write, list and get, retirement; the legacy move, carry-back, and tombstone files map onto the claim and the in-file retirement); its `add`-path component-ownership guard ("does `marketplace/bundles/{prefix}` exist?") is a *deliberate change* excluded from the differential corpus, replaced by the audience predicate (xref:10-job-and-lesson-records.adoc#lesson-record[Lesson Record (project lesson store)], Audience Classification) and verified by state-machine tests.
+
+|*Redesigned (Hypermedia & Native Services)*
+|Phase routers (`phase-1-init` .. `phase-6-finalize`), `plan-orchestrator`, `marshalld` build server, `manage-config.py` & `marshall-steward/upgrade.py` (replaced by the server-computed effective configuration over sparse team files and the `project-setup` workflow; no migration chain, `PM-EXT-7`), `manage-locks` (`merge_lock.py`, `build_queue.py`; replaced by the runtime lock manager and lease records, `PM-IMPL-7`), `manage_personas.py`, `manage-providers/credentials.py`, `manage-execution-manifest.py` (the execution manifest is composed in-process by `ExecutionManifestResolver`), the workflow-integration verbs of `workflow-integration-{git,github,gitlab,sonar}` (replaced by workflow primitives and sub-workflows such as `git.commit_and_push`), and `plan-retrospective/scripts/*` (`compile-report`, `collect-fragments`, the `check-*` checks, `extract-chat-signal`) together with `audit-archived-plan-retrospectives` (replaced by the server's post-run quality report engine and its corpus mode, link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-quality-report[Phase Workflows Specification, Post-Run Quality Report])
+|Workflow DSL AST verification (`PM-TEST-3`), configuration schema and default-unit invariant verification (`DefaultUnitInvariantTest`), scenario/compaction resume tests (`PM-TEST-4`), and security boundary tests (`PM-TEST-5`).
+
+|*Retired (Obsolete Infrastructure)*
+|`execute-script.py` proxy, `argparse_surface.py`, `permission-doctor` / `permission-fix`, `inject_project_dir.py`, static multi-host bundle transpilers, and shell-command composition helpers
+|Not reimplemented and not tested in `PM-MCP`; they stay in legacy `plan-marshall` (`PM-MIG-2`). No `PM-MCP` tool, client bundle artifact, or host permission rule names or runs them.
+|===
+
+[#differential-harness]
+=== Differential Equivalence Harness (`PM-TEST-2`)
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-32[PM-WATCH-GEN-32], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-57[PM-WATCH-GEN-57], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-58[PM-WATCH-GEN-58]_
+
+* *Fixture Corpus Differential Runner (`PM-TEST-2`)*: In JUnit 5 (`pm-mcp-core`), parameterized differential tests execute each `Ported` Java store primitive and its reference Python counterpart against identical initial fixture trees in a test sandbox (the legacy `.plan/` layout for Python, the `.marshall/` layout for Java). The harness maps the Python result through the legacy -> target mapping, which lives in test code only (`PM-TEST-2`): it is re-verified against the latest `plan-marshall` version before it is implemented or changed, a target field or stored identifier it cannot populate fails the test instead of being defaulted or guessed, and no reverse mapping exists. The harness then canonicalizes JSON/JSONL outputs (normalizing generated UUIDs and ISO-8601 timestamps), and asserts zero structural diff across both returned payloads and resulting stores for all canonical store read/write invariants.
+* *Known-Defect Baseline*: A known defect of the Python reference is either fixed in `plan-marshall` before the differential run or recorded as a named *deliberate change* with its own fixture, for which the harness asserts the corrected behaviour. A differential run never adopts a known defect as the equivalence baseline, and an equivalence proof for a structural refactor is taken only after every behaviour fix touching the same code has landed.
+* *No Shadow Execution*: Differential tests never run on live stores, and the runtime has no routing seam, executor adapter, or automatic fallback to Python (`PM-MIG-2`). Behaviour on real work is measured by parallel runs: the same requests executed by legacy `plan-marshall` and by `PM-MCP` on separate clones or checkouts, compared by the server-computed metrics (`priced_units`, discipline events, outline and triage quality; `PM-MIG-4`).

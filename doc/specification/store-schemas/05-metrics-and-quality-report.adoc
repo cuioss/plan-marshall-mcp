@@ -1,0 +1,249 @@
+= Store Schemas Specification: Metrics & Quality Report
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Metrics & Quality Report
+
+[#metrics-store]
+== Metrics Store (`metrics.json`)
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-26[PM-WATCH-STORE-26], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-35[PM-WATCH-STORE-35]_
+
+The plan's `metrics.json` holds the dispatch and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:../dispatch-and-effort.adoc[Dispatch & Effort Specification], Post-Return Integrity Invariants). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
+
+* *Rows*: One row per dispatch (`dispatch_id`, `phase`, `step_id` or null, `envelope_id` or null with its summed `predicted_cost_tokens` and their basis (`uncalibrated` or `calibrated`), `lifecycle_state` (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#_dispatch_id_generation_lifecycle_states[Dispatch & Effort Specification, Lifecycle States]), `status`, `cause_class`, `spend_class`, `population`, the usage columns of the `returned:<dispatch_id>` link (`token_usage`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`), each a measured integer, `"unmeasured"` (with `not_reported_by_client` where the client profile cannot report it), or, for a step that runs inline by design, `"inline"`, and the server-measured `duration_ms` with its `duration_basis`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:../job-runtime.adoc[Job Runtime Specification], Wait Attribution), one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `boundary` (`closed`, `re_entered`, or `provisional` with `measured_until` and `excluded_steps`), `step_firings` as a map from step id to firing count), and one row per served document read (Served-Content Ledger below).
+* *Served-Content Ledger*: Every `pm_skill`, `pm_skill_file`, and skill `resources/read` served in a plan or epic scope appends `{uri, section?, bytes, plan_id, phase, dispatch_id?, served_at}`; `bytes` is the rendered size served, `0` for an empty section. `dispatch_id` is set when the read carries it (the server renders it into the load directives of a dispatch prompt) and is otherwise null. A read without a scope is attributed to no plan. `record-metrics` publishes from these rows the per-document consumption (reads per URI and section, bytes, repeat reads within one dispatch). It measures only what the server serves; host `Read`/`Grep` of files is not observable.
+* *Aggregates*: Every sum (per phase, per cause class, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total; Phase 6, which `record-metrics` measures from inside, is recorded `boundary: provisional` with `measured_until` and its `excluded_steps`.
+* *Populations*: Every token figure carries a `population` stamp (`dispatched` or `main_context`); an absent stamp reads `dispatched`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
+* *Re-Entry*: Re-entry is derived from observables (rows timestamped after the phase's recorded `end_time`), never from a close counter. A re-entered phase is labelled `re_entered` and accumulates across closes.
+* *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`, `unconfirmed`) is a total function over the dispatch `status` enum plus `INCOMPLETE_SUBMISSION` and `UNCONFIRMED` (class `unconfirmed`: no observable host reaction, link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#cause-class[Dispatch & Effort Specification, Cause Classes]), and the per-class populations sum to the total dispatch population with an asserted residual of `0`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
+* *Spend Classes*: `spend_class` (`submitted`, `findings_only`, `no_product`, `unmeasured`) is derived by the server from what the dispatch produced (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification, Spend Classes]); it is a separate dimension from `status` and `cause_class`, and waste is read only from `no_product`.
+* *Stall Rate*: A termination with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
+* *Ledger Divergence*: Where two ledgers can diverge (dispatch rows vs audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
+* *One Writer per Name*: Every metric name has exactly one writer. A second producer over another population uses a different name.
+* *Raw Components Only*: Rows persist measured token components, never a weighted or priced figure. `priced_units` is derived in views from the rows and one named constant table (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-metrics-and-landing[Phase Workflows Specification, Metric Aggregates]); a change of the weights re-derives every figure, including legacy baselines, from the persisted components.
+* *Session Attribution*: A dispatch row references the host session that rendered the dispatch by its `client_session_id` (the row of the scope's session log, xref:01-format-and-session-log.adoc#scope-session-log[Scope Session Log (`sessions.jsonl`)]; `null` when the host provides none), never by a copy of the client or model identity.
+
+Aggregates are never persisted; they are derived in views from `rows[]`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/metrics.json",
+  "title": "MetricsStore",
+  "type": "object",
+  "required": ["format_version", "rows"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "rows": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/dispatchRow" },
+          { "$ref": "#/$defs/waitRow" },
+          { "$ref": "#/$defs/phaseCloseRow" },
+          { "$ref": "#/$defs/servedReadRow" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "measure": {
+      "description": "A measured integer, 'unmeasured', or 'inline' (a step that runs inline by design).",
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "enum": ["unmeasured", "inline"] }
+      ]
+    },
+    "phase": { "type": "string", "enum": ["phase-1-init", "phase-2-refine", "phase-3-outline", "phase-4-plan", "phase-5-execute", "phase-6-finalize"] },
+    "dispatchRow": {
+      "type": "object",
+      "required": ["kind", "dispatch_id", "phase", "step_id", "envelope_id", "predicted_cost", "lifecycle_state", "status", "cause_class", "spend_class", "population", "token_usage", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "tool_uses", "unmeasured_reason", "duration_ms", "duration_basis", "client_session_id", "recorded_at"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "dispatch" },
+        "dispatch_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "step_id": { "type": ["string", "null"] },
+        "envelope_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "predicted_cost": {
+          "type": ["object", "null"],
+          "required": ["tokens", "basis"],
+          "additionalProperties": false,
+          "properties": {
+            "tokens": { "type": "integer", "minimum": 0, "description": "Summed predicted_cost_tokens of the envelope." },
+            "basis": { "type": "string", "enum": ["uncalibrated", "calibrated"] }
+          }
+        },
+        "lifecycle_state": { "type": "string", "description": "Dispatch lifecycle state (dispatch-and-effort.adoc, Lifecycle States)." },
+        "status": { "type": "string", "description": "Dispatch return status, including INCOMPLETE_SUBMISSION and UNCONFIRMED (dispatch-and-effort.adoc)." },
+        "cause_class": { "type": "string", "enum": ["terminal_error", "retryable", "returned_with_findings", "benign", "stall", "unconfirmed"] },
+        "spend_class": { "type": "string", "enum": ["submitted", "findings_only", "no_product", "unmeasured"] },
+        "population": { "type": "string", "enum": ["dispatched", "main_context"] },
+        "token_usage": { "$ref": "#/$defs/measure" },
+        "input_tokens": { "$ref": "#/$defs/measure" },
+        "output_tokens": { "$ref": "#/$defs/measure" },
+        "cache_read_input_tokens": { "$ref": "#/$defs/measure" },
+        "cache_creation_input_tokens": { "$ref": "#/$defs/measure" },
+        "tool_uses": { "$ref": "#/$defs/measure" },
+        "unmeasured_reason": { "type": ["string", "null"], "enum": ["not_reported_by_client", "not_returned", null] },
+        "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "duration_basis": { "type": "string", "description": "What the server measured duration_ms between (dispatch-and-effort.adoc)." },
+        "client_session_id": { "type": ["string", "null"], "pattern": "^[\\x21-\\x7E]{1,128}$", "description": "Session row of the scope's sessions.jsonl that rendered the dispatch." },
+        "recorded_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "waitRow": {
+      "type": "object",
+      "required": ["kind", "phase", "wait_reason", "deliberate", "duration_ms", "started_at"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "wait" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "wait_reason": { "type": "string", "description": "Wait attribution reason (job-runtime.adoc, Wait Attribution)." },
+        "deliberate": { "type": "boolean" },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "started_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "phaseCloseRow": {
+      "type": "object",
+      "required": ["kind", "phase", "start_time", "end_time", "duration_ms", "duration_clamped", "boundary", "step_firings"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "phase_close" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "start_time": { "type": "string", "format": "date-time" },
+        "end_time": { "type": "string", "format": "date-time" },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "duration_clamped": { "type": "boolean" },
+        "boundary": { "type": "string", "enum": ["closed", "re_entered", "provisional"] },
+        "measured_until": { "type": "string", "format": "date-time", "description": "provisional only." },
+        "excluded_steps": { "type": "array", "items": { "type": "string" }, "description": "provisional only." },
+        "step_firings": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+      }
+    },
+    "servedReadRow": {
+      "type": "object",
+      "required": ["kind", "uri", "bytes", "plan_id", "phase", "dispatch_id", "served_at"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "served_read" },
+        "uri": { "type": "string", "minLength": 1 },
+        "section": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "plan_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
+        "phase": { "anyOf": [ { "$ref": "#/$defs/phase" }, { "type": "null" } ] },
+        "dispatch_id": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "served_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
+----
+
+[#quality-report]
+== Quality Report Record (`quality-report.json`)
+
+The plan's `quality-report.json` is written once per firing of `plan-marshall:plan-retrospective` (`995`) by the server's report engine (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-quality-report[Phase Workflows Specification, Post-Run Quality Report]). It is derived only from persisted plan stores and from the metrics snapshot composed from them at the report's call (labelled `measured_until`); no model-authored text enters it. A re-fire replaces it atomically, and the store is covered by the digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/quality-report.json",
+  "title": "QualityReport",
+  "type": "object",
+  "required": ["format_version", "mode", "plans", "computed_at", "engine_version", "instruments"],
+  "additionalProperties": false,
+  "$defs": {
+    "count": {
+      "type": "object",
+      "description": "Every published count names its population.",
+      "required": ["population"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": ["integer", "number"], "description": "Omitted when the population is empty or the figure is withheld or unmeasured." },
+        "population": { "type": "integer", "minimum": 0 },
+        "state": { "type": "string", "enum": ["measured", "withheld", "unmeasured", "unmeasurable", "floor"], "default": "measured" },
+        "withheld_reason": { "type": ["string", "null"] },
+        "zero_reason": { "type": ["string", "null"], "enum": ["structural", "starved", "gated", "no_count", "disciplinary", "no_block", "fired", null] }
+      }
+    }
+  },
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "mode": { "type": "string", "enum": ["plan", "corpus"] },
+    "plans": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "plan_id values the report covers (one in plan mode)." },
+    "computed_at": { "type": "string", "format": "date-time" },
+    "engine_version": { "type": "string", "description": "Runtime release version (PM-DIST-1) of the engine that computed the report." },
+    "populations": {
+      "type": "object",
+      "description": "Corpus mode: plans per population; plans without an execution manifest form the separately sized indeterminate population.",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "quality_chain": {
+      "type": "object",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["step_id", "presence"],
+            "properties": {
+              "step_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9-]{0,63}$" },
+              "presence": { "type": "string", "enum": ["not_admitted", "admitted_not_fired", "fired", "fired_but_refused", "after_window", "indeterminate"] },
+              "assurance_verdict": { "type": ["string", "null"], "enum": ["checked", "degraded", "not_reached", "never_performed", "attempted_over_empty_scope", "unadjudicated", null] },
+              "structural_limit": { "type": ["string", "null"], "description": "The step's declared cannotReach class, reported apart from degraded." },
+              "yield": { "type": "object", "description": "Per resolution, source and severity: one $defs/count per enum member." }
+            }
+          }
+        },
+        "coverage": { "$ref": "#/$defs/count" },
+        "escape_distance": { "type": "object", "description": "Per detecting stage (build, self_review, automatic_review, human): one $defs/count." }
+      }
+    },
+    "review_retrospective": { "type": ["object", "null"], "description": "Null when the plan has no pull request (with the reason in instruments)." },
+    "footprint": { "type": "object", "description": "Three-way reconciliation results and the assessment comparison state." },
+    "spend": {
+      "type": ["object", "null"],
+      "description": "Spend read from the metrics snapshot; null in corpus mode for plans whose metrics are unreadable (counted as floor).",
+      "required": ["measured_until", "excluded_steps"],
+      "properties": {
+        "measured_until": { "type": "string", "format": "date-time", "description": "Instant of the snapshot (plan mode) or the latest snapshot instant folded (corpus mode)." },
+        "excluded_steps": { "type": "array", "items": { "type": "string" }, "description": "Steps outside the window: the report's own step and every later manifest step." },
+        "per_phase": { "type": "object", "description": "Per phase: tokens and priced_units as $defs/count, with population stamp and boundary (closed, re_entered, provisional)." },
+        "per_spend_class": { "type": "object", "description": "Per spend class (submitted, findings_only, no_product, unmeasured) and termination status: one $defs/count." },
+        "per_step": { "type": "object", "description": "Per finding-filing step and firing cause: one $defs/count." },
+        "finalize_spend_ratio": { "type": "object", "description": "Numerator (cumulative finalize spend) and denominator (the compared anchor column or fallback ceiling) as $defs/count, with the column and unit named." }
+      }
+    },
+    "instruments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["instrument", "gates_merge", "proves", "falsifiable_preconditions", "self_included"],
+        "additionalProperties": false,
+        "properties": {
+          "instrument": { "type": "string" },
+          "gates_merge": { "type": "boolean", "const": false },
+          "proves": { "type": "string" },
+          "falsifiable_preconditions": { "type": "array", "items": { "type": "string" } },
+          "self_included": { "type": "boolean" },
+          "self_included_reason": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["measured", "unmeasured", "withheld"] }
+        }
+      }
+    }
+  }
+}
+----
+
+* *Counts with Populations*: Every published count is a `count` object; a rate is published as numerator and denominator counts, never as a bare ratio. An empty population renders `unmeasurable`; `withheld`, `unmeasured`, and `0` are distinct values. A plan or store the engine cannot read contributes `floor` (a lower bound, never healthy).
+* *Report Instruments Never Gate*: `gates_merge` is `false` for every instrument (schema constant); the report is written after the merge and no step reads it as a precondition.
+* *One Schema for Both Modes*: A corpus report has exactly this schema; it is a fold over the per-plan results of the same engine.

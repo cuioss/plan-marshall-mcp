@@ -1,0 +1,216 @@
+= Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification: Dispatch Observability & Spend Accounting
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../dispatch-and-effort.adoc[Sub-Agent Dispatch, Effort Resolution & Epic Emission Specification] » Dispatch Observability & Spend Accounting
+
+== Dispatch Observability & Return Protocol
+_See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Sub-Agent Dispatch & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+Because MCP servers do not directly spawn host sub-agents—the host session executes its native agent-spawning tool (`Agent` in Claude Code, `task` in OpenCode, `invoke_subagent` in Antigravity, `spawn_agent` in Codex)—the server cannot observe sub-agent termination, harness cancellation, or token consumption unless the dispatching session reports the outcome back through a paired hypermedia link.
+
+=== `dispatch_id` Generation & Lifecycle States
+
+Every time the workflow engine renders a representation offering a `dispatch:<entity>` link (including concurrent fan-out dispatches such as per-module architecture enrichment), it allocates or reuses an active `dispatch_id` and pairs the dispatch link with a corresponding `returned:<dispatch_id>` transition link in the parent representation. *Pairing exception*: a reader dispatch (xref:03-escalation-roles-readers.adoc#_reader_agent_family_execution_context_reader[Reader Agent Family (`execution-context-reader`)]) is paired with `ingest_candidates:<dispatch_id>` instead, which carries the return fields of `returned:<dispatch_id>` together with the candidate payload; no `returned:` link is rendered for it.
+
+* *Identifier Format*: `dsp-<4_digit_seq>-<6_hex_nonce>` (link:../identifiers/01-general-rules-and-registry.adoc#id-dispatch-id[`dispatch_id` grammar], e.g., `dsp-0003-8f2a1c`), unique within its plan or epic scope. The identifier carries no scope: every call that names it also names its `plan_id` or `epic_id`, and the server resolves it only within that addressed scope; an identifier unknown in the addressed scope is rejected (`rejected.reason: link_not_available`).
+* *Audit Logging on Render*: One `[DISPATCH]` audit record is written per firing (never per role lookup). A re-dispatch after an unconfirmed or failed run allocates a new `dispatch_id` and writes a new `[DISPATCH]` record.
+
+The lifecycle state of a dispatch is the closed enumeration `ALLOCATED | CLAIMED | RETURNED | INCOMPLETE_SUBMISSION | UNCONFIRMED | SUPERSEDED`, persisted on the dispatch record. No state is entered by a clock: there is no dispatch timeout.
+
+[cols="1,3,3"]
+|===
+|Lifecycle State |Entry |Exit
+
+|`ALLOCATED`
+|A representation offering `dispatch:<entity>` is rendered and persisted with a new `dispatch_id`. A re-render before the sub-agent claims the dispatch reuses the same `dispatch_id`.
+|`CLAIMED` on the first entity-scoped call; `RETURNED` or `INCOMPLETE_SUBMISSION` when the return arrives unclaimed (always for a reader dispatch, whose sub-agent has no MCP tools and never claims); `SUPERSEDED` on `redispatch:<entity>`; `UNCONFIRMED` at phase close.
+
+|`CLAIMED`
+|The first entity-scoped `pm_state` or `pm_do` call targeting `entity` (or carrying `dispatch_id`). Records `claimed_at`; confirms that the host launched the sub-agent and that it has MCP connectivity.
+|`RETURNED` or `INCOMPLETE_SUBMISSION` on the return; `SUPERSEDED` on `redispatch:<entity>`; `UNCONFIRMED` at phase close.
+
+|`RETURNED`
+|The parent session follows `returned:<dispatch_id>` (for a reader dispatch `ingest_candidates:<dispatch_id>`) with a non-`success` status, or with `status: success` while the entity has recorded its required `submit`; or `resume:<entity>` finds that `submit` recorded. Records `returned_at`, `reported_status`, `display_detail`, `token_usage` and each reported token component and `tool_uses` (`measured` integer or `"unmeasured"`), and the server-measured `duration_ms`.
+|None (terminal). A non-`success` return leaves the remaining work to a fresh dispatch with a new `dispatch_id` (Post-Return Integrity Invariants, item 3); the returned dispatch is never superseded.
+
+|`INCOMPLETE_SUBMISSION`
+|The return reports `status: success` while the entity has not recorded its required `submit` (Post-Return Integrity Invariants, item 2); the return fields are recorded as for `RETURNED`, and the `dispatch_incomplete` condition is raised on the dispatching state.
+|`RETURNED` or `SUPERSEDED` on `resume:<entity>`. The condition's `escalate` defers the exit to the operator and never settles the dispatch; if the scope is aborted while the condition holds, `INCOMPLETE_SUBMISSION` is its terminal disposition.
+
+|`UNCONFIRMED`
+|Derived by the server when the phase that allocated the dispatch closes (its phase transition or the scope's abort) while the dispatch is still `ALLOCATED` (never claimed) or `CLAIMED` (never returned).
+|None (terminal).
+
+|`SUPERSEDED`
+|`redispatch:<entity>` on an `ALLOCATED` or `CLAIMED` dispatch; `resume:<entity>` that re-dispatches the remaining work of an `INCOMPLETE_SUBMISSION` dispatch; a loop-back iteration that creates a new envelope for the entity.
+|None (terminal). Any subsequent `pm_do` or `pm_state` referencing a `SUPERSEDED` `dispatch_id` is rejected immediately with `reason: "stale_dispatch_id"`.
+|===
+
+There is no separate aborted state. A dispatch whose sub-agent the host harness aborted is `RETURNED` with `status: harness_cancellation` when the parent session reports it; an abort that is never reported leaves the dispatch `ALLOCATED` or `CLAIMED` until `redispatch:<entity>` supersedes it or the phase close derives `UNCONFIRMED`.
+
+[#dispatch-recovery-links]
+==== Dispatch Recovery Links (`redispatch:<entity>`, `resume:<entity>`)
+
+Both links are entity-addressed (link:../hypermedia-format/02-link-grammar.adoc#link-identifier-grammar[Hypermedia Format Specification, Link Identifier Grammar]); `<entity>` is the dispatched entity (`envelope-M`, `enrich-<module_id>`, a finding), never the `dispatch_id`, so the link stays valid across the dispatch it replaces. Neither takes a free parameter, and neither re-runs a sub-agent blindly: both first inspect the entity store and the worktree (Post-Return Integrity Invariants, item 3) and render the observed partial progress in `facts`.
+
+* *`redispatch:<entity>`* (rel `retry`, form `noop`): offered by the dispatching state beside every `dispatch:<entity>` whose dispatch is `ALLOCATED` or `CLAIMED`. Following it marks that dispatch `SUPERSEDED` and returns the dispatching state with a fresh `dispatch:<entity>` for the entity's remaining work, paired with the return link of the new `dispatch_id`.
+* *`resume:<entity>`* (rel `next`, form `noop`): offered only by the `dispatch_incomplete` condition (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-dispatch_incomplete[State Catalogue, Conditions]). Following it re-reads the entity's persisted state: when the required `submit` is now recorded, the dispatch becomes `RETURNED`, the condition is cleared, and the dispatching state takes its outcome for the completed submission; otherwise the dispatch becomes `SUPERSEDED`, the condition is cleared, and the dispatching state offers a fresh `dispatch:<entity>` for the remaining work.
+
+=== Normative Schema for `returned:<dispatch_id>`
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-3[PM-WATCH-DISP-3], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-4[PM-WATCH-DISP-4], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-5[PM-WATCH-DISP-5]_
+
+In the parent representation, every active `dispatch:<entity>` link is accompanied by a `returned:<dispatch_id>` link with `rel = "submit"` and `form = "submit"` (a reader dispatch by `ingest_candidates:<dispatch_id>` instead, whose schema adds the candidate payload to these fields; xref:03-escalation-roles-readers.adoc#_reader_agent_family_execution_context_reader[Reader Agent Family (`execution-context-reader`)]):
+
+[source,text]
+----
+links[2]{rel,link,form,free}:
+  dispatch,dispatch:envelope-1,dispatch,""
+  submit,returned:dsp-0001-4b9c10,submit,"status:enum[success|error|loop_back|blocked|harness_cancellation],display_detail:text[1..80],token_usage:int[1..10000000]?,input_tokens:int[0..10000000]?,output_tokens:int[0..10000000]?,cache_read_input_tokens:int[0..10000000]?,cache_creation_input_tokens:int[0..10000000]?,tool_uses:int[0..100000]?"
+----
+
+The link above is rendered for a client profile declaring `dispatch.token_usage_components: all` (link:../client-profiles.adoc[Client Profiles Specification]). The server renders only the usage parameters the active profile can report: `total_only` omits the four component parameters, `none` omits every token parameter, and `tool_uses` is rendered only where the profile declares `dispatch.reports_tool_uses: true`. A parameter that is not rendered is recorded as `unmeasured` with the reason `not_reported_by_client`, never as `0`. `duration_ms` is never a link parameter: the server measures it (Post-Return Integrity Invariants, item 6).
+
+When the sub-agent finishes (or fails/cancels in the host harness), the parent session invokes `pm_do` on `returned:<dispatch_id>` with the following JSON Schema for `args`:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/dispatch-return-args-v1.json",
+  "title": "DispatchReturnArgs",
+  "type": "object",
+  "required": ["status", "display_detail"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "success",
+        "error",
+        "loop_back",
+        "blocked",
+        "harness_cancellation"
+      ],
+      "description": "Terminal status reported by the sub-agent or observed by the host harness."
+    },
+    "display_detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[\\x20-\\x7E]+(?<!\\.)$",
+      "description": "Concise single-line ASCII summary (1..80 chars) without a trailing period."
+    },
+    "token_usage": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 10000000,
+      "description": "Total tokens consumed by the sub-agent if reported by the host; omit or pass null when unmeasured."
+    },
+    "input_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Uncached input tokens reported by the host; a measured 0 is legal; omit or pass null when unmeasured."
+    },
+    "output_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Output tokens reported by the host; omit or pass null when unmeasured."
+    },
+    "cache_read_input_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Input tokens read from the prompt cache; omit or pass null when unmeasured."
+    },
+    "cache_creation_input_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 10000000,
+      "description": "Input tokens written to the prompt cache; omit or pass null when unmeasured."
+    },
+    "tool_uses": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 100000,
+      "description": "Number of tool calls the sub-agent made, if reported by the host; omit or pass null when unmeasured."
+    }
+  }
+}
+----
+
+The four component names mirror the per-dispatch usage columns of `plan-marshall` (`manage-metrics`: `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, each optional and never defaulted to `0`); re-verify them against the latest `plan-marshall` version before implementing. The total keeps its lower bound of `1`, because a sub-agent that ran always consumed tokens; a measured `0` is legal only for a component (for example `cache_creation_input_tokens: 0`).
+
+=== Post-Return Integrity Invariants
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-6[PM-WATCH-DISP-6], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-7[PM-WATCH-DISP-7], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-8[PM-WATCH-DISP-8], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-5[PM-WATCH-GEN-5], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-8[PM-WATCH-GEN-8]_
+
+The workflow engine enforces six non-negotiable post-return invariants when processing `returned:<dispatch_id>`:
+
+1. *Unmeasured Token Usage Never Fabricates Zero*: If `token_usage` is omitted or `null` in `returned:<dispatch_id>`, the server persists `"token_usage": "unmeasured"` in the dispatch ledger and phase metrics store (`metrics.json`). It **must never** record `0`, because a zero token count corrupts cost aggregations and masks missing host telemetry. A step that runs inline by design (for example when the neutral profile converts a dispatch into an inline step, `PM-CLIENT-4`) records `"token_usage": "inline"`; `unmeasured` and `inline` are declared before any scoring and never collapse into each other or into `0`. Every token total aggregated from the dispatch ledger is published as a population-stamped aggregate (`rows`, `rows_unmeasured`, `population_count`, with the population `dispatched`; link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]); when `rows_unmeasured > 0` the total is marked `total_is_floor: true` and never wins a reconciliation against another source.
+2. *Submit-Before-Return Verification (No Synthesized Submissions)*: When `returned:<dispatch_id>` is called with `status: "success"`, the server inspects the persisted state of the target `entity`. If the entity reached its required terminal submission state (e.g., `envelope.completed`, or the expected outline/triage artifact was submitted via `pm_do`), the return succeeds and advances the parent workflow. If the entity has **not** recorded its required `submit` transition (for example, the sub-agent edited files or answered in prose and returned `"success"` without calling `pm_do(link="submit:...")`), the server **never synthesizes a missing submission**. Instead, it marks the dispatch record `INCOMPLETE_SUBMISSION`, logs an attribution defect in the audit log, and raises the `dispatch_incomplete` condition on the dispatching parent state (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-dispatch_incomplete[State Catalogue, Conditions]; the state and `call_stack` stay unchanged), offering only `resume:<entity>` (to complete or re-dispatch after inspecting disk state) and `escalate`.
+3. *No Blind Retry on Unconfirmed Dispatches*: When a dispatch fails to return (`harness_cancellation`, empty return, or host crash) or remains `ALLOCATED` / `CLAIMED` without completion, the server never retries the sub-agent blindly and never re-offers it on a timeout. It inspects the worktree (`worktree_sha`) and entity store on disk first, exposes the observed partial progress (e.g., tasks $t_1$ completed, $t_2$ pending in `envelope-1`) in `facts`, and issues a fresh `dispatch_id` only for the remaining uncompleted tasks in the envelope.
+4. *Citations-Only Return for Read-Only Workers*: Read-only worker dispatches (such as deep-lane codebase exploration or verification sweeps) persist their detailed findings and component assessments via entity-scoped `submit` links during execution and return a short `display_detail`, keeping raw findings out of the parent session's context window. The server computes the aggregate counts from the records the entity submitted and renders them as `facts` of the parent representation; `display_detail` is display text only and is never read as evidence of a count.
+5. *Dispatch Reconciliation*: The `[DISPATCH]` audit record written on render and the `returned:<dispatch_id>` entry of the dispatch ledger are two records of one dispatch. Every `[DISPATCH]` record ends in exactly one terminal disposition: `RETURNED`, `SUPERSEDED`, `UNCONFIRMED` (still `ALLOCATED` or `CLAIMED` when its phase closes), or `INCOMPLETE_SUBMISSION` (only when the scope was aborted while the `dispatch_incomplete` condition held); <<_dispatch_id_generation_lifecycle_states>>. `record-metrics` publishes, per divergence class (`row_absent_from_return_ledger`, `row_absent_from_dispatch_audit`, `boundary_never_closed`, `phase_re_entered`), the row count and the token mass the divergence hides.
++
+[#cause-class]
+*Cause Classes*: Every dispatch carries exactly one `cause_class` from the closed set `terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`, `unconfirmed` (metrics row field, link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]). A returned dispatch is classified from its termination `status` (and `INCOMPLETE_SUBMISSION` from that disposition); `unconfirmed` is the class of every dispatch in the lifecycle state `UNCONFIRMED`, whose cause is the absence of any observable reaction of the host: the dispatch was never claimed and never returned before its phase closed. A `SUPERSEDED` dispatch keeps the class of its return when one was recorded and is otherwise `stall` (its remaining work was re-offered). The per-class populations sum to the total dispatch population of the phase and of the plan, `UNCONFIRMED` dispatches included, with an asserted residual of `0`; a dispatch left unclassified fails the assertion and is never dropped from the total.
+6. *Per-Column Usage Persistence & Server-Measured Duration*: The total, each token component, and `tool_uses` are persisted independently, each as a measured integer or `"unmeasured"`; a column is never derived from another (the total is never split, the components are never summed into a missing total) and never defaulted to `0`. `duration_ms` is measured by the server from the dispatch's `claimed_at` to its `returned_at` (from its render to `returned_at` for a dispatch that was never claimed, recorded with `duration_basis: rendered` instead of `claimed`); a dispatch that never returns keeps `duration_ms: "unmeasured"`. When every usage column of every dispatch in a phase is `"unmeasured"`, `record-metrics` reports `instrument_dark: true` for that phase instead of a total.
+
+[#spend-accounting-budget-anchors]
+== Spend Accounting & Budget Anchors
+_See Requirement link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-2[PM-WATCH-DISP-2], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-3[PM-WATCH-DISP-3], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-35[PM-WATCH-PHASE-35]_
+
+Measured spend is compared against a fixed anchor table keyed by the plan's `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`, link:../phase-workflows.adoc[Phase Workflows Specification]) and its `ChangeType` (`analysis`, `feature`, `enhancement`, `bug_fix`, `tech_debt`, `verification`, in the priority order of link:../phase-workflows/03-q-gate-and-execute.adoc#_single_writer_change_type_contract[Phase Workflows Specification, Single-Writer `change_type` Contract]). Every pair of the full cross-product is either `anchored` or `fallback`; no pair is left undefined. The Phase 4 budget projection compares the summed predicted task cost with the anchor of the plan's pair.
+
+[cols="2,2,2,2"]
+|===
+|`scope_estimate` |`ChangeType` |Warning (tokens / wall minutes) |Error (tokens / wall minutes)
+
+|`surgical` |`feature`, `tech_debt` |600,000 / 45 |1,000,000 / 75
+|`surgical` |`bug_fix` |500,000 / 30 |800,000 / 45
+|`single_module` |`feature`, `tech_debt` |1,000,000 / 75 |1,600,000 / 120
+|`single_module` |`bug_fix` |800,000 / 60 |1,300,000 / 90
+|`multi_module` |`feature`, `tech_debt` |1,500,000 / 120 |2,500,000 / 180
+|`multi_module` |`bug_fix` |1,200,000 / 90 |2,000,000 / 150
+|`broad` |`feature`, `tech_debt` |2,000,000 / 180 |3,500,000 / 240
+|`broad` |`bug_fix` |1,500,000 / 120 |2,500,000 / 180
+|===
+
+All other pairs (every pair with `scope_estimate` `none`, and every pair with `ChangeType` `enhancement`, `verification`, or `analysis`) are `fallback` pairs. A fallback pair has no absolute anchor and is checked against normalized ceilings instead: tokens per changed file above 50,000, worked seconds per task above 900 (unanchored), a single phase's share of the plan's tokens above 0.50, or tokens per deliverable above 500,000. The canonical reference plan for the table is a surgical bug fix of 958,064 tokens over 2 files.
+
+The anchored values and the fallback ceilings are `plan-marshall`'s (`plan-retrospective/references/plan-efficiency.md` § 2, Calibration anchors table); re-verify them against the latest `plan-marshall` version before implementing. *Deliberate change vs. `plan-marshall`*: its key space adds a seventh change type `feature_breaking` (scored by its planning-lane router, absent from its canonical change-type table), whose rows are all `fallback`; `PM-MCP` keeps the six canonical change types, because breaking-ness is the plan's `compatibility` field, not a change type, so those rows do not exist.
+
+The server applies the anchors at three points, and nowhere else:
+
+* *Planning-Time Projection (advisory)*: At `plan.describe-tasks` the Phase 4 budget projection yields the non-blocking `split_advice` fact (link:../phase-workflows.adoc[Phase Workflows Specification], Deterministic Task Derivation). It never enters a state of kind `awaiting_user` or `blocked` and never raises a condition.
+* *Pre-Merge Finalize Spend Check*: Before the pre-merge barrier, `default:branch-cleanup` compares the plan's cumulative finalize spend (the tokens of every Phase 6 dispatch and of the measured main session in Phase 6, one population per figure) with the error column of the plan's pair; for a fallback pair it compares the finalize phase's share of the plan's tokens with the `0.50` ceiling. Above it, the plan enters `finalize.spend-escalate`, where the operator acknowledges the overrun before the merge proceeds; an acknowledgement covers the spend recorded up to its instant, so further finalize spend is checked again. The ratio (`finalize_spend_ratio`: value, compared column, unit, population) is a landing fact in every case. An unmeasured finalize spend yields `finalize_spend_ratio: not_derivable` and no escalation; it is never read as within budget.
+* *Post-Run Comparison*: `record-metrics` and the post-run quality report render measured spend against the pair's anchor.
+
+*Spend Classes*: Every dispatch is classified by what it produced, from the entity and findings records the server holds, never from its termination `status`:
+
+[cols="1,4"]
+|===
+|Class |Condition
+
+|`submitted`
+|The dispatched entity recorded its required `submit` transition.
+
+|`findings_only`
+|No required `submit` was recorded, but the dispatch filed at least one finding (`FindingRecord.dispatch_id`).
+
+|`no_product`
+|The dispatch returned or was superseded without a submit and without a filed finding.
+
+|`unmeasured`
+|The dispatch's token usage is unmeasured, whatever it produced (its product is still shown in the cross-tabulation); it is counted by rows, never summed as `0`.
+|===
+
+Every dispatch belongs to exactly one class; the class token sums add up to the measured total with an asserted residual of `0`, and `unmeasured` rows are reported as a row count beside the sums. The termination `status` (`success`, `error`, `loop_back`, `blocked`, `harness_cancellation`) is a separate dimension, rendered as a cross-tabulation with the classes, so an `error` return that filed real findings is `findings_only`, never waste.

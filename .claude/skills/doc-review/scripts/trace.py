@@ -7,6 +7,11 @@ Reports broken links/anchors (Asciidoctor auto-id rules), requirement <-> specif
 bidirectionality, the Specification.adoc index, roadmap coverage, and watch-item counts, gaps and
 backlinks. Run it once before editing (baseline) and after every edit batch; compare the two outputs:
 only findings that are new against the baseline are caused by the edits.
+
+A large specification may be split into parts: `specification/<spec>.adoc` stays the index (header,
+Overview, Traceability, Status, `== Parts`) and `specification/<spec>/NN-<topic>.adoc` hold the
+sections. A part belongs to its spec `specification/<spec>.adoc` for every check: a link to a part
+counts as a link to the spec, and the Traceability section is read from the index only.
 """
 import re, os, sys, collections, subprocess
 if len(sys.argv) > 1:
@@ -20,6 +25,17 @@ for dp, _, fns in os.walk(ROOT):
         if fn.endswith('.adoc'):
             p = os.path.relpath(os.path.join(dp, fn), ROOT)
             files[p] = open(os.path.join(dp, fn), encoding='utf-8').read()
+
+# a link to specification/<spec>.adoc or to one of its parts specification/<spec>/<part>.adoc
+SPEC_REF = re.compile(r'specification/([a-z-]+)(?:/[0-9a-z-]+)?\.adoc')
+def spec_refs(text):
+    return {m + '.adoc' for m in SPEC_REF.findall(text)}
+def is_spec_index(p):
+    return p.startswith('specification/') and p.count('/') == 1
+def spec_of(p):
+    """specification/<spec>/<part>.adoc -> specification/<spec>.adoc; other paths unchanged"""
+    m = re.match(r'^specification/([a-z-]+)/[^/]+\.adoc$', p)
+    return f'specification/{m.group(1)}.adoc' if m else p
 
 def autoid(title):
     # Asciidoctor order: special characters become entities first, then inline quotes become tags;
@@ -84,6 +100,17 @@ for p, txt in files.items():
 print('BROKEN LINKS', len(broken))
 for b in broken: print('  ', b)
 
+# split specifications: every part is listed in its index, every listed part exists
+for p in sorted(files):
+    sp = spec_of(p)
+    if sp != p:
+        if sp not in files: print('PART WITHOUT INDEX', p)
+        elif f'link:{os.path.relpath(p, os.path.dirname(sp))}[' not in files[sp]: print('PART NOT LISTED IN INDEX', p)
+for p in sorted(files):
+    if is_spec_index(p):
+        for m in re.finditer(r'^\* link:([a-z-]+/[^\[]+\.adoc)\[', files[p], re.M):
+            if os.path.normpath(os.path.join('specification', m.group(1))) not in files: print('INDEX LISTS MISSING PART', p, m.group(1))
+
 # requirement ids and titles
 reqs = {}
 for p, txt in files.items():
@@ -98,7 +125,7 @@ def req_body(rid):
     p, _ = reqs[rid]; txt = files[p]
     s = txt.index(f'[#{rid}]'); e = txt.find('\n[#PM-', s+5)
     return txt[s: e if e > 0 else len(txt)]
-req2spec = {r: set(re.findall(r'specification/([a-z-]+\.adoc)', req_body(r))) for r in reqs}
+req2spec = {r: spec_refs(req_body(r)) for r in reqs}
 for r, s in req2spec.items():
     if not s: print('REQ WITHOUT SPEC LINK', r)
 
@@ -106,8 +133,9 @@ for r, s in req2spec.items():
 spec2req = {}
 for p, txt in files.items():
     if p.startswith('specification/'):
-        m = re.search(r'== Traceability\n(.*?)\n== ', txt, re.S)
-        spec2req[os.path.basename(p)] = set(re.findall(r'#(PM-[A-Z]+-\d+)\[', m.group(1))) if m else set()
+        if is_spec_index(p):  # parts carry no Traceability section of their own
+            m = re.search(r'== Traceability\n(.*?)\n== ', txt, re.S)
+            spec2req[os.path.basename(p)] = set(re.findall(r'#(PM-[A-Z]+-\d+)\[', m.group(1))) if m else set()
         # title mismatches in traceability
         for mm in re.finditer(r'#(PM-[A-Z]+-\d+)\[PM-[A-Z]+-\d+: ([^\]]+)\]', txt):
             rid, t = mm.group(1), mm.group(2).strip()
@@ -141,7 +169,7 @@ for s in sorted(spec2req):
 # prefix taxonomy table in Requirements.adoc
 print('\n== Taxonomy table vs actual req->spec union')
 for m in re.finditer(r'\|`(PM-[A-Z]+)`\n\|[^\n]*\n\|[^\n]*\n\|([^\n]*)', files['Requirements.adoc']):
-    pre = m.group(1); tab = set(re.findall(r'specification/([a-z-]+\.adoc)', m.group(2)))
+    pre = m.group(1); tab = spec_refs(m.group(2))
     act = set().union(*[req2spec[r] for r in reqs if r.startswith(pre + '-')])
     act_back = {s for s, rr in spec2req.items() if any(r.startswith(pre+'-') for r in rr)}
     if tab != act or tab != act_back:

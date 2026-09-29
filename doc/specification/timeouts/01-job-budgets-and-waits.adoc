@@ -1,0 +1,265 @@
+= Timeouts & Budgets Specification: Job Budgets & Waits
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts & Budgets Specification] » Job Budgets & Waits
+
+[#job-budgets]
+== Job Budgets & Escalation
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-15[PM-WATCH-JOB-15], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-16[PM-WATCH-JOB-16]_
+
+Every job, and every in-process `git` or `ci` operation of the native variant (<<in-process-operations>>), runs under a wall-clock budget $t$ allocated at its start and recorded, with its `budget_derivation`, in the job record (`PM-EXEC-4`, `PM-EXEC-6`); the representation carries neither, since the derivation only selects the retry link the server offers (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]). The budget is keyed per project by the *budget key*:
+
+* build jobs: the canonical command `<build_system>:<verb>[@<module_id>]` (canonical verb from the link:../job-runtime/02-confinement-and-environment.adoc#canonical-build-verbs[Canonical Build Verb Set], module omitted for a whole-tree run; a build profile is named literally in the verb's template and is no key component), for example `maven:quality-gate` or `maven:module-tests@plan-marshall-mcp`;
+* `git` and `ci` operations: `<kind>:<operation>`, where `<operation>` is the closed contract operation name of the composing primitive, for example `git:worktree-remove` or `ci:checks`. The key is the same for the native and the CLI variant: a project uses one variant per integration, so the key needs no variant component;
+* `project_script` jobs: `project_script:<project_script_id>`.
+
+Learned values live in the project's `<PM_MCP_BASE>/projects/<project_id>/build-timings.json` (link:../store-schemas/09-derived-facts-and-build-timings.adoc#build-timings-store[Store Schemas, Build Timings Store]) under this key (link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning], which defines which runs feed the learned baseline).
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[engine-floor]]Engine floor $F$
+|Maven, Gradle, npm: `300`; pyproject (`pw`, every command): `330` (plan-marshall's per-tool outer floors `MAVEN_OUTER_FLOOR_SECONDS`, `GRADLE_OUTER_FLOOR_SECONDS`, `NPM_OUTER_FLOOR_SECONDS`, `PYTEST_OUTER_FLOOR_SECONDS`, verified at plan-marshall commit `88fcfc9ef`). `git`, `ci`: the floor of the operation class (rows below).
+|fixed
+|Is itself the lower bound of every budget of its key; no derivation and no configuration ever undercuts it.
+|build jobs, `git` and `ci` operations
+|—
+|link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]; link:../domain-extensions/06-configuration.adoc#_tier_3_adaptive_build_timeouts_crash_replay_state[Domain Extensions, Tier 3]
+
+|[[learned-baseline]]Learned baseline $L$
+|Max-biased blend over finished runs of the key: $L_{\text{new}} = \lfloor 0.8 \times \max(L_{\text{old}}, d) + 0.2 \times \min(L_{\text{old}}, d) \rfloor$ for a finished run of duration $d$; the first observation is stored raw.
+|not configured (server-managed per-project store `build-timings.json`)
+|—
+|build jobs, `git` and `ci` operations
+|—
+|link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]
+
+|[[budget-allocation]]Allocated budget $t$
+|First match: (1) an escalation budget $E$ is set for the key → $t = E$ (`escalated`); (2) an operator budget $O$ is enrolled for the key → $t = \max(F, O)$ (`operator`); (3) the key has a learned value → $t = \max(F, \lfloor 1.25 \times L \rfloor)$ (`learned` with its observation count); (4) otherwise $t = F$ (`floor_default`).
+|via the operator budget $O$ (next row)
+|$t \ge F$ always. The escalation cap $C$ bounds only the escalation step, never an operator budget.
+|build jobs, `git` and `ci` operations
+|The runtime terminates the job's process group (<<grace-period>>), or cancels an in-process operation (<<in-process-operations>>), and records `timed_out` (<<no-verdict-rule>>).
+|link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]; link:../job-runtime/01-pipeline-and-subprocesses.adoc#outcome-derivation[Job Runtime, Outcome Derivation]
+
+|[[operator-budget]]Operator budget $O$
+|Seconds per budget key, set by the operator.
+|`command_budgets` of the project's enrolment file `enrolments/<project_id>.json` (link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas, Project Enrolment Store]), written only through the operator CLI
+|Clamped up to $F$; may exceed the escalation cap $C$.
+|build jobs, `git` and `ci` operations
+|As allocated budget.
+|link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning] (Seeded Wait Budgets)
+
+|[[escalation-budget]]Escalation budget $E$
+|Set by a `timed_out` run with budget $t$ for the next run of the same key: $E = \max(t, \min(2 \times t, C))$. One-shot: the next finished run of the key clears it. A timed-out run never feeds $L$.
+|the cap $C$ (next row)
+|$E \ge t$ (an escalation never lowers a budget, also when $t > C$); $E \le \max(t, C)$.
+|build jobs, `git` and `ci` operations
+|As allocated budget.
+|link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning]
+
+|[[escalation-cap]]Escalation cap $C$
+|`1800` (plan-marshall's `MAX_TIMEOUT`)
+|`escalation_cap_seconds` in `machine-config.json` (link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas, Machine Configuration Store])
+|minimum `330` (the highest engine floor)
+|the escalation step
+|—
+|this table
+
+|[[git-local-budget]]`git` local operation class
+|Floor `120`; allocation as above. Operations that read or change only the local repository without running hooks: the read family (`status`, `diff`, `diff-names`, `ls-files`, `resolve`, `ancestry`, `log`, `merge-preview`, `worktree-sha`, `remotes`, `read-tree-at`), the refs family (`branch-create`, `branch-delete`, `ref-delete`), and the worktree family (`worktree-add`, `worktree-list`, `worktree-remove`, `worktree-prune`).
+|via $O$ per operation key
+|$F = 120$
+|`git` operations (native and CLI variant)
+|`timed_out`; never answered with `--force` or any other widening flag; a timed-out `worktree-remove` runs the <<worktree-remove-recheck>>.
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]; link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout, Worktree Lifecycle]
+
+|[[git-hook-budget]]`git` hook-running operation class
+|Floor `300`; allocation as above. Operations that write commits or rewrite the working tree and, in the CLI variant, run repository hooks (the native variant never runs a hook): the commit family (`stage-and-commit`, `rebase`, `rebase-continue`, `rebase-abort`, `switch`, `fast-forward`, `move`, `capture-snapshot`, `restore-paths`).
+|via $O$ per operation key
+|$F = 300$
+|`git` operations (native and CLI variant)
+|`timed_out`; a partial rebase or merge is reported from the worktree state, never aborted or forced by the runtime.
+|link:../workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`)
+
+|[[git-network-budget]]`git` network operation class
+|Floor `300`; allocation as above. Operations that contact a remote: the network family (`fetch`, `push`, in the CLI variant including its `pre-push` hook, and `ls-remote`).
+|via $O$ per operation key
+|$F = 300$
+|`git` operations (native and CLI variant)
+|`timed_out`; a push is re-verified from the remote ref state (`ls-remote`) before any retry.
+|link:../workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`)
+
+|[[ci-query-budget]]`ci` query operation class
+|Floor `60`; allocation as above. Read-only provider operations (native requests, or `gh`/`glab` jobs of the CLI variant): pull-request and check inspection, run lookup, review and comment retrieval, merge-queue membership reads, repository facts, and the single poll of a `bot_poll` job.
+|via $O$ per operation key
+|$F = 60$
+|`ci` operations and `bot_poll` jobs
+|`timed_out`; the enclosing wait re-polls (<<waits>>).
+|link:../job-runtime.adoc[Job Runtime]; link:../phase-workflows.adoc[Phase Workflows], Phase 6
+
+|[[ci-mutation-budget]]`ci` mutation operation class
+|Floor `120`; allocation as above. Provider operations that change provider state (native requests, or `gh`/`glab` jobs of the CLI variant): pull-request create, edit and close, comments, review triggers, thread replies and resolution, merge, merge-queue enqueue, branch delete.
+|via $O$ per operation key
+|$F = 120$
+|`ci` operations
+|`timed_out`; the effect is confirmed only from the provider's observed state before any retry (never from the exit status).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]
+
+|[[project-script-budget]]`project_script` budget
+|The enrolled maximum timeout of the script, used as $t$ for every run; no learning and no escalation.
+|`max_timeout_seconds` of the entry in `enrolments/<project_id>.json -> project_scripts` (operator CLI, link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas, Project Enrolment Store])
+|minimum `10`; no cap beyond the operator's value
+|`project_script` jobs
+|`timed_out`; the retry is offered at the same budget beside `escalate` (the operator raises the maximum by re-enrolment).
+|link:../domain-extensions.adoc[Domain Extensions] (Project Script Jobs); link:../job-runtime.adoc[Job Runtime]
+
+|[[grace-period]]Termination grace period
+|`5` between `SIGTERM` and `SIGKILL` to the job's process group.
+|fixed
+|—
+|every termination of a job group (budget expiry, cancel, drain, orphan termination) and the final `SIGTERM` of an evicted language server
+|`SIGKILL` to the whole group, also when its leader is gone.
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]
+
+|[[cancel-group-retry]]Cancel-before-group retry
+|When `kill(-pgid, SIGTERM)` answers `ESRCH` because the `pm-mcp-exec` launcher has not yet called `setpgid`, the runtime signals the PID directly and retries against the group every `0.1` for at most `10` attempts (`1` in total).
+|fixed
+|—
+|`cancel:<job_id>`, budget expiry, drain
+|After the last attempt the job is settled from its exit status; `cancel_before_group` is recorded in the job record either way.
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_process_termination_cancellation_protocol[Job Runtime, Process Termination]
+
+|[[http-request-timeout]]Native request timeout
+|Connect `10`, read `60` for every HTTP request of a native `git` or `ci` operation (provider REST and GraphQL requests, git HTTPS transport), inside the operation's class budget.
+|fixed
+|—
+|native `git` and `ci` operations
+|The request is aborted; the operation ends `timed_out` (<<no-verdict-rule>>) unless the operation's own retry rule re-issues the request within the remaining class budget.
+|<<in-process-operations>>
+|===
+
+[#in-process-operations]
+=== In-Process Operations of the Native Variant
+
+A native `git` or `ci` operation runs inside the runtime, not as a process (link:../job-runtime/01-pipeline-and-subprocesses.adoc#in-process-operations[Job Runtime Specification, In-Process Operations]); the operation classes, floors, allocation, learning, escalation, and the no-verdict rule above apply to it unchanged:
+
+* *Cooperative Cancellation*: At budget expiry, on `cancel:<job_id>`, and at drain, the runtime cancels the operation cooperatively: JGit operations through their `ProgressMonitor` (`isCancelled`) and revision-walk cancellation, provider requests by interrupting the HTTP exchange. Every HTTP request additionally carries the <<http-request-timeout>>, so no single request can outlast the class budget.
+* *Abandonment*: An operation that has not returned within the termination grace period (<<grace-period>>) after cancellation is abandoned: it is recorded at the deadline, and the result that arrives later is discarded.
+* *Partial Results Discarded*: A cancelled or abandoned operation yields no result record; nothing it observed before the cancellation is used. A mutation it may have applied is established only from the observed repository or provider state before any retry, as for a job (a push by `ls-remote`, a merge or enqueue by the provider observation, a worktree removal by the <<worktree-remove-recheck>>).
+* *Outcome*: Budget expiry records `timed_out`, which is `no_verdict` (<<no-verdict-rule>>); cancellation records `cancelled`, drain records `killed`.
+
+[#no-verdict-rule]
+=== Timed-Out Outcomes Are No-Verdict
+
+* *Every `timed_out` is `no_verdict`*: A job settled `timed_out` counts as `no_verdict` in every roll-up (landing facts, metrics, gate facts, CI taxonomy, finding counts), never as `failed` and never as `succeeded`, whatever its `budget_derivation`. It never fails a gate, and it emits zero located code errors or findings (`PM-EXEC-4`).
+* *The derivation selects only the retry offer*: A `timed_out` job auto-offers `retry` with the escalation budget $E$ when $E > t$ (derivations `floor_default`, `learned`, `operator`, and `escalated` below the cap). When $E = t$ (the budget already reached $\max(t, C)$) or for a `project_script`, `retry` is offered at $t$ together with `escalate`, so the operator can enrol an operator budget above the cap.
+* *Budget statistic*: A budget always names the statistic it came from (the blend $L$ with its observation count, never a median or percentile); a p50 or p95 duration quoted in a record or report is labelled as such and is never used as a budget.
+
+[#worktree-remove-recheck]
+=== Partial-Removal Re-Check after a Timed-Out `git worktree remove`
+
+A `timed_out` `git worktree remove` can leave a partially deleted tree. Before any retry and before the removal is recorded:
+
+1. The runtime runs `git.worktree-list` in the main checkout (budget class <<git-local-budget>>) and checks whether the worktree directory still exists.
+2. *Unregistered and absent*: the removal is complete; it is recorded (`worktree_path: null`) with `removal_evidence: recheck`.
+3. *Registered but the directory is absent*: the runtime runs `git.worktree-prune` and repeats step 1 once; it records the removal only on the re-checked positive evidence.
+4. *Directory present (registered or not)*: `worktree_path` stays set, the step reports `worktree_removal: partial` with the remaining path, and `retry` is offered with the escalation budget; the retry never adds `--force`.
+5. *Re-check itself fails or times out*: the removal is `indeterminate`; nothing is recorded as removed (link:../store-schemas/13-leases-integrity-testing.adoc#evidence-based-removal-sweeps[Store Schemas, Evidence-Based Removal Sweeps]).
+
+[#waits]
+== Waits & Long-Polls
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-5[PM-WATCH-JOB-5]_
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[bounded-wait]]Bounded wait window
+|Compiled default `240` per client profile.
+|`connection.bounded_wait_seconds` of the client profile; operator override in `<PM_MCP_BASE>/conf/profiles/<client_id>.json`
+|`15`..`3600`; profile validation also rejects a value above `connection.idle_timeout_seconds − 30`
+|`wait:<job_id>`, `wait:<composite_id>`, `wait:decision:<decision_id>`, a `pm_build` call and its `job_id` continuation, when the connection does not qualify for a progress wait
+|The call returns the running representation (or the unchanged `blocked` representation) with fresh `wait:` and `cancel:` links and reports whether the job state changed during the window; never an MCP transport timeout.
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]; link:../hypermedia-format.adoc[Hypermedia Format] (`wait` form, Short-Circuit Matrix); link:../mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools, `pm_build`]
+
+|[[progress-wait]]Progress wait upper bound
+|`1800`
+|`progress_wait_max_seconds` in `machine-config.json`
+|`60`..`7200`
+|the same waits, when the client profile declares `progress_resets_timeout: true` and the request carries a `progressToken`
+|As bounded wait.
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]; link:../runtime-model.adoc#_connection_scoped_rendering[Runtime Model, Connection-Scoped Rendering]
+
+|[[progress-interval]]Progress notification interval
+|`5` between `notifications/progress` frames (stage and elapsed time).
+|fixed
+|never more than `60` between two frames of one progress wait
+|progress waits
+|—
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]
+
+|[[decision-wait]]Operator decision wait
+|One bounded or progress wait window per `wait:decision:<decision_id>` call; the pending decision itself never expires.
+|as bounded / progress wait
+|as bounded / progress wait
+|`blocked` condition, `execute.awaiting-infeasible-decision`
+|Returns the unchanged representation with its `blocked` condition; the decision stays pending until the operator resolves it or the scope terminates.
+|link:../workflow-dsl/02-units-jobs-decisions.adoc#escalation-decision-wait[Workflow DSL, Escalation Without Elicitation]; link:../cli-and-security/02-credentials-and-operator.adoc#operator-channel-isolation[CLI & Security, Operator Channel Isolation]
+
+|[[elicitation-wait]]Elicitation request
+|Held within the window (bounded or progress) of the call that issued `elicitation/create`.
+|as bounded / progress wait
+|as bounded / progress wait
+|operator-authorizing and routine elicitations
+|The server withdraws the request, records the decision as pending, and raises the `blocked` condition with `wait:decision:<decision_id>`; a declined or cancelled elicitation is an answer, not an expiry.
+|link:../cli-and-security/02-credentials-and-operator.adoc#operator-channel-isolation[CLI & Security, Operator Channel Isolation]
+
+|[[ci-wait]]CI wait
+|No deadline: a CI wait is re-polled window by window and never lapses. When no learned figure exists, the operator budget of the CI key seeds the expected duration recorded with the wait (an operator view, never rendered).
+|seed via $O$
+|—
+|CI constituents of `wait:<job_id>` and composite waits
+|Window expiry only (as bounded wait).
+|link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime, Adaptive Timeout Learning] (Seeded Wait Budgets)
+
+|[[ci-repoll-cadence]]Provider re-poll cadence inside a window
+|`30` between two observations of the same provider resource (check runs of a head, reviews and comments of a pull request, merge-queue membership). Conditional requests (`ETag` / `If-None-Match`, answered `304`) are used wherever the provider supports them. One shared poll per `(credential, resource)` serves every wait of the runtime that observes that resource. A provider `Retry-After` or rate-limit reset instant defers the next poll to that instant.
+|fixed
+|never more often than every `30`; never before a stated `Retry-After` or reset instant
+|CI waits, the provider observations of review-bot waits, <<merge-queue-wait>>
+|A provider rate limit is recorded as the wait slice reason `provider_rate_limit` (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Wait Attribution]) and the wait continues; it is never a timeout and never a failure.
+|link:../phase-workflows.adoc[Phase Workflows], Phase 6; link:../hypermedia-format/03-composite-wait-and-encoder.adoc#_deterministic_evaluation_immediate_short_circuit_matrix[Hypermedia Format, Short-Circuit Matrix]; _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-19[PM-WATCH-JOB-19]_
+
+|[[review-bot-windows]]Review-bot rate windows, re-review timeout, attempt ceiling
+a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published and parsed (a floor to re-check, never a deadline); otherwise `claimed_at + rate_interval_seconds` of the bot's registry record; otherwise, for a record without an interval, the compiled rate-window floor `3600`.
+* *Re-review timeout*: the `reset_at` of the bot's open window; without an open window, `rate_interval_seconds` plus the compiled completion allowance `600` (the floor `3600` plus `600` for a record without an interval).
+* *Attempt ceiling*: the registry record's `attempt_ceiling`, compiled default `6`, counted per `(repository, pr_number, bot_kind)`; each posted trigger counts as one attempt.
+|fixed (floor `3600`, allowance `600`, default ceiling `6`); per bot through the registry fields `rate_interval_seconds` and `attempt_ceiling` (link:../store-schemas/03-findings-and-review-records.adoc#review-bot-registry[Store Schemas, Review-Bot Registry Record])
+|`reset_at` never earlier than a published ETA
+|`finalize.review-window-wait`, the `rereview_timeout` gap class, review-bot window claims
+|Window reset: the unproven bots are re-triggered once (never inside a closed window). Re-review timeout: the `rereview_timeout` gap asks the operator. Attempt ceiling reached: no further trigger; the bot resolves `unproven` and the wait routes to `finalize.review-escalate`.
+|link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_refusals_rate_windows[Phase Workflows, Refusals & Rate Windows]; _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-27[PM-WATCH-PHASE-27], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-13[PM-WATCH-STORE-13]_
+
+|[[merge-queue-wait]]Merge-queue landing wait
+|Stall-based, no fixed deadline: the stall clock restarts on every observed progress of the queue entry (a change of position or state, `ci.queue-membership`); `timed_out` after no observed progress for `2 ×` the queue's check-response timeout (the `check_response_timeout` of the derived fact `merge_queue_enforced`, link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas, Derived Facts]), or for the compiled fallback `3600` when the provider states none. Re-polled at the <<ci-repoll-cadence>>.
+|fixed (derived from the provider's queue configuration)
+|—
+|`finalize.merge-queue-wait`, epic landing
+|`timed_out` routes to `escalate`; a `timed_out` landing is `no_verdict` (<<no-verdict-rule>>).
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]; link:../dispatch-and-effort.adoc[Dispatch & Effort] (Epic Landing); _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-78[PM-WATCH-PHASE-78]_
+
+|Host cancellation of a wait
+|Immediate: a host `notifications/cancelled` ends the pending wait or call only.
+|fixed
+|—
+|every wait
+|The job keeps running; only `cancel:<job_id>` cancels a job.
+|link:../runtime-model.adoc#_cancellation[Runtime Model, Cancellation]
+|===

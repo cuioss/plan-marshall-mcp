@@ -1,0 +1,303 @@
+= Domain Extensions, Build Map & Configuration Split Specification: Architecture Enrichment & Project Setup State Machine
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../domain-extensions.adoc[Domain Extensions, Build Map & Configuration Split Specification] » Architecture Enrichment & Project Setup State Machine
+
+== Architecture Enrichment Judgment Links & Project Setup State Machine
+
+Only semantic module enrichment (`responsibility`, `purpose`, and `key_packages` with their reasoning) requires model judgment. `PM-MCP` replaces the legacy `marshall-steward` first-run wizard (Steps 1–16) and its `upgrade` verb with one dedicated **`project-setup`** state machine (`classpath:/workflows/project-setup.pmwf`), hosted by the project's workspace scope (`scope workspace`; entered with `pm-mcp enter --client <client> workspace` and driven through `pm_state` / `pm_do` with `plan_id: "NO_PLAN"`, `PM-ARCH-4`; its state lives in `workspace/mcp/status.json` of the per-project machine store `<PM_MCP_BASE>/projects/<project_id>/`, link:../filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]). The workspace scope exists once the project is enrolled: `pm-mcp operator enrol` creates the project's machine store for every project, and the first run of the setup workflow creates `.marshall/`. Enrolment (`pm-mcp operator enrol`, host tools) therefore precedes the workspace scope and is never a state of the setup workflow; the credentials of the git and provider integrations are verified in `setup.verify-credentials`, and every other missing secret is handled by the credential check (`pm-mcp operator credentials`, `PM-CRED-3`) where the credential is used. The workflow has one start state, `setup.entry`, an `auto` state that routes by server facts: without `.marshall/config/` (first run) to `setup.prepare-workspace`, which creates `.marshall/config/` with the copies of the binary's default workflow units (the JSON team files stay absent until a deviation is configured, since they are sparse), otherwise to the reconcile path starting at `setup.reconcile-config`. The workflow unit `project-setup.pmwf` itself is compiled into the binary and is never project-owned: the setup workflow must be able to repair a project whose units fail verification. The workflow has no terminal state: the workspace scope lives as long as the project's enrolment, and every run ends in the resting `link` state `setup.completed`, whose `reconcile` link returns to `setup.entry` for the next run. A project that also runs on legacy `plan-marshall` starts from a clean slate like any other: `PM-MCP` imports nothing from its `.plan/` (`PM-MIG-2`), so its first setup run takes the first-run path; setup never reads or writes `.plan/`. Its states are catalogued in the link:../state-catalogue/06-setup-epic-other.adoc#state-catalogue-setup[State Catalogue, Project Setup: `setup`].
+
+[source,text]
+----
+                               setup.entry
+                (auto: routes by server facts — first run or configured)
+         │ first_run                                   │ configured
+         ▼                                             ▼
+setup.prepare-workspace                        setup.reconcile-config
+  (auto: .gitignore entries; creates              (auto: config.validate — team files,
+   .marshall/config/ with the default units)       local-config.json, project units;
+         │                                         format refusals offer a rewrite)
+         ▼                                             │
+setup.effort-ladder                                    │
+  (auto: validates the operator file                   │
+   local-config.json incl. effort ladder)              │
+         │                                             │
+         ▼                                             ▼
+setup.select-integration-variants  (link, operator channel only: native or cli
+                                    per integration, commit_identity; passes when
+                                    every stored choice is still valid)
+         │
+         ▼
+setup.verify-credentials  (auto: credential per native integration, enrolled host
+                           tool per CLI integration; refreshes network facts)
+         │ first run                                   │ reconcile run
+         ▼                                             │
+setup.project-settings                                 │
+  (link: configure_project — sparse team keys;         │
+   operator posture only via elicitation)              │
+         │                                             │
+         ▼                                             ▼
+setup.detect-domains  (auto: scans provides_file_globs & descriptors,
+                       derives domain activation; overrides from domains.json)
+         │
+         ▼
+setup.discover-modules  (job: descriptor parsers & enrolled discovery templates;
+                         reconcile run: rediscovery + pm://architecture/drift)
+         │ first run                                   │ reconcile run
+         ▼                                             ▼
+setup.seed-build-map                            setup.reseed-build-map
+  (link: confirm_build_map /                      (passes when in sync; on drift link:
+   customize_routes)                               reseed_build_map / keep_build_map)
+         │                                             │
+         ▼                                             ▼
+setup.select-providers                          setup.offer-new-steps
+  (link: configure_providers — CI derived,        (awaiting_user: adopt or decline each
+   ci_provider override, Sonar, review bots)       changed default unit, three-way diff)
+         │                                             │
+         ▼                                             │
+setup.configure-finalize                               │
+  (link: configure_finalize; optional step             │
+   lanes, every lane:ask element answered)             │
+         │                                             │
+         ▼                                             │
+setup.merge-queue                                      │
+  (link: recheck_merge_queue /                         │
+   skip_merge_queue; probe only, passes                │
+   when enforced or not eligible)                      │
+         │                                             │
+         ▼                                             ▼
+setup.enrich-architecture  (dispatch:enrich-<module_id>; first run: every unenriched
+                            module, reconcile run: modules in drift changed[] only)
+         │  [Guard: every_module_enriched]
+         ▼
+setup.commit-changes  (link: land / leave; re-entered on aborted)
+         │ land                                          │ leave
+         ▼                                               │
+setup.land-changes  (call git.commit_and_push)           │
+         │ committed_* / pushed_clean / in_sync / clean  │
+         ▼                                               ▼
+setup.completed  (link: reconcile — resting state of the workspace scope)
+         │ reconcile
+         ▼
+setup.entry
+----
+
+[#setup-integration-variants]
+*Integration variants* (`setup.select-integration-variants`): Every git and provider operation is a contract of a provider module (link:../../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]) with two interchangeable implementations: the *native variant* (in-process JGit, respectively the GitHub or GitLab client over `cui-http`, authenticated with the agent credential of the token lane) and the *CLI variant* (the enrolled `git`, `gh`, or `glab` host tool, acting with the operator's ambient authentication). The project's variant is decided explicitly, per integration, by the operator in this state; there is no implicit default, the compiled default table holds no variant, and `machine-config.json` `project_defaults` cannot carry one.
+
+* *Integrations*: `git` (the `git.*` contracts: repository, worktree, and transport operations, among them the working-tree digest `git.worktree-sha`, one operation with the same digest in both variants, link:../job-runtime/03-parsers-and-gates.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash]) and the CI provider integration `github` or `gitlab` (the `ci.*` contracts together with the provider's review-thread and code-scanning finding sources, `pm-mcp-findings`). The provider integration asked for is the one the local derivation of `ci_provider` names (a known provider host of the push remote) or the team override `project.json` `ci_provider`; when neither names it, only `git` is asked here, and `setup.select-providers` asks the provider integration once its `configure_providers` link sets the override. The Sonar integration (`pm-mcp-sonar`) has only a native variant and is not asked. One variant holds for all operations of an integration; integrations may differ (for example `git` `cli` with `github` `native`), operations within one integration never do.
+* *Decision*: The choice is taken only through the operator channel: following the state's link `select_variants` (rel `next`) opens an elicitation; on a connection without elicitation support it raises the `blocked` condition (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-blocked[State Catalogue, `blocked`]) whose `facts.operator_command` names `pm-mcp operator config --project <project_id>`. Per integration the elicitation shows `native` as the recommended value, the result of the derived fact `git_native_capability` (for `git`: each repository feature the native variant cannot serve, with its reason), and, for a `cli` choice, that the operator's own ambient identity (credential helper, SSH agent, `gh`/`glab` login, signing key) will act for every operation of that integration. A `cli` choice requires the host tool in the project's enrolment (`cli_tool_not_enrolled` names `pm-mcp operator enrol`). The answer is written to `local-config.json` `integrations.<integration>.variant` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]); the same elicitation captures the commit author `commit_identity {name, email}` while it is unset, prefilled with the operator's global git `user.name` and `user.email` read once as a proposal and confirmed or edited by the operator (never re-read silently afterwards).
+* *Validity*: The state passes without a link when every integration it asks for has a stored choice that is still valid. A stored `native` choice is invalid while `git_native_capability` reports a missing capability for it (a repository feature that appeared after the decision: hooks, signing requirement, filter drivers, LFS, submodules, SHA-256 or partial or sparse repositories, an SSH-only remote); the state then asks again and shows the finding. There is no automatic fallback to the CLI variant: switching silently would switch to the operator's credentials.
+* *Before the decision*: No git or provider operation runs for the project, in either variant, before the integration it belongs to has a valid choice: every such primitive refuses with `integration_variant_unset` naming the integration and this state, and `pm_start` of the project refuses with the same reason. The derivation of `git_native_capability` itself is no git operation: the server reads the repository configuration and files directly (`extensions.*`, `core.hooksPath`, non-sample files under `.git/hooks/`, `.husky/`, `lefthook.yml`, `.pre-commit-config.yaml`, `.gitattributes` drivers, `.gitmodules`, `lfs.url`, the remote URLs).
+* *Model-facing minimality*: The chosen variants, the capability details, and the identity notice are rendered to the operator (elicitation) and served on demand by the operator surfaces (`pm-mcp operator config`, `pm-mcp status`, `pm://project/config`), never pushed into the state's model-facing `facts`, which name only the integrations still undecided (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-27[PM-WATCH-EXT-27], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-28[PM-WATCH-EXT-28]_
+
+[#setup-verify-credentials]
+*Credential verification* (`setup.verify-credentials`): An `auto` state that checks, per decided integration, that the chosen variant can act, then refreshes the network derived facts (link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas Specification, Derived Facts]) with the chosen variants:
+
+* *Native `github`*: resolves the token-lane entry `github` (`PM-CRED-2`, project entry before global entry). For a GitHub App it mints the App JWT (RS256, JDK `Signature`), resolves the App's installation for the repository, and mints an installation token restricted to the repository and a read-only permission set (held in memory per `PM-CRED-5`, never persisted); for a fine-grained or classic personal access token it calls `ci.whoami`. The check derives the network facts `agent_identity` (login, kind, permissions on the repository; operator-only) and `checks_visible`. A credential that cannot read check runs is accepted: the operator is told that `ci.checks` will report `completeness: incomplete`. A token without expiry is accepted and shown on `pm-mcp operator credentials status`.
+* *Native `gitlab`*: resolves the entry `gitlab` (project access token, group access token, service-user or personal access token, all accepted alike) and calls `ci.whoami`; an `expires_at` within the credential expiry warning window (link:../timeouts/02-runtime-leases-operator-web.adoc#credential-expiring-window[Timeouts & Budgets Specification]) is reported as `expiring`.
+* *Native `git`*: the transport credential is the provider's entry for a provider host and `git-https` for any other HTTPS host; the check resolves the effective push and fetch URLs (with `insteadOf` rewrites), requires `https` after the SSH mapping of known provider hosts and the origin of the credential entry's `url` (`remote_origin_mismatch`, audited), and reads the push remote's refs with `git.ls-remote`.
+* *CLI integrations*: no credential is read; the state verifies the enrolled host tool and records that the integration acts as `identity: operator_ambient` (audit record).
+* *Committer identity*: the committer of server commits is resolved from the verified agent credential (a GitHub App's `<slug>[bot]` noreply address, the token's user), else the fixed `plan-marshall-mcp` noreply identity; the author is the operator's `commit_identity`. Both variants produce the same author and committer metadata.
+* *Failure*: a missing credential or a failing check raises the `blocked` condition with the `pm-mcp operator credentials` command (`PM-CRED-3`); its resolution re-runs the check. A failing check is never a fallback to another variant or credential.
+
+Exit: `setup.project-settings` on the first run, `setup.detect-domains` on the reconcile run; back to `setup.select-integration-variants` when the refreshed facts invalidate a stored `native` choice (for example the network fact `signed_commits_required`, an input of `git_native_capability`).
+
+[#setup-merge-queue]
+*Merge-queue probe* (`setup.merge-queue`): The state reports the derived network fact `merge_queue_enforced` (`{enforced, available, check_response_timeout}`, link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas Specification, Derived Facts Store]) for the base branch. The project is eligible when a CI provider integration is selected, the derived fact `push_remote` is non-empty, and `available` is not `no`. `available` is `no` only where the provider's answer is readable: GitHub, a repository owned by a user, or a private or internal repository whose organization plan is readable and is not Enterprise Cloud; GitLab, a tier below Premium when the tier is readable. An `indeterminate` or stale value counts as eligible. It passes without a link when the queue is enforced or the project is not eligible. Otherwise it names the provider setting that enables the queue (GitHub: the "Require merge queue" rule of a ruleset on the base branch; GitLab: merge trains with merged-results pipelines) and offers `recheck_merge_queue` (re-derives the fact after the operator changed the setting) and `skip_merge_queue`. The server never changes the setting and persists no key: administrative repository changes need admin scope, which the agent identity does not hold. *Deliberate change vs. `plan-marshall`*: `plan-marshall` provisions the queue (ruleset create or update, `merge_trains_enabled=true`) and persists a `use_merge_queue` opt-in.
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-30[PM-WATCH-EXT-30], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-31[PM-WATCH-EXT-31]_
+
+In `setup.enrich-architecture`, the engine offers concurrent entity-scoped `dispatch:enrich-<module_id>` links (or direct `enrich:<module_id>` submission links for single-module repositories). The submission parameters mirror `plan-marshall`'s `architecture enrich module` and `architecture enrich package` commands (`manage-architecture/scripts/architecture.py`, purpose values from `manage-architecture/standards/architecture-persistence.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing:
+
+[cols="2,1,5"]
+|===
+|Parameter |Required |Content
+
+|`responsibility`
+|Yes
+|Module description, 1–3 sentences.
+
+|`responsibility_reasoning`
+|No
+|Sources the responsibility was derived from (for example the README overview or a central type).
+
+|`purpose`
+|No
+|Module classification, closed enum `library` \| `extension` \| `deployment` \| `runtime` \| `parent` \| `bom` \| `integration-tests` \| `benchmark`.
+
+|`purpose_reasoning`
+|No
+|Signal the purpose was derived from (for example `packaging=jar`, no runtime dependencies).
+
+|`reasoning`
+|No
+|Shared rationale, applied to `responsibility_reasoning` and `purpose_reasoning` where the specific field is not supplied.
+
+|`key_packages`
+|No
+|List of `{package, description, components}`: `package` is a repository-relative path that must resolve to an existing location (the path is the identity key), `description` is 1–2 sentences and required, and `components` optionally names the package's key types. A dotted package identifier is rejected with `invalid_link_args` whose `detail` names `non_resolving_package_key` (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[closed rejection reasons]); only the server-derived `packages` facts of `pm://architecture/modules/{module_id}` may carry dotted names.
+|===
+
+The reasoning fields carry the enrichment rationale required by `PM-EXT-3` and are persisted next to the values they justify. *Deliberate hardening vs. `plan-marshall`*: `purpose` is validated against the closed enum; `plan-marshall` documents the same eight values but its CLI accepts any string. The state cannot transition to `setup.commit-changes` until the **`every_module_enriched`** guard evaluates to `true` (every discovered module has a `responsibility`). On the reconcile path the state is scoped to the modules listed in `changed[]` of `pm://architecture/drift`: only those are offered for enrichment, and the state passes without a dispatch when the list is empty; a module listed in `indeterminate[]` is never treated as changed.
+
+*Landing*: `setup.commit-changes` is a `link` state offering the routine decision `land` or `leave`; `land` enters the `call` state `setup.land-changes`, which runs `call git.commit_and_push (message_mode=step_or_fallback, push_mode=if_push_remote)` on the primary checkout with the setup staging set `.marshall/config/**` (team files and workflow units), `.gitignore`, and `.marshall/project-architecture/**` (link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_site_reuse_matrix_across_workflows[Workflow DSL Specification, Call-Site Reuse Matrix]). Every outcome except `aborted` enters `setup.completed`; `aborted` returns to the decision. `leave` enters `setup.completed` with the changes uncommitted.
+
+=== Steward Wizard Step Mapping
+
+Every step of the `plan-marshall` first-run wizard and every stage sub-step and gate of its `upgrade` verb maps to exactly one disposition: a `project-setup` state, or *retired* with the reason. No wizard step or upgrade gate survives outside the `project-setup` workflow. The wizard steps mirror `marshall-steward/references/wizard-flow.md` and the upgrade stages and gates mirror `marshall-steward/scripts/upgrade.py` and `references/upgrade-flow.md`, verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+
+[cols="2,3,4"]
+|===
+|`plan-marshall` step or gate |Legacy action |`PM-MCP` disposition
+
+3+|*First-run wizard (`wizard-flow.md`)*
+
+|Step 1: Gitignore Setup
+|Writes the `.plan/` entries with tracked-file exceptions into `.gitignore` (`gitignore_setup.py`).
+|`setup.prepare-workspace` (writes the `.marshall/` partition into `.gitignore`).
+
+|Step 2: Update Project Documentation
+|Appends executor and temp-file conventions to the project's agent documentation (`determine_mode fix-docs`).
+|*Retired*: there is no executor or script-call convention to document; agent-facing guidance ships with the client bundle (`pm-mcp client install`) and the `skill://` resources.
+
+|Step 3: Ensure Executor Permission
+|Consults, then widens the host allow-list for `execute-script.py`.
+|*Retired*: there is no executor. Host permissions for the MCP server are written by `pm-mcp client install`.
+
+|Step 4: Generate Executor
+|Generates `.plan/execute-script.py`.
+|*Retired*: there is no executor; the runtime executes every primitive in-process or as a job.
+
+|Step 5: Initialize Marshal.json
+|Creates `.plan/marshal.json` with defaults (`manage-config init`).
+|`setup.prepare-workspace` (creates `.marshall/config/` with the default workflow units; no JSON defaults are written, the team files are sparse; an existing `.plan/marshal.json` is never read, `PM-MIG-2`).
+
+|Step 5b: Effort Ladder & Pin Setup
+|Seeds and validates the machine-local effort ladder and materializes model pins (`effort_pins`).
+|`setup.effort-ladder` validates the operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (including its `effort_ladder`) and fails closed on a malformed file; nothing is seeded, absent entries resolve to the client profile's compiled ladder; model pins are applied when `pm-mcp client install` / `update` renders the agent variants.
+
+|Step 6: Project Default Base Branch
+|Seeds `project.default_base_branch` from `origin/HEAD` (fallback `main`).
+|Derived (fact `base_branch_default`); `setup.project-settings` writes `project.json` `base_branch` only when the team chooses another branch.
+
+|Step 6b: Interaction Mode
+|Persists `interaction_mode` (`basic` \| `advanced` \| `expert`).
+|Operator posture in `local-config.json`, set through the operator channel (elicitation in `setup.project-settings`, or `pm-mcp operator config`); never a team key.
+
+|Step 7: Discover and Activate Providers
+|Detects and activates VCS, CI, and other providers.
+|`setup.select-integration-variants` (native or CLI variant per integration, operator channel) and `setup.select-providers` (derived CI provider, Sonar, review bots).
+
+|Step 8: Project Architecture
+|Applies extension `config_defaults`, discovers modules, runs the LLM architectural analysis.
+|`setup.detect-domains` (domain activation; no `config_defaults` are written, domain defaults are compiled defaults), `setup.discover-modules` (discovery), `setup.enrich-architecture` (analysis).
+
+|Step 8b: Seed the Build Map
+|Seeds `build.map` after architecture discovery (write-once).
+|`setup.seed-build-map`.
+
+|Step 9: Configure Skill Domains
+|Activates the applicable skill domains and profiles from the architecture analysis.
+|`setup.detect-domains` (domain activation) together with the per-module Axis-A applicability evaluated in `setup.discover-modules`.
+
+|Step 10: Plan Phase Settings
+|Sets `branch_strategy`, `compatibility`, `commit_and_push`.
+|`setup.project-settings` (`compatibility`, `simplicity`, `minimum_lane` in `workflow.json`). `branch_strategy` and `commit_and_push` are *retired*: plans always use a feature branch, a worktree, and a pull request, and a local-only outcome is derived from the absence of a push remote (derived fact `push_remote`).
+
+|Step 11: Quality Pipeline Configuration
+|Selects `verification_steps` and finalize steps.
+|`setup.configure-finalize` (optional step lanes and parameters in `workflow.json`; which steps exist is the project's `finalize.pmwf` unit, whose mandatory steps cannot be removed).
+
+|Step 11b: Resolve Adversarial Infra Elements (`lane: ask`)
+|Mandatory, non-skippable answer for every `lane: ask` finalize element.
+|`setup.configure-finalize`: the state does not advance while a `lane: ask` element is unanswered.
+
+|Step 12: Review Gates
+|Sets the `*_without_asking` transition flags.
+|*Retired*: the five flags are replaced by the per-plan `continuation_policy`, whose default is the operator's `continuation.default_policy` in `local-config.json` (operator channel); outline approval and the other operator-authorizing decisions are never automatic.
+
+|Step 13: Detect CI Provider and Configure Credentials
+|Detects the CI provider, verifies its CLI, optionally configures credentials.
+|`setup.select-providers` (CI detection), `setup.select-integration-variants` (variant per integration; a CLI variant requires its host tool, enrolled by `pm-mcp operator enrol`, which precedes the workspace scope), and `setup.verify-credentials` (agent credential per native integration: GitHub App installation token or token `whoami`, GitLab token `whoami` with expiry; missing or failing credentials raise the `blocked` condition naming `pm-mcp operator credentials`, `PM-CRED-3`). *Deliberate change vs. `plan-marshall`*: no CLI is verified or required for a native integration.
+
+|Step 13.5: Merge-Queue Provisioning
+|Probes the platform merge queue and persists the `use_merge_queue` opt-in.
+|`setup.merge-queue` probes and reports the derived fact `merge_queue_enforced` and names the provider setting that enables a queue; it never provisions one (<<setup-merge-queue>>). No opt-in is persisted, because whether a queue is enforced is derived from the provider and an enforced queue is never bypassed.
+
+|Step 14: Permission Setup
+|Grants standing host permissions for routine commands.
+|*Retired*: replaced by `pm-mcp client install`; the MCP tool surface needs no per-command approvals.
+
+|Step 14b: OpenCode Enforcement Apply
+|Copies the permission block into `opencode.json` and places the guard plugin.
+|*Retired*: script-call enforcement is moot without an executor; the OpenCode host configuration is written by `pm-mcp client install opencode`.
+
+|Step 15: Summary
+|Prints the wizard summary.
+|`setup.completed` (the facts of the resting state's representation).
+
+|Step 16: Step-Ordering + End-of-Run Landing Cycle
+|Runs `sync-defaults` and `steps-sort`, then lands the wizard-created artifacts.
+|Ordering: *retired* (sparse files hold no step maps to sync or sort; the step order is a descriptor property and the project's `finalize.pmwf` unit). Landing: `setup.commit-changes` (`land` / `leave`) and `setup.land-changes`.
+
+3+|*`upgrade` verb (`upgrade.py`, `upgrade-flow.md`)*
+
+|Stage top-level gates (suppressed by `--integrate true`)
+|Prompts before each of the four stages.
+|*Retired*: each reconcile-path state is its own gate; there is no stage grouping to confirm. Changes of the binary's default workflow units (including newly shipped finalize steps) are offered as a three-way diff in `setup.offer-new-steps` (§ Configuration Validation & Upgrades Before 1.0).
+
+|Stage 1 `regenerate-target-tree` (meta project)
+|Regenerates the generated target tree.
+|*Retired*: no generated target tree; client bundles are compiled into the binary.
+
+|Stage 1 `regenerate-executor`
+|Regenerates `.plan/execute-script.py`.
+|*Retired*: there is no executor.
+
+|Stage 1 `cache-freshness-check` (consumer project)
+|Verifies the plugin cache is fresh.
+|*Retired*: there is no plugin cache; bundle and binary parity is reported by `pm-mcp client status` and repaired by `pm-mcp client update`.
+
+|Stage 1 `cache-retention-sweep` and nested gate `cache-retention-prune`
+|Sweeps and, on confirmation, prunes stale plugin-cache versions.
+|*Retired*: there is no plugin cache.
+
+|Stage 2 `reconcile-marshal-json`
+|Reconciles `marshal.json` (`sync-defaults`, `steps-sort`, key normalization).
+|`setup.reconcile-config` validates the team files, the operator file, and the project units and offers a rewrite of a file the binary refuses by format; default sync, step sorting, and key normalization are *retired* (sparse files).
+
+|Stage 2 `migrate-bot-lists`
+|Maps the retired `enabled_bots` knob onto `required_bots` / `optional_bots`.
+|*Retired*: no legacy configuration is imported (`PM-MIG-2`), so the `enabled_bots` knob never exists in `.marshall/config/project.json`; `review.required_bots` / `review.optional_bots` are answered in `setup.select-providers`.
+
+|Stage 2 `validate-bot-lists`
+|Reports bot tokens that match no registered reviewer.
+|`setup.reconcile-config` (validation on read: every bot token resolves in the review-bot registry, `unregistered_kind`).
+
+|Stage 2 `migrate-architecture-descriptors`
+|Rewrites architecture descriptors (`discover --force --apply migration`) and checks for regression (`descriptor-regression-check`).
+|`setup.discover-modules` on the reconcile path (rediscovery plus the `pm://architecture/drift` regression report).
+
+|Stage 2 nested gate `build-map-reseed`
+|Compares `build.map` with the live derivation and, on confirmation, re-seeds (`build-map seed --force`).
+|`setup.reseed-build-map`.
+
+|Stage 3 `executor-preflight`
+|Checks the regenerated executor.
+|*Retired*: there is no executor.
+
+|Stage 3 `content-drift-report` (meta project)
+|Reports drift between sources and the generated target tree.
+|*Retired*: no generated target tree.
+
+|Stage 4 `run-landing-cycle` and nested gates `land-leave`, `branch-reuse`
+|Lands the reconciled artifacts, asking whether to land or leave them and whether to reuse an existing branch.
+|`setup.commit-changes` (`land` / `leave` links) and `setup.land-changes` (branch handling by `git.commit_and_push`).
+|===

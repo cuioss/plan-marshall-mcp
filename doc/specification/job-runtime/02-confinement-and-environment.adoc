@@ -1,0 +1,160 @@
+= Job Runtime Specification: Confinement, Job Environment & Build Verbs
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../job-runtime.adoc[Job Runtime Specification] » Confinement, Job Environment & Build Verbs
+
+== Linux Filesystem Confinement (Landlock)
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-20[PM-WATCH-JOB-20], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-21[PM-WATCH-JOB-21]_
+
+On Linux (`PM-SEC-5`, `PM-TECH-4`), the `pm-mcp-exec` launcher (xref:01-pipeline-and-subprocesses.adoc#_process_group_creation_via_the_pm_mcp_exec_launcher[Process-Group Creation via the `pm-mcp-exec` Launcher]) confines every job before `execve`:
+
+. `prctl(PR_SET_NO_NEW_PRIVS, 1)`: the job and all its descendants can never gain privileges (setuid/setgid binaries, file capabilities).
+. A Landlock ruleset (Landlock ABI >= 2, Linux >= 5.19, applied via FFM) that grants read and execute access to the whole filesystem except `<PM_MCP_BASE>` (see *Read set* below) and write access only to:
+** the job's own project root (which contains all of that project's worktrees under `.marshall/local/worktrees/` and its `.marshall/local/temp/`); never the root of another enrolled project and never the per-project machine store under `<PM_MCP_BASE>`,
+** the build toolchain caches declared per project in the enrolment field `write_paths` (for example `~/.m2/repository`, `~/.gradle`, `~/.npm`, `~/.cache/pip`),
+** the system temporary directory (`/tmp`; the JVM ignores `TMPDIR` for `java.io.tmpdir`) and device nodes under `/dev`.
+
+The write set never contains `<PM_MCP_BASE>` (enrolments, machine configuration, credentials, logs, and the machine stores stay out of every job's reach) and never `~/.plan-marshall/`.
+
+*Read set*: The whole of `<PM_MCP_BASE>` is outside every job's read set: the runtime token in `run/` (link:../runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), the credential files, the enrolments and their HMAC sidecars, the machine stores, and the logs. The installation directory `<PM_MCP_HOME>` (the binaries) lies apart from it and stays readable. Because Landlock rules only grant access, the runtime builds the read set as read and execute rules on `/` minus the path to `<PM_MCP_BASE>`: for each directory from `/` down to the parent of `<PM_MCP_BASE>`, a rule for every entry except the next directory on that path. The entries are enumerated at job start; an entry created later on that path (for example a new file directly in the home directory) is not readable by the job, which is accepted. On macOS and on Linux without Landlock a job can read `<PM_MCP_BASE>`, the token included, like any process of the user; this lies within the same-user boundary accepted for the operator channel (link:../../later-improvements.adoc#_l_1_operator_proof_beyond_the_cli_checks[Later Improvements, L-1]). The runtime token and every other runtime secret are never passed in a job's argument vector or environment (<<Job Environment (`PM-SEC-5`)>>).
+
+The ruleset is inherited across `fork`/`execve` and cannot be removed by the job. The runtime passes the read and write sets to the launcher as an argument vector computed from the project's enrolment file at job start, so enrolment changes take effect for the next job without restarting anything.
+
+Properties and limits:
+
+* *Warm build daemons*: Whether a build uses a daemon is decided by the project's build configuration (for example `org.gradle.daemon` in `gradle.properties`) and the enrolled command templates (`mvnd` or `mvn`, `--no-daemon`), never by `PM-MCP`. A Gradle daemon or `mvnd` started from a confined job keeps that job's ruleset, which covers only that job's project root. A daemon reused by a build of another enrolled project therefore fails that project's writes (`EACCES`); an `EACCES` under a daemon-backed build points to this. The operator avoids it with per-project daemon settings of the build tool or with daemon-less templates. Enrolling a project needs no daemon restart.
+* *Container runtimes*: Docker, Docker Compose, and Testcontainers talk to the container daemon over its socket; writes performed by the daemon itself are outside the job's confinement (`PM-EXEC-4`).
+* *Not covered*: Landlock does not restrict network address families and does not provide a private `/tmp`. `RestrictAddressFamilies` and `PrivateTmp` are therefore not enforced.
+* *ABI Floor*: ABI 1 denies every cross-directory rename and link (`LANDLOCK_ACCESS_FS_REFER` arrives with ABI 2), which breaks Gradle, npm, and Java `Files.move` with `EXDEV`. On a kernel offering only ABI 1 the runtime applies no ruleset and records `confinement: partial(abi=1)`; it never reports a job as confined unless ABI >= 2 was applied. Rights that later ABIs add (for example `LANDLOCK_ACCESS_FS_TRUNCATE`, ABI 3) are handled as best effort, and the applied ABI is recorded in every job record (`landlock_abi`).
+* *Unavailable Landlock*: On kernels without Landlock (older kernels, some WSL2 kernels), jobs run with `PR_SET_NO_NEW_PRIVS` only; the runtime records `confinement: unavailable` in each job record and in `pm-mcp status`, and this is an accepted residual platform risk (`PM-SEC-5`).
+
+== Job Environment (`PM-SEC-5`)
+
+The runtime builds every job environment from scratch; nothing is inherited from the runtime's own environment, which belongs to whichever CLI command or service manager started it (link:../runtime-model.adoc[Runtime & Interaction Model Specification]). Each variable has one provenance: `enrolment` values are captured by the operator CLI at enrolment into the project's `build_environment` (enrolment file `enrolments/<project_id>.json`) and refreshed only by re-enrolment; `runtime` values are computed at job start.
+
+[cols="2,1,1,3"]
+|===
+|Variable |Job types |Provenance |Rule
+
+|`PATH`
+|all
+|runtime
+|Directories of the enrolled host tools and interpreters only; the runtime itself never searches it (`PM-EXEC-1`).
+
+|`HOME`, `USER`, `LOGNAME`
+|all
+|runtime
+|The runtime user's values.
+
+|`LANG`, `LC_ALL`, `LC_*`
+|all
+|enrolment
+|As captured; `LC_ALL=C.UTF-8` when none was captured.
+
+|`TMPDIR`
+|all
+|runtime
+|Forced to the system temporary directory inside the Landlock write set.
+
+|`JAVA_HOME`, `GRADLE_USER_HOME`
+|`build`, `project_script`
+|enrolment
+|`JAVA_HOME` and `GRADLE_USER_HOME` as captured; `MAVEN_OPTS`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, and `GRADLE_OPTS` are never passed, since they inject flags outside the pinned build configuration (`PM-EXEC-1`).
+
+|`DOCKER_HOST`, `DOCKER_CONFIG`, `TESTCONTAINERS_*`
+|`build`
+|enrolment
+|As captured.
+
+|Credential variables (`*_TOKEN`, `*_PASSWORD`, `*_SECRET`, `*_KEY`, `GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, …)
+|none
+|—
+|Never passed and never captured at enrolment; the enrolment refuses to record a variable matching these patterns.
+|===
+
+A variable not listed is not passed.
+
+*`git` and `ci` jobs*: These jobs exist only for the CLI variant of an integration (`PM-EXEC-5`); a native-variant operation runs in process and has no job environment. The CLI variant authenticates with the operator's ambient credentials by design (link:../cli-and-security/02-credentials-and-operator.adoc#cli-variant-credentials[CLI, Coordination & Security Specification, Credentials of the CLI Variant]); its jobs receive the rows above that name all job types plus:
+
+[cols="2,1,1,3"]
+|===
+|Variable |Job types |Provenance |Rule
+
+|`HOME`
+|`git`, `ci`
+|runtime
+|Configuration discovery (`~/.gitconfig`, credential helpers, `~/.ssh`, the GPG agent socket for signing); already passed to all job types.
+
+|`SSH_AUTH_SOCK`
+|`git` (network operations and signing)
+|enrolment
+|Only when the effective remote is an SSH remote or the repository signs with SSH; a socket missing at job start is not replaced, and the job fails with the tool's authentication error.
+
+|`GH_CONFIG_DIR`, `GLAB_CONFIG_DIR`, `XDG_CONFIG_HOME`
+|`ci`
+|enrolment
+|As captured, so that `gh` and `glab` find the operator's login.
+
+|`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`
+|`git`
+|runtime
+|Non-interactive guards: a missing credential fails instead of prompting.
+
+|`GIT_OPTIONAL_LOCKS=0`
+|`git` (read operations)
+|runtime
+|Read-only calls never take the index lock.
+
+|`GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`
+|`ci`
+|runtime
+|Non-interactive, parseable output.
+
+|`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`
+|`git` (commit-creating operations)
+|runtime
+|The committer resolved from the agent credential, or the fixed `plan-marshall-mcp` noreply identity (link:../cli-and-security/02-credentials-and-operator.adoc#agent-credentials[CLI, Coordination & Security Specification, Agent Credentials of the Native Variant]); the author is set on the argument vector (`-c user.name=… -c user.email=…` from `commit_identity`), so both variants produce identical commit metadata.
+
+|`JAVA_HOME`, `GRADLE_USER_HOME`
+|`git` (operations that run repository hooks)
+|enrolment
+|As for `build` jobs, because a hook started by `git` typically runs the project's build tools; the flag-injecting variables stay excluded.
+|===
+
+The credential row applies unchanged, and additionally `GH_ENTERPRISE_TOKEN`, `GITLAB_PRIVATE_TOKEN`, `GIT_ASKPASS`, `SSH_ASKPASS`, and `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` are never passed: no agent token reaches a CLI job, neither as a variable nor through an askpass or credential helper served by `pm-mcp`.
+
+*Write paths of CLI-variant jobs*: The Landlock write set of a `ci` job additionally contains the `gh` or `glab` configuration directory (token refresh rewrites `hosts.yml`). `~/.ssh/known_hosts` stays read-only for every job: an unknown host key fails the job and is never accepted (no `accept-new`). Repository hooks and signing programs are started by `git` inside the CLI `git` job and inherit its environment, write set, and budget (the hook-running `git` class, link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]); there is no separate hook or filter job type.
+
+[#canonical-build-verbs]
+== Canonical Build Verb Set
+
+This is the one closed set of canonical build verbs of PM-MCP. `pm_build.command` (link:../mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools Specification]), `PM-TOOL-2`, the canonical argument templates of link:../domain-extensions.adoc[Domain Extensions Specification] (Tier 2), the budget keys of link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets Specification], and the link:../identifiers/02-registry-stores-to-web.adoc#id-build-verb[Identifier Registry] use exactly this set. It equals `plan-marshall`'s `ALL_CANONICAL_COMMANDS` (`script-shared/scripts/extension/_extension_constants.py`, verified at plan-marshall commit `88fcfc9ef`; re-verify before implementing), in the same order:
+
+[cols="1,2,3"]
+|===
+|Verb |`plan-marshall` constant |Meaning
+
+|`clean` |`CMD_CLEAN` |Remove build output.
+|`compile` |`CMD_COMPILE` |Compile production sources (build class `compile`).
+|`test-compile` |`CMD_TEST_COMPILE` |Compile test sources.
+|`module-tests` |`CMD_MODULE_TESTS` |Run the unit tests (build class `module-tests`).
+|`integration-tests` |`CMD_INTEGRATION_TESTS` |Run the integration tests.
+|`e2e` |`CMD_E2E` |Run the end-to-end tests.
+|`coverage` |`CMD_COVERAGE` |Run the tests with coverage measurement and thresholds (xref:03-parsers-and-gates.adoc#_native_coverage_report_parsers[Native Coverage Report Parsers]).
+|`benchmark` |`CMD_BENCHMARK` |Run the benchmarks; never a gate.
+|`quality-gate` |`CMD_QUALITY_GATE` |Static checks, formatting, and lint.
+|`arch-gate` |`CMD_ARCH_GATE` |Architecture rules through a domain-owned engine.
+|`verify` |`CMD_VERIFY` |Full verification including tests (build class `verify`).
+|`install` |`CMD_INSTALL` |Install the artifacts into the local repository (a toolchain cache of the enrolment's `write_paths`).
+|`clean-install` |`CMD_CLEAN_INSTALL` |`clean` followed by `install`.
+|`package` |`CMD_PACKAGE` |Package the artifacts.
+|===
+
+* *Scope is not a verb*: Every verb runs whole-tree without `module` and module-scoped with it; gate scope follows from `module` alone (xref:03-parsers-and-gates.adoc#_gate_honesty_verification[Gate Honesty Verification], Gate Coverage).
+* *Resolution*: A verb resolves through the project's enrolled template or the domain's compiled default template; a verb without either is refused (`refused`, reason `verb_not_supported`), never approximated by another verb.
+* *Deliberate deviations*: None against `plan-marshall`'s set. The two PM-MCP-only verbs of earlier drafts are removed: `test` duplicated `module-tests`, and `format-check` is part of `quality-gate`.

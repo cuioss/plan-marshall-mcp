@@ -1,0 +1,342 @@
+= Workflow DSL & Engine Specification: Reusable Sub-Workflows
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Reusable Sub-Workflows
+
+== Reusable Compound Sub-Workflows & Call-Stack Execution (`PM-WF-16`)
+_See Requirement link:../../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+Workflows are composed not only of atomic `do` / `auto` / `job` primitives, but also of reusable, config-aware *compound sub-workflows* (`scope subworkflow`). A compound sub-workflow encapsulates a multi-state sub-process—combining deterministic `auto` checks, configuration lookups, conditional interactive pauses, and recovery branches—so that Phase 5 (`execute`), Phase 6 (`finalize`), `marshall-steward`, and `plan-orchestrator` invoke the exact same state machine rather than duplicating states or collapsing interactive recovery into opaque Java code.
+
+=== Call-Stack Execution & Persistence Semantics
+
+1. *Sub-Workflow Invocation (`call`)*: When the engine transitions into a `StateNode` whose behavior is `StateBehavior.SubWorkflowCall(subWorkflowId, paramBindings, transitions)`, it pushes a `CallFrame(callerWorkflowId, callerStateId, callerPhase, subWorkflowId, paramBindings, Instant.now().toString())` onto the `call_stack` array in `mcp/status.json` and sets `status.state` to the target sub-workflow's `startState` while preserving `status.phase = callerPhase` whenever a sub-workflow state declares `phase inherit` (the caller state's resolved phase value; xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar for the Workflow DSL]). `callerWorkflowId` is the id of the caller's definition unit, `plan` for every state of the merged plan workflow (xref:02-units-jobs-decisions.adoc#workflow-definition-units[Workflow Definition Units (Multi-File Workflows)]). Preserving `callerPhase` guarantees that phase-scoped guards (such as `in_worktree`), phase metric accounting (`metrics.json`), and terminal-title updates remain invariant regardless of which caller invoked the sub-workflow.
+2. *Interactive Pauses & Job Waits Inside a Sub-Workflow*: If execution inside the sub-workflow reaches an `AutoStep`, the engine executes it immediately in the same turn. If execution reaches an `InteractiveLinks` state (such as `git.artifact-review`, `git.compose-message`, `git.commit-fix`, or `git.sync-required`) or a `JobStep`, the engine persists `mcp/status.json` (with the active `call_stack` and sub-workflow `state`) and returns that state's TOON representation to the caller. Subsequent `pm_do` or `pm_state` calls resolve against the active sub-workflow state at the top of `call_stack`, surviving context compactions and daemon restarts identically to top-level states.
+3. *Sub-Workflow Return (`terminal <outcome_id> <outcome_class>`)*: When a transition inside the sub-workflow lands on a `StateNode` whose `terminalOutcome` is present with the id `outcomeId`, the engine pops the top `CallFrame` from `call_stack`, looks up `outcomeId` in the caller state's `OutcomeTransition` table, transitions `status.state` to `targetStateId` in `callerWorkflowId`, and continues auto-chaining in the same atomic transaction.
+
+=== Canonical Reusable Sub-Workflow: `git.commit_and_push` (`git-commit-and-push.pmwf`)
+
+The `git.commit_and_push` sub-workflow models the complete git commit-and-push sub-process grounded in `workflow-integration-git`, `phase-5-execute` (Step 10a), and `phase-6-finalize` (Step 3 item 5f, `standards/push.md`, and post-PR re-push). The unit and its states stay in `pm-mcp-core`; the git operations its primitives invoke are contracts of the provider module `pm-mcp-git` (xref:01-module-boundary-and-grammar.adoc#_module_boundary_decoupled_core_architecture[Module Boundary & Decoupled Core Architecture]).
+
+==== Bound Parameter Contract
+
+The sub-workflow header declares both parameters with `param` (see the DSL definition below); every `call git.commit_and_push (…)` site must bind both exactly once with a declared value (Rule 6 in xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]).
+
+[cols="1,2,3"]
+|===
+|Parameter |Allowed Values |Semantics
+
+|`message_mode`
+|`auto_deliverable` \| `step_or_fallback` \| `interactive` \| `none_assert_clean`
+|Controls commit message sourcing: `auto_deliverable` formats `feat(<module>): complete deliverable <N> - <title>` from the active deliverable (*a `PM-MCP` choice*: `plan-marshall`'s `phase-5-execute` Step 10a derives the commit message from the task title instead); `step_or_fallback` uses a step-supplied commit message or `chore(finalize): apply <step_id> changes`; `interactive` pauses in `git.compose-message` with diff analysis facts for model submission; `none_assert_clean` expects a clean working tree (used by `finalize.push-barrier`) and routes any unexpected dirty files through `git.compose-message` before pushing.
+
+|`push_mode`
+|`never` \| `if_push_remote` \| `always` \| `post_pr_conditional`
+|Controls push execution after commit (or on a clean tree): `never` stops after local commit; `if_push_remote` pushes when the project has a push remote (derived fact `push_remote`, link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas Specification, Derived Facts Store]; a `stale` or `failed` fact is `indeterminate`, never "no remote"); `always` pushes unconditionally; `post_pr_conditional` pushes if and only if the caller step has `order > 20` (post-`create-pr`) and a push remote exists. No configuration key suppresses a push (`plan-marshall`'s `commit_and_push` does not exist).
+|===
+
+==== Declarative DSL Definition (`classpath:/workflows/git-commit-and-push.pmwf`)
+
+[source,text]
+----
+workflow git.commit_and_push version 1 format 1
+scope subworkflow
+param message_mode: enum[auto_deliverable|step_or_fallback|interactive|none_assert_clean]
+param push_mode: enum[never|if_push_remote|always|post_pr_conditional]
+start git.inspect-worktree
+
+state git.inspect-worktree
+  phase inherit
+  auto git.inspect-worktree
+    dirty                   -> git.detect-artifacts
+    clean_skip_push         -> git.done-clean
+    clean_needs_push_check  -> git.evaluate-push-policy
+
+state git.detect-artifacts
+  phase inherit
+  auto git.detect-artifacts
+    clean_or_safe_deleted   -> git.resolve-message
+    uncertain_or_prohibited -> git.artifact-review
+    oracle_failed           -> git.artifact-escalate
+
+state git.artifact-review
+  phase inherit
+  skill pm/git/artifact-cleanup
+  facts git.artifact-candidates
+  link next confirm_cleanup [submit] (action: enum[delete_uncertain|keep_tracked], paths: list<text>?)
+    do git.apply-artifact-decision
+      resolved              -> git.resolve-message
+      prohibited_remaining  -> git.artifact-review
+  link abort abort [noop] ()
+    do git.abort-commit
+      aborted               -> git.done-aborted
+
+state git.artifact-escalate
+  phase inherit
+  facts git.artifact-oracle-error
+  link retry retry [noop] ()
+    do git.retry-oracle
+      ok                    -> git.detect-artifacts
+  link escalate escalate [escalate] (reason: text[1..500])
+    escalate gitignore_oracle_failure
+      approved              -> git.stage-under-oracle-override
+      denied                -> git.done-aborted
+
+state git.stage-under-oracle-override
+  phase inherit
+  auto git.apply-oracle-override
+    recorded                -> git.resolve-message
+
+state git.resolve-message
+  phase inherit
+  auto git.resolve-message
+    ready                   -> git.stage-and-commit
+    needs_interactive       -> git.compose-message
+
+state git.compose-message
+  phase inherit
+  skill pm/git/commit-message
+  facts git.diff-summary
+  link next commit [submit] (message: text[1..2000])
+    do git.validate-message
+      valid                 -> git.stage-and-commit
+  link abort abort [noop] ()
+    do git.abort-commit
+      aborted               -> git.done-aborted
+
+state git.stage-and-commit
+  phase inherit
+  auto git.stage-and-commit
+    committed               -> git.evaluate-push-policy
+    nothing_to_commit       -> git.evaluate-push-policy
+    hook_failed             -> git.commit-fix
+
+state git.commit-fix
+  phase inherit
+  skill pm/git/commit-recovery
+  facts git.hook-failure
+  link retry retry [noop] ()
+    do git.retry-commit
+      ok                    -> git.evaluate-push-policy
+      hook_failed           -> git.commit-fix
+      attempts_exhausted    -> git.done-aborted
+  link fix recompose [submit] (message: text[1..2000])
+    do git.validate-message
+      valid                 -> git.stage-and-commit
+  link abort abort [noop] ()
+    do git.abort-commit
+      aborted               -> git.done-aborted
+
+state git.evaluate-push-policy
+  phase inherit
+  auto git.evaluate-push-policy
+    skip_push_committed     -> git.done-committed-local
+    skip_push_clean         -> git.done-clean
+    push_required           -> git.verify-freshness
+
+state git.verify-freshness
+  phase inherit
+  auto git.pre-commit-verify-freshness
+    fresh_or_exempt         -> git.check-branch-parity
+    stale_or_undecidable    -> git.freshness-blocked
+
+state git.freshness-blocked
+  phase inherit
+  skill pm/finalize/push-barrier
+  facts git.freshness-status
+  link fix run_verification_build [noop] ()
+    do build.enqueue-verification
+      started               -> git.freshness-build-running
+  link escalate escalate [escalate] (reason: text[1..500])
+    escalate force_stale_push
+      approved              -> git.push-under-freshness-override
+      denied                -> git.done-aborted
+
+state git.push-under-freshness-override
+  phase inherit
+  auto git.push
+    pushed_with_commit      -> git.done-committed-and-pushed
+    pushed_clean_tree       -> git.done-pushed-clean
+    up_to_date              -> git.done-in-sync
+    rejected_non_ff         -> git.sync-required
+    rejected_lease          -> git.sync-required
+
+state git.freshness-build-running
+  phase inherit
+  job build.verify-worktree
+    succeeded               -> git.verify-freshness
+    failed                  -> git.freshness-blocked
+    failed_unparsed         -> git.freshness-blocked
+    refused                 -> git.freshness-blocked
+    cancelled               -> git.freshness-blocked
+    timed_out               -> git.freshness-blocked
+    killed                  -> git.freshness-blocked
+    indeterminate           -> git.freshness-blocked
+
+state git.check-branch-parity
+  phase inherit
+  auto git.push-barrier-decision
+    first_push              -> git.execute-push
+    refire                  -> git.execute-push
+    skip                    -> git.done-in-sync
+
+state git.execute-push
+  phase inherit
+  auto git.push
+    pushed_with_commit      -> git.done-committed-and-pushed
+    pushed_clean_tree       -> git.done-pushed-clean
+    up_to_date              -> git.done-in-sync
+    rejected_non_ff         -> git.sync-required
+    rejected_lease          -> git.sync-required
+
+state git.sync-required
+  phase inherit
+  skill pm/git/sync-recovery
+  facts git.branch-divergence
+  link fix sync_rebase [noop] ()
+    do git.rebase-onto-upstream
+      rebased               -> git.verify-freshness
+      conflict              -> git.resolve-conflicts
+  link escalate escalate [escalate] (reason: text[1..500])
+    escalate force_push_with_lease
+      approved              -> git.push-with-lease
+      denied                -> git.done-aborted
+
+state git.push-with-lease
+  phase inherit
+  auto git.push
+    pushed_with_commit      -> git.done-committed-and-pushed
+    pushed_clean_tree       -> git.done-pushed-clean
+    up_to_date              -> git.done-in-sync
+    rejected_non_ff         -> git.sync-required
+    rejected_lease          -> git.sync-required
+
+state git.resolve-conflicts
+  phase inherit
+  skill pm/git/sync-recovery
+  facts git.rebase-conflict
+  link fix continue_rebase [noop] ()
+    do git.rebase-continue
+      rebased               -> git.verify-freshness
+      conflict              -> git.resolve-conflicts
+  link alt abort_rebase [noop] ()
+    do git.rebase-abort
+      aborted               -> git.sync-escalate
+
+state git.sync-escalate
+  phase inherit
+  facts git.rebase-conflict
+  link retry retry [noop] ()
+    do git.rebase-onto-upstream
+      rebased               -> git.verify-freshness
+      conflict              -> git.resolve-conflicts
+  link abort abort [noop] ()
+    do git.abort-commit
+      aborted               -> git.done-aborted
+
+state git.done-committed-local terminal committed_local success
+  phase inherit
+
+state git.done-committed-and-pushed terminal committed_and_pushed success
+  phase inherit
+
+state git.done-pushed-clean terminal pushed_clean success
+  phase inherit
+
+state git.done-in-sync terminal in_sync skip
+  phase inherit
+
+state git.done-clean terminal clean skip
+  phase inherit
+
+state git.done-aborted terminal aborted aborted
+  phase inherit
+----
+
+NOTE: The sub-workflow has three operator escalations, each of whose `approved` outcome enters an `auto` state performing the approved action (Rule 10, xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]; xref:02-units-jobs-decisions.adoc#decision-registry[Decision Registry & Typed Escalation Outcomes]): `gitignore_oracle_failure` enters `git.stage-under-oracle-override`, `force_stale_push` enters `git.push-under-freshness-override`, and `force_push_with_lease` enters `git.push-with-lease`, which executes the forced push. A repository hook failure is never bypassed: `git.commit-fix` offers `retry`, `recompose`, and `abort`, and `git.retry-commit` returns `attempts_exhausted` after `3` failed commit attempts on an identical staged change set (the staged tree id and the message; compiled constant, link:../timeouts.adoc[Timeouts & Budgets Specification]); the counter resets when the staged tree or the message changes (a fix, a hook that rewrote files, a `recompose`). Hooks run only in the CLI variant, so only that variant reaches `git.commit-fix`. `attempts_exhausted` enters `git.done-aborted`, whose `aborted` the caller routes to its `<phase>.commit-aborted`. The three push states `git.execute-push`, `git.push-under-freshness-override`, and `git.push-with-lease` route the outcome set of `git.push` uniformly: `pushed_with_commit` -> `git.done-committed-and-pushed`, `pushed_clean_tree` -> `git.done-pushed-clean`, `up_to_date` -> `git.done-in-sync`, `rejected_non_ff` and `rejected_lease` -> `git.sync-required`. A rebase conflict is model work: `git.resolve-conflicts` offers `continue_rebase` (the model has resolved the conflicted files in the checkout) and `abort_rebase`, which restores the pre-rebase branch and enters `git.sync-escalate` (`retry` the sync, or `abort`, whose `aborted` outcome lets the caller offer `abort-plan`).
+
+`git.done-in-sync` (outcome `in_sync`, class `skip`) is returned when nothing was pushed because the remote branch already holds the local `HEAD` (the parity decision `skip`, or a push answered `up_to_date`); `pushed_clean` is returned only after an executed push of a clean tree. Every caller routes `in_sync` like `pushed_clean`.
+
+`git.done-aborted` (outcome `aborted`, class `aborted`) only leaves the sub-workflow: it is entered by the model-followed `abort` links of `git.artifact-review`, `git.compose-message`, `git.commit-fix`, and `git.sync-escalate`, by exhausted commit attempts, and by the denied escalations, and never ends the plan, the epic, or the workspace run. The caller routes the returned `aborted` to one of its own `link` states (Rule 6): `execute.commit-aborted` and `finalize.commit-aborted` (retry the commit, or request `abort-plan`), `setup.commit-changes`, and `epic.active` (link:../state-catalogue/05-git-commit-and-push.adoc#state-git.done-aborted[State Catalogue]).
+
+==== Six-Stage Execution Contract of `git.commit_and_push`
+_Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-6[PM-WATCH-DSL-6], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-7[PM-WATCH-DSL-7], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-10[PM-WATCH-DSL-10], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-9[PM-WATCH-STORE-9], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-73[PM-WATCH-PHASE-73], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-74[PM-WATCH-PHASE-74]_
+
+* *Stage 1 — Working-Tree Inspection (`git.inspect-worktree`)*:
+** Resolves the target checkout path from the locked scope context: `worktree_path` of a plan while it is set, the main checkout (the enrolled `project_root`) for a plan whose `worktree_path` is `null` and for `workspace`, and the shared epic worktree (link:../filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification]) when `epic`. Git-tracked orchestrator state is never committed on the primary checkout (`PM-ARCH-5`).
+** Executes `git -C <tree> status --porcelain` (ignoring `.marshall/local/**`).
+** If uncommitted changes exist (`staged`, `unstaged`, or `untracked`), returns `dirty -> git.detect-artifacts`.
+** If the working tree is clean: returns `clean_skip_push -> git.done-clean` when `push_mode == never`; otherwise returns `clean_needs_push_check -> git.evaluate-push-policy` so clean-tree push barriers (`finalize.push-barrier` or post-rebase pushes) proceed directly to the freshness and parity checks without creating an empty commit.
+* *Stage 2 — `.gitignore`-Aware Artifact Detection & Cleanup (`git.detect-artifacts`)*:
+** Scans the working tree against `artifact-patterns.json` (`*.temp`, `*.backup*`, `*.orig`, `*.swp`, `.DS_Store`, `Thumbs.db`, coverage/build scratch files) while querying `git -C <tree> check-ignore`.
+** Fails closed (`oracle_failed -> git.artifact-escalate`) if the `.gitignore` oracle cannot be evaluated. The operator's approval of `gitignore_oracle_failure` enters `git.stage-under-oracle-override`, whose primitive `git.apply-oracle-override` records an override bound to the current `HEAD` that names the paths the oracle could not classify; the next `git.stage-and-commit` of the same call stages those paths under the override and records it in the commit's audit record, and the override lapses with that commit or when `HEAD` moves.
+** Unconditionally excludes `.marshall/**` and any nested git worktrees or submodules (`git submodule status` / `.git` file markers) from deletion.
+** Automatically deletes `safe` untracked artifact files and records `artifacts_deleted` in the audit log.
+** Transitions to `git.artifact-review` only for paths in the change set of this commit (porcelain entries: staged, unstaged, untracked) that match artifact patterns and are `uncertain`, or for prohibited secret files (`.env*`, `*.pem`, `*.key`, `credentials.json`) in that change set. Unchanged tracked files are never candidates; unchanged tracked files that match artifact patterns are recorded only as a count (`tracked_pattern_matches`) in the audit record, never rendered, since no link acts on them.
+* *Stage 3 — In-Memory Commit Message Resolution, Validation & Trailer Injection (`git.resolve-message` / `git.compose-message`)*:
+** When `message_mode` is `auto_deliverable` or `step_or_fallback`, resolves the deterministic commit message in memory (e.g., `feat(<module>): complete deliverable <N> - <title>` or `chore(finalize): apply <step_id> changes`).
+** When `message_mode == interactive` (or `none_assert_clean` when unexpected dirty files were found), transitions to `git.compose-message`, populates `facts` via `git.diff-summary` (changed file count, module scope, priority-ordered suggested type `fix > feat > perf > refactor > docs > style > test > chore > ci`), and accepts `message: text[1..2000]` directly in `pm_do` `args`.
+** Validates Conventional Commits format (`<type>[optional (<scope>)][!]: <subject>`) via `ConventionalCommitValidator` and deterministically appends the configured trailer `Co-Authored-By: {name} <{email}>`, resolved as in `plan-marshall` (`manage-run-config` `commit-trailer get`) from the operator's `commit_trailer{name,email}` in the machine-local `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, falling back to `machine-config.json` `project_defaults.commit_trailer` and then to the compiled default `plan-marshall <noreply@cuioss.de>` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]); the schema refuses an empty value or one containing an angle bracket or line break. No team file is ever consulted for the trailer.
+** The trailer names the system that produced the commit; it is independent of the commit's author and committer (Stage 4), which are never taken from the message.
+** The resolved trailer is the only authority: a `Co-Authored-By:` line in a model-supplied `message` is rejected (`invalid_link_args`, `detail` names the line), and the only trailer in the commit is the one the server appends. The commit's audit record carries `trailer_source: {name, email}`, each half `configured`, `default`, or `invalid_ignored` (a stored value that was treated as absent); it is provenance for the operator and is never rendered in `facts`.
+* *Stage 4 — Staging, `stdin`-Piped Commit & Change-Ledger Stamping (`git.stage-and-commit`)*:
+** *Footprint check first*: Before anything is staged, the primitive runs the footprint check for every caller (plan, epic, and workspace scope; <<_call_site_reuse_matrix_across_workflows>>): (1) the worktree boundary: no dirty path of the target checkout lies outside the staging set derived below, and for a plan no file outside its worktree was dirtied; (2) the pinned build files: no enrolled wrapper's `pinned_files` (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Verify-Not-Resolve]) changed in the target checkout; (3) the main checkout: for a plan scope, no main-checkout path outside `.marshall/local/` is absent from `entry_baseline` or changed since it (`mcp/status.json`, link:../store-schemas.adoc[Store Schemas Specification]); for a `local_changes` plan this is the `entry_baseline` re-recorded by `land.worktree-init` after the capture restored the main checkout's captured paths, so the captured changes and their restoration never count as a violation (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]). A violation raises the `footprint_violation` condition on the current state (the sub-workflow state `git.stage-and-commit`, xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]) naming the offending files, and no commit is made; the condition's `fix` re-runs the check. The check is part of the primitive, not of a link, so no caller can reach a commit around it.
+** Derives the staging set from the plan, never from whatever the working tree holds: the dirty paths intersected with the declared footprint, the accepted deviations, the task `target_files`, and the step-declared outputs (for epic scopes, `.marshall/orchestrator/**`; for the workspace scope, the setup call's set `.marshall/config/**`, `.gitignore`, and `.marshall/project-architecture/**`). A dirty path outside that set is never staged.
+** Stages the scoped files (`git -C <tree> add -- <paths>`) and invokes `git -C <tree> commit -F -`, streaming the validated UTF-8 commit message + trailer directly to child `stdin` in memory (`PM-EXEC-5`) with zero `.plan/temp/` files.
+** *Author and committer*: The commit's author is the operator: `commit_identity{name, email}` of the operator's `local-config.json` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), captured in project setup. The committer is the agent identity resolved from the provider credential (the derived fact `agent_identity`: for a GitHub App its `<app-slug>[bot]` noreply address, for a token the token's user); without a resolvable agent identity it is the compiled identity `plan-marshall-mcp <noreply@cuioss.de>`. Both variants produce identical metadata: the native variant sets author and committer on the commit object, the CLI variant passes the author as `-c user.name=… -c user.email=…` and the committer through `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`. The operator's own git `user.*` configuration is never read at commit time. Author and committer are recorded in the commit's audit record and never rendered in `facts` (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+** Captures `commit_sha` (`git -C <tree> rev-parse HEAD`) and git-sourced `changed_paths` (`git -C <tree> diff-tree --no-commit-id --name-only -r <commit_sha>`), appending a `kind = "change"` entry to `change-ledger.jsonl`.
+** When invoked from a Phase 6 `mutates_source: true` step: re-stamps `head_at_completion = commit_sha` on `head_dependent: true` steps in `mcp/status.json`, and when the commit follows the latest successful build (any such step, not only steps at `order >= 10`, `pre-push-quality-gate.order`; for example `architecture-refresh` at `9` on re-entry; link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_finalize_commit_instrumentation_freshness_reconcile_post_pr_re_push_pm_wf_16[Phase Workflows Specification, Finalize Commit Instrumentation] item 3), writes a `freshness_reconcile` record (`commit_sha`, `step_id`, `prior_build_worktree_sha` from the latest passing build row in `change-ledger.jsonl`) so the downstream push gate recognizes the finalize-internal commit without requiring a redundant full build when no source-affecting inputs changed.
+** If `git commit` exits non-zero due to a repository pre-commit hook, returns `hook_failed -> git.commit-fix`.
+* *Stage 5 — Config-Driven Push Policy & Freshness Precondition (`git.evaluate-push-policy` -> `git.verify-freshness`)*:
+** Evaluates `push_mode` together with the derived fact `push_remote`: `push_mode == never` skips push (`skip_push_committed -> git.done-committed-local`); `push_mode == if_push_remote` requires push if and only if a push remote exists; `push_mode == post_pr_conditional` requires push if and only if a push remote exists and the calling finalize step has `order > 20` (after `create-pr`), automating post-PR re-push for late source-mutating steps (`adr-propose` or triage fixes); `push_mode == always` requires push unconditionally.
+** Before any push, `git.pre-commit-verify-freshness` verifies `change-ledger.jsonl` freshness (`fresh` corroborated on both notation and scope dimensions against the current `worktree_sha`, computed by the git contract operation `git.worktree-sha`, one node for both variants that returns the digest and its `worktree_sha_version`, `exempt` when `build-decision == not_necessary`, or reconciled via `freshness_reconcile`). If `stale` or `undecidable`, transitions to `git.freshness-blocked` (offering `run_verification_build` or operator `escalate`). The approval of `force_stale_push` enters `git.push-under-freshness-override`, which runs `git.push` under an override record bound to the current `HEAD` and to the rendered `stale_reason`; the override is recorded in the audit record and lapses when `HEAD` moves.
+** When no reconciliation record names the live `HEAD`, `git.freshness-status` reports `stale_reason: reconciliation_record_absent` together with the causes that absence admits (`admitted_causes` ⊆ `source_drift_unbuilt`, `no_successful_build`, `record_owed_not_emitted`, `commit_outside_reconcile_membership`). The refusal reports what it observed and never asserts a single inferred cause; the fail-closed halt is unchanged.
+** `git.freshness-blocked` renders, beside `stale_reason`, the evidence it would accept: the required build notation(s) and the scope (`whole_tree` or a module list); the current `worktree_sha` is recorded in the audit record, not rendered.
+* *Stage 6 — Branch Sync Parity Probe & Push Execution (`git.check-branch-parity` -> `git.execute-push`)*:
+** `git.push-barrier-decision` first reads the persisted fact `branch_pushed_at` in `mcp/status.json`. When it is unset, the branch has never been pushed by this plan and the decision is `first_push` (`git -C <tree> push --set-upstream origin <branch>`) without consulting the probe. When it is set (re-entry), the decision follows `plan-marshall`'s push-barrier mapping (`workflow-integration-git/scripts/git-workflow.py`, `push_barrier_action`, verified at commit `1d4a1da37`; re-verify before implementing): it runs `git.branch-sync-state` and returns `refire` only for `ahead`; `synced`, `remote_absent_landed`, `remote_absent_unverified`, and any unrecognised state return `skip`, which ends the call with `in_sync` (`git.done-in-sync`). A never-pushed branch and a squash-merged-and-deleted branch are indistinguishable locally, so `remote_absent_unverified` is resolved with provider evidence before it is classified: `ci.pr-find` by the head branch finding a merged pull request turns it into `remote_absent_landed` (`skip`, re-pushing would resurrect a landed branch); finding no pull request at all turns it into `never_pushed`, which pushes (`refire`); any other observation (an open or closed-unmerged pull request, or a provider that cannot be observed) keeps `remote_absent_unverified`, which never pushes. *Deliberate change vs. `plan-marshall`*: `plan-marshall` never pushes on `remote_absent_unverified` and consults no provider evidence.
+** `git.branch-sync-state` classifies the plan's recorded `branch_name` (`mcp/status.json`), never the ambient `HEAD` of the checkout, and fetches the remote ref before classifying. A classification made without a fetch in the same transaction is labelled unverified (as `remote_absent_unverified` already is) and is never used to claim that the branch is unpushed. *Deliberate change vs. `plan-marshall`*: its `branch-sync-state` is a read-only comparison against the local remote-tracking ref and never fetches.
+** `git.execute-push` sets `branch_pushed_at` (timestamp and pushed `HEAD`) in `mcp/status.json` on the first successful push and refreshes it on every later successful push, so it always names the last pushed commit. A push answered `up_to_date` pushed nothing and returns `in_sync`.
+** If `git push` is rejected as non-fast-forward (`rejected_non_ff{remote_sha}`), transitions to `git.sync-required` (offering `sync_rebase` or operator `force_push_with_lease` escalation). `sync_rebase` rebases onto the fetched upstream; a conflict enters `git.resolve-conflicts` (model work, never an operator decision).
+** *Explicit push lease*: A forced push always names its lease explicitly as the expected remote SHA, in both variants: the `remote_sha` observed at the rejection that raised the escalation, else the SHA of the last recorded push (`branch_pushed_at`). The local remote-tracking ref is never the lease, because a fetch between observation and push moves it and turns the lease into a plain force. `git.push-with-lease` runs the approved forced push; a `rejected_lease{remote_sha}` (the remote moved again) returns to `git.sync-required`. Before every retry of a rejected push, the remote branch is re-read (`ls-remote`) and the retry uses the re-read SHA. *Deliberate change vs. `plan-marshall`*: `plan-marshall` pushes `--force-with-lease` without an expected value, taking the lease from the tracking ref.
+
+==== Call-Site Reuse Matrix Across Workflows
+
+[cols="2,2,2,3"]
+|===
+|Caller Workflow & State |`message_mode` |`push_mode` |Behavior & Config Interaction
+
+|`execute.pmwf` -> `execute.chain-tail-commit`
+|`auto_deliverable`
+|`never`
+|Per-deliverable checkpoint commit at the tail of each deliverable's verification chain (`Step 10a`); cleans artifacts, commits via `stdin`, stamps `change-ledger.jsonl`, and stays local until Phase 6.
+
+|`execute.pmwf` -> `execute.remediation-commit`
+|`interactive`
+|`never`
+|Commits model fixes produced during `verification-feedback` triage in Phase 5; validates Conventional Commit message, stamps `change-ledger.jsonl`, and re-enters build verification.
+
+|`finalize.pmwf` -> `finalize.settle-commit`
+|`step_or_fallback`
+|`post_pr_conditional`
+|Phase 6 commit instrumentation after any `mutates_source: true` step (`simplify`, `security-audit`, `architecture-refresh`, `pre-push-quality-gate`, `automatic-review`, `sonar-roundtrip`, `adr-propose`); re-stamps `head_at_completion`, records `freshness_reconcile` (any commit after the latest successful build), and automatically re-pushes if `order > 20` and the project has a push remote (derived fact `push_remote`).
+
+|`finalize.pmwf` -> `finalize.push-barrier`
+|`none_assert_clean`
+|`if_push_remote`
+|Phase 6 `default:push` barrier (`order == 11`); verifies working-tree cleanliness (or commits residual changes), checks the derived fact `push_remote`, enforces `pre-commit-verify-freshness` and `branch-sync-state`, and pushes to `origin/<branch>` (`in_sync` when the remote branch already holds `HEAD`). A plan of source `pr` re-pushes the adopted pull-request head branch through this state and `finalize.settle-commit`; there is no separate pull-request repair workflow.
+
+|`epic.pmwf` -> `epic.commit-ledger`
+|`step_or_fallback`
+|`never`
+|Commits epic ledger updates in the shared epic worktree on the fixed epic branch, staging only `.marshall/orchestrator/**` paths. Never commits on the primary checkout; ledger changes reach the default branch only through the epic landing (link:../dispatch-and-effort/04-epic-coordination.adoc#epic-landing[Dispatch & Effort Specification]); `aborted` returns to `epic.active`.
+
+|`project-setup.pmwf` -> `setup.land-changes`
+|`step_or_fallback`
+|`if_push_remote`
+|Entered from the `land` link of the decision state `setup.commit-changes`. Commits the project-setup changes on the primary checkout with full artifact cleanup and trailer injection, staging only `.marshall/config/**`, `.gitignore`, and `.marshall/project-architecture/**`; `aborted` returns to `setup.commit-changes` (link:../state-catalogue/06-setup-epic-other.adoc#state-catalogue-setup[State Catalogue, Project Setup]).
+|===

@@ -1,0 +1,400 @@
+= Domain Extensions, Build Map & Configuration Split Specification: Provenance-Preserving Merge Algorithms
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../domain-extensions.adoc[Domain Extensions, Build Map & Configuration Split Specification] » Provenance-Preserving Merge Algorithms
+
+== Provenance-Preserving Merge Algorithms (ADR-014)
+_See Requirement link:../../Requirements.adoc#PM-EXT-2[PM-EXT-2: Provenance-Preserving Edge Derivation & Path Attribution Merges]_
+
+When multiple domains and resolvers are active in a repository, `PM-MCP` merges their module dependency edges (Axis C) and path-prefix ownership claims (Axis D) using deterministic, order-independent algorithms ported from `_derivation_merge.py` and `_path_attribution_merge.py` (ADR-014; `extension-api/scripts/`, verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing). Neither merge ever throws or aborts on a producer's output: a producer that fails is reported and its siblings still contribute, and every candidate the merge drops is recorded as a note prefixed `merge: ` on the producer's own report, so a dropped candidate is never silent and is always distinguishable from the producer's own notes.
+
+=== Edge Derivation Merge (`DerivationMerge`)
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-5[PM-WATCH-EXT-5]_
+
+The edge derivation merge combines directed inter-module edges $(u \to v)$ from all explicitly activated Axis-C resolvers while preserving full producer provenance and distinguishing "zero edges found" from "resolver did not run":
+
+1. *Activation by Explicit Resolver ID*: Resolvers are invoked strictly by their `resolverId` (never implicitly by file extension). A resolver disabled by the machine-local `derivation_resolvers` binding is not invoked; the caller folds in a `ResolverExecutionResult` with status `NOT_DISPATCHED` and reason `DISABLED`, which is reported with zero edges and excluded from the count of resolvers that ran.
+2. *Idempotent Union with Provenance*: Multiple resolvers discovering the same directed edge $(u, v)$ are merged into a single `MergedDependencyEdge` record whose `resolverIds` set is the sorted union of all contributing resolver IDs. A resolver's `contributedEdgeCount` counts its distinct accepted pairs.
+3. *Reported Drops*: Malformed candidates (a missing edge or endpoint), self-edges $(u, u)$, and edges naming a module outside the discovered module set are dropped, each with a `merge: ` note on the producing resolver's report.
+4. *Explicit Non-Run Reporting for LSP & External Resolvers*: An `LspSymbolEdgeResolver` (or `ProjectScriptEdgeResolver`) that could not execute **never returns an empty edge list masquerading as a clean scan**. Instead, it returns a `ResolverExecutionResult` with status `NOT_RUN` and an explicit `NonRunReason` (`ABSENT`, `FAILED_TO_START`, `TIMEOUT`, `UNSUPPORTED`).
+5. *Failing Resolver Isolation*: A resolver whose `deriveEdges` throws `ResolverException` is folded in by `DerivationMerge.invoke` as status `ERROR` with zero edges and a `merge: ` note carrying the sanitized exception (simple class name and message, line breaks collapsed to spaces, truncated to 200 characters; never a stack trace). It contributes no edges, counts as dispatched, and never aborts the merge; its siblings still contribute.
+6. *Duplicate Resolver IDs*: When two results carry the same `resolverId`, the first registration wins; the second is dropped entirely (no edges, no report of its own) and the surviving report receives a `merge: ` note naming the dropped duplicate.
+7. *Ordered Output*: Every map in the result is an ordered, unmodifiable view (`TreeMap` by key), never `Map.copyOf`, whose iteration order is unspecified; merged edges are sorted by `(from, to)` and reports by `resolverId`, so two runs over the same input serialize byte-identically.
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.architecture;
+
+import de.cuioss.pm.mcp.core.domain.EdgeDerivationAxis;
+import de.cuioss.pm.mcp.core.domain.ResolverException;
+import de.cuioss.pm.mcp.core.domain.WorkspaceDiscoveryContext;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+public final class DerivationMerge {
+
+    private static final String MERGE_NOTE = "merge: ";
+
+    private static final int MAX_ERROR_TEXT = 200;
+
+    public enum ResolverStatus { RAN, NOT_RUN, NOT_DISPATCHED, ERROR }
+
+    public enum NonRunReason { NONE, ABSENT, FAILED_TO_START, TIMEOUT, UNSUPPORTED, DISABLED }
+
+    public record RawEdge(String fromModule, String toModule, String detail) {}
+
+    public record ResolverExecutionResult(
+            String resolverId,
+            ResolverStatus status,
+            NonRunReason nonRunReason,
+            String diagnosticMessage,
+            List<RawEdge> edges,
+            List<String> notes          // the resolver's own suppression notes
+    ) {}
+
+    public record MergedDependencyEdge(
+            String fromModule,
+            String toModule,
+            List<String> resolverIds,
+            Map<String, List<String>> detailsByResolver
+    ) {}
+
+    public record ResolverStatusReport(
+            String resolverId,
+            ResolverStatus status,
+            NonRunReason nonRunReason,
+            String diagnosticMessage,
+            int contributedEdgeCount,   // distinct accepted (from, to) pairs
+            List<String> notes          // resolver notes followed by "merge: " drop notes
+    ) {}
+
+    public record DerivationMergeResult(
+            List<MergedDependencyEdge> edges,
+            List<ResolverStatusReport> resolverReports,
+            int dispatchedResolverCount // excludes NOT_DISPATCHED reports
+    ) {}
+
+    /** Invokes one resolver; a thrown ResolverException becomes an ERROR result, never an abort. */
+    public static ResolverExecutionResult invoke(EdgeDerivationAxis resolver, WorkspaceDiscoveryContext context) {
+        try {
+            return resolver.deriveEdges(context);
+        } catch (ResolverException e) {
+            return new ResolverExecutionResult(resolver.resolverId(), ResolverStatus.ERROR, NonRunReason.NONE,
+                    null, List.of(), List.of(MERGE_NOTE + "deriveEdges() failed: " + sanitize(e)));
+        }
+    }
+
+    /** Simple class name and message, single line, bounded; never a stack trace. */
+    static String sanitize(ResolverException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage().replaceAll("[\\r\\n\\t]+", " ").strip();
+        String text = e.getClass().getSimpleName() + (message.isEmpty() ? "" : ": " + message);
+        return text.length() <= MAX_ERROR_TEXT ? text : text.substring(0, MAX_ERROR_TEXT) + "...";
+    }
+
+    public DerivationMergeResult merge(
+            Set<String> knownModules,
+            List<ResolverExecutionResult> results) {
+
+        record EdgeKey(String from, String to) implements Comparable<EdgeKey> {
+            @Override
+            public int compareTo(EdgeKey o) {
+                int c = this.from.compareTo(o.from);
+                return c != 0 ? c : this.to.compareTo(o.to);
+            }
+        }
+
+        Map<EdgeKey, TreeSet<String>> provenance = new TreeMap<>();
+        Map<EdgeKey, Map<String, TreeSet<String>>> details = new TreeMap<>();
+        Map<String, ResolverStatusReport> reports = new TreeMap<>();
+
+        Map<String, List<String>> duplicateNotes = new TreeMap<>();
+
+        for (ResolverExecutionResult res : results) {
+            if (reports.containsKey(res.resolverId())) {
+                // First registration wins; the duplicate is dropped and named on the surviving report
+                duplicateNotes.computeIfAbsent(res.resolverId(), k -> new ArrayList<>())
+                        .add(MERGE_NOTE + "dropped duplicate registration of resolver id '" + res.resolverId()
+                                + "' (status " + res.status() + ") - the first registration wins");
+                continue;
+            }
+            List<String> notes = new ArrayList<>(res.notes());
+            if (res.status() != ResolverStatus.RAN) {
+                // NOT_RUN, NOT_DISPATCHED and ERROR contribute no edges
+                reports.put(res.resolverId(), new ResolverStatusReport(
+                        res.resolverId(), res.status(), res.nonRunReason(),
+                        res.diagnosticMessage(), 0, List.copyOf(notes)));
+                continue;
+            }
+            Set<EdgeKey> contributed = new TreeSet<>();
+            for (RawEdge edge : res.edges()) {
+                if (edge == null || edge.fromModule() == null || edge.toModule() == null) {
+                    notes.add(MERGE_NOTE + "dropped malformed candidate " + edge
+                            + " - not a (from, to) pair of module names");
+                    continue;
+                }
+                if (edge.fromModule().equals(edge.toModule())) {
+                    notes.add(MERGE_NOTE + "dropped self-edge (" + edge.fromModule() + " -> "
+                            + edge.toModule() + ") - a module does not depend on itself");
+                    continue;
+                }
+                List<String> unknown = new ArrayList<>();
+                if (!knownModules.contains(edge.fromModule())) {
+                    unknown.add(edge.fromModule());
+                }
+                if (!knownModules.contains(edge.toModule())) {
+                    unknown.add(edge.toModule());
+                }
+                if (!unknown.isEmpty()) {
+                    notes.add(MERGE_NOTE + "dropped edge (" + edge.fromModule() + " -> " + edge.toModule()
+                            + ") - unknown module endpoint(s): " + String.join(", ", unknown));
+                    continue;
+                }
+                EdgeKey key = new EdgeKey(edge.fromModule(), edge.toModule());
+                contributed.add(key);
+                provenance.computeIfAbsent(key, k -> new TreeSet<>()).add(res.resolverId());
+                if (edge.detail() != null && !edge.detail().isBlank()) {
+                    details.computeIfAbsent(key, k -> new TreeMap<>())
+                            .computeIfAbsent(res.resolverId(), r -> new TreeSet<>())
+                            .add(edge.detail());
+                }
+            }
+            reports.put(res.resolverId(), new ResolverStatusReport(
+                    res.resolverId(), ResolverStatus.RAN, NonRunReason.NONE,
+                    res.diagnosticMessage(), contributed.size(), List.copyOf(notes)));
+        }
+
+        duplicateNotes.forEach((id, extra) -> reports.computeIfPresent(id, (k, r) -> {
+            List<String> notes = new ArrayList<>(r.notes());
+            notes.addAll(extra);
+            return new ResolverStatusReport(r.resolverId(), r.status(), r.nonRunReason(),
+                    r.diagnosticMessage(), r.contributedEdgeCount(), List.copyOf(notes));
+        }));
+
+        List<MergedDependencyEdge> mergedEdges = provenance.entrySet().stream()
+                .map(entry -> {
+                    EdgeKey k = entry.getKey();
+                    TreeMap<String, List<String>> detMap = new TreeMap<>();
+                    details.getOrDefault(k, Map.of())
+                            .forEach((r, s) -> detMap.put(r, List.copyOf(s)));
+                    // ordered view, never Map.copyOf (unspecified iteration order)
+                    return new MergedDependencyEdge(k.from(), k.to(), List.copyOf(entry.getValue()),
+                            Collections.unmodifiableSortedMap(detMap));
+                })
+                .toList();
+
+        int dispatched = (int) reports.values().stream()
+                .filter(r -> r.status() != ResolverStatus.NOT_DISPATCHED)
+                .count();
+
+        return new DerivationMergeResult(mergedEdges, List.copyOf(reports.values()), dispatched);
+    }
+}
+----
+
+=== Path Attribution Merge & Collision Rejection (`PathAttributionMerge`)
+
+The path attribution merge combines Axis-D `claim_paths` claims across active attributors and resolves repository-relative file paths to their owning module via longest-prefix matching:
+
+1. *Single Shared Spelling Normalizer (`normalizeSpelling`)*: Claim registration and file lookup pass through the exact same normalizer. Normalization is spelling-only: it trims surrounding whitespace, folds backslashes to `/`, strips leading `./` runs, and strips trailing slashes. It resolves no symlink, touches no filesystem, does not collapse `..` segments, does not strip a leading `/`, and does not collapse `//`; whether a path is admissible is a policy decision of each side, not a spelling decision.
+2. *Claim Validity Filters (Drop and Report, Never Throw)*: A claim survives only if it is well-formed (non-null prefix and module), its normalized prefix bounds a subtree inside the repository, and its `target_module` is a known module (a discovered module or a registered synthetic domain module such as the one owning `.marshall`). A blank or root-level prefix (`""`, `.`, `..`, or a bare `/`), an absolute prefix (a leading `/` or a drive letter such as `C:/`), and a repository-escaping prefix (any normalized segment equal to `..`, not only the first) are dropped; a merely dot-relative prefix (`./doc`) is normalized to `doc`, not dropped. Every dropped claim appends a `merge: ` note naming the claim and the reason to the claiming attributor's report. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `_normalize_prefix` drops only a leading `..` segment and admits `/etc` or `doc/../../x`; `PM-MCP` drops both, because such a prefix can never bound a subtree inside the repository.
+3. *Failing Attributor Isolation*: An attributor whose `claimPaths()` throws `AttributorException` is reported with status `ERROR`, `claimCount` `0`, and a `merge: ` note carrying the sanitized failure (simple class name and message, as in `DerivationMerge.sanitize`); it contributes no claims, and its siblings still contribute. A failing attributor never aborts the merge. *Duplicate attributor IDs*: when two attributors share an `attributorId`, the first registration wins; the second is not invoked, and the surviving report receives a `merge: ` note naming the dropped duplicate. All internal maps are ordered (`TreeMap` / `LinkedHashMap` in registration order), never `HashMap` or `Map.copyOf`.
+4. *Collision Without Winner Invariant*: If two attributors claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` yields no claim, is recorded as a `PathClaimCollision` diagnostic, and every contending attributor receives a `merge: ` note naming all contending modules. Identical claims `(same prefix, same target_module)` merge idempotently into one claim carrying the sorted union of producer IDs. Differently-scoped prefixes (`.marshall` and `.marshall/local`) are not a collision.
+5. *Per-Attributor Report*: Every attributor yields exactly one `AttributorReport(attributorId, status, claimCount, notes)`, where `claimCount` counts the surviving (non-collided) claims it produced. Zero attributors is a first-class outcome (empty claims, empty reports, never an exception); the report count distinguishes "no attributor ran" from "attributors ran and none claimed the path".
+6. *Segment-Boundary Longest-Prefix Lookup*: A spelling-normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`, so `.marshalls/x` never resolves through a `.marshall` claim. Among all matching claims, the longest prefix wins; this is resolution order, not a collision tie-break.
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.architecture;
+
+import de.cuioss.pm.mcp.core.domain.AttributorException;
+import de.cuioss.pm.mcp.core.domain.PathClaimSet;
+import de.cuioss.pm.mcp.core.domain.PathOwnershipAxis;
+import de.cuioss.pm.mcp.core.domain.PathOwnershipClaim;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+public final class PathAttributionMerge {
+
+    private static final String MERGE_NOTE = "merge: ";
+
+    private static final Set<String> ROOT_LEVEL_PREFIXES = Set.of("", ".", "..");
+
+    public enum AttributorStatus { OK, ERROR }
+
+    public record ActivePathClaim(String normalizedPrefix, String targetModule, List<String> producers) {}
+
+    public record PathClaimCollision(String normalizedPrefix, Map<String, List<String>> producersByTargetModule) {}
+
+    public record AttributorReport(String attributorId, AttributorStatus status, int claimCount, List<String> notes) {}
+
+    public record AttributionTable(
+            List<ActivePathClaim> claimsByDescendingLength,
+            List<PathClaimCollision> collisions,
+            List<AttributorReport> attributorReports
+    ) {
+        public Optional<ActivePathClaim> attributePath(String rawFilePath) {
+            String norm = normalizeSpelling(rawFilePath);
+            for (ActivePathClaim claim : claimsByDescendingLength) {
+                String prefix = claim.normalizedPrefix();
+                if (norm.equals(prefix) || norm.startsWith(prefix + "/")) {
+                    return Optional.of(claim);
+                }
+            }
+            return Optional.empty();
+        }
+    }
+
+    /** Spelling-only normalizer shared by the claim side and the lookup side. */
+    public static String normalizeSpelling(String raw) {
+        String p = raw.strip().replace('\\', '/');
+        while (p.startsWith("./")) {
+            p = p.substring(2);
+        }
+        int end = p.length();
+        while (end > 0 && p.charAt(end - 1) == '/') {
+            end--;
+        }
+        return p.substring(0, end);
+    }
+
+    /** Simple class name and single-line message, bounded to 200 characters; never a stack trace. */
+    static String sanitize(AttributorException e) {
+        String message = e.getMessage() == null ? "" : e.getMessage().replaceAll("[\\r\\n\\t]+", " ").strip();
+        String text = e.getClass().getSimpleName() + (message.isEmpty() ? "" : ": " + message);
+        return text.length() <= 200 ? text : text.substring(0, 200) + "...";
+    }
+
+    /**
+     * Identity key of a claimed prefix; empty when the prefix bounds no subtree inside the repository:
+     * root-level, absolute (leading '/' or drive letter), or repository-escaping (any '..' segment).
+     * Deliberate hardening vs. plan-marshall, which rejects only a leading '..' segment.
+     */
+    static Optional<String> normalizePrefix(String raw) {
+        String p = normalizeSpelling(raw);
+        boolean absolute = p.startsWith("/") || p.matches("^[A-Za-z]:(/.*)?$");
+        boolean escaping = List.of(p.split("/")).contains("..");
+        if (ROOT_LEVEL_PREFIXES.contains(p) || absolute || escaping) {
+            return Optional.empty();
+        }
+        return Optional.of(p);
+    }
+
+    public AttributionTable buildTable(Set<String> knownModules, List<PathOwnershipAxis> attributors) {
+        record ClaimKey(String prefix, String module) implements Comparable<ClaimKey> {
+            @Override
+            public int compareTo(ClaimKey o) {
+                int c = this.prefix.compareTo(o.prefix);
+                return c != 0 ? c : this.module.compareTo(o.module);
+            }
+        }
+
+        Map<ClaimKey, TreeSet<String>> producers = new TreeMap<>();
+        Map<String, AttributorStatus> statusById = new LinkedHashMap<>();   // registration order
+        Map<String, List<String>> notesById = new TreeMap<>();
+
+        for (PathOwnershipAxis attributor : attributors) {
+            String id = attributor.attributorId();
+            if (statusById.containsKey(id)) {
+                // First registration wins; the duplicate is not invoked and is named on the surviving report
+                notesById.computeIfAbsent(id, k -> new ArrayList<>()).add(MERGE_NOTE
+                        + "dropped duplicate registration of attributor id '" + id + "' - the first registration wins");
+                continue;
+            }
+            PathClaimSet declared;
+            try {
+                declared = attributor.claimPaths();
+            } catch (AttributorException e) {
+                statusById.put(id, AttributorStatus.ERROR);
+                notesById.put(id, new ArrayList<>(List.of(MERGE_NOTE + "claimPaths() failed: " + sanitize(e))));
+                continue;
+            }
+            statusById.put(id, AttributorStatus.OK);
+            List<String> notes = new ArrayList<>(declared.notes());
+            for (PathOwnershipClaim claim : declared.claims()) {
+                if (claim == null || claim.pathPrefix() == null || claim.targetModule() == null) {
+                    notes.add(MERGE_NOTE + "dropped malformed claim " + claim
+                            + " - not a (path_prefix, module_name) pair");
+                    continue;
+                }
+                Optional<String> prefix = normalizePrefix(claim.pathPrefix());
+                if (prefix.isEmpty()) {
+                    notes.add(MERGE_NOTE + "dropped claim ('" + claim.pathPrefix() + "' -> " + claim.targetModule()
+                            + ") - blank, root-level, absolute, or repo-escaping prefix does not bound a subtree"
+                            + " inside the repository");
+                    continue;
+                }
+                if (!knownModules.contains(claim.targetModule())) {
+                    notes.add(MERGE_NOTE + "dropped claim (" + prefix.get() + " -> " + claim.targetModule()
+                            + ") - unknown module name");
+                    continue;
+                }
+                producers.computeIfAbsent(new ClaimKey(prefix.get(), claim.targetModule()), k -> new TreeSet<>())
+                        .add(id);
+            }
+            notesById.put(id, notes);   // a later duplicate appends its note after these
+        }
+
+        Map<String, TreeMap<String, TreeSet<String>>> byPrefix = new TreeMap<>();
+        producers.forEach((key, ids) ->
+                byPrefix.computeIfAbsent(key.prefix(), p -> new TreeMap<>()).put(key.module(), ids));
+
+        List<ActivePathClaim> active = new ArrayList<>();
+        List<PathClaimCollision> collisions = new ArrayList<>();
+        Map<String, Integer> claimCountById = new TreeMap<>();
+
+        byPrefix.forEach((prefix, targets) -> {
+            if (targets.size() == 1) {
+                var single = targets.firstEntry();
+                active.add(new ActivePathClaim(prefix, single.getKey(), List.copyOf(single.getValue())));
+                single.getValue().forEach(id -> claimCountById.merge(id, 1, Integer::sum));
+            } else {
+                // Collision: never pick a winner; no claim, a diagnostic, and a note to every contender
+                TreeMap<String, List<String>> reportMap = new TreeMap<>();
+                targets.forEach((mod, ids) -> reportMap.put(mod, List.copyOf(ids)));
+                collisions.add(new PathClaimCollision(prefix, Collections.unmodifiableSortedMap(reportMap)));
+                String note = MERGE_NOTE + "suppressed claim on prefix '" + prefix
+                        + "' - contested by more than one module (" + String.join(", ", targets.keySet()) + ")";
+                targets.values().stream()
+                        .flatMap(Set::stream)
+                        .distinct()
+                        .sorted()
+                        .forEach(id -> notesById.computeIfAbsent(id, k -> new ArrayList<>()).add(note));
+            }
+        });
+
+        active.sort(Comparator.comparingInt((ActivePathClaim c) -> c.normalizedPrefix().length())
+                .reversed()
+                .thenComparing(ActivePathClaim::normalizedPrefix));
+
+        List<AttributorReport> reports = statusById.entrySet().stream()
+                .map(e -> new AttributorReport(
+                        e.getKey(),
+                        e.getValue(),
+                        claimCountById.getOrDefault(e.getKey(), 0),
+                        List.copyOf(notesById.getOrDefault(e.getKey(), List.of()))))
+                .toList();
+
+        return new AttributionTable(List.copyOf(active), List.copyOf(collisions), reports);
+    }
+}
+----

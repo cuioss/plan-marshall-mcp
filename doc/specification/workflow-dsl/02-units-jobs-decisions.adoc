@@ -1,0 +1,170 @@
+= Workflow DSL & Engine Specification: Workflow Units, Job States & Decisions
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Workflow Units, Job States & Decisions
+
+[#workflow-definition-units]
+== Workflow Definition Units (Multi-File Workflows)
+
+A workflow definition may be split across several `.pmwf` files:
+
+* *Plan workflow*: All phase workflow files of a plan (`init.pmwf`, `refine.pmwf`, `outline.pmwf`, `plan.pmwf`, `execute.pmwf`, `land.pmwf` for the `land` lane states, `finalize.pmwf`) together form *one* workflow definition. The loader merges them into a single `WorkflowDefinition` before validation: `states` and `migrations` are the union of all files, the definition's `startState` is the `start` of `init.pmwf`, and the `start` of every other phase file names that phase's entry state. A transition in one phase file may therefore target a state declared in another (for example `allocated -> execute.dispatch-ready` in `finalize.pmwf`). Every phase file declares `scope plan` and its own `workflow <part> version <n>` header; the part headers identify files only. The merged unit carries a header of its own, which no file declares: `id` is `plan`, `scope` is `plan`, and `version` is derived from the part versions as their sum, recorded with the part versions themselves (`WorkflowDefinition.partVersions`, xref:04-ast-node-model.adoc#_ast_node_model[AST Node Model]). Because a part version only ever increases, the derived version increases with every change of any part. The unit id `plan` is the value of `CallFrame.callerWorkflowId` for every `call` made from a plan-workflow state (`status.json` `call_stack[].caller_workflow_id`), whichever phase file declares the calling state; the part header `workflow plan` of `plan.pmwf` (Phase 4) is a file identifier and never names the unit.
+* *Other top-level workflows*: Every other file with `scope plan`, `epic`, `workspace`, or `entity` (for example `epic.pmwf` with `scope epic`, `project-setup.pmwf` with `scope workspace`) forms a single-file definition.
+* *Sub-workflows*: Every `scope subworkflow` file (for example `git-commit-and-push.pmwf`) is a separately scoped definition. Its states are never merged into a caller's definition and are reachable only through `call`; transitions inside a sub-workflow may target only states of the same sub-workflow, and transitions outside it may never target a sub-workflow state.
+
+The same unit rules apply to the default units of the binary and to a project's own copies in `.marshall/config/` (xref:04-ast-node-model.adoc#project-owned-units[Project-Owned Workflow Units & Compiled Invariants]); a project never mixes a default file with its own copies inside one definition unit.
+
+All static verification rules (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]) run over the merged definition unit: state identifiers must be unique across all files of the unit, transition targets must exist in the unit, every state must be reachable from the unit's `startState` under every combination of the configuration keys its guards declare, outcome coverage is exhaustive per state, and link identifier patterns are unique within their state.
+
+[#implicit-job-links]
+== Implicit Links of Job States
+
+Every `job` and `composite_job` state implicitly offers two links that are never declared in DSL source:
+
+[cols="1,1,1,3"]
+|===
+|Link |`rel` |`form` |Semantics
+
+|`wait:<job_id>`
+|`wait`
+|`wait`
+|Bounded blocking wait on the running job (`PM-WF-8`); returns the next state's representation once the job settles, or the updated running representation.
+
+|`cancel:<job_id>`
+|`abort`
+|`noop`
+|Cancels the running job (for a composite job, all constituent jobs); the job settles with the outcome `cancelled`.
+|===
+
+Independently of the state kind, the engine accepts the self-report link `report_bypass` in every state of a live plan, epic, or entity scope and never renders it (link:../hypermedia-format/01-representation-and-link-forms.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]); it returns the unchanged representation and never changes state, so it needs no outcome transition. Implicit links count as offered for every check that compares link identifiers against the workflow definitions (for example the vocabulary-skill link check, `PM-WATCH-TOOL-6`).
+
+`<job_id>` is the job identifier of a `job` state (for example `wait:b-3f9a2c417e0d8b65`) and the composite identifier, which equals the state identifier, of a `composite_job` state (for example `wait:finalize.concurrent-wait`). The outcome enumeration of every `job` and `composite_job` primitive contains `cancelled`, so every such state must declare an explicit `cancelled -> <state>` outcome transition; Rule 2 (exhaustive outcome coverage) enforces it. A `job` state's outcome enumeration is the closed job outcome set of `PM-EXEC-4` (`succeeded`, `failed`, `failed_unparsed` for build jobs only, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`); a `composite_job` primitive declares its own closed workflow outcomes (`PM-WF-8`). A DSL link whose identifier pattern collides with an implicit link fails validation. `<job_id>` is always the job bound in `active_job` (<<job-state-binding>>); `wait` on a bound job only waits and never starts one.
+
+[#job-state-binding]
+== Job State Entry & Binding (`JobStep`)
+_See Requirement link:../../Requirements.adoc#PM-ARCH-8[PM-ARCH-8: Runtime & Relay Lifecycle, Crash Recovery & Job Drain]_
+
+A `job` state is a resting state over exactly one job. The engine binds it as follows (normative for `StateBehavior.JobStep`):
+
+1. *One job per entry*: Entering a `job` state starts exactly one job through the state's primitive, unless a job id is already bound for the state. A job id is bound when the entering transition carries one (item 3) or when `active_job` already names this state.
+2. *`active_job` in the state transaction*: `mcp/status.json` records `active_job {state_id, job_id}` (link:../store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas Specification, Workflow State Store]) in the same journaled transaction (link:../store-schemas/01-format-and-session-log.adoc#transaction-journal[Transaction Journal]) as the state change that enters the state and the enqueue of the job. A crash therefore leaves either the old state without a job or the new state with its bound job, never a job without a binding or a job state without its job.
+3. *Enqueued by a preceding primitive*: A primitive that enqueues a job for the following state (an `auto` state or a `do` link action, for example `build.enqueue-verification` before `git.freshness-build-running`) declares `enqueuesJob()` and returns the job's id as its primitive result (`PrimitiveResult.spawnedJobId`) with the outcome `started`. The `started` transition enters the `job` (or `composite_job`) state, which binds that id and starts nothing itself. Rule 1 (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]) verifies the binding: every `started` outcome of an `enqueuesJob()` primitive targets a `job` or `composite_job` state, and no other outcome of such a primitive does.
+4. *Re-entry only waits*: A `pm_state` or `pm_do` on a job state whose bound job is `queued` or `running`, including the first call after a runtime restart, only waits on it (`wait:<job_id>`); it never starts a second job.
+5. *Killed jobs are routed, never restarted*: A bound job that the runtime recorded `killed` (for example an orphaned `running` job marked on restart, `PM-ARCH-8`) settles the state with the outcome `killed`, which every `job` state routes explicitly (Rule 2). The engine never re-enqueues a job on its own (no blind re-execution); a new job starts only when a declared transition enters a job state again, for example through a `retry` link.
+6. *Leaving clears the binding*: The transition that leaves the state (on the job's outcome, or on `cancel:<job_id>`) clears `active_job` in the same transaction.
+
+A `composite_job` state follows the same rules with its composite identifier (the state identifier) as the bound id; its constituent jobs are recorded in `active_jobs`.
+
+[#escalation-decision-wait]
+== Escalation Without Elicitation & the Implicit Decision Wait
+
+An `escalate <decision>` link action requests an operator decision (`PM-SEC-3`). On a connection that declared elicitation support, the engine prompts through `elicitation/create` and takes the link's outcome transition for the answer. Otherwise it records the pending decision in the scope's `mcp/status.json` (`pending_decision` with a fresh `decision_id`, link:../store-schemas.adoc[Store Schemas Specification]) and raises the `blocked` condition on the current state (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]): `state` and `call_stack` stay unchanged, and the representation carries `condition: blocked` and `facts.operator_command` and offers exactly one implicit link. `facts.operator_command` is the exact CLI invocation that resolves the decision: the dedicated verb where the decision kind has one (the unsolicited operator actions `authorize-merge`, `force-gate`, `delete-plan`), otherwise the generic `pm-mcp operator decide <plan|epic> <scope_id> <decision_id> <outcome> [--param k=v …]` with the scope and `decision_id` filled in and the declared outcomes and `escalateParams` of the decision kind listed (`decide` posts to the same `/api/v1/operator/` decision endpoint the web app uses):
+
+[cols="1,1,1,3"]
+|===
+|Link |`rel` |`form` |Semantics
+
+|`wait:decision:<decision_id>`
+|`wait`
+|`wait`
+|Bounded wait (`PM-IMPL-4`) on the pending decision record. Once the operator resolves the decision through `pm-mcp operator`, the condition is cleared, the escalate link's outcome transition for that resolution is taken from the current state, and the next state's representation is returned; when the wait bound expires, the unchanged representation with its `blocked` condition is returned.
+|===
+
+The `wait:decision:` identifier prefix is reserved for this implicit link; a DSL link whose identifier pattern collides with it fails validation.
+
+[#decision-registry]
+== Decision Registry & Typed Escalation Outcomes
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Routine User Dialogue vs Operator-Authorizing Elicitation]_
+
+Escalation decisions are typed like primitives. Every decision kind named by an `escalate <decision>` link action is registered server-side in the `DecisionRegistry` (`pm-mcp-core`, beside the primitive registry) as a `DecisionSpec`: the closed outcome enumeration of the decision kind, one `DecisionOutcomeClass` per outcome (as every `Primitive<P, R>` outcome declares an `OutcomeClass`, xref:05-primitives.adoc#primitive-outcome-classes[Outcome Classes & Step Records]), and, for every approving outcome, the primitive that performs the approved action. A decision kind that is not registered fails validation (Rule 2 in xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]). The operator's resolution, by elicitation or `pm-mcp operator` (the generic `decide` verb or a dedicated verb), is accepted only when it names a declared outcome of the pending decision's kind and its parameters validate against the kind's `escalateParams`; `pending_decision.resolution` (link:../store-schemas.adoc[Store Schemas Specification]) never holds any other value.
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.spi;
+
+import java.util.Map;
+import java.util.Set;
+
+public enum DecisionOutcomeClass { APPROVED, DENIED, ABORTED }
+
+public record DecisionSpec(
+    String decisionKind,                          // e.g. "loop_limit_extension"
+    Set<String> outcomes,                         // closed outcome enumeration, e.g. {"extended", "aborted"}
+    Map<String, DecisionOutcomeClass> classes,    // exactly one class per outcome
+    Map<String, String> approvedActions,          // APPROVED outcome -> primitive id performing the approved action
+    List<ParamSpec> escalateParams                // free parameters of every escalate link of this kind (possibly empty)
+) {}
+----
+
+* *`APPROVED`*: The operator authorizes an action. The outcome names the primitive that performs it (`approvedActions`), and its transition must enter an `auto` state running that primitive (Rule 10).
+* *`DENIED`*: The operator declines the action. The transition leads to a state that does not perform it (a retry or alternative state of the same unit, or the unit's `aborted` terminal state) and never records the step `done` (Rule 9).
+* *`ABORTED`*: The operator stops the scope. The transition leads to the unit's `aborted` terminal state: `plan.aborted` in the plan workflow, `epic.aborted` in the epic workflow, and in a sub-workflow the terminal state with outcome `aborted`, which returns to the caller (xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar for the Workflow DSL], Abort model).
+
+The registered decision kinds (of the reference excerpts and of the State Catalogue, link:../state-catalogue.adoc[State Catalogue]):
+
+[cols="2,2,2,3"]
+|===
+|Decision kind |Outcomes (class) |Approved action |Rule 10 status
+
+|[[decision-abort-plan]]`abort-plan`
+|`aborted` (`ABORTED`) -> `plan.aborted`; `resumed` (`DENIED`) -> the state that offered the request (a self-transition). `escalateParams`: `reason: text[1..500]`.
+|None (no `APPROVED` outcome)
+|Conforms. Requested by the link `abort` (rel `escalate`) of every plan state whose routine answers include ending the plan (`<phase>.qgate-exhausted`, `init.lesson-premise` `close`, `init.sibling-collision`, `refine.hypothesis-refuted`, `land.verification-feedback`, `<phase>.commit-aborted`, the merge-path link states `finalize.merge-lease-interrupted`, `finalize.merge-sync-escalate`, `finalize.merge-remote-moved`, `finalize.merge-refused`, `finalize.merge-queue-exit`, and `finalize.merge-gap`, `finalize.adopt-blocked`, and the other states the State Catalogue names).
+
+|[[decision-abort-epic]]`abort-epic`
+|`aborted` (`ABORTED`) -> `epic.aborted`; `resumed` (`DENIED`) -> `epic.active`. `escalateParams`: `reason: text[1..500]`.
+|None (no `APPROVED` outcome)
+|Conforms. Requested by the link `abort` (rel `escalate`) of `epic.active`.
+
+|[[decision-land-verification-failed]]`land-verification-failed`
+|`recapture` (`APPROVED`), `abort-plan` (`ABORTED`) -> `plan.aborted`. `escalateParams`: `reason: text[1..500]`.
+|`land.recapture-changes`
+|Conforms: `recapture -> land.recapture` (`auto land.recapture-changes`). The `ABORTED` outcome enters `plan.aborted` directly, because the decision is already the operator's.
+
+|[[decision-archive-with-open-pr]]`archive-with-open-pr`
+|`close-pr-and-archive` (`APPROVED`), `hand-back` (`APPROVED`), `keep` (`DENIED`) -> `finalize.archive-held`. Requested by the only link of `finalize.archive-held`, `escalate` (declared in the unit, never raised by the engine), which the `pr_open_unmerged` outcome of `finalize.archive-plan` and the `keep` links of `finalize.close-pr-failed` and `finalize.hand-back-failed` enter. `escalateParams`: none (empty). The operator is offered `close-pr-and-archive` and `keep` for a plan of every source except `pr`, and `hand-back` and `keep` for a plan of source `pr` (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]), whose pull request is never closed by the plan.
+|`close-pr-and-archive`: `finalize.close-pr-and-archive`; `hand-back`: `finalize.hand-back-and-archive`
+|Conforms: `close-pr-and-archive -> finalize.close-pr-and-archive` (`auto finalize.close-pr-and-archive`: re-observes the pull request, closes it with a comment and archives, link:../state-catalogue/04-plan-finalize-terminal.adoc#state-finalize.close-pr-and-archive[State Catalogue]); `hand-back -> finalize.hand-back-and-archive` (`auto finalize.hand-back-and-archive`: re-observes the pull request, posts a summary comment, leaves it open and archives). Every comment either action posts is idempotent: it carries a hidden marker naming the `plan_id`, and a retry looks for an existing comment with that marker before posting, so no comment is posted twice (as for every comment the plan posts, including the grant comments).
+
+|[[decision-wind-down-unmerged]]`wind-down-unmerged`
+|`approved` (`APPROVED`), `denied` (`DENIED`) -> the `link` state that raised it (a self-transition). Requested by the `wind_down` link (rel `escalate`) of `finalize.merge-refused`, `finalize.merge-queue-exit`, and `finalize.merge-gap`. `escalateParams`: `reason: text[1..500]`.
+|`finalize.wind-down`: ends the merge path without a merge; completes `default:branch-cleanup` as `failed`, records `merge_outcome` from the observed pull request (link:../store-schemas/02-workflow-state-store.adoc#merge-outcome-mapping[Store Schemas Specification, Merge Outcome Mapping]: `declined` when it is closed, `dequeued` when it was ejected, `enqueued_not_landed` with the owed item `post_merge_cleanup` when it is still queued), and continues in the post-run band (metrics, landing, archive)
+|Conforms: `approved -> finalize.wind-down` (`auto finalize.wind-down`). An unmerged plan leaves the merge path only through this decision or `abort-plan`.
+
+|`loop_limit_extension`
+|`extended` (`APPROVED`), `aborted` (`ABORTED`)
+|`plan.allocate-remediation-tasks`
+|Conforms: `extended -> finalize.allocate-after-extension` (xref:07-loop-back-diagrams-verification.adoc#loop-back-bounds[Worktree-Constrained Loop-Back & Iteration Bounds]).
+
+|[[decision-grant-mapping]]`review_barrier_gap`, `ci_failure_override`, `wait_cancelled_override`, `finalize_spend_overrun`, `merge_action`, `red_ci_gate`, `rereview_timeout`
+|`approved` (`APPROVED`), `denied` (`DENIED`). Requested by the `escalate` links of `finalize.ci-failed` (`ci_failure_override`), `finalize.review-escalate` (`review_barrier_gap`), `finalize.wait-cancelled` (`wait_cancelled_override`), `finalize.spend-escalate` (`finalize_spend_overrun`), whose `denied` enters `plan.aborted`, and of `finalize.merge-gap`, whose one `escalate` link raises the kind named by the active gap class (`review_barrier_gap`, `merge_action`, `red_ci_gate`, `rereview_timeout`) and whose `denied` returns to `finalize.merge-gap` (a denied gap never aborts the plan). `escalateParams`: `reason: text[1..500]`.
+|`merge.gate-entry`, the entry primitive of `finalize.merge-gate`: records what the approval grants, runs the finalize spend check and Phase-Exit Completeness, and reads the recorded grants and acknowledgements that the merge path evaluates. What an approval records: `ci_failure_override` a grant of the gap class `red_ci_gate` (HEAD-bound); `finalize_spend_overrun` a spend acknowledgement only, no grant; `wait_cancelled_override` an acknowledgement only, no grant (evidence still missing at the barrier raises its own gap through `finalize.merge-gap`); `review_barrier_gap` (from `finalize.review-escalate` or `finalize.merge-gap`), `merge_action`, `red_ci_gate`, and `rereview_timeout` a grant of that class (HEAD-bound)
+|Conforms: `approved -> finalize.merge-gate` (`auto merge.gate-entry`), which records the grant (HEAD-bound, one gap class) or the acknowledgement and re-runs the merge path from its entry (link:../state-catalogue/04-plan-finalize-terminal.adoc#state-finalize.merge-gate[State Catalogue]). The `approved` transitions of `review_barrier_gap` (from `finalize.review-escalate`), `ci_failure_override`, and `wait_cancelled_override` complete the wait-region steps `default:ci-verify`, `plan-marshall:automatic-review`, and `default:sonar-roundtrip` as `skipped_by_operator`, referencing the decision (Rule 9); the barrier predicates and the `red_ci_gate` check still guard the merge.
+
+|`landing_delivery_failure`
+|`approved` (`APPROVED`), `denied` (`DENIED`)
+|`finalize.retry-landing-delivery`: repeats the landing delivery once more and completes the `emit-landing` step, with `landing_delivery: pending` when the repeated delivery fails again
+|Conforms: `approved -> finalize.retry-landing-delivery` (`auto finalize.retry-landing-delivery`).
+
+|`gitignore_oracle_failure`
+|`approved` (`APPROVED`), `denied` (`DENIED`) -> `git.done-aborted`, which returns `aborted` to the caller. Requested by the `escalate` link of `git.artifact-escalate`. `escalateParams`: `reason: text[1..500]`.
+|`git.apply-oracle-override`: records a HEAD-bound override naming the paths the `.gitignore` oracle could not classify
+|Conforms: `approved -> git.stage-under-oracle-override` (`auto git.apply-oracle-override`); the following `git.stage-and-commit` stages under that override (xref:06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Six-Stage Execution Contract of `git.commit_and_push`], Stage 2).
+
+|`force_stale_push`
+|`approved` (`APPROVED`), `denied` (`DENIED`) -> `git.done-aborted`. Requested by the `escalate` link of `git.freshness-blocked`. `escalateParams`: `reason: text[1..500]`.
+|`git.push` under an override record bound to `HEAD` and to the rendered `stale_reason`
+|Conforms: `approved -> git.push-under-freshness-override` (`auto git.push`).
+
+|`force_push_with_lease`
+|`approved` (`APPROVED`), `denied` (`DENIED`) -> `git.done-aborted`. Requested by the `escalate` link of `git.sync-required`. `escalateParams`: `reason: text[1..500]`.
+|`git.push` with an explicit lease: the expected remote SHA (Stage 6)
+|Conforms: `approved -> git.push-with-lease` (`auto git.push`).
+|===
+
+A failing repository hook and a rebase conflict are not operator decisions: a hook failure is fixed in `git.commit-fix` (no bypass exists, and a bounded number of attempts returns `aborted` to the caller), and a conflict is resolved by the model in `git.resolve-conflicts`, whose abort path returns to `git.sync-escalate` (xref:06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Declarative DSL Definition (`classpath:/workflows/git-commit-and-push.pmwf`)]).

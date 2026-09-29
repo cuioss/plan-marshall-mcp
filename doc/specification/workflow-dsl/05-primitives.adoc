@@ -1,0 +1,158 @@
+= Workflow DSL & Engine Specification: Primitive Interface & Transition Validation
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Primitive Interface & Transition Validation
+
+== Typed Java `Primitive<P, R>` Interface & Transition Validation
+_See Requirement link:../../Requirements.adoc#PM-WF-6[PM-WF-6: Independent Server-Side Transition & Parameter Validation]_
+
+[#primitive-spi-contract]
+=== `Primitive<P, R>` SPI Contract
+
+Every deterministic server operation is encapsulated as a stateless Java `Primitive<P, R>` in `pm-mcp-core`:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.spi;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+public enum OutcomeClass { SUCCESS, SKIP, FAILURE, INDETERMINATE, UNSETTLED, ABORTED }
+
+/** The external event a primitive waits for before its outcome can change (Rule 11). */
+public enum AwaitedEvent { NONE, JOB_SETTLED, OPERATOR_DECISION, MODEL_SUBMIT, HEAD_CHANGE, TIME }
+
+public interface PrimitiveOutcome {
+    String wireName();
+
+    /**
+     * Class of the outcome; decides which step record the engine writes (see Outcome Classes).
+     */
+    OutcomeClass outcomeClass();
+}
+
+public record PrimitiveResult<R extends Enum<R> & PrimitiveOutcome>(
+    R outcome,
+    Map<String, Object> updatedFacts,
+    Optional<String> spawnedJobId
+) {}
+
+public interface Primitive<P extends Record, R extends Enum<R> & PrimitiveOutcome> {
+
+    /**
+     * Canonical dotted primitive identifier (e.g., "git.stage-and-commit", "git.push", "findings.triage").
+     */
+    String id();
+
+    /**
+     * Record class defining the free and state-resolved parameters.
+     */
+    Class<P> parameterType();
+
+    /**
+     * Closed enum class of all possible deterministic outcomes.
+     */
+    Class<R> outcomeType();
+
+    /**
+     * Execute the operation within the locked scope context and return one of the closed outcomes.
+     */
+    PrimitiveResult<R> execute(WorkflowExecutionContext context, P parameters);
+
+    /**
+     * Artifacts this primitive produces as side effects (Rule 8), e.g. "pr_title".
+     */
+    default Set<String> producedArtifacts() { return Set.of(); }
+
+    /**
+     * Artifacts this primitive requires before it can pass (Rule 8), e.g. a gate requiring "pr_title".
+     */
+    default Set<String> requiredArtifacts() { return Set.of(); }
+
+    /**
+     * External event this primitive waits for (Rule 11); NONE for a primitive whose outcome
+     * depends only on state it reads in the same transaction.
+     */
+    AwaitedEvent awaitedEvent();
+
+    /**
+     * True for a primitive that enqueues a job for the following job state and returns its id
+     * in PrimitiveResult.spawnedJobId with the outcome "started" (Rule 1, Job State Entry & Binding).
+     */
+    default boolean enqueuesJob() { return false; }
+}
+----
+
+[#primitive-outcome-classes]
+==== Outcome Classes & Step Records
+_Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-9[PM-WATCH-DSL-9]_
+
+Every outcome constant declares one `OutcomeClass`, and the engine derives the step record from it, never from the outcome name:
+
+* *`SUCCESS`*: The step completed with its work; the engine records `done`.
+* *`SKIP`*: The step had nothing to do. A primitive with an optional input declares a `skipped_<reason>` outcome of this class for the absent-input case; the step record stores `skipped`, `work_performed: false`, and the reason, and downstream steps treat it as neither a failure nor produced content.
+* *`FAILURE`* and *`INDETERMINATE`*: The step record stores `failed` or `indeterminate`; neither is ever recorded as `done`, and `INDETERMINATE` is never folded into success or failure (`PM-EXEC-4`).
+* *`UNSETTLED`*: Outcomes that hand the step back without settling it (`loop_back`, defer). The engine writes no completion record, so a re-fired step never produces two completions.
+* *`ABORTED`*: A flow was left by a model-followed `abort` link or a denied escalation inside it (the sub-workflow terminal `git.done-aborted`, outcome `aborted`). Like `UNSETTLED` it writes no completion record: the caller routes the outcome back to a decision state or to an escalation (xref:01-module-boundary-and-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar for the Workflow DSL], Abort model), never to a state that continues the flow as if the operation had succeeded, and never completes a step `done` or `skipped` on it.
+
+=== Concrete Primitive Example (`GitStageAndCommitPrimitive`)
+
+The example is the primitive behind the `git.stage-and-commit` state of the `git.commit_and_push` sub-workflow (xref:06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Six-Stage Execution Contract of `git.commit_and_push`], Stage 4); its outcome wire names are the ones that state routes on.
+
+[source,java]
+----
+public final class GitStageAndCommitPrimitive
+        implements Primitive<GitStageAndCommitPrimitive.Params, GitStageAndCommitPrimitive.Outcome> {
+
+    public record Params(@FreeParam(minLength = 1, maxLength = 2000) String message) {}
+
+    public enum Outcome implements PrimitiveOutcome {
+        COMMITTED("committed", OutcomeClass.SUCCESS),
+        NOTHING_TO_COMMIT("nothing_to_commit", OutcomeClass.SKIP),
+        HOOK_FAILED("hook_failed", OutcomeClass.FAILURE);
+
+        private final String wireName;
+        private final OutcomeClass outcomeClass;
+        Outcome(String wireName, OutcomeClass outcomeClass) {
+            this.wireName = wireName;
+            this.outcomeClass = outcomeClass;
+        }
+        @Override public String wireName() { return wireName; }
+        @Override public OutcomeClass outcomeClass() { return outcomeClass; }
+    }
+
+    @Override public String id() { return "git.stage-and-commit"; }
+    @Override public Class<Params> parameterType() { return Params.class; }
+    @Override public Class<Outcome> outcomeType() { return Outcome.class; }
+    @Override public AwaitedEvent awaitedEvent() { return AwaitedEvent.NONE; }
+
+    @Override
+    public PrimitiveResult<Outcome> execute(WorkflowExecutionContext ctx, Params params) {
+        // Runs the footprint check, stages the derived staging set, appends the resolved
+        // Co-Authored-By trailer (refusing one in the model-supplied message),
+        // and streams the UTF-8 message via stdin to `git -C <worktree> commit -F -`
+        ...
+    }
+}
+----
+
+[#independent-transition-validation]
+=== Independent Server-Side Transition & Parameter Validation (`PM-WF-6`)
+
+[[_independent_server_side_transition_parameter_validation_pm_wf_6]]
+When `pm_do(scope_id, link, args, dispatch_id)` arrives, the workflow engine executes a single atomic transaction under the scope's exclusive lock (acquired through the lock manager in the total lock order, link:../store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]); all of its store writes form one journaled transaction (link:../store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]):
+
+1. *Load Authoritative State*: Read `mcp/status.json` for `scope_id` (applying any `migrate` mapping if `status.json` references a renamed released state) and resolve the active `StateNode` (within the top `CallFrame.subWorkflowId()` if `call_stack` is non-empty, or the root workflow otherwise).
+2. *Verify Dispatch Claim (if `dispatch_id` present)*: If `dispatch_id` is superseded (a `dispatch_id` has no time-based expiry), reject immediately with `reason: "stale_dispatch_id"`.
+3. *Re-Compute Active Links & Guards*: Evaluate all `LinkSpec` entries on `StateNode`, expanding entity placeholders (`triage:<finding_id>`) against current persisted stores (`findings.jsonl`, `tasks/TASK-*.json`) and evaluating each link's `GuardExpr` to a `GuardResult` (xref:04-ast-node-model.adoc#guard-results[Three-Valued Guard Results]): only `HELD` links are active, and a `COULD_NOT_EVALUATE` result raises the `guard_indeterminate` condition instead of dropping the link. While `pending_condition` is set, the active set is only the condition's links (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]).
+4. *Verify Link Offering*: Confirm that `link` exactly matches one of the currently active, guard-satisfied `LinkSpec` instances. If `link` is not in the active set, return `isError: false` with the current representation and a `rejected.reason` from the closed enumeration (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[MCP Tool & Resource Surface Specification]): `operator_only` for an operator transition, which is never offered to the model; `stale_entity` for an entity-addressed link whose entity is no longer in an accepting state; `link_not_available` for any other identifier, including invented or paraphrased ones.
+5. *Validate & Bind Free Parameters (`P`)*: Validate the raw `args` map against the `LinkSpec.freeParams` constraints (`additionalProperties: false`, required keys, enum membership, string length bounds, integer ranges) and execute any attached content validator (`OutlineValidator`, `AsciiDocValidator`, `ConventionalCommitValidator`) in-process on submitted text payloads. If validation fails, return `isError: false` with the current representation and `rejected.reason` `undeclared_param` (a key the link does not declare), `missing_param` (a required key is absent), or `invalid_link_args` (type, range, or content-validator violation); `detail` names the offending parameter.
+6. *Verify Task Footprint (`submit:TASK-*` only)*: For a task `submit:<task_id>` link, verify the task's contribution: that no files outside the plan's worktree were dirtied by host tools and that no enrolled wrapper's `pinned_files` (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Verify-Not-Resolve]) changed inside it; on violation, the link's primitive is not executed and the `footprint_violation` condition is raised on the current state (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]), naming the offending files; `state` and `call_stack` are unchanged. Commits are not checked here: every commit, whatever its caller and whichever link or state leads to it, is guarded by the footprint check that `git.stage-and-commit` runs as its first step (xref:06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Six-Stage Execution Contract of `git.commit_and_push`], Stage 4).
+7. *Execute Primitive & Advance State*: Instantiate `P`, invoke `primitive.execute(context, params)`, look up the returned `R.wireName()` in `LinkSpec.transitions`, persist the new `state` (and updated `call_stack` if entering or exiting a `SubWorkflowCall`) in `mcp/status.json`, append the transition event to `audit.jsonl`, and render the next state's TOON representation (executing chained `auto` and `call` steps until an interactive link state, async job state, or root terminal state is reached).

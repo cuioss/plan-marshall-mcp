@@ -1,0 +1,301 @@
+= Domain Extensions, Build Map & Configuration Split Specification: Recipes, Extension Points & Project Scripts
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../domain-extensions.adoc[Domain Extensions, Build Map & Configuration Split Specification] » Recipes, Extension Points & Project Scripts
+
+== Declarative Recipe Engine & Tier-1 Init Routing
+_See Requirement link:../../Requirements.adoc#PM-EXT-4[PM-EXT-4: Declarative Recipe Model & Tier-1 Init Routing]_
+
+Recipes define repeatable, structured plan templates for recurring engineering campaigns (such as `recipe-code-review`, `recipe-security-audit`, `recipe-simplify-codebase`, `recipe-agentfile-hygiene`, `recipe-lesson-cleanup`, `recipe-doc-verify`, `recipe-verify-ascii-diagrams`, `recipe-cui-logging-enforce`). A recipe plan runs under the same server boundaries as any plan; in particular a `recipe-simplify-codebase` completion that deletes a test file or test method added earlier in the same plan is rejected as in the finalize `simplify` step (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, catalogue row `5`]). `recipe-lesson-cleanup` routes a lesson corpus under the Corpus Routing Campaign rules of the lesson store (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record]): one recorded disposition per lesson, idempotent re-runs, population deltas reported.
+
+=== Declarative Recipe Descriptor Schema
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-12[PM-WATCH-EXT-12]_
+
+Both built-in recipes (`classpath:/recipes/<recipe_id>.json`) and project-local recipes (`.marshall/recipes/<recipe_id>.json` + `.marshall/recipes/<recipe_id>.md`) are defined as declarative data structures.
+
+*Domain recipes (`provides_recipes`)*: `plan-marshall`'s `provides_recipes()` hook becomes packaging: a domain recipe (such as `pm-dev-java-cui`'s `cui-logging-enforce`) is part of its domain bundle, compiled into the classpath next to the domain descriptor, and registered under the bundle's `domain_id` (its descriptor's `domain` field equals that `domain_id`). The recipe registry is assembled at build time; two recipes with the same `recipe_key` (built-in or domain) fail the build, so a collision never reaches a runtime registry and no registration order decides a winner.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/recipe-descriptor-v1.json",
+  "title": "RecipeDescriptor",
+  "type": "object",
+  "required": [
+    "format_version",
+    "recipe_key",
+    "display_name",
+    "description",
+    "scope",
+    "default_change_type",
+    "target_harvester",
+    "deliverable_template",
+    "pr_title_template"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "recipe_key": { "type": "string", "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$", "maxLength": 37, "description": "Registry key as in plan-marshall (e.g. code-review); at most 37 characters so the recipe plan ID fits the plan_id grammar (identifiers.adoc, recipe_key)." },
+    "display_name": { "type": "string", "minLength": 3, "maxLength": 100 },
+    "description": { "type": "string", "description": "Scored by keyword overlap together with display_name." },
+    "domain": { "type": "string", "description": "Optional domain; matches the plan's domain for the domain score." },
+    "scope": { "type": "string", "enum": ["module", "codebase_wide"] },
+    "default_change_type": { "type": "string" },
+    "pr_title_template": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 72,
+      "description": "Conventional Commit title with {parameter} placeholders bound from recipe_params, rendered deterministically at init.recipe-selected into status.metadata.pr_title (phase-workflows.adoc, Plan Source Contracts). An unbound placeholder or a rendered title that fails ConventionalCommitValidator refuses the recipe descriptor at load time."
+    },
+    "lane": { "type": "object", "description": "Optional execution-profile seed (posture and per-step overrides), lowest precedence." },
+    "skill_uri": {
+      "type": "string",
+      "pattern": "^skill://pm/recipe/[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+    },
+    "parameters_schema": {
+      "type": "object",
+      "description": "Free per-recipe input schema (a JSON Schema 2020-12 object schema) for recipe_params; there is no fixed parameter vocabulary (no global scope x thoroughness matrix). The server validates recipe_params against it at pm_start and refuses a violation; defaults declared in it are applied by the server. Absent means the recipe takes no parameters and any non-empty recipe_params is refused.",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "object" }
+      }
+    },
+    "target_harvester": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "discovered_modules",
+            "module_packages",
+            "markdown_sections",
+            "ascii_diagram_blocks",
+            "stalled_lessons",
+            "footprint_diff",
+            "project_script",
+            "request_scoped"
+          ],
+          "description": "request_scoped: no harvest runs; the deliverables come from the pre-diagnosed request (named files, root cause, exact change), as for surgical-fix."
+        },
+        "project_script_id": {
+          "type": ["string", "null"],
+          "pattern": "^[a-z][a-z0-9-]{0,63}$",
+          "description": "Key of the enrolled project script (project_scripts of enrolments/<project_id>.json, whose binding must be worker_kind recipe_harvester with this recipe as target); required when kind == 'project_script'."
+        }
+      }
+    },
+    "deliverable_template": {
+      "type": "object",
+      "required": ["granularity", "profile", "title_pattern", "steps"],
+      "additionalProperties": false,
+      "properties": {
+        "granularity": {
+          "type": "string",
+          "enum": ["per_target", "per_module", "single_plan_wide"]
+        },
+        "profile": {
+          "type": "string",
+          "enum": ["implementation", "module_testing", "integration_testing", "verification", "documentation"],
+          "description": "Task profile of the generated deliverables; equals the task profile enum (store-schemas.adoc, Task Record)."
+        },
+        "title_pattern": { "type": "string" },
+        "steps": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
+----
+
+=== Tier-1 Init Routing & Deterministic Deliverable Generation
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-9[PM-WATCH-PHASE-9]_
+
+The scoring and routing rules mirror `plan-marshall` (`script-shared/scripts/recipe_scoring.py`, `phase-1-init/SKILL.md`, verified at commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing).
+
+1. *Explicit Choice Beats Heuristic Match*: A plan started from a recipe (`pm_start` with `recipe_id`, i.e. source `recipe`) bypasses scoring and routes directly to `init.recipe-selected`.
+2. *Registry-Wide Deterministic Scoring*: For every source other than `recipe` (`request`, `issue`, `lesson`; a `local_changes` plan goes to the land lane and is not scored), during `phase-1-init` (ahead of light/deep planning-lane routing), the server scores **every** registered recipe (no domain pre-filter): $\text{confidence} = 0.6 \cdot \text{keyword} + 0.25 \cdot \text{domain} + 0.15 \cdot \text{scope}$, rounded to three decimals, where `keyword` is the share of the recipe's `display_name` + `description` tokens (stop-words removed) found in the request, `domain` is `1` when the recipe's `domain` equals the plan's domain, and `scope` is `1` when the plan's `scope_estimate` maps to the recipe's `scope` (`surgical` and `single_module` map to `module`, `multi_module` and `broad` to `codebase_wide`) and `0` otherwise, including a `scope_estimate` of `none`, unknown, or unresolved; an unknown plan domain scores `domain` `0`, as in `plan-marshall`. The weights and thresholds are `plan-marshall`'s. *Deliberate change vs. `plan-marshall`*: its scorer maps only `surgical` to `module` and `broad` to `codebase_wide` (`recipe_scoring.py`, besides informal synonyms that are no `scope_estimate` values), so a `single_module` or `multi_module` plan scores `scope` `0` there. For the surgical-fix recipe only, a pre-diagnosed-change shape score of the request may raise the confidence (`max`). Recipes below `0.35` are dropped.
+3. *Auto-Route or Ask*: Scoring always runs (item 2); `recipes.auto_route` never switches it off, it only chooses between auto-routing and asking. When the operator's `recipes.auto_route` (`local-config.json`, default `true`) holds and the top confidence is at least the compiled auto-route threshold `0.6` (a calibration of the scorer, not configurable), the engine selects that recipe without asking. Otherwise (auto-routing disabled, or the top confidence below the threshold), if candidates remain, it enters `init.recipe-candidate` (the single state of the recipe selection dialogue, kind `awaiting_user`; recipe selection never uses another `init` question state) offering `use_recipe:<recipe_key>` (`rel = "next"` for the highest-scoring recipe, `rel = "alt"` for the others) and `skip_recipe` (`rel = "alt"`) to proceed with standard light/deep planning.
+4. [[recipe-plan-id]]*Recipe Plan ID*: A recipe plan's `plan_id` is `recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC), so every run gets a fresh branch name; its grammar and the 37-character bound of `recipe_key` that keeps it within the `plan_id` grammar are in the link:../identifiers/01-general-rules-and-registry.adoc#id-recipe-plan-id[Identifier Registry]. *Deliberate change vs. `plan-marshall`*: `plan-marshall` uses hour precision (`{yyyy-mm-dd-hh}`), which collides when the same recipe runs twice within an hour.
+5. *Server-Side Target Harvesting & Deliverable Generation*: When a recipe is selected, the server executes the recipe's deterministic `target_harvester` (e.g., enumerating packages per module, scanning `.md`/`.adoc` files for misaligned ASCII box diagrams, or invoking an enrolled `project_script` harvester) and populates the solution outline deliverables automatically. A recipe whose harvester kind is `request_scoped` (`surgical-fix`) runs no harvest: its deliverables come from the pre-diagnosed request (the named files, root cause, and exact change; one deliverable per affected file or one for the whole cohesive edit), and a request that names no file or crosses a module boundary is refused by the recipe's fit gate rather than widened. The deliverables are derived in the Phase 3 entry state of the recipe shortcut, `outline.recipe-entry` (link:../state-catalogue/02-plan-phases-1-3.adoc#state-outline.recipe-entry[State Catalogue]). The workflow exposes judgment links only where model evaluation is required: confirming or pruning harvested targets (`confirm_recipe_targets`, offered by `outline.recipe-confirm` before `outline.review`) and verifying coverage at completion.
+6. *Auditable, Idempotent Harvest Runs*: A recipe run records one disposition per harvested target; for `recipe-lesson-cleanup` over `stalled_lessons` the dispositions are `routed`, `reclassified`, and `retired` (through the lesson's in-file retirement with its mandatory `reason` and `verdict`, link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Retirement]); the `stalled_lessons` population is the lessons with a stale claim (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]). Re-running on unchanged input is a no-op keyed on the target's duplicate key (for lessons: link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Upstream Release, Duplicates]). If the population differs between harvesting and action, the run reports the delta (added and removed target ids) and never adopts it silently.
+7. *Empty Harvest Is a No-Op, Never an Empty PR*: When the harvester (after `confirm_recipe_targets` pruning) yields zero targets, the plan creates no deliverables, no commit, and no pull request: it ends as `completed` with `merge_outcome: no_pr` (link:../store-schemas.adoc[Store Schemas Specification, `merge_outcome`]) and the fact `empty_harvest` (harvester kind and the population it scanned) in its landing envelope. An empty pull request is never created for a recipe plan.
+8. *Recipe Parameters*: `recipe_params` (link:../mcp-tools.adoc[MCP Tools Specification, `pm_start`]) is validated by the server against the recipe's own `parameters_schema`; there is no global parameter vocabulary such as a fixed scope × thoroughness matrix. A violation refuses `pm_start` before any plan directory is created, and a recipe without `parameters_schema` refuses non-empty `recipe_params`.
+9. *Doc-Shaped Lesson Route*: For source `lesson`, the server additionally evaluates `plan-marshall`'s doc-shaped predicate over the lesson body (`phase-1-init` Step 5c-lesson): the body has at least one `## Directive` or `## Actions` section, contains no fenced code block tagged `python`, `py`, `java`, `js`, `javascript`, `ts`, or `typescript`, and the first non-empty line of no directive section begins (case-insensitively) with `test`, `refactor`, `implement`, `add code`, `write code`, or `migrate`. When all three hold, the plan is routed to the `lesson-cleanup` recipe (`init.recipe-selected`, recorded with `route_reason: doc_shaped_lesson`) ahead of the registry scoring; otherwise the lesson is scored like any other source.
+10. *Request-Aspect Classification*: For every source other than `recipe`, the server classifies the request aspect (`analysis`, `planning`, `implementation`) by keyword-table token overlap (`plan-marshall`'s `aspect-classify`): the higher of `analysis` and `planning` is accepted only when its overlap confidence is at least `0.7` (independent of the recipe thresholds) and beats the `implementation` overlap; otherwise the aspect is `implementation`. The result is persisted as `status.metadata.request_aspect` with its confidence, silently (no question), and records intent only; it never decides whether a build is needed.
+
+Items 9 and 10 are Tier-1 routing computed by the server in `init.classify` with zero model calls. *Deliberate change vs. `plan-marshall`*: `plan-marshall` lets the orchestrating model apply the doc-shaped predicate and offers a bounded model fallback for an ambiguous aspect; `PM-MCP` computes both deterministically and has no model fallback.
+
+[[self-review-surfacer]]
+== Pre-Submission Self-Review Surfacer Extension Point (`ext-self-review-*`)
+_See Requirement link:../../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-13[PM-WATCH-EXT-13], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-14[PM-WATCH-EXT-14], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-15[PM-WATCH-EXT-15], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-16[PM-WATCH-EXT-16], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-17[PM-WATCH-EXT-17], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-18[PM-WATCH-EXT-18], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-19[PM-WATCH-EXT-19], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-20[PM-WATCH-EXT-20], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-24[PM-WATCH-EXT-24], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-26[PM-WATCH-EXT-26], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-45[PM-WATCH-GEN-45]_
+
+The self-review surfacer is a domain extension point, not a recipe: a domain bundle registers at most one compiled surfacer `ext-self-review-<domain_id>` (in `plan-marshall`: `pm-plugin-development:ext-self-review-plan-marshall`), declaring the content classes it covers and its detectors. During `phase-6-finalize`, the pre-submission structural self-review step (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, catalogue row `8`, `pre-submission-self-review`]) runs the surfacers registered for the plan's domains as deterministic candidate detectors over the plan's realized diff to surface high-risk patterns (unvalidated boundary inputs, asymmetric function pairs, description-vs-body mismatches, stale ordinal prose, unguarded flags) as structured facts for model review.
+
+*Outcomes*: every round records exactly one of three outcomes, carried into the landing facts as `self_review` (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_landing_envelope_emit_landing[Phase Workflows Specification § Landing Envelope]):
+
+* `reviewed`: at least one applicable surfacer ran and the model submitted its verdict over the surfaced candidates.
+* `not_covered`: a surfacer is registered for the plan's domains but does not apply to the footprint; the surfacer names the reason (`no_covered_content_class` with the uncovered content classes, or `zero_detectors`).
+* `not_run`: no surfacer is registered for any of the plan's domains; the reason is `no_domain_surfacer`.
+
+Neither `not_covered` nor `not_run` is ever recorded or rendered as `clean` or `passed`. The contract rules:
+
+* **AsciiDoc Content Class**: `*.adoc` paths form their own content class `asciidoc` (never `other`), covered at least by the stale-count and ordinal-prose detector: a count or ordinal stated in prose ("the five bands", "the third item", "13-state vocabulary") that no longer matches the enumeration, table, or list it describes, including one in a file the plan did not edit, is a candidate. PM-MCP's own documentation is AsciiDoc, so its changes are reviewed rather than reported `not_covered`.
+* **Applicability by Content Class**: A surfacer is applicable when its declared content classes cover at least one content class of the realized footprint; a footprint whose paths all fall in content class `other` has no applicable surfacer. An inapplicable surfacer is never run: the step records `not_covered` with the surfacer's reason and the uncovered content classes and completes non-blocking, never as `clean`. The reasons `no_domain_surfacer`, `no_covered_content_class`, and `zero_detectors` are round-invariant at an unchanged `HEAD`.
+* **Not Run Is Not Clean Invariant**: When no self-review surfacer is registered for the plan's domains, the server records `"status": "not_run"` with `"reason": "no_domain_surfacer"` in the finalize ledger—never `"clean"` or `"passed"`. Every active surfacer records its `scope_statement`, `structural_limit`, and `delta_coverage`; a detector class with zero matching files in the diff is recorded as `unapplicable`, never counted toward measured clean coverage.
+* **Which Zero Coverage**: Per content class the surfacer records `files`, `files_with_candidates`, and `detectors`; a class with `files > 0` and `detectors == 0` is recorded as `gap`, never as clean. The reach map is derived from the registered detectors. Every realized path with no applicable detector is listed as `not_scanned` in the step facts and the landing facts, and a round over only `not_scanned` paths is `not_covered`. Per-file candidate counts distinguish `examined_zero` (an applicable detector ran on the file and found nothing) from `not_scanned`.
+* **Run-Emitted Diagnostics**: Diagnostics emitted by the plan's own run (build, validator, or gate output) whose subject overlaps the plan footprint are surfaced as candidates alongside the detector findings.
+* **Target-Class Seeding**: When the plan's approved outline names the defect class the plan exists to remove (its target defect class), the surfacer also seeds candidates of that class over the plan footprint in every round, because a fix for a class is the likeliest place to re-commit it; the seeded candidates are counted in the round's `cohort_size` like any other.
+* **Out-of-Surface Findings**: Findings identified outside the surface go into a non-blocking `observed_out_of_surface` list whose count reaches the step summary, so `clean`, `nothing_found`, and `suppressed` stay distinct outcomes.
+* **Round Accounting**: `cohort_size` is published per round and cumulatively. A finding at a file and line of a prior round's finding is marked `repeat_site` with its repeat count. A finding classified `self_seeded` (introduced by the previous round's fix) records that classification at WARNING level; its remedy is the deletion of the added clause, gated on that recorded classification. Each round records `findings_total` and `findings_self_seeded`; from round 2 the step's facts state the self-seeded share, the vocabulary skill prescribes deleting the added text or replacing it with a pointer as the default remediation, and the share of every round is rendered in `finalize.loop-limit-reached` (link:../workflow-dsl/07-loop-back-diagrams-verification.adoc#loop-back-bounds[Workflow DSL Specification]). The share is a signal only: `max_iterations` remains the loop's only automatic bound.
+* **Delta Round Narrowing Invariant**: On subsequent finalize iterations after a fix, delta self-review rounds narrow only the candidate file set to files modified since the previous reviewed `worktree_sha`, never narrowing the hunk basis against the plan's base commit. Every fix hunk is reviewed together with its full enclosing passage (the enclosing section, list, table, or code block), never as the bare hunk. The plan's base commit is the footprint `base_ref` defined in link:../store-schemas.adoc[Store Schemas Specification] (§ Three-Way File Footprint Reconciliation). Before computing candidates the step fetches `origin/<base_branch>` itself; the fail-closed refusal applies only when the base commit or the previous `worktree_sha` is still unresolvable after that fetch, and then the step fails with an explicit error rather than silently widening or skipping. The delta candidate set also includes the reference closure: every file of the plan footprint that references a path or a declared symbol changed since the previous reviewed `worktree_sha` (a document line made stale by an edit in another file is therefore a candidate in the next delta round, not only in the closing full round). When the previous round's `worktree_sha` is not an ancestor of `HEAD` (the branch was rebased), delta resolution is skipped, open findings stay pending, and a full round is required: an endpoint diff across an upstream advance never marks a finding fixed. A delta round can never close the step: a clean delta round is followed by exactly one full-surface round over the whole plan diff, and only a clean full-surface round records `done` (`may_close = true`). A delta round that surfaces findings loops back without a confirmation round.
+
+[[retrospective-aspects]]
+== Retrospective Aspect Extension Point (`provides_retrospective_aspects`)
+_See Requirement link:../../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+
+`plan-marshall`'s `provides_retrospective_aspects()` hook lets a domain bundle attach deterministic, script-backed analysis fragments to `plan-retrospective` for plans of its domain (`pm-plugin-development` is the only bundle declaring one). In `PM-MCP` it becomes an extension point of the post-run quality report (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-quality-report[Phase Workflows Specification § Post-Run Quality Report]):
+
+* *Registration*: A domain bundle registers each aspect as a compiled instrument keyed `(domain_id, aspect)`; the report engine runs it only when the plan's domains include that `domain_id`. There is no script path and no model dispatch: the aspect is part of the in-process report engine.
+* *Instrument Contract*: A domain aspect is an instrument like any built-in one and obeys the report's Instrument Contract (populations, declared `proves` / `falsifiable_preconditions` / `self_included`, `zero_reason`, clean rendered). An aspect that cannot read its inputs renders `unmeasured`, never `0`.
+* *Observability Only*: Every domain aspect declares `gates_merge: false`; its verdicts are INFO decisions in `quality-report.json` and never enter the pre-merge barrier.
+
+== Out-of-Process Project Script Jobs (`project_script`) & Domain Workers
+_See Requirement link:../../Requirements.adoc#PM-EXT-5[PM-EXT-5: Out-of-Process Project Script Jobs & Domain Workers]_
+
+To support repository-specific automation (`finalize-step-*` skills that ship executable checks, custom `recipe-*` target harvesters) and third-party/organization domain workers (custom build-log parsers, marker scanners, or module discovery for languages not compiled into `pm-mcp`) without compromising the GraalVM native-image closed world, `PM-MCP` provides a permanent **`project_script`** job type in the Job Runtime (see link:../job-runtime.adoc[Job Runtime Specification]).
+
+=== Division of Authority: Server vs. `project_script`
+
+[source,text]
+----
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PM-MCP Daemon (Authoritative State & Security Boundary)                 │
+│  • Owns workflow state machine, step ordering, gating, and locks        │
+│  • Verifies script path, interpreter hash, and SHA-256 against enrolment│
+│  • Serializes closed JSON input payload; spawns isolated process group  │
+│  • Validates stdout against strict output JSON Schema                   │
+│  • Persists findings/facts into the per-project machine store atomically│
+└───────────────────┬─────────────────────────────────▲───────────────────┘
+                    │ stdin: ProjectScriptInput JSON  │ stdout: ProjectScriptOutput JSON
+                    ▼                                 │
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Out-of-Process `project_script` Subprocess (Stateless Fact Producer)    │
+│  • Runs in sanitized environment (no provider credentials)              │
+│  • Reads worktree files read-only; NEVER writes to .marshall/ stores    │
+│  • Returns structured facts, candidate findings, or parsed log records  │
+└─────────────────────────────────────────────────────────────────────────┘
+----
+
+1. *No Direct Store Mutation*: A `project_script` subprocess is a stateless fact producer. It **must never** write directly to the per-project machine store (`<PM_MCP_BASE>/projects/<project_id>/`, outside its Landlock write set anyway), `.marshall/orchestrator/`, or `.marshall/config/`. All persistence is performed by the daemon after validating the script's JSON output.
+2. *Operator Enrolment Precondition*: Every `project_script` (and its runtime interpreter, such as a pinned `python3` binary) must be enrolled by the operator in the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (`project_scripts.<project_script_id>`, link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]) with its repository-relative script path, expected SHA-256 content hash, interpreter, maximum timeout (`max_timeout_seconds`, the budget of every run, link:../timeouts/01-job-budgets-and-waits.adoc#project-script-budget[Timeouts & Budgets Specification]), its binding (`worker_kind` ∈ `finalize_step`, `recipe_harvester`, `log_parser`, `module_discovery`, `edge_resolver`, and `target`, the step id, recipe key, or build system it serves), and its `argument_schema` (an inline JSON Schema, validated as a schema at enrolment, against which the runtime validates the arguments of every run, `PM-EXT-5`). A job that uses a script for another worker kind or target than its binding is refused. If a script file is modified in the working tree without re-enrolment, the verify-not-resolve digest check rejects execution with job outcome `refused`.
+
+=== Normative Input & Output JSON Schemas for `project_script`
+
+==== Standard Input Payload (`stdin`)
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/project-script-input-v1.json",
+  "title": "ProjectScriptInput",
+  "type": "object",
+  "required": [
+    "format_version",
+    "job_id",
+    "worker_kind",
+    "workspace_root",
+    "worktree_path",
+    "worktree_sha",
+    "parameters",
+    "changed_files"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "job_id": { "type": "string", "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
+    "plan_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
+    "worker_kind": {
+      "type": "string",
+      "enum": ["finalize_step", "recipe_harvester", "log_parser", "module_discovery", "edge_resolver"]
+    },
+    "workspace_root": { "type": "string" },
+    "worktree_path": { "type": "string" },
+    "worktree_sha": { "type": "string" },
+    "base_commit_sha": { "type": ["string", "null"] },
+    "parameters": {
+      "type": "object",
+      "description": "Validated step or recipe parameters declared in the descriptor's parameter schema."
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "log_file_path": {
+      "type": ["string", "null"],
+      "description": "Populated when worker_kind == 'log_parser'."
+    }
+  }
+}
+----
+
+==== Standard Output Payload (`stdout`)
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-1[PM-WATCH-JOB-1]_
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/project-script-output-v1.json",
+  "title": "ProjectScriptOutput",
+  "type": "object",
+  "required": ["format_version", "status", "summary", "facts", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "status": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "indeterminate"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "facts": {
+      "type": "object",
+      "description": "Worker-kind-specific structured facts (e.g. harvested targets, discovered modules, or edges)."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "severity", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"], "minimum": 1 },
+          "column": { "type": ["integer", "null"], "minimum": 1 },
+          "category": { "type": "string" },
+          "rule_id": { "type": ["string", "null"] },
+          "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
+          "message": { "type": "string", "minLength": 1, "maxLength": 1000 }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
+----

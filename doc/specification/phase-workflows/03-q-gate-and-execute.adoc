@@ -1,0 +1,236 @@
+= Phase Workflows & Finalize Specification: Q-Gate Contracts & Phase 5 Execute
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../phase-workflows.adoc[Phase Workflows & Finalize Specification] » Q-Gate Contracts & Phase 5 Execute
+
+== Q-Gate Validation, Change-Type & Scope-Deviation Contracts
+_See Requirement link:../../Requirements.adoc#PM-WF-11[PM-WF-11: Q-Gate Validation Loop, Change-Type & Scope-Deviation Contracts]_
+
+=== Q-Gate Validation Loop
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-52[PM-WATCH-GEN-52], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-6[PM-WATCH-PHASE-6], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-10[PM-WATCH-PHASE-10], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-12[PM-WATCH-PHASE-12]_
+
+Quality Gate (`Q-Gate`) validation runs at the tail of Phase 3 (deep lane only; the light lane never runs it), at the tail of Phase 4, and in Phase 2 only for lesson-derived plans on the deep lane (narrative-vs-code validation; a light lesson-derived plan never enters Phase 2, and its premise contradictions surface through the light envelope's premise check as a judgment escalation to `deep`), mirroring `plan-marshall` (verified at commit `1d4a1da37`; re-verify before implementing). It catches structural defects (narrative-vs-code drift, missing consumer sweeps, invalid CLI flags, tier deltas, architecture mismatches, and unresolved lesson citations) before advancing to the next phase.
+
+==== Modes, Iteration Ceiling & Content-Hash Rerun Gate
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-13[PM-WATCH-PHASE-13]_
+
+[cols="1,3"]
+|===
+|Parameter / Rule |Normative Specification
+
+|*Mode* (fixed `until_clean`)
+|The Q-Gate mode is not configurable in any phase: validation and remediation iterate until `pending_findings_blocking_count == 0` or the iteration ceiling is reached, bounded by the ceiling and the surgical bypass. *Deliberate change vs. `plan-marshall`*: its `q_gate_validation` knob (`off` skips validation, `once` leaves known findings open) does not exist, because both only weaken the gate; the presence of the Q-Gate states in the deep-lane `outline` and in the `plan` unit is a compiled invariant (link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification, Compiled Invariants]).
+
+|*Iteration Ceiling* (`max_qgate_iterations = 3`)
+|The Q-Gate auto-loop runs **at most 3 iterations** per phase (`qgate_iteration` persisted in `mcp/status.json`, range `0..3`).
+
+|*Content-Hash Rerun Gate*
+|Before running Q-Gate validators on iteration $k$, the engine computes `sha256(target_artifact)` (`request.md` in Phase 2, `outline.md` in Phase 3, `TASK-*.json` bundle in Phase 4) and compares it to `status.qgate_last_evaluated_hash`. If the hash is identical, the validators are not re-run: with `pending_findings_blocking_count == 0` the loop exits clean; with open blocking findings the plan transitions directly to `<phase>.qgate-exhausted` with `facts.reason: artifact_unchanged` (routine answers `edit` or the request `abort`, which raises `abort-plan`; closing the gate is only the operator-authorizing `force-gate`), since unchanged content cannot produce a different verdict.
+
+|*Surgical Bypass Predicate*
+|In Phase 3 (`outline`), Q-Gate validation is automatically bypassed (logging `(phase-3-outline:qgate-bypass)` to the audit log) if and only if all three conditions hold: `scope_estimate == "surgical"`, `change_type` $\in \{\text{"bug\_fix"}, \text{"tech\_debt"}, \text{"verification"}\}$, and `deliverable_count == 1`. *Deliberate change vs. `plan-marshall`*: `plan-marshall` applies the same surgical-scope bypass to its Phase 4 Q-Gate (its "B2"); in `PM-MCP` the bypass is limited to Phase 3 and `plan.qgate` runs on every path into Phase 5 (`INV-PLAN-1`, link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification, Compiled Invariants]).
+
+|*Exit & Exhaustion Semantics*
+|The loop exits to the next state (`refine.ready`, `outline.review`, or `execute.worktree-init`) as soon as `pending_findings_blocking_count == 0`. (In Phase 2 lesson-derived plans, `stale` narrative-vs-code findings are non-blocking signals preserved for Phase 3 confirmation, whereas `invalid` findings are blocking.) If `pending_findings_blocking_count > 0` after iteration 3, the plan transitions to `<phase>.qgate-exhausted` (kind `awaiting_user`), where the routine answers are `edit` and the request `abort` (the operator decision `abort-plan`, never ended by the model); closing the gate over open blocking findings is only the operator-authorizing `force-gate` (elicitation or operator CLI, recorded with its `exemption_class`), never a model-relayed answer. A Q-Gate pass over zero recorded component assessments is `not_evaluated` and never exits the loop as clean.
+
+|*Convergence Record*
+|Each iteration records `findings_raised`, `findings_self_seeded` (findings located in lines changed by the previous iteration's fix) and, on exhaustion, `findings_at_ceiling` (raised in the last iteration, whose fixes no round reviews). The exit renders `converged` vs `oscillating` from these figures, never from the last count alone.
+
+|*Deterministic Ordering Check*
+|Ordering phrases (`before`, `after`, `gate`, `first`, `then`, `depends on`) in a deliverable's narrative that name another deliverable without a corresponding `depends:` edge are filed as non-blocking Q-Gate findings; `depends:` edges between deliverables that name each other symmetrically are audited for cycles and omissions.
+|===
+
+=== Single-Writer `change_type` Contract
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-21[PM-WATCH-GEN-21]_
+
+`change_type` classifies the intent of a plan and its deliverables using a closed 6-value enumeration orthogonal to `domain` and `profile`:
+
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.classification;
+
+public enum ChangeType {
+    ANALYSIS("analysis", 1),
+    FEATURE("feature", 2),
+    ENHANCEMENT("enhancement", 3),
+    BUG_FIX("bug_fix", 4),
+    TECH_DEBT("tech_debt", 5),
+    VERIFICATION("verification", 6);
+
+    private final String wireName;
+    private final int priorityOrder;
+
+    ChangeType(String wireName, int priorityOrder) {
+        this.wireName = wireName;
+        this.priorityOrder = priorityOrder;
+    }
+
+    public String wireName() { return wireName; }
+    public int priorityOrder() { return priorityOrder; }
+}
+----
+
+The priority order is `plan-marshall`'s documented order (`ref-workflow-architecture/standards/change-types.md`, Priority Ordering Rationale). *Deliberate change vs. `plan-marshall`*: its planning-lane routing also knows the value `feature_breaking`, which does not exist here; whether a change breaks compatibility is the separate `compatibility` field (`breaking`, `deprecation`, `smart_and_ask`; Phase 2), never a change type.
+
+==== Single-Writer Heuristic vs Judgment Fallback
+
+To prevent conflicting writes between deterministic heuristics and model judgment, `status.metadata.change_type` enforces a strict *single-writer* protocol at the start of Phase 3 (`outline.detect-change-type`):
+
+1. *Deterministic Heuristic First (`ChangeTypeHeuristic`)*: Scores `clarified_request` (falling back to `original_input`) against fixed keyword tables, applying compound-intent guards and `bug_fix`-vs-`tech_debt` object disambiguation. If a single `ChangeType` wins with $\text{confidence} \ge 0.70$ and no top-two score tie, `ChangeTypeHeuristic` persists `status.metadata.change_type` and advances directly to the plan's lane state, `outline.deep` or `outline.light` (`ambiguous = false`). If no keyword fires, the top two scores tie, or $\text{confidence} < 0.70$, `ChangeTypeHeuristic` returns `ambiguous = true` and **writes nothing** to `status.json`.
+2. *Judgment Fallback (`submit`)*: Only when `ambiguous == true` does the engine enter `outline.classify-change-type`, offering a `submit` link (`change_type:enum[feature|bug_fix|tech_debt|enhancement|verification|analysis],rationale:text[1..500]`) guided by `skill://pm/outline/detect-change-type/SKILL.md`. The submitted value becomes the single authoritative write to `status.metadata.change_type`.
+
+==== Plan-vs-Deliverable Scope Reconciliation & Classification Validation
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-9[PM-WATCH-PHASE-9]_
+
+* *Scope Disagreement Refusal*: Every deliverable in `outline.md` declares its own deliverable-scoped `change_type`, while `status.metadata.change_type` holds the plan-scoped classification. `OutlineValidator` and `ExecutionManifestResolver` reconcile the two scopes and **refuse** incompatible combinations: a deliverable with `change_type: verification` or `analysis` is read-only by definition; if any of its `Affected files` carries a mutating intent (`write-new`, `write-replace`, `delete`), or if a plan classified as `verification`/`analysis` contains mutating deliverables, validation fails closed with `change_type_scope_disagreement`.
+* *Flag-Not-Block Classification Validation*: When `scope_estimate` is updated in Phase 2 or Phase 3, `classification-validate` checks for narrow-over-large mismatches (for example, `change_type == bug_fix` paired with `scope_estimate == broad`). Mismatches emit an advisory warning fact in `facts.classification_warning` but never block a transition.
+
+=== Scope-Deviation Contract
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-14[PM-WATCH-PHASE-14]_
+
+When an executing leaf sub-agent in Phase 5 (`execute`) discovers that completing a task requires modifying files outside the deliverable's declared `Affected files` or violating a declared architectural constraint, it must never silently widen its footprint or soften the deliverable requirements.
+
+==== Deviation Submission & Batching Mechanics
+
+* *Decide Before Logging or Mutating*: The sub-agent invokes the entity-scoped `deviate:TASK-NNN` (`submit`) link with a structured `ScopeDeviationRequest`:
++
+[source,java]
+----
+package de.cuioss.pm.mcp.core.workflow.deviation;
+
+import java.util.List;
+
+public record ScopeDeviationRequest(
+    String taskId,
+    String deliverableId,
+    List<String> unplannedFiles,
+    String deviationSummary,
+    String impactAssessment,
+    DeviationDisposition recommendedDisposition
+) {}
+
+public enum DeviationDisposition {
+    HOLD("hold"),
+    ACCEPT("accept"),
+    SPLIT("split");
+
+    private final String wireName;
+    DeviationDisposition(String wireName) { this.wireName = wireName; }
+    public String wireName() { return wireName; }
+}
+----
+
+* *Loop-Back Footprint Review*: At every `loop_back`, before remediation tasks are allocated, the server re-captures `realized_files` and presents `realized − (declared ∪ approved_widening)` as one batched item of `execute.deviation-review` (link:../workflow-dsl/07-loop-back-diagrams-verification.adoc#loop-back-bounds[Workflow DSL Specification, Loop-Back Bounds]). `accept` absorbs the paths into `approved_widening[]` with provenance `observed`, never into `declared_files`; `hold` keeps them outside the declaration, so they stay reported as drift. Drift the operator already reviewed is not presented again in later rounds.
+* *Task Blocking & Envelope Batching*: Submitting a deviation marks `TASK-NNN` as `blocked` before any out-of-scope file write or decision-log entry occurs. If an envelope encounters multiple deviations across independent tasks in its pass, all pending `ScopeDeviationRequest` records are batched into a single operator escalation state (`execute.deviation-review`).
+* *Three Closed Operator Dispositions*: The operator resolves each deviation through MCP elicitation or `pm-mcp operator decide` on the pending deviation decision using one of three deterministic branches:
+
+[cols="1,2,4"]
+|===
+|Disposition |Required Operator Input |Deterministic Server Side Effects
+
+|`hold`
+|Optional guidance note (`text[0..1000]`)
+|Refuses the scope expansion. The declared footprint in `references.json` remains unchanged; `TASK-NNN` is returned to `pending` (with the hold constraint attached) so the sub-agent either implements strictly within the declared files or reports `infeasible`.
+
+|`accept`
+|**Mandatory** `rationale: text[1..2000]`
+|Persists the operator's `rationale` in `mcp/status.json` (`accepted_deviations[]`), records `unplannedFiles` in `references.json -> approved_widening[]` with their provenance (`deviation_task_id`, `approved_via: elicitation \| operator_cli`, `phase`, `approved_at`) and never in the declared files, which stay immutable after `outline.review` approval (the effective declaration is `declared ∪ approved_widening[].path`, and every reconciliation result names which of the two admitted a path), writes a `[DEVIATION:ACCEPT]` audit entry, for a plan of an epic appends a non-blocking `surface_overlap_detected` event to the epic inbox when the widened surface now overlaps another unordered non-terminal plan of that epic (link:../dispatch-and-effort/04-epic-coordination.adoc#epic-surface-disjointness[Dispatch & Effort Specification, Staging-Time Surface Disjointness]), unblocks `TASK-NNN`, and deterministically renders the deviation description and operator `rationale` into the Pull Request body's `## Scope Deviations` section during `create-pr` (order `20`).
+
+|`split`
+|Lesson title/summary (`text[1..1000]`)
+|Keeps the current deliverable's footprint unchanged, creates a new tracked lesson in the main-anchored lesson store (`manage-lessons`) capturing the deferred work, records the new `lesson_id` in `references.json`, unblocks `TASK-NNN` with the out-of-scope portion excised (a task whose whole content is excised becomes `removed`, `disposition.by: split`), and sets `status.metadata.pr_title_stale` (the shipped scope shrank). A task that ends `infeasible` and a deliverable removed by a gate set the same flag.
+|===
+
+---
+
+== Phase 5 Execute & Verification Sweep
+_See Requirement link:../../Requirements.adoc#PM-WF-7[PM-WF-7: Worktree-Constrained Loop-Back & Iteration Bounds]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+Every Phase 5 state is catalogued in the link:../state-catalogue/03-plan-phases-4-5-land.adoc#state-catalogue-execute[State Catalogue, Phase 5: `execute`].
+
+=== Worktree Materialization & Envelope Execution Loop
+
+At Phase 5 entry (`execute.worktree-init`), the daemon creates the plan's feature branch and isolated git worktree at `.marshall/local/worktrees/<plan_id>/` and records its canonical path as `worktree_path` in `mcp/status.json` in the same transaction; the plan directory stays in the machine store and is never moved (link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]).
+
+[source,text]
+----
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ Phase 5: execute                                                                 │
+│                                                                                  │
+│  execute.worktree-init                                                           │
+│    │ (branch + worktree created; worktree_path recorded in status.json)          │
+│    ▼                                                                             │
+│  execute.dispatch-ready ──(dispatch:envelope-M)──► Leaf Sub-Agent (entity scope) │
+│    ▲                                                 │                           │
+│    │ (next task in envelope)                         ▼                           │
+│    │                                          submit:TASK-NNN                    │
+│    │                                          (server verifies diff, obfuscation,│
+│    │                                           footprint, task verify commands)  │
+│    │                                                 │                           │
+│    │                          ┌──────────────────────┴────────────────────┐      │
+│    │                          │ Last task of deliverable (Chain Tail)?    │      │
+│    │                          └──────────┬─────────────────────┬──────────┘      │
+│    │                                 No  │                     │ Yes             │
+│    └─────────────────────────────────────┘                     ▼                 │
+│                                                   execute.chain-tail-commit      │
+│                                                   (call git.commit_and_push +    │
+│                                                    module-scoped build job)      │
+│                                                                │                 │
+│    ┌───────────────────────────────────────────────────────────┘                 │
+│    │ (all envelopes completed; or file relocation forces whole-tree sweep)       │
+│    ▼                                                                             │
+│  execute.verify-sweep (manifest.phase_5.verification_steps)                      │
+│    ├──► [triage_required] ──► execute.verification-feedback (remediate & re-run) │
+│    └──► [all green] ──► execute.exit-barrier (Pending-Tasks + Freshness Gates)   │
+│                           │                                                      │
+│                           ▼                                                      │
+│                     Phase 6: finalize                                            │
+└──────────────────────────────────────────────────────────────────────────────────┘
+----
+
+==== Task Envelope Execution & Independent Server Verification
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-47[PM-WATCH-GEN-47], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-1[PM-WATCH-DISP-1], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-6[PM-WATCH-PHASE-6], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-11[PM-WATCH-STORE-11]_
+
+1. *Envelope Dispatch*: `execute.dispatch-ready` offers `dispatch:envelope-M` (`form: dispatch`) paired with `returned:<dispatch_id>` (`form: submit`). The dispatched sub-agent calls `pm_state(plan_id, entity="envelope-M", dispatch_id)` and receives only the current active task (`TASK-NNN`) and its resolved `skill://pm/...` URIs.
+2. *Independent Verification on `submit:TASK-NNN`*: The server never trusts a sub-agent's self-reported completion. When `submit:TASK-NNN` is invoked, the daemon independently verifies: (a) *Non-Empty Diff & Footprint Check* — for write-intent tasks, verifies that `git status --porcelain` in the worktree contains changes, that no files outside the worktree were touched, and that every modified path is a write-intent entry (`write-new`, `write-replace`, `write-conditional`, `delete`) of the deliverable's `Affected files` or of `approved_widening[]` (`verify_failure_scope` / scope-creep check) — a modified `(read)` entry is its own outcome `read_only_modified` (blocking finding), never absorbed as in scope — forbidding batched destructive `git checkout` commands; (b) *Obfuscation & Marker Check* — scans modified lines for prohibited suppression comments, `TODO`/`FIXME` markers, or rewrite markers; and (c) *Independent Command Re-Run* — executes the task's declared verification command via the daemon's build runner and verifies a passing verdict artifact. When the verification passes, the server appends (d) a *Task Diff Record* to `change-ledger.jsonl`: `kind: "task_diff"` with `task_id`, `deliverable_id`, the `worktree_sha` of the worktree at submit, `changed_paths` (the paths changed since the previous task's recorded snapshot, present and possibly empty), and `commit_sha: null`, because tasks never commit. This is the only producer of per-task change attribution.
+3. *Context Budget Yield & Infeasibility*: If a sub-agent approaches its context window limit before finishing all tasks in `envelope-M`, it invokes `yield:envelope-M` (`budget_yield`, free parameter `yield_reason:enum[budget|blocked_dependency]`, persisted as data beside the dispatch classification in the metrics store) and the server splits the remaining unstarted tasks of `envelope-M` into a new envelope `envelope-(M+1)` with a fresh `dispatch_id`. If a task is genuinely impossible as specified, the sub-agent submits `infeasible:TASK-NNN` with evidence; the server sets the task to `infeasible` with the evidence as its disposition, `infeasible` is terminal for that task, and substituting a weaker deliverable under the same name is strictly prohibited. The server opens the operator decision for the affected deliverable at once (elicitation, or a pending decision record reachable through `wait:decision:<decision_id>`) without halting the plan: dispatch continues for every task that does not depend, transitively through `depends_on`, on the infeasible deliverable, and running tasks are never cancelled. The plan enters `execute.awaiting-infeasible-decision` only when no runnable task remains and the decision is still open (`PM-WATCH-GEN-47`); this is a real state entered by its own condition, not the `blocked` condition overlay.
+4. *Dependency-Ordered Dispatch*: A task is yielded to its envelope's sub-agent only when every task in its `depends_on` is `completed` or `skipped`; an envelope is offered for dispatch only when its first task is yieldable. A task whose dependency is `infeasible` or `removed` is never yielded.
+5. *Deciding an `infeasible` deliverable*: The decision may arrive while independent tasks still run or after the plan entered `execute.awaiting-infeasible-decision`. Neither the running plan nor `execute.awaiting-infeasible-decision` offers the model a link that changes a task or a deliverable; the deliverable is settled, and `execute.awaiting-infeasible-decision` left, only through one of two operator-authorizing decisions (xref:01-planning-phases-1-2.adoc#_routine_user_interaction_vs_operator_authorizing_decisions[Routine User Interaction vs Operator-Authorizing Decisions]), and the model never chooses removal:
+** `remove-deliverable`: the `infeasible` task keeps its status and evidence, and every other task of the deliverable becomes `removed` (`disposition.by: operator`, with the decision id); the operator's decision also names every deliverable that depends on it, whose tasks are removed with it, since a removal that would leave a remaining task depending on a `removed` task is refused. The server sets `status.metadata.pr_title_stale` and records a scope amendment in `mcp/status.json -> amendments[]` (`source: operator`) naming the removed deliverables and the infeasibility evidence.
+** `loop-back-outline`: the plan loops back to `phase-3-outline` with the evidence as an amendment; a deliverable the revised outline drops has its tasks set `removed` by the outline gate (`disposition.by: outline_gate`), and Phase 4 derives the tasks of the revised deliverables additively; `completed` tasks are never reopened (`PM-WF-7`).
+
+=== Per-Deliverable Chain-Tail Commit & Module Build (`git.commit_and_push`)
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-17[PM-WATCH-PHASE-17]_
+
+Individual tasks never run `git commit`. When the last task belonging to deliverable $D_i$ (the *chain tail*) passes independent verification:
+
+1. *Chain-Tail Commit via `call git.commit_and_push`*: The server transitions to `execute.chain-tail-commit`, which invokes the reusable compound sub-workflow `call git.commit_and_push (message_mode=auto_deliverable, push_mode=never)` (`PM-WF-16`, see link:../workflow-dsl.adoc[Workflow DSL Specification]). The sub-workflow cleans untracked build/temp artifacts against `artifact-patterns.json` (respecting `.gitignore` and excluding `.marshall/**`), formats the conventional commit message (`feat(<module>): complete deliverable <N> - <title>`) with the configured `Co-Authored-By` trailer, streams the message over `stdin` to `git -C <worktree> commit -F -`, and appends a `kind = "change"` entry to `change-ledger.jsonl` stamped with the new `commit_sha` and git-sourced `changed_paths`.
+2. *Per-Deliverable Module Build*: Immediately after `git.commit_and_push` returns `committed_local` (or `clean` for read-only deliverables), the server spawns a module-scoped build job running the per-deliverable verification verbs of the effective configuration (`workflow.json` `plan.phase-5-execute.per_deliverable_verbs`, default `compile` and `module-tests`, as `plan-marshall`'s `per_deliverable_build`; link:../store-schemas/07-project-configuration.adoc#config-workflow-json[Store Schemas Specification, `workflow.json`]), scoped to $D_i$'s module, and records a `kind = "build"` entry in `change-ledger.jsonl`. If the module build passes, the envelope advances to the next deliverable's tasks (or completes the envelope); if the module build fails, the envelope transitions immediately to `execute.verification-feedback` (`triage_required`). A module build ending `timed_out`, `killed`, `indeterminate`, `refused`, or `failed_unparsed` never advances the envelope either: it transitions to `execute.verification-feedback` with a no-verdict reason and offers `retry`, because an absent verdict is never admitted as a pass.
+
+=== Whole-Tree Verification Gates & `triage_required` Routing
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-15[PM-WATCH-PHASE-15], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-66[PM-WATCH-PHASE-66]_
+
+Once all task envelopes reach completion, `execute.verify-sweep` runs the end-of-phase verification pipeline declared in `manifest.phase_5.verification_steps` (ordered by the `ext-point-build-verify-step` descriptors: `module-tests`, `quality-gate`, `coverage`, and domain `arch-gate`):
+
+* *Footprint-Driven Scope & Relocation Override*: The server compares the realized git footprint (`references.json:realized_footprint`) against project modules to scope build executions. However, if any deliverable in the plan performed a **file relocation or deletion** (any `Affected files` entry with `delete` intent or a git rename `R`), the server unconditionally forces a **whole-tree build and verification sweep** across all modules to catch broken cross-module imports or references. A realized path claimed by no module but routed by the build map as build-neutral (for example `.github/**`) is classified `no_module`: it neither blocks nor widens a module-scoped gate to whole-tree, and the scope decision lists it.
+* *`triage_required` -> Verification-Feedback Transition*: Whenever any per-deliverable module build or end-of-phase verification step fails, the engine ingests the parsed build/test/arch-gate failures into `findings.jsonl`, sets the phase sub-state to `execute.verification-feedback` (`triage_required`), and offers a `dispatch:verify-feedback` link (or inline `fix` links) that diagnoses the root cause against `verify_failure_scope`, applies the fix, commits via `call git.commit_and_push (message_mode=interactive, push_mode=never)`, and re-enters `execute.verify-sweep`.
+* *Baseline-Red Gates*: Before a failing whole-tree gate routes to `triage_required`, the server re-runs it on the plan's merge base (link:../job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime Specification, Gate Honesty Verification], Baseline Separation). Diagnostics present on the base are never plan findings (coverage debt in untouched modules is a non-blocking `baseline_debt` finding); a gate red only through baseline diagnostics enters `execute.baseline-red` (in Phase 6 `finalize.baseline-red`), which offers only `escalate`: the operator may accept the known-red base for the current `HEAD` and merge base, which the step records as `done` with `assurance_verdict: degraded` and the baseline diagnostics named, or stop the plan. The plan is never looped back to remediate a baseline failure.
+
+=== Phase 5 Exit Barrier: Dual Freshness & Pending-Tasks Gates
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-25[PM-WATCH-GEN-25], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-17[PM-WATCH-PHASE-17]_
+
+Transitioning from `phase-5-execute` to `phase-6-finalize` is governed by an atomic dual-gate barrier in `execute.exit-barrier`. **Both gates are always evaluated together before acting on either** so a single diagnostics payload surfaces all reasons if both fail:
+
+1. *Pending-Tasks & Clean-Tree Gate*: Every `tasks/TASK-*.json` record in the plan must be in a terminal status (`completed`, `skipped`, `infeasible`, or `removed`), every `skipped`, `infeasible`, or `removed` task must carry its recorded `disposition` (link:../store-schemas/06-task-references-manifest.adoc#_task_record_schema_taskstask_nnn_json[Store Schemas Specification, Task Record]), and no task may be open (`pending_count == 0`, `in_progress_count == 0`, `blocked_count == 0`); the gate reports the counts of every status and lists each non-`completed` task with its disposition. The worktree must have zero uncommitted modifications (`git status --porcelain` is empty). A barrier failing on open tasks routes to `execute.dispatch-ready` while runnable tasks remain, and otherwise to `execute.awaiting-infeasible-decision` (link:../state-catalogue/03-plan-phases-4-5-land.adoc#state-execute.exit-barrier[State Catalogue]).
+2. *Worktree Freshness Gate (`worktree_sha`)*: Freshness is keyed strictly on `worktree_sha` — the SHA-256 digest over the `HEAD` commit id plus, for every path the status reports as changed, deleted, or untracked (sorted by path), the path and either the file's bytes read from disk or a deletion marker, computed by the single git contract operation `git.worktree-sha` for both variants (link:../job-runtime/03-parsers-and-gates.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash]) — never on `HEAD` commit SHA alone (which would misclassify an unbuilt dirty tree as fresh). The gate queries the change ledger (`change-ledger.jsonl`) and reads the explicit closed-enum `status` member (`fresh`, `exempt`, `stale`, `undecidable`), never inferring freshness from a process exit code or from `"not stale"`: `fresh` requires that every required build notation for the realized footprint has a passing `kind = "build"` ledger entry whose recorded `worktree_sha` equals the current live `worktree_sha` and every ledger row matches a registered build notation of the project; `exempt` applies when the `build-decision` verdict over the build map and the realized footprint is `not_necessary` (every realized path is build-neutral); the `documentation_only` file-type bucket is a file role for `profiles[]` assignment and is never read as a build verdict (as in `plan-marshall` ADR-004); `stale` / `undecidable` fails the barrier with an explicit `stale_reason` (`tree_modified_since_build`, `last_build_failed`, `no_successful_build`, `missing_module_build`, `unrecognized_build_notation`, `reconciliation_record_absent`, `ledger_unreadable`, or `worktree_sha_unavailable`), routing back to `execute.verify-sweep`. A live or recorded `worktree_sha` that is `unavailable` (a failed git invocation) makes the gate `undecidable` with `worktree_sha_unavailable`, never `fresh`, and ledger rows of another `worktree_sha_version` never match the live digest (link:../job-runtime/03-parsers-and-gates.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash], rules 4 and 5).
++
+`last_build_failed` (the latest build row for a required notation is not `succeeded`) is a different operator action than `tree_modified_since_build` (source edited after a passing build) and is never reported as it; when no successful build exists at all the reason is `no_successful_build` and no `freshness_reconcile` is recorded (it requires a `prior_build_worktree_sha`). `reconciliation_record_absent` lists in `facts.admitted_causes` the causes that absence admits (`source_drift_unbuilt`, `no_successful_build`, `record_owed_not_emitted`, `commit_outside_reconcile_membership`), so the refusal reports what it observed rather than guessing one cause. Where the step records show that `HEAD` is a finalize-internal commit, the refusal names the committing step.
+
+---
