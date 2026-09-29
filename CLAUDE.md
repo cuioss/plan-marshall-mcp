@@ -101,13 +101,21 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 AsciiDoc (`.adoc`) for all project documentation. Requirements go into `doc/requirements/`,
 technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`),
-analyses and variants into `doc/discussions/`. Don't create new documents without asking.
+analyses and variants into `doc/discussions/`. Documentation of the implemented system goes into three
+trees: concepts (`doc/Concepts.adoc`, `doc/concepts/`), developer (`doc/DeveloperGuide.adoc`,
+`doc/developer/`) and user (`doc/UserGuide.adoc`, `doc/user/`). Don't create new documents without asking,
+except topic documents inside those three trees written by `traced-implementation`.
+
 Every concrete implementation follows the project skill `traced-implementation`: each planned task traces
 to its requirements, specification sections and watch items (the _Implementation watch_ line below a
-heading, plus `doc/implementation-watch/cross-cutting.adoc`); after implementation, coverage is verified
-against all three; a requirement the implementation proves wrong is corrected (with evidence) in the same
-plan, never worked around in code; the same PR then deletes the implemented specification sections and watch items and
-links each requirement to its implementing classes and tests (`Implementation:` / `Verified by:` lines).
+heading, plus `doc/implementation-watch/cross-cutting.adoc`) and assigns each specified statement its
+destination (code, test, concept, developer or user documentation); after implementation, coverage is
+verified against all three; a requirement the implementation proves wrong is corrected (with evidence) in
+the same plan, never worked around in code; the same PR writes the concept, developer and user
+documentation for the slice from the specification and watch corpus (describing the implemented system,
+verified against the code), deletes the implemented specification sections and watch items, and links each
+requirement to its classes, tests and documentation (`Implementation:` / `Verified by:` / `Documentation:`
+lines).
 
 ## Git Workflow
 
