@@ -54,7 +54,9 @@ _Implementation watch: link:../implementation-watch/cross-cutting.adoc#PM-WATCH-
 3. *Single Writer Set*: Every writer of a `PM-MCP` store runs inside the one `PM-MCP` runtime and serializes through its own locks. Legacy `plan-marshall` never touches `.marshall/` or `<PM_MCP_BASE>`, and `PM-MCP` never writes `.plan/` or `~/.plan-marshall/` (`PM-MIG-2`), so no store is shared and no cross-runtime lock protocol exists.
 4. *Absent vs Unparseable*: Every store and document reader returns one of `absent`, `empty`, `parsed`, or `unreadable` (with the failing line or offset). An input that yields no parsable content is `unreadable`, never an empty record and never `absent`. Consumers handle `unreadable` explicitly: they fail closed or report `indeterminate`.
 5. *One Wire Shape per Instant*: Every persisted or exchanged instant is an RFC 3339 UTC string (`"format": "date-time"`, `Z` suffix); epoch numbers are never persisted. A process start instant is taken from the OS (`ProcessHandle.Info.startInstant()`) and stored in the same shape. Durations are integers whose field name carries the unit (`duration_ms`, `*_seconds`).
-6. *JSONL Append Discipline*: A JSONL store is appended to only under the lock of its store (the scope lock for plan, epic, and workspace stores; the audit lock for `audit.jsonl`), by one `write` on a descriptor opened with `O_APPEND` (`StandardOpenOption.APPEND`), followed by `fsync` (`FileChannel.force(true)`); every appended record ends with a newline. A last line without a trailing newline is a torn tail left by an interrupted append: the next writer, still under the store's lock and before appending, truncates the file to the end of the last complete line and appends an audit record `jsonl_tail_repaired` (`category: store`, `details{store, truncated_bytes, truncated_sha256}`). Lines before the last complete newline are never touched; a malformed complete line stays in place and is reported `unreadable` with its line number (item 4). In `audit.jsonl` a torn tail lies after the anchored head (`audit.head` is updated only after a complete append), so the repair never touches a chained record.
+6. *JSONL Append Discipline*: A JSONL store is appended to only under the lock of its store (the scope lock for plan, epic, and workspace stores; the audit lock for `audit.jsonl`; the mailbox leaf lock for a plan's `mcp/mailbox.jsonl`, <<epic-inbox-record>>), by one `write` on a descriptor opened with `O_APPEND` (`StandardOpenOption.APPEND`), followed by `fsync` (`FileChannel.force(true)`); every appended record ends with a newline. A last line without a trailing newline is a torn tail left by an interrupted append: the next writer, still under the store's lock and before appending, truncates the file to the end of the last complete line and appends an audit record `jsonl_tail_repaired` (`category: store`, `details{store, truncated_bytes, truncated_sha256}`). Lines before the last complete newline are never touched; a malformed complete line stays in place and is reported `unreadable` with its line number (item 4). In `audit.jsonl` a torn tail lies after the anchored head (`audit.head` is updated only after a complete append), so the repair never touches a chained record.
++
+*Single exception*: The refresh of `last_seen_at` in the last row of a scope's `sessions.jsonl` (<<_scope_session_log_sessions_jsonl>>) is not an append: it replaces the file by a journaled replace (<<transaction-journal>>) under the scope lock, in which every earlier row stays byte-identical and only that one field of the last row changes. No other JSONL store is ever rewritten.
 
 [#transaction-journal]
 === Transaction Journal (`mcp/transaction-journal.json`)
@@ -110,14 +112,14 @@ Every write to the server-owned stores of a plan, epic, or workspace scope runs 
 _Implementation watch: link:../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-1[PM-WATCH-STORE-1]_
 
 [[_scope_session_log_sessions_jsonl]]
-Every scope keeps an append-only session log in the per-project machine store (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]): `plans/<plan_id>/sessions.jsonl`, `epics/<epic_id>/sessions.jsonl`, or `workspace/sessions.jsonl` (the project's workspace scope, link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]). Each row records one host session that entered or addressed the scope. The *current identity* of the scope is its last row: every scope-addressed MCP call resolves the client profile from it (`PM-ARCH-4`); the project is the store the log lives in, never a path recorded in a row.
+Every scope keeps a session log in the per-project machine store (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), append-only apart from the `last_seen_at` refresh of its last row (the single exception to the JSONL append discipline, <<format-versioning>> item 6): `plans/<plan_id>/sessions.jsonl`, `epics/<epic_id>/sessions.jsonl`, or `workspace/sessions.jsonl` (the project's workspace scope, link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]). Each row records one host session that entered or addressed the scope. The *current identity* of the scope is its last row: every scope-addressed MCP call resolves the client profile from it (`PM-ARCH-4`); the project is the store the log lives in, never a path recorded in a row.
 
 * *Appended by `pm-mcp enter`*: Every `pm-mcp enter` on an existing scope appends one row (link:cli-and-security.adoc#_entry_identity_recording_pm_mcp_enter[CLI, Coordination & Security Specification, Entry Identity Recording]).
 * *Appended by the server*: When a scope-addressed call carries a `PM-MCP-Client-Session` header (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]) whose value differs from the `client_session_id` of the scope's last row, the server appends a row for that session in a short transaction under the scope lock, outside any snapshot read. Such a row keeps the declared `client` of the previous row (a declaration is only ever made by `pm-mcp enter`), takes `client_detected` from the connection's MCP `clientInfo.name`, and records `client_build: null` (the version probe runs only in `pm-mcp enter`).
-* *`last_seen_at`*: The server refreshes `last_seen_at` of the last row at most once per minute per scope, by a journaled replace of the file in which every earlier row stays byte-identical; no other field of any row is ever changed, and no earlier row is ever touched.
+* *`last_seen_at`*: The server refreshes `last_seen_at` of the last row at most once per refresh interval per scope (link:timeouts.adoc#session-last-seen-refresh[Timeouts & Budgets Specification, Session Row `last_seen_at` Refresh Interval]), by a journaled replace of the file in which every earlier row stays byte-identical; no other field of any row is ever changed, and no earlier row is ever touched.
 * *Pending Entry Record*: When the entered plan does not exist yet, `pm-mcp enter` writes a pending entry record `pending/<entry_id>.json` of the per-project machine store and prints the `entry_id`. `pm_start(entry_id, ...)` consumes it inside the plan initialization transaction: its `session` becomes the first row of the new plan's `sessions.jsonl`, its `from_epic` is copied into the plan's `mcp/status.json` `origin.epic_id` (the single carrier of epic membership, <<_workflow_state_store_mcpstatus_json>>), and the pending file is deleted. A consumed `entry_id` no longer exists, so each pending record starts at most one plan.
 * *History in the Log*: The session history of a scope is the log itself. A row whose declared `client` differs from the previous row's additionally appends an `identity` audit record (`event: entry_handover`, `details` with the previous and the new `client` and `client_session_id`, <<audit-log>>).
-* *Integrity*: `sessions.jsonl` follows the JSONL append discipline (<<format-versioning>> item 6) and is covered by the scope's digest sidecar (<<store-digest-verification>>).
+* *Integrity*: `sessions.jsonl` follows the JSONL append discipline (<<format-versioning>> item 6, including its single stated exception for the `last_seen_at` refresh) and is covered by the scope's digest sidecar (<<store-digest-verification>>).
 
 [source,json]
 ----
@@ -179,7 +181,7 @@ Every scope keeps an append-only session log in the per-project machine store (l
       "enum": ["host", "declared", null],
       "description": "host: exposed by the host (Identity Probes); declared: pm-mcp enter --model; null: unknown."
     },
-    "pm_mcp_version": { "type": "string", "minLength": 1, "description": "Release version of the pm-mcp binary that wrote the row (PM-DIST-1)." },
+    "pm_mcp_version": { "type": "string", "minLength": 1, "description": "Release version of the runtime binary (pm-mcpd) that wrote the row (PM-DIST-1)." },
     "bundle_version": { "type": ["string", "null"], "minLength": 1, "description": "Installed client bundle version (state/install-records.json); null when no bundle is installed for the client." },
     "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Enrolment identifier resolved by the rule of filesystem-layout.adoc, Plan & Worktree Resolution." },
     "entered_from": { "type": "string", "enum": ["main_checkout", "worktree"] },
@@ -189,7 +191,7 @@ Every scope keeps an append-only session log in the per-project machine store (l
       "description": "Required iff entered_from == worktree: the name <x> of the worktree .marshall/local/worktrees/<x> (a plan_id, or _epics for the shared epic worktree; filesystem-layout.adoc, Project Resolution Rule)."
     },
     "first_seen_at": { "type": "string", "format": "date-time" },
-    "last_seen_at": { "type": "string", "format": "date-time", "description": "Refreshed at most once per minute, last row only." },
+    "last_seen_at": { "type": "string", "format": "date-time", "description": "Refreshed at most once per refresh interval (timeouts.adoc#session-last-seen-refresh), last row only." },
     "transcript_locator": {
       "type": ["string", "null"],
       "minLength": 1,
@@ -556,8 +558,8 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
         "type": "object",
         "required": ["job_id", "kind", "status", "started_at"],
         "properties": {
-          "job_id": { "type": "string", "pattern": "^[bcgrpl]-[0-9a-f]{4,16}$" },
-          "kind": { "type": "string", "enum": ["build", "git", "ci", "project_script", "bot_poll", "lsp"] },
+          "job_id": { "type": "string", "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
+          "kind": { "type": "string", "enum": ["build", "git", "ci", "project_script", "bot_poll"] },
           "status": {
             "type": "string",
             "enum": ["queued", "running", "succeeded", "failed", "failed_unparsed", "refused", "cancelled", "timed_out", "killed", "indeterminate"]
@@ -573,7 +575,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
       "additionalProperties": false,
       "properties": {
         "state_id": { "type": "string", "description": "The job or composite_job state the job is bound to; equals state while set." },
-        "job_id": { "type": "string", "pattern": "^([bcgrpl]-[0-9a-f]{4,16}|[a-z][a-z0-9_-]{0,31}(\\.[a-z][a-z0-9_-]{0,31})*)$", "description": "The bound job_id (identifiers.adoc, job_id), or the composite identifier (the state_id) of a composite_job state." }
+        "job_id": { "type": "string", "pattern": "^([bcgrp]-[0-9a-f]{16}|[a-z][a-z0-9_-]{0,31}(\\.[a-z][a-z0-9_-]{0,31})*)$", "description": "The bound job_id (identifiers.adoc, job_id), or the composite identifier (the state_id) of a composite_job state." }
       }
     },
     "pending_condition": {
@@ -1079,8 +1081,8 @@ The epic inbox (`.marshall/orchestrator/<epic_id>/inbox.jsonl`, plan → epic an
 
 * *Store-Assigned Identity*: The store allocates `message_id` as the next number above the highest ever written in that file, including ids of lines it cannot parse; an id is never reused, and a caller never supplies one. A `claimed`, `processed`, `consumed`, or `annotation` event for an unknown or already-folded-terminal message is refused.
 * *Fold*: Inbox messages fold to `pending` (only `message`), `claimed`, or `processed`; mailbox messages fold to `unconsumed` or `consumed`, or `unknown` when a referencing line is unreadable. The empty states (`no_file`, `empty_file`, `all_processed`) and `unreadable` (with the failing line) are distinct and never read as each other.
-* *Writers*: Inbox events are appended under the epic lock in the shared epic worktree copy (link:filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification]); mailbox events under the plan lock in the plan directory, which never moves except on archival, when it carries the mailbox with it. The mailbox is covered by the plan's store digests (`mcp/digests.json`, <<store-digest-verification>>), so an out-of-band edit is detected; the git-tracked inbox is protected by its git history.
-* *Read Scope*: The epic scope reads all inbox messages; a plan scope reads only the inbox messages whose `sender` is itself, and only its own mailbox.
+* *Writers*: Inbox events are appended under the epic lock in the shared epic worktree copy (link:filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification]). The plan mailbox has its own leaf lock, taken on `mcp/mailbox.jsonl` itself like the audit log (<<lock-free-snapshot-reads>>): the epic's transaction holds the epic lock, then takes the mailbox leaf lock, reads the last `message_id`, and appends one line; the plan's `consumed` events are appended under the same leaf lock. The plan directory never moves except on archival, when it carries the mailbox with it. The mailbox is advisory content and is not covered by the plan's store digests; a reader ignores a torn last line (the next writer repairs it, <<format-versioning>>, item 6). The git-tracked inbox is protected by its git history.
+* *Read Scope*: Inbox and mailbox resources are readable by every scope of their project (`PM-SEC-2` is the boundary); a representation points each scope at its own messages (the epic at its inbox, a plan at its own inbox messages and its mailbox).
 
 [#epic-ledger-records]
 == Epic Ledger Records (`epic.json`, `queue/<plan_id>.json`, `landings.jsonl`)
@@ -1160,7 +1162,7 @@ One file per staged plan, created with `CREATE_NEW` and updated row-locally; the
         "modules": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
     },
-    "spec_section": { "type": "string", "minLength": 1, "description": "Anchor of the row's section in spec.md." },
+    "spec_section": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Anchor of the row's section in spec.md." },
     "regrounded_at_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "description": "Commit the row's specification was last re-grounded against; null when never re-grounded." },
     "intake": {
       "type": "object",
@@ -1214,7 +1216,7 @@ Every line of `landings.jsonl` is one landing record: `format_version` plus the 
 == Change Ledger Record (`change-ledger.jsonl`)
 _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-13[PM-WATCH-JOB-13], link:../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-9[PM-WATCH-STORE-9], link:../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-10[PM-WATCH-STORE-10]_
 
-Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine store (or, for a plan-less service call such as `pm_build` without `plan_id`, in the workspace scope's `workspace/change-ledger.jsonl`, link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]) records a `worktree_sha`-stamped build execution, file footprint change, or asynchronous job outcome (`PM-SVC-1`, `PM-IMPL-7`).
+Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine store (or, for a plan-less service call such as `pm_build` with `plan_id: NO_PLAN`, in the workspace scope's `workspace/change-ledger.jsonl`, link:filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]) records a `worktree_sha`-stamped build execution, file footprint change, or asynchronous job outcome (`PM-SVC-1`, `PM-IMPL-7`).
 
 [source,json]
 ----
@@ -1272,7 +1274,7 @@ Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine st
     },
     "examined_modules": { "type": "array", "items": { "type": "string" } },
     "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
-    "job_id": { "type": ["string", "null"], "pattern": "^[bcgrpl]-[0-9a-f]{4,16}$" },
+    "job_id": { "type": ["string", "null"], "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
     "commit_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
     "changed_paths": { "type": "array", "items": { "type": "string" } },
     "change_origin": {
@@ -1283,7 +1285,12 @@ Each line in `plans/<plan_id>/change-ledger.jsonl` of the per-project machine st
     "expect": {
       "type": ["string", "null"],
       "enum": ["green", "red", null],
-      "description": "For kind == 'build': the pm_build expect parameter. A failed run with expect == 'red' is expected_red (no finding); a succeeded run with expect == 'red' is expected_red_went_green; an expect == 'red' row never satisfies a freshness gate (mcp-tools.adoc, pm_build)."
+      "description": "For kind == 'build': the pm_build expect parameter. A failed run with expect == 'red' is expected_red (no finding); a succeeded run with expect == 'red' is expected_red_went_green (recorded in expect_result); an expect == 'red' row never satisfies a freshness gate (mcp-tools.adoc, pm_build)."
+    },
+    "expect_result": {
+      "type": ["string", "null"],
+      "enum": ["expected_red", "expected_red_went_green", null],
+      "description": "For kind == 'build' with expect == 'red': expected_red when the run failed (the result's expectation: met), expected_red_went_green when it succeeded (expectation: violated); null otherwise."
     },
     "deliverable_id": { "type": ["string", "null"] },
     "task_id": { "type": ["string", "null"], "description": "Required for kind == 'task_diff'; written only by the submit:TASK-NNN verification." },
@@ -2382,6 +2389,19 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
             "superseded_lessons_days": { "type": "integer", "minimum": 0, "default": 0 },
             "arch_constraint_quiet_days": { "type": "integer", "minimum": 0, "default": 90 }
           }
+        },
+        "reader": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "webfetch_domains": {
+              "type": "array",
+              "default": [],
+              "uniqueItems": true,
+              "description": "Optional validator hygiene for reader dispatches (execution-context-reader*, which have only WebSearch and WebFetch and no local file access): the candidate validator refuses a cited URL whose host is not listed. Empty means no URL filter (dispatch-and-effort.adoc, reader dispatches).",
+              "items": { "type": "string", "pattern": "^(\\*\\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$" }
+            }
+          }
         }
       }
     }
@@ -2591,7 +2611,7 @@ The value schemas of the two fact kinds that replace the former separate discove
               "required": ["job_id", "value"],
               "additionalProperties": false,
               "properties": {
-                "job_id": { "type": "string", "pattern": "^[bcgrpl]-[0-9a-f]{4,16}$" },
+                "job_id": { "type": "string", "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
                 "value": { "type": "object" }
               }
             }
@@ -2665,8 +2685,8 @@ The learned budgets of one project (link:job-runtime.adoc#_adaptive_timeout_lear
     "format_version": { "type": "integer", "const": 1 },
     "keys": {
       "type": "object",
-      "description": "Budget keys (timeouts.adoc, Job Budgets): <build_system>:<verb>[@<module_id>][+<profile>...], git:<operation>, ci:<operation> (the contract operation name; one key for the native in-process operation and the CLI job alike). project_script keys never learn.",
-      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9-]*(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?(\\+[A-Za-z0-9][A-Za-z0-9_.-]*)*$" },
+      "description": "Budget keys (timeouts.adoc, Job Budgets): <build_system>:<verb>[@<module_id>] (a verb's template names its build profile literally, so the key carries none), git:<operation>, ci:<operation> (the contract operation name; one key for the native in-process operation and the CLI job alike). project_script keys never learn.",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9-]*(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?$" },
       "additionalProperties": { "$ref": "#/$defs/keyTimings" }
     }
   },
@@ -2698,8 +2718,17 @@ The learned budgets of one project (link:job-runtime.adoc#_adaptive_timeout_lear
 
 [#job-record]
 == Job Record (`<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.json`)
+_Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-22[PM-WATCH-JOB-22], link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-23[PM-WATCH-JOB-23]_
 
-The write-ahead job journal: one record per job, written before `ProcessBuilder.start()` (for an in-process `git` or `ci` operation of the native variant, before the operation starts; link:job-runtime.adoc#in-process-operations[Job Runtime Specification, In-Process Operations]) and replaced atomically at fate (link:domain-extensions.adoc#_tier_3_adaptive_build_timeouts_crash_replay_state[Domain Extensions Specification, Tier 3], link:job-runtime.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]). A record is written under the lock of the scope that owns the job (the plan lock, or the workspace lock for a job without a plan). The project's recovery after a runtime restart reads every record left `running` (link:runtime-model.adoc#_startup_sequence[Runtime & Interaction Model Specification, Startup]); retention removes records with their logs after `job_logs_days`. The raw log stays `<PM_MCP_BASE>/logs/jobs/<job_id>.log`.
+The write-ahead job journal: one record per job, written at three points, each an atomic replace under the lock of the scope that owns the job (the plan lock, or the workspace lock for a job without a plan):
+
+. *Write-ahead*: before `ProcessBuilder.start()`, with `status: running`, `pid: null`, and `process_started_at: null` (for an in-process `git` or `ci` operation of the native variant, before the operation starts; link:job-runtime.adoc#in-process-operations[Job Runtime Specification, In-Process Operations]).
+. *Post-spawn*: mandatory for a `process` job: the launcher reports its PID before `execve`, and the record is replaced with `pid`, `process_started_at`, and `spawned_at` before the job counts as running (before it enters `active_jobs` or a result reports it `running`).
+. *Fate*: replaced at fate (link:domain-extensions.adoc#_tier_3_adaptive_build_timeouts_crash_replay_state[Domain Extensions Specification, Tier 3], link:job-runtime.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]).
+
+*Write order at job end*: the job record's fate, then the change-ledger row (<<_change_ledger_record_change_ledger_jsonl>>), then the timing observation (<<build-timings-store>>), then the build-slot release (<<machine-lease-stores>>). A crash in between loses at most a freshness mark (the build runs again) or a timing sample; no marker records the progress and nothing is re-derived.
+
+*Recovery*: The project's recovery after a runtime restart reads every record left `running` (link:runtime-model.adoc#_startup_sequence[Runtime & Interaction Model Specification, Startup]): a record whose `spawned_at` lies before the system boot time is marked `killed` and nothing is signalled; a record with `pid: null` is marked `killed` with the audit note `orphan unidentifiable` and nothing is signalled; every other record gets the same-boot process-group probe and termination (link:job-runtime.adoc[Job Runtime Specification]). Retention removes records with their logs after `job_logs_days`. The raw log is `<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.log`, next to the record.
 
 [source,json]
 ----
@@ -2708,12 +2737,12 @@ The write-ahead job journal: one record per job, written before `ProcessBuilder.
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/job-record.json",
   "title": "JobRecord",
   "type": "object",
-  "required": ["format_version", "job_id", "kind", "execution", "scope", "budget_key", "budget_seconds", "budget_derivation", "argv_digest", "status", "fate", "pid", "process_started_at", "confinement", "created_at", "spawned_at", "ended_at", "exit_code", "signal"],
+  "required": ["format_version", "job_id", "kind", "execution", "scope", "budget_key", "budget_seconds", "budget_derivation", "argv_digest", "status", "fate", "pid", "process_started_at", "confinement", "landlock_abi", "created_at", "spawned_at", "ended_at", "exit_code", "signal", "outcome_row", "refusal_reason", "cancel_before_group", "self_report_contradiction", "clamped_values", "gate_facts"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "job_id": { "type": "string", "pattern": "^[bcgrpl]-[0-9a-f]{4,16}$" },
-    "kind": { "type": "string", "enum": ["build", "ci", "git", "bot_poll", "project_script", "lsp"] },
+    "job_id": { "type": "string", "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
+    "kind": { "type": "string", "enum": ["build", "ci", "git", "bot_poll", "project_script"] },
     "execution": { "type": "string", "enum": ["process", "in_process"], "description": "in_process only for git and ci operations of the native variant; their process fields (argv_digest, pid, process_started_at, spawned_at, exit_code, signal) are null and confinement is not_applicable." },
     "scope": {
       "type": "object",
@@ -2738,14 +2767,91 @@ The write-ahead job journal: one record per job, written before `ProcessBuilder.
     "argv_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the verified argument vector; null for an in_process operation." },
     "status": { "type": "string", "enum": ["refused", "running", "ended"], "description": "running is never a fate." },
     "fate": { "type": ["string", "null"], "enum": ["succeeded", "failed", "failed_unparsed", "timed_out", "cancelled", "killed", "indeterminate", "refused", null], "description": "null iff status == running." },
-    "pid": { "type": ["integer", "null"], "minimum": 1, "description": "Job PID, equal to its process-group id; null for a refused job and an in_process operation." },
-    "process_started_at": { "type": ["string", "null"], "format": "date-time", "description": "OS process start instant; with pid the liveness identity." },
+    "pid": { "type": ["integer", "null"], "minimum": 1, "description": "Job PID, equal to its process-group id, set by the mandatory post-spawn replace; null in the write-ahead record, for a refused job, and for an in_process operation. A running record with pid null after a restart is killed as an unidentifiable orphan." },
+    "process_started_at": { "type": ["string", "null"], "format": "date-time", "description": "OS process start instant, set with pid by the post-spawn replace; with pid the liveness identity." },
     "confinement": { "type": "string", "pattern": "^(confined|partial\\(abi=1\\)|unavailable|not_applicable)$" },
     "created_at": { "type": "string", "format": "date-time" },
     "spawned_at": { "type": ["string", "null"], "format": "date-time" },
     "ended_at": { "type": ["string", "null"], "format": "date-time" },
     "exit_code": { "type": ["integer", "null"] },
-    "signal": { "type": ["string", "null"], "description": "Terminating signal, if any." }
+    "signal": { "type": ["string", "null"], "description": "Terminating signal, if any." },
+    "landlock_abi": { "type": ["integer", "null"], "minimum": 2, "description": "Landlock ABI version of the ruleset applied to the job (Linux, confinement confined); null when no ruleset was applied (partial(abi=1), unavailable, not_applicable, macOS)." },
+    "outcome_row": { "type": ["integer", "null"], "minimum": 1, "maximum": 10, "description": "Row of the closed outcome derivation table (job-runtime.adoc#outcome-derivation) that decided the fate; null iff status == running." },
+    "refusal_reason": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]*$", "description": "The refusal reason (for example enrolment_tampered, build_config_changed, path_traversal_rejected); non-null iff fate == refused." },
+    "cancel_before_group": { "type": "boolean", "description": "true when a termination signal met ESRCH before the launcher called setpgid and was sent to the PID directly (job-runtime.adoc Process Termination, step 4)." },
+    "self_report_contradiction": {
+      "type": ["object", "null"],
+      "description": "project_script only: the contradiction of outcome row 6 between the job's self-reported status and the observed evidence; null otherwise.",
+      "required": ["reported_status", "exit_code", "parse_result"],
+      "additionalProperties": false,
+      "properties": {
+        "reported_status": { "type": "string", "minLength": 1 },
+        "exit_code": { "type": ["integer", "null"] },
+        "parse_result": { "type": "string", "minLength": 1, "description": "The parser's verdict on the job log." }
+      }
+    },
+    "clamped_values": {
+      "type": "array",
+      "description": "Every configured value used by this job that lay outside its floor or cap and was clamped (timeouts.adoc#configuration-keys); empty when none was clamped. Never rendered in the job facts.",
+      "items": {
+        "type": "object",
+        "required": ["key", "configured", "used", "source"],
+        "additionalProperties": false,
+        "properties": {
+          "key": { "type": "string", "minLength": 1 },
+          "configured": { "type": ["number", "string", "null"], "description": "null when the source is unreadable." },
+          "used": { "type": "number" },
+          "source": { "type": "string", "enum": ["machine_config", "local_config", "enrolment", "profile_override", "compiled_default", "invalid", "unreadable"] }
+        }
+      }
+    },
+    "gate_facts": {
+      "type": ["object", "null"],
+      "description": "Server-derived gate coverage facts of a build job whose result is a gate result (job-runtime.adoc Gate Honesty Verification, item 2); null for every other job. Only gate_coverage, degraded, and uncovered are rendered.",
+      "required": ["gate_coverage", "degraded", "empty_scope", "structural_limits", "uncovered", "parity_population"],
+      "additionalProperties": false,
+      "properties": {
+        "gate_coverage": { "type": "string", "enum": ["COMPLETE", "PARTIAL", "UNKNOWN"] },
+        "degraded": {
+          "type": "array",
+          "description": "Non-empty iff gate_coverage == PARTIAL.",
+          "items": {
+            "type": "object",
+            "required": ["dimension", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "dimension": { "type": "string", "minLength": 1 },
+              "reason": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "empty_scope": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "Dimensions attempted over an empty scope; neither a pass nor a gap." },
+        "structural_limits": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 }, "description": "Per checked analysis kind its registered limit, or UNKNOWN when none is registered; never omitted." },
+        "uncovered": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "not_at_this_scope and not_by_this_gate for a declared scope; undeclared without one, never an empty list.",
+          "properties": {
+            "not_at_this_scope": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "not_by_this_gate": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "undeclared": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "parity_population": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["dimension", "relation"],
+            "additionalProperties": false,
+            "properties": {
+              "dimension": { "type": "string", "minLength": 1 },
+              "relation": { "type": "string", "enum": ["equal", "subset", "closed"] }
+            }
+          }
+        }
+      }
+    }
   }
 }
 ----
@@ -2760,7 +2866,7 @@ Lessons live in the project's lesson store in the per-project machine store and 
 * *Lock*: Lesson id allocation and every write, claim, release, or retirement in the lesson store run under the lesson store lock `locks/lessons.lock` of the per-project machine store (<<lock-free-snapshot-reads>>), each as one journaled transaction (<<transaction-journal>>), so two concurrent sessions never allocate the same `lesson_id` and never claim the same lesson.
 * *File Format*: A lesson file starts with a line `---`, followed by the front matter, a line `---`, and the Markdown body. The front matter is YAML restricted to the JSON data model (YAML 1.2 core schema; anchors, aliases, tags, and multiple documents are refused) and is validated against the `LessonFrontMatter` schema below, including `format_version`, on every read and write; a write with missing or invalid front matter is rejected, and a file without parseable front matter lists as `present_unreadable`. The body is free Markdown; the `title` lives only in the front matter.
 * *Revisions*: A change of the body replaces it wholesale and increments `revision`; the new body carries its own `sources[]` (the evidence it was regenerated from), and `revisions[]` appends `{n, at, sources, body_sha256}` for the new revision. Old bodies are not kept; `revisions[]` keeps their digests and sources, so the derivation of every revision stays stated. A body is never edited in part (`PM-WATCH-STORE-17`).
-* *Lesson-Store Digest*: Every server write, claim, release, or retirement in the lesson store records the size and SHA-256 of the lesson file in `.digests.json` (the sidecar format of <<store-digest-verification>>) in the same transaction as the lesson write. On read, a lesson whose file differs from its entry is `store_tampered` for that lesson only; a lesson file that disappeared while its entry remains is reported as `deleted_out_of_band`, and a file without an entry is reported as `untracked`. None of these states is ever read as `absent`, and an out-of-band edit is accepted only with `pm-mcp operator accept-edit`, which re-baselines that lesson's entry and records the action in `audit.jsonl`.
+* *Lesson-Store Digest*: Every server write, claim, release, or retirement in the lesson store records the size and SHA-256 of the lesson file in `.digests.json` (the sidecar format of <<store-digest-verification>>) in the same transaction as the lesson write. On read, a lesson whose file differs from its entry is `store_tampered` for that lesson only; a lesson file that disappeared while its entry remains is reported as `deleted_out_of_band`, and a file without an entry is reported as `untracked`. None of these states is ever read as `absent`, and an out-of-band edit is accepted only with `pm-mcp operator accept-edit lesson <lesson_id>`, which shows the path and the recorded and current size and SHA-256 before confirmation, re-baselines that lesson's entry, and records the action in `audit.jsonl`.
 
 [source,json]
 ----
@@ -2901,10 +3007,10 @@ Lessons live in the project's lesson store in the per-project machine store and 
 
 One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, holding the operator-authorized project root, build wrappers with their pinned files, pinned host tools, the canonical and discovery command templates, provider verification overrides, language servers, approved out-of-process project scripts, operator budgets, the Landlock write paths, and the captured build environment (`PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`, `PM-EXT-6`). Written exclusively via the operator channel (`pm-mcp operator enrol`, link:cli-and-security.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). The set of enrolled projects is the directory listing; the operator-owned `enrolments/` directory is separate from the server-owned `projects/`.
 
-* *Integrity*: Every operator CLI write of an enrolment file runs under its own lock `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock` and also writes its sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac`, the lowercase-hex HMAC-SHA-256 over the exact bytes of the canonical file the CLI wrote, keyed with the operator-lane secret from the OS keyring (service `de.cuioss.pm-mcp`; on hosts without a keyring `<PM_MCP_BASE>/state/enrolment-hmac.key`, mode `0600`). The runtime verifies a project's file before serving the project for the first time after start and before every verify-not-resolve check, and refuses with `enrolment_tampered` on mismatch (link:cli-and-security.adoc#enrolment-integrity[CLI, Coordination & Security Specification, Enrolment Integrity]).
+* *Integrity*: Every write of an enrolment file (an operator verb, executed by the runtime on the CLI's request; the CLI writes no store) runs under its own lock `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock`, and the runtime also writes its sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac`, the lowercase-hex HMAC-SHA-256 over the exact bytes of the canonical file the runtime wrote, keyed with the operator-lane secret from the OS keyring (service `de.cuioss.pm-mcp`; on hosts without a keyring `<PM_MCP_BASE>/state/enrolment-hmac.key`, mode `0600`), which only `pm-mcpd` reads; the key never leaves the runtime. The runtime verifies a project's file before serving the project for the first time after start and before every verify-not-resolve check, and refuses with `enrolment_tampered` on mismatch (link:cli-and-security.adoc#enrolment-integrity[CLI, Coordination & Security Specification, Enrolment Integrity]).
 * *Isolation*: A tampered, unreadable, or schema-invalid enrolment file blocks only its own project; every other project is served. `project_root` is unique across all enrolment files; the operator CLI checks it at every enrolment write and the runtime at start, and a duplicate root blocks both projects with `enrolment_root_conflict` until the operator resolves it.
 * *Closed and Exact*: The schema is closed at every level (`additionalProperties: false`), and a file whose `format_version` is not the binary's is refused (`format_outdated` or `format_newer`, naming the file, <<format-versioning>>).
-* *Templates Decide What Runs*: A build job runs the canonical template of its build system and verb (`build.canonical_templates`), or the compiled default when none is enrolled; there is no goal allowlist per wrapper. Typed placeholders (`{module}`, `{profile}`) are validated at job time (link:domain-extensions.adoc#enrolled-argument-templates[Domain Extensions Specification, Tier 2]).
+* *Templates Decide What Runs*: A build job runs the canonical template of its build system and verb (`build.canonical_templates`), or the compiled default when none is enrolled; there is no goal allowlist per wrapper. The typed placeholder `{module}`, the only one, is validated at job time; a verb that needs a build profile names it literally in its template (for example `"integration-tests": ["verify", "-Pintegration-tests", "-pl", "{module}"]`) (link:domain-extensions.adoc#enrolled-argument-templates[Domain Extensions Specification, Tier 2]).
 
 [source,json]
 ----
@@ -2920,7 +3026,7 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
     "argv": {
       "type": "array",
       "minItems": 1,
-      "description": "Argument vector; an element may contain the typed placeholders {module} and {profile}, validated at job time; shell metacharacters and the forbidden free flags are refused at enrolment.",
+      "description": "Argument vector; an element may contain the typed placeholder {module} (the only placeholder; build profiles are named literally), validated at job time; shell metacharacters and the forbidden free flags are refused at enrolment.",
       "items": { "type": "string", "minLength": 1 }
     }
   },
@@ -3054,8 +3160,8 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
     },
     "command_budgets": {
       "type": "object",
-      "description": "Operator budgets in seconds per budget key (<build_system>:<verb>[@<module_id>][+<profile>...], git:<operation>, ci:<operation>); clamped up to the engine floor, may exceed the escalation cap, recorded as budget_derivation operator (timeouts.adoc, Job Budgets).",
-      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9-]*(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?(\\+[A-Za-z0-9][A-Za-z0-9_.-]*)*$" },
+      "description": "Operator budgets in seconds per budget key (<build_system>:<verb>[@<module_id>], git:<operation>, ci:<operation>); clamped up to the engine floor, may exceed the escalation cap, recorded as budget_derivation operator (timeouts.adoc, Job Budgets).",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9-]*(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?$" },
       "additionalProperties": { "type": "integer", "minimum": 1 }
     },
     "write_paths": {
@@ -3073,12 +3179,36 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
 }
 ----
 
+[#project-store-identity]
+=== Project Store Identity (`<PM_MCP_BASE>/projects/<project_id>/store.json`)
+_Implementation watch: link:../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-23[PM-WATCH-CLI-23]_
+
+The per-project machine store records the main checkout it belongs to. `pm-mcp operator enrol` writes `store.json` once, when it creates the store; nothing changes it afterwards. `pm-mcp operator unenrol` removes only the enrolment file and its sidecar and leaves the store with this record in place (link:cli-and-security.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). Enrolling the same `project_id` again reuses the store only when the new `project_root` equals the recorded one; otherwise the enrolment is refused (`project_store_root_mismatch`), naming both roots.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/project-store.json",
+  "title": "ProjectStoreIdentity",
+  "type": "object",
+  "required": ["format_version", "project_id", "project_root", "created_at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Equals the store directory name." },
+    "project_root": { "type": "string", "minLength": 1, "description": "Canonical absolute path of the main checkout at the enrolment that created the store." },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
 == Machine Configuration, Credentials & Security Audit Stores
 
 [#machine-config]
 === Machine Configuration Store (`<PM_MCP_BASE>/machine-config.json`)
 
-Configures machine-wide build concurrency limits, warm LSP pool sizing, the machine-level timeouts and budgets (drain timeout, escalation cap, progress wait bound, language server timeouts, audit rotation age), and `project_defaults`, the machine-wide defaults of the per-project operator keys of `local-config.json` (<<local-config>>, `PM-EXT-6`). The pending entry record age and the lock-wait report threshold are compiled constants (link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]). The timeout values, their bounds, and their expiry behaviour are defined in link:timeouts.adoc#configuration-keys[Timeouts & Budgets Specification]; the `default`, `minimum`, and `maximum` values below equal them.
+Configures machine-wide build concurrency limits, warm LSP pool sizing, the machine-level timeouts and budgets (drain timeout, escalation cap, progress wait bound, language server timeouts, audit rotation age), and `project_defaults`, the machine-wide defaults of the per-project operator keys of `local-config.json` (<<local-config>>, `PM-EXT-6`). The pending entry record age and the lock-wait report threshold are compiled constants (link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]). Written only by the runtime (on `pm-mcp operator config`) under `locks/machine-config.lock`; the CLI reads it directly only for the drain timeout that bounds `pm-mcp drain` (link:cli-and-security.adoc#cli-file-reads[CLI, Coordination & Security Specification, Direct File Reads]). The timeout values, their bounds, and their expiry behaviour are defined in link:timeouts.adoc#configuration-keys[Timeouts & Budgets Specification]; the `default`, `minimum`, and `maximum` values below equal them.
 
 [source,json]
 ----
@@ -3159,7 +3289,7 @@ The allowed origin for a credential is the origin of the `url` of its operator-o
     "client_id": { "type": "string", "minLength": 1, "description": "github_app only: the App's client id, JWT issuer." },
     "private_key": { "type": "string", "pattern": "^-----BEGIN PRIVATE KEY-----", "description": "github_app only: PKCS#8 PEM; the stored secret from which installation tokens are derived (never persisted themselves, PM-CRED-5)." },
     "installation_id": { "type": "integer", "minimum": 1, "description": "github_app only, optional: else discovered per repository owner through GET /repos/{owner}/{repo}/installation." },
-    "expires_at": { "type": "string", "format": "date-time", "description": "Optional expiry of a token: taken from the provider by set and verify where reported, else entered by the operator at set; absent means no known expiry, shown by status, never refused. status reports expiring within 14 days." },
+    "expires_at": { "type": "string", "format": "date-time", "description": "Optional expiry of a token: taken from the provider by set and verify where reported, else entered by the operator at set; absent means no known expiry, shown by status, never refused. status reports expiring within the credential expiry warning window (timeouts.adoc#credential-expiring-window)." },
     "username": { "type": "string", "minLength": 1 },
     "password": { "type": "string", "minLength": 1 },
     "header_name": { "type": "string", "minLength": 1, "default": "Authorization", "description": "token only." },
@@ -3300,7 +3430,7 @@ The records of local trust and browser access (link:runtime-model.adoc#runtime-t
 
 *`run/runtime.token`*: not JSON and without `format_version`: the file content is exactly the runtime token, 43 base64url characters without padding and without a trailing newline (256 bits, link:identifiers.adoc#id-runtime-token[Identifier Registry, runtime token]). Mode `0600` in the `0700` directory `<PM_MCP_BASE>/run/`; written atomically by the runtime at every start before the socket is bound, replacing the previous token; read by every local client after its owner, mode, and no-symlink check; never read by a job (outside every job's Landlock read set). A token file that is absent, of another length, or outside the alphabet makes a client refuse with a diagnostic naming the path, never guess.
 
-*`state/web-devices.json`*: the web device store, mode `0600`, written only by the runtime under `locks/web-devices.lock` (pairing, revocation, idle expiry, and the `last_used_at` update at most once per minute per device). A device secret is never stored, only its SHA-256. An unreadable or invalid store authenticates no device and leaves every other function of the runtime unaffected; `pm-mcp web devices revoke --all` rewrites it empty.
+*`state/web-devices.json`*: the web device store, mode `0600`, written only by the runtime under `locks/web-devices.lock` (pairing, revocation, idle expiry, and the `last_used_at` update at most once per write interval per device, link:timeouts.adoc#device-last-used-granularity[Timeouts & Budgets Specification]). A device secret is never stored, only its SHA-256. An unreadable or invalid store authenticates no device and leaves every other function of the runtime unaffected; `pm-mcp web devices revoke --all` rewrites it empty.
 
 [source,json]
 ----
@@ -3324,7 +3454,7 @@ The records of local trust and browser access (link:runtime-model.adoc#runtime-t
           "label": { "type": "string", "minLength": 1, "maxLength": 64, "description": "From pm-mcp web pair --label, else the device_id; display only." },
           "secret_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the UTF-8 device secret (pmw_...); the secret itself is returned once at pairing and never stored." },
           "created_at": { "type": "string", "format": "date-time" },
-          "last_used_at": { "type": "string", "format": "date-time", "description": "Last authenticated request, written at most once per minute; older than 90 days (compiled) expires the device." }
+          "last_used_at": { "type": "string", "format": "date-time", "description": "Last authenticated request, written at most once per write interval (timeouts.adoc#device-last-used-granularity); older than the device idle expiry (timeouts.adoc#device-idle-expiry) expires the device." }
         }
       }
     }
@@ -3332,7 +3462,7 @@ The records of local trust and browser access (link:runtime-model.adoc#runtime-t
 }
 ----
 
-*Pairing code (in memory only)*: The open pairing is held in the runtime's memory, never persisted: the SHA-256 of the normalized code, the label, `expires_at` (issue plus 5 minutes), and the failure count (at most 5). At most one pairing is open; a new one replaces it, a redemption or the fifth failure removes it. A runtime restart discards it, so a pairing code never survives a restart and nothing about it is recoverable from disk.
+*Pairing code (in memory only)*: The open pairing is held in the runtime's memory, never persisted: the SHA-256 of the normalized code, the label, `expires_at` (issue plus the pairing code lifetime, link:timeouts.adoc#pairing-code-ttl[Timeouts & Budgets Specification]), and the failure count (at most the pairing failed-attempt limit, link:timeouts.adoc#pairing-attempt-limit[Timeouts & Budgets Specification]). At most one pairing is open; a new one replaces it, a redemption or the failure that reaches the limit removes it. A runtime restart discards it, so a pairing code never survives a restart and nothing about it is recoverable from disk.
 
 *`run/web.json`*: the process record of the web server, written by `pm-mcp-web` itself at start (under its process lock `locks/web.lock`, held for its lifetime) and removed at stop; read by `pm-mcp status`, `pm-mcp web pair|open|disable`. It is the web server's own process file, not a store the runtime writes; a record whose `pid` and `start_instant` do not match a live process is stale and reported as "web server not running".
 
@@ -3389,7 +3519,60 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
     "scope_id": { "type": ["string", "null"] },
     "actor": { "type": "string", "description": "Client profile ID or OS principal username." },
     "outcome": { "type": "string", "enum": ["allowed", "refused", "succeeded", "failed", "warning"] },
-    "details": { "type": "object" }
+    "identity_mismatch": { "type": ["boolean", "null"], "description": "Session-bound records only: true when declared_client and detected_env disagree (PM-CLIENT-3); null on machine-level records." },
+    "details": { "type": "object", "description": "Event-specific fields. A session-bound record (a transition, enter) carries the identity tuple declared_client, detected_env, and os_principal; a machine-level record carries os_principal only; a checkpoint record carries the checkpoint fields." }
+  }
+}
+----
+
+*Identity tuple*: The three-tier identity tuple (link:cli-and-security.adoc#_security_audit_trail_three_tier_identity_verification[CLI, Coordination & Security Specification, Security Audit Trail]) lives in `details`, and only on session-bound records (state transitions and `enter`): `details{declared_client, detected_env, os_principal}`, with the top-level `identity_mismatch` set. A machine-level record (runtime start, an operator verb, a sweep, a lease or audit-chain event) carries `details.os_principal` only and `identity_mismatch: null`.
+
+*Checkpoint records*: A rotation appends a `security` record with `event: checkpoint`, `scope_type: machine`, and `details{record_count, head_hash, hmac}` (the number of records in the file before the checkpoint, the hash of the last canonical line before it, and the HMAC-SHA-256 over both under the enrolment integrity key).
+
+[#audit-head]
+*`logs/audit.head`* (written under the audit lock after every append, atomically replaced; the HMAC is over the canonical JSON of the other fields):
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/audit-head.json",
+  "title": "AuditHead",
+  "type": "object",
+  "required": ["format_version", "file", "record_count", "last_event_id", "head_hash", "index_head_hash", "hmac"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "file": { "type": "string", "const": "audit.jsonl", "description": "The current log file." },
+    "record_count": { "type": "integer", "minimum": 0 },
+    "last_event_id": { "type": ["string", "null"], "format": "uuid", "description": "null for an empty log." },
+    "head_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the last canonical line; 64 '0' characters for an empty log." },
+    "index_head_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the last line of audit-index.jsonl; 64 '0' characters before the first rotation." },
+    "hmac": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "HMAC-SHA-256 under the enrolment integrity key." }
+  }
+}
+----
+
+[#audit-index]
+*`logs/audit-index.jsonl`* (append-only, one line per rotated file, written under the audit lock at rotation, hash-chained like the log):
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/audit-index-entry.json",
+  "title": "AuditIndexEntry",
+  "type": "object",
+  "required": ["format_version", "prev_hash", "file", "first_event_id", "last_event_id", "record_count", "checkpoint_hash"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "prev_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the previous index line; 64 '0' characters for the first." },
+    "file": { "type": "string", "pattern": "^audit-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.jsonl$" },
+    "first_event_id": { "type": "string", "format": "uuid" },
+    "last_event_id": { "type": "string", "format": "uuid", "description": "The event_id of the file's checkpoint record." },
+    "record_count": { "type": "integer", "minimum": 1 },
+    "checkpoint_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the checkpoint record's canonical line." }
   }
 }
 ----
@@ -3402,9 +3585,9 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
 
 *Web access records*: A successful pairing appends an `operator` record with `event: web_device_paired`, `outcome: succeeded`, and `details{device_id, label, mode}`; a failed redemption a `security` record with `event: web_pairing_failed`, `outcome: refused`, and `details{failures, pairing_invalidated}` (never the submitted code); a revocation an `operator` record with `event: web_device_revoked`, `outcome: succeeded`, and `details{device_id, reason}` (`reason`: `operator` for `pm-mcp web devices revoke` or a revocation from the web app, `idle_expired` for the 90-day idle expiry), including one record per device for `revoke --all`. An action taken through a paired device carries `details.channel: web` and `details.device_id`; one through the CLI `details.channel: cli`. No record carries a device secret, its hash, or the runtime token (link:cli-and-security.adoc#web-server[CLI, Coordination & Security Specification, Web Server & Pairing]).
 
-*Stall records*: A plan that becomes stalled (link:runtime-model.adoc#stalled-plans[Runtime & Interaction Model Specification]) appends one `transition` record per stall episode with `event: plan_stalled`, `outcome: warning`, `scope_type: plan`, and `details{state, idle_since, idle_seconds}`; the next transition or model call on the plan ends the episode, and a later stall starts a new one. The record is operator and metrics data only and never appears in a model-facing representation.
+*Stall records*: A plan (or epic) that becomes stalled (link:runtime-model.adoc#stalled-plans[Runtime & Interaction Model Specification]) appends one `transition` record per stall episode with `event: plan_stalled`, `outcome: warning`, `scope_type: plan` (or `epic` for a stalled epic), and `details{state, idle_since, idle_seconds}`; the next transition or model call on the scope ends the episode, and a later stall starts a new one. The record is operator and metrics data only and never appears in a model-facing representation.
 
-*Hash chain (`PM-SEC-6`)*: The canonical line of a record is its exact UTF-8 byte sequence in `audit.jsonl`, excluding the terminating newline. A writer appends only under the log's `FileChannel.lock()`, after reading the current last line to compute `prev_hash`. The writer also maintains the HMAC-anchored head `logs/audit.head` and, on rotation, a `checkpoint` record plus an entry in the hash-chained index `logs/audit-index.jsonl` (link:cli-and-security.adoc[CLI, Coordination & Security Specification], Security Audit Logging). The runtime verifies incrementally from the last checkpoint at startup; a mismatch, unparsable line, missing log, reset, truncation, or head mismatch is reported to the operator and recorded as an `audit_chain_broken` record (`category: security`, `details.reason` `link_broken | missing | reset | truncated | head_mismatch`, and `details.first_broken_line` for `link_broken`), and the log is never rewritten or repaired.
+*Hash chain (`PM-SEC-6`)*: The canonical line of a record is its exact UTF-8 byte sequence in `audit.jsonl`, excluding the terminating newline. A writer appends only under the log's `FileChannel.lock()`, after reading the current last line to compute `prev_hash`. The writer also maintains the HMAC-anchored head `logs/audit.head` (<<audit-head>>) and, on rotation, a `checkpoint` record plus an entry in the hash-chained index `logs/audit-index.jsonl` (<<audit-index>>; link:cli-and-security.adoc#_security_audit_trail_three_tier_identity_verification[CLI, Coordination & Security Specification, Security Audit Trail]). The runtime verifies incrementally from the last checkpoint at startup; a mismatch, unparsable line, missing log, reset, truncation, or head mismatch is reported to the operator and recorded as an `audit_chain_broken` record (`category: security`, `details.reason` `link_broken | missing | reset | truncated | head_mismatch`, and `details.first_broken_line` for `link_broken`), and the log is never rewritten or repaired.
 
 [#machine-lease-stores]
 == Machine Lease Stores (`merge-queue.json`, `review-bot-windows.json`, `build-slots.json`)
@@ -3412,7 +3595,7 @@ _Implementation watch: link:../implementation-watch/store-schemas.adoc#PM-WATCH-
 
 The three lease stores in `<PM_MCP_BASE>/state/` are updated only in short transactions under their machine store locks (<<lock-free-snapshot-reads>>; `PM-IMPL-7`, `PM-WF-15`). Every lease owner has the same shape, and every instant follows the one wire shape (<<format-versioning>> item 5), so a lease written by one component and reclaimed by another round-trips byte-identical instants.
 
-*Ownership vs Liveness*: A lease is owned by its scope (`scope_type`, `scope_id`), never by the runtime instance; `holder_instance` records only which runtime currently serves it. At runtime start, a lease whose `holder_instance` is no longer alive (PID plus start instant) is not released but marked `orphaned_at`; the next call addressing the owning scope adopts it (sets `holder_instance` to the new runtime, clears `orphaned_at`) under the machine store lock. An orphaned lease is released only on positive evidence of abandonment: the owning scope is terminal, archived, or no longer resolvable; its `lease_expires_at` passed without adoption; or, for a build slot, its job was recorded as `killed` at the restart (a build slot is therefore released at once). For the merge holder, provider-side evidence also counts: when the provider observation of the holder's pull request (`ci.pr-observe`) reports it merged or closed, the next admission transaction releases the holder lease, with an audit record naming the observation, whether or not the lease is orphaned or expired. An unobservable or failed provider observation is no evidence and releases nothing.
+*Ownership vs Liveness*: A lease is owned by its scope (`project_id`, `scope_type`, `scope_id`), never by the runtime instance; the project's recovery after a runtime start selects the project's leases by `project_id`; `holder_instance` records only which runtime currently serves it. At runtime start, a lease whose `holder_instance` is no longer alive (PID plus start instant) is not released but marked `orphaned_at`; the next call addressing the owning scope adopts it (sets `holder_instance` to the new runtime, clears `orphaned_at`) under the machine store lock. An orphaned lease is released only on positive evidence of abandonment: the owning scope is terminal, archived, or no longer resolvable; its `lease_expires_at` passed without adoption; or, for a build slot, its job was recorded as `killed` at the restart (a build slot is therefore released at once). For the merge holder, provider-side evidence also counts: when the provider observation of the holder's pull request (`ci.pr-observe`) reports it merged or closed, the next admission transaction releases the holder lease, with an audit record naming the observation, whether or not the lease is orphaned or expired. An unobservable or failed provider observation is no evidence and releases nothing.
 
 [source,json]
 ----
@@ -3421,11 +3604,12 @@ The three lease stores in `<PM_MCP_BASE>/state/` are updated only in short trans
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/lease-owner.json",
   "title": "LeaseOwner",
   "type": "object",
-  "required": ["scope_type", "scope_id", "holder_instance"],
+  "required": ["project_id", "scope_type", "scope_id", "holder_instance"],
   "additionalProperties": false,
   "properties": {
+    "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Enrolment identifier of the owning project (identifiers.adoc, project_id); recovery selects a project's leases by it." },
     "scope_type": { "type": "string", "enum": ["plan", "epic", "workspace"] },
-    "scope_id": { "type": "string", "description": "plan_id, epic_id, or the enrolment identifier of the project for the workspace scope" },
+    "scope_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "plan_id or epic_id; null for the workspace scope (identifiers.adoc, scope_id)." },
     "holder_instance": {
       "type": "object",
       "description": "Runtime instance currently serving the lease; liveness only, never ownership",
@@ -3454,11 +3638,11 @@ The three lease stores in `<PM_MCP_BASE>/state/` are updated only in short trans
 The stores reside in the per-project machine store (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), outside the repository working tree and behind the host deny rules for `<PM_MCP_BASE>/**`, so an out-of-band edit is no longer a working-tree accident; a host shell with filesystem write access can still modify them directly outside the MCP server:
 
 * Digests live in the sidecar `mcp/digests.json` (`{"format_version": 1, "stores": {"<relative path>": {"size": <int>, "sha256": "<hex>"}}}`), never inside a store they protect.
-* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, `metrics.json`, `quality-report.json`, the findings, assessment, review-participation, and change-ledger JSONL files, the plan mailbox `mcp/mailbox.jsonl`, the session log `sessions.jsonl`, `outline.md`, `request.md`), the server records the file's size and SHA-256 in the sidecar under the plan lock; the workspace scope's stores (`mcp/status.json`, `sessions.jsonl`, the findings and change-ledger JSONL files) are recorded the same way in `workspace/mcp/digests.json` under the workspace lock, and an epic scope's stores in `epics/<epic_id>/digests.json` under the epic lock.
+* On every server write to a plan store (`mcp/status.json`, `references.json`, `TASK-*.json`, `execution-manifest.json`, `metrics.json`, `quality-report.json`, the findings, assessment, review-participation, and change-ledger JSONL files, the session log `sessions.jsonl`, `outline.md`, `request.md`; not the plan mailbox `mcp/mailbox.jsonl`, which is advisory content under its own leaf lock, <<epic-inbox-record>>), the server records the file's size and SHA-256 in the sidecar under the plan lock; the workspace scope's stores (`mcp/status.json`, `sessions.jsonl`, the findings and change-ledger JSONL files) are recorded the same way in `workspace/mcp/digests.json` under the workspace lock, and an epic scope's stores in `epics/<epic_id>/digests.json` under the epic lock.
 * The digest of a store is updated in the same transaction as the store write, and only through the transaction journal (<<transaction-journal>>): a transaction that fails part-way leaves its journal, which recovery rolls forward (runtime start, and lazily on the first call to the scope) before any digest is compared. A store whose content differs from its sidecar entry while a journal of its scope lists it is never reported as tampered; recovery completes the transaction first.
 * On every subsequent read inside a transition, the engine verifies size and SHA-256 against the sidecar. `store_tampered` is decided only by a reader that holds the store's scope lock, after journal recovery: any remaining mismatch immediately raises the `store_tampered` condition on the scope's current state (link:state-catalogue.adoc#condition-store_tampered[State Catalogue, Conditions]), which replaces any other condition, leaves `state` and `call_stack` unchanged, and requires operator resolution.
 * A lock-free snapshot reader (<<lock-free-snapshot-reads>>) that sees a digest mismatch, or a transaction journal, may observe a transaction in flight. It never reports `store_tampered`; it serves the snapshot with `facts.store_integrity: digest_unverified` naming the store, and the next locked access of the scope decides.
-* An intentional manual edit is accepted with `pm-mcp operator accept-edit <plan_id> <store>`, which re-baselines that store's digest and records the action in `audit.jsonl`.
+* An intentional manual edit is accepted with `pm-mcp operator accept-edit plan <plan_id> <store>`, `accept-edit epic <epic_id> <store>`, or `accept-edit workspace <store>` (link:cli-and-security.adoc#operator-accept-edit[CLI, Coordination & Security Specification, Accept-Edit]), which shows the path and the recorded and current size and SHA-256 before confirmation (no diff: the prior content is not kept), re-baselines that store's digest, and records the action in `audit.jsonl`. The resolutions of `store_tampered` are closed: `accept-edit`, or the operator decision `abort-plan` (`abort-epic` for an epic scope).
 * The project's lesson store keeps its own sidecar with the same format and rules, at lesson granularity (<<lesson-record>>): an out-of-band edit or deletion of one lesson blocks only that lesson.
 
 [#three-way-footprint]
@@ -3499,6 +3683,7 @@ When the operator invokes plan deletion (`delete-plan` via elicitation or CLI), 
 
 [#lock-free-snapshot-reads]
 === Lock-Free Snapshot Reads, Transaction Locks & Leases (`PM-IMPL-7`)
+_Implementation watch: link:../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-26[PM-WATCH-DISP-26]_
 
 [[_lock_free_snapshot_reads_transaction_locks_leases_pm_impl_7]]
 * *Lock-Free Snapshot Reads*: Because every store update uses atomic write-and-rename (`<file>.tmp.<uuid>` -> `<file>`), all read-only operations (`pm_state`, `pm_plans`, `pm_epics`, `pm://` resources) read the current inode snapshot directly without acquiring file locks. A snapshot reader never decides `store_tampered`; it reports `digest_unverified` (<<store-digest-verification>>).
@@ -3513,8 +3698,8 @@ When the operator invokes plan deletion (`delete-plan` via elicitation or CLI), 
 +
 The per-project server and operator stores that are not guarded by a scope lock have their own lock files in the per-project machine store: `projects/<project_id>/locks/local-config.lock` guards `local-config.json`, and `projects/<project_id>/locks/build-timings.lock` guards `build-timings.json` (<<build-timings-store>>).
 +
-The append-only `logs/audit.jsonl` is never replaced by rename (rotation renames it only under its own lock) and may be locked directly; `logs/audit.head` and `logs/audit-index.jsonl` are written under that audit lock.
-* *Transaction Locks*: Short locks held only for one transaction. All locks of the runtime and the CLI are acquired in one total order, and a transaction that needs several locks acquires them strictly in this order to prevent deadlocks:
+The append-only `logs/audit.jsonl` is never replaced by rename (rotation renames it only under its own lock) and may be locked directly; `logs/audit.head` and `logs/audit-index.jsonl` are written under that audit lock. A plan's append-only mailbox `mcp/mailbox.jsonl` is locked directly the same way (<<epic-inbox-record>>).
+* *Transaction Locks*: Short locks held only for one transaction, all taken by the runtime (the CLI's only lock is the process lock `runtime-start.lock`). They are acquired in one total order, and a transaction that needs several locks acquires them strictly in this order to prevent deadlocks:
 . workspace lock: `<PM_MCP_BASE>/projects/<project_id>/locks/workspace.lock` (the project's one workspace scope)
 . plan locks: `<PM_MCP_BASE>/projects/<project_id>/locks/plan-<plan_id>.lock`, lexicographic by `plan_id`
 . epic locks: `<PM_MCP_BASE>/projects/<project_id>/locks/epic-<epic_id>.lock`, lexicographic by `epic_id`
@@ -3523,20 +3708,25 @@ The append-only `logs/audit.jsonl` is never replaced by rename (rotation renames
 . local configuration lock: `<PM_MCP_BASE>/projects/<project_id>/locks/local-config.lock` (`local-config.json`)
 . build timings lock: `<PM_MCP_BASE>/projects/<project_id>/locks/build-timings.lock` (`build-timings.json`)
 . machine store locks: `<PM_MCP_BASE>/locks/{build-slots,enrolments/<project_id>,install-records,machine-config,merge,review-bot,web-devices}.lock`, alphabetical by lock path (several enrolment locks lexicographic by `project_id`)
-. leaf locks: the audit log lock (`<PM_MCP_BASE>/logs/audit.jsonl`) and the digest sidecar writes; nothing is acquired after a leaf lock
+. leaf locks: the audit log lock (`<PM_MCP_BASE>/logs/audit.jsonl`), the mailbox lock of a plan (`plans/<plan_id>/mcp/mailbox.jsonl`, taken by an epic transaction under its epic lock and by the plan's consumption events), and the digest sidecar writes; nothing is acquired after a leaf lock
 +
-The runtime singleton lock (`locks/runtime.lock`, held for the process lifetime), the relay start lock (`locks/runtime-start.lock`), and the web server's singleton lock (`locks/web.lock`, held by `pm-mcp-web` for its lifetime) are process locks, not transaction locks, and stay outside this order. Workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings locks live in the per-project machine store outside the directories they protect (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), so archiving a plan directory or editing an epic in a worktree never splits a lock.
+The runtime singleton lock (`locks/runtime.lock`, held for the process lifetime), the on-demand start lock (`locks/runtime-start.lock`, the CLI's only lock, held by a CLI command until its authenticated round trip with the started runtime succeeds or the runtime start timeout expires), and the web server's singleton lock (`locks/web.lock`, held by `pm-mcp-web` for its lifetime) are process locks, not transaction locks, and stay outside this order. Workspace, plan, epic, epic worktree, lesson store, local configuration, and build timings locks live in the per-project machine store outside the directories they protect (link:filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), so archiving a plan directory or editing an epic in a worktree never splits a lock.
 * *Order Assertion*: The lock manager asserts the order on every acquisition against the locks the current transaction already holds (re-entry of a held lock is allowed). An out-of-order acquisition is refused: the call fails with `internal_fault` (link:mcp-tools.adoc[MCP Tools Specification]), nothing is written, and an audit record `lock_order_violation` (`category: store`, `outcome: refused`, `details{held, requested}`) is appended. A unit test of the lock manager covers an out-of-order acquisition at every level boundary.
-* *Leases*: Long-lived claims (merge holder in `merge-queue.json`, review-bot windows in `review-bot-windows.json`, build slots in `build-slots.json`) are lease records owned by a scope (`scope_type`, `scope_id`), served by a runtime instance (`holder_instance`: PID and start instant), and bounded by an expiry (<<machine-lease-stores>>); a restart orphans a lease instead of releasing it, and the owning scope adopts it on its next call. A lease is claimed or released inside a short transaction on the machine store lock and is never held as an OS lock, so holding a lease while taking a plan lock does not invert the lock order.
+* *Leases*: Long-lived claims (merge holder in `merge-queue.json`, review-bot windows in `review-bot-windows.json`, build slots in `build-slots.json`) are lease records owned by a scope (`project_id`, `scope_type`, `scope_id`), served by a runtime instance (`holder_instance`: PID and start instant), and bounded by an expiry (<<machine-lease-stores>>); a restart orphans a lease instead of releasing it, and the owning scope adopts it on its next call. A lease is claimed or released inside a short transaction on the machine store lock and is never held as an OS lock, so holding a lease while taking a plan lock does not invert the lock order.
 * *Lock Manager*: All acquisitions in the runtime go through one lock manager (link:runtime-model.adoc#_in_process_lock_manager[Runtime & Interaction Model Specification]).
 
 [#evidence-based-removal-sweeps]
 === Evidence-Based Removal Sweeps
 _Implementation watch: link:../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-39[PM-WATCH-GEN-39]_
 
-Every removal sweep (retention purges of job logs, archived plans and superseded lessons under the four retention keys of the operator's `local-config.json`, link:timeouts.adoc#retention-days[Timeouts & Budgets Specification]; worktree orphan sweeps):
+There are two kinds of removal sweep:
 
-* runs as a dry run unless the operator explicitly applies it;
+* *Retention purges*: job records with their logs, archived plans and superseded lessons under the four retention keys of the operator's `local-config.json` (link:timeouts.adoc#retention-days[Timeouts & Budgets Specification]). They run only through the operator verb `pm-mcp operator sweep [<project_id>] [--apply]` (link:cli-and-security.adoc#operator-channel-isolation[CLI, Coordination & Security Specification, Operator Channel Isolation]): without `--apply` it lists the purge candidates with their evidence (a dry run on demand); with `--apply` it removes them, one audit record each. There is no automatic dry run and no candidate count in `pm-mcp status`. The store of a project that `unenrol` left in place (<<project-store-identity>>) is itself a purge candidate of `sweep <project_id>`, on the evidence that no enrolment file names its `project_id`.
+* *Automatic sweeps*: the pending-record sweep, run by the project's recovery after a runtime start (link:runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]) and periodically by the running runtime (fixed interval, link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]), which removes pending entry records older than the pending entry record maximum age (link:timeouts.adoc#pending-entry-max-age[Timeouts & Budgets Specification]), each with an audit record (`pm_start` does no age check); the baseline worktree sweep of the recovery; and the baseline worktree removal of every plan-worktree enumeration (link:filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). They run unattended, since their evidence (the compiled maximum age of a pending entry record, a plan that no longer resolves or is terminal) needs no operator judgement.
+
+Every removal sweep:
+
+* removes, if it is a retention purge, only on `pm-mcp operator sweep --apply` and otherwise only lists; an automatic sweep is exempt from this rule only and applies its removals, each with an audit record;
 * reports for every kept item the first keep-rule that fired, and for every removed item the trigger that fired;
 * reports the source (`compiled_default`, `derived`, `team`, or `operator`, <<project-configuration-store,Project Configuration>>) of every configuration value it used;
 * reports an empty population as one of `root_absent`, `root_unreadable`, `nothing_listed`, or `all_kept`, never as a bare zero;

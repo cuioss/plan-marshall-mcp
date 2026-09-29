@@ -27,6 +27,18 @@ Guard:: The runtime derives job outcomes itself; a `project_script` output `stat
 observed exit and parse evidence and never adopted blindly.
 Source:: truthful-signals PLAN-TRUTH-155 D5.
 
+[#PM-WATCH-JOB-23]
+=== PM-WATCH-JOB-23: A crash at job end loses at most a freshness mark or a timing sample
+
+Anchor:: link:../specification/job-runtime.adoc#outcome-derivation[Job Runtime § Outcome Derivation] (Write order at job end),
+link:../specification/store-schemas.adoc#job-record[Store Schemas § Job Record] (Write order at job end)
+Hazard:: Settling a job in an arbitrary order lets a crash leave a released build slot with an unsettled record, or a
+ledger row that stamps a build whose job record never recorded its fate.
+Guard:: Crash injection after each step of the fixed order (job record fate, change-ledger row, timing observation,
+build-slot release): after restart every store is consistent, and the only losses are a missing ledger row (the next
+freshness check re-runs the build) or a missing timing sample; no step is re-derived and no marker file exists.
+Source:: operator decision of 2026-09-29 (doc review); no plan-marshall defect record.
+
 == Subprocess Lifecycle & Process-Group Isolation
 
 [#PM-WATCH-JOB-2]
@@ -137,20 +149,50 @@ with `Retry-After` or a reset instant defers the next request to that instant, t
 because of it.
 Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-27); no plan-marshall defect record.
 
+[#PM-WATCH-JOB-22]
+=== PM-WATCH-JOB-22: Recovery signals only a process it can identify
+
+Anchor:: link:../specification/job-runtime.adoc#_process_termination_cancellation_protocol[Job Runtime § Process Termination & Cancellation Protocol] (Live Orphans after a Runtime Crash),
+link:../specification/store-schemas.adoc#job-record[Store Schemas § Job Record] (Post-spawn, Recovery)
+Hazard:: A job counted as running before its record names the PID leaves an orphan the recovery cannot identify; a
+recovery that trusts a PID from before the last boot, or guesses one, signals an unrelated process that reuses it.
+Guard:: Crash injection between spawn and the post-spawn replace: after restart the record (`pid: null`) is marked
+`killed` with the audit note "orphan unidentifiable" and no signal is sent; a `running` record whose `spawned_at` lies
+before the system boot time is marked `killed` and no signal is sent; control: a same-boot record with `pid` and
+`process_started_at` is probed and its process group terminated as specified.
+Source:: operator decision of 2026-09-29 (doc review); no plan-marshall defect record.
+
 == Linux Filesystem Confinement (Landlock)
 
 [#PM-WATCH-JOB-20]
-=== PM-WATCH-JOB-20: A job cannot read the runtime token
+=== PM-WATCH-JOB-20: A job cannot read the PM-MCP base directory
 
 Anchor:: link:../specification/job-runtime.adoc#_linux_filesystem_confinement_landlock[Job Runtime § Linux Filesystem Confinement] (Read set),
 link:../Requirements.adoc#PM-SEC-5[PM-SEC-5]
-Hazard:: Landlock rules only grant access, so a read rule on `/` also grants `<PM_MCP_BASE>/run/`; a job that reads
-`runtime.token` can call every endpoint of the local API, the operator endpoints included.
-Guard:: On Linux with Landlock, a job fixture tries to read `<PM_MCP_BASE>/run/runtime.token` and fails with a
-permission error, while it reads a sibling entry of `run/` under `<PM_MCP_BASE>` and a sibling of each directory on
-the path from `/` (read set built by sibling enumeration); control: an entry created on that path after job start is
-not readable by the job, which is the accepted limitation, and an entry created elsewhere stays readable.
-Source:: PM-MCP client architecture design review, operator decisions of 2026-09-28 (Z1-6); no plan-marshall defect record.
+Hazard:: Landlock rules only grant access, so a read rule on `/` also grants `<PM_MCP_BASE>`; a job that reads
+`run/runtime.token` can call every endpoint of the local API, the operator endpoints included, and a job that reads a
+fallback credential file, an enrolment, or another project's machine store learns what the operator never gave it.
+Guard:: On Linux with Landlock, a job fixture tries to read `<PM_MCP_BASE>/run/runtime.token`, a fallback credential
+file under `<PM_MCP_BASE>/credentials/`, and an entry of the per-project machine store, and each read fails with a
+permission error; positive control: the same job reads a binary under `<PM_MCP_HOME>`, a sibling of `<PM_MCP_BASE>`
+in its parent directory, and a sibling of each directory on the path from `/` (read set built by sibling
+enumeration); control: an entry created on that path after job start is not readable by the job, which is the
+accepted limitation, and an entry created elsewhere stays readable.
+Source:: PM-MCP client architecture design review, operator decisions of 2026-09-28 (Z1-6), read set widened to the
+whole of `<PM_MCP_BASE>` by the operator decision of 2026-09-29; no plan-marshall defect record.
+
+[#PM-WATCH-JOB-21]
+=== PM-WATCH-JOB-21: A job writes only its own project root
+
+Anchor:: link:../specification/job-runtime.adoc#_linux_filesystem_confinement_landlock[Job Runtime § Linux Filesystem Confinement] (Write set),
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5]
+Hazard:: A write set built from every enrolled project root, or one that still covers `<PM_MCP_BASE>`, lets a job of
+one project rewrite another project's sources or the runtime's own stores and enrolments.
+Guard:: On Linux with Landlock, a job fixture of project A writes into the enrolled root of project B and into
+`<PM_MCP_BASE>` (an enrolment file and a machine-store file), and each write fails with a permission error; positive
+control: the same job writes into its own project root, one of its worktrees, `.marshall/local/temp/`, a declared
+toolchain cache, and `/tmp`, and each write succeeds.
+Source:: operator decision of 2026-09-29 (doc review); no plan-marshall defect record.
 
 == Native Build Output Parsers
 
@@ -282,3 +324,17 @@ Token-Sheriff #744 (JaCoCo 0.70 / 0.57 against 0.80) fanning out into 5 findings
 Source:: process-compliance inbox `truth-179-opencode-target-detection-landed-005`; truthful-signals
 PLAN-TRUTH-145 § FOLDED 2026-09-15 (c) item -062.
 
+== Working-Tree Hash (`worktree_sha`)
+
+[#PM-WATCH-JOB-24]
+=== PM-WATCH-JOB-24: Both git variants compute the same `worktree_sha`
+
+Anchor:: link:../specification/job-runtime.adoc#worktree-sha[Job Runtime § Working-Tree Hash],
+link:../Requirements.adoc#PM-SVC-1[PM-SVC-1]
+Hazard:: A digest computed from variant-specific status output, or from bytes that git configuration reshapes, marks
+a fresh build stale (or a stale build fresh) when a project switches between the native and the CLI variant.
+Guard:: Fixture repositories with changed, deleted, untracked, and ignored paths: the native (`StatusCommand`) and the
+CLI (`git status --porcelain -z`) variant of `git.worktree-sha` return identical digests and version `1`, and an
+ignored path does not change the digest; control: setting `core.autocrlf`, `core.quotePath`, and `diff.noprefix`
+leaves both digests unchanged.
+Source:: operator decision of 2026-09-29 (doc review); no plan-marshall defect record.

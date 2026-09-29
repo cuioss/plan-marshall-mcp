@@ -115,7 +115,7 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 [#machine-layout]
 == Machine-Wide Runtime Layout (`<PM_MCP_BASE>`)
 
-`pm-mcp` persists machine-wide configuration, cross-process `FileChannel.lock()` files, audit logs, project enrolments, the fallback credential store, and the per-project machine stores in its instance directory `<PM_MCP_BASE>`, default `~/.plan-marshall-mcp/`; the only override is the environment variable `PM_MCP_BASE` (`PM-ARCH-2`, `PM-ARCH-6`, `PM-DIST-5`). `PM-MCP` never reads `PLAN_MARSHALL_HOME` or `PLAN_MARSHALL_CREDENTIALS_DIR`, and never reads or writes `~/.plan-marshall/`. The binaries live apart from it in the read-only installation directory `<PM_MCP_HOME>/bin/` (link:cli-and-security.adoc#installation-layout[CLI, Coordination & Security Specification, Installation Layout]), which holds no configuration file: machine settings are `machine-config.json`.
+The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `FileChannel.lock()` files, audit logs, project enrolments, the fallback credential store, and the per-project machine stores in its instance directory `<PM_MCP_BASE>`, default `~/.plan-marshall-mcp/`; the only override is the environment variable `PM_MCP_BASE` (`PM-ARCH-2`, `PM-ARCH-6`, `PM-DIST-5`). `PM-MCP` never reads `PLAN_MARSHALL_HOME` or `PLAN_MARSHALL_CREDENTIALS_DIR`, and never reads or writes `~/.plan-marshall/`. The binaries live apart from it in the read-only installation directory `<PM_MCP_HOME>/bin/` (link:cli-and-security.adoc#installation-layout[CLI, Coordination & Security Specification, Installation Layout]), which holds no configuration file: machine settings are `machine-config.json`.
 
 [source,text]
 ----
@@ -148,7 +148,7 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 │   └── runtime.json                     # Runtime record: pid, start instant, version, effective socket path
 │                                        # (default or $TMPDIR fallback), written at socket bind
 │
-├── run/                                 # Runtime directory (mode 0700); outside every job's Landlock read set
+├── run/                                 # Runtime directory (mode 0700); like all of <PM_MCP_BASE> outside every job's Landlock read set
 │   ├── runtime.token                    # Runtime token, rewritten at every runtime start before bind (mode 0600)
 │   ├── runtime.sock                     # Unix domain socket of the runtime (mode 0600); if this path
 │   │                                    # exceeds sun_path, $TMPDIR/pm-mcp-<hash>/runtime.sock instead
@@ -159,7 +159,7 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
 │
 ├── locks/                               # Cross-process OS FileChannel.lock() primitives
 │   ├── runtime.lock                     # Runtime singleton lock (held for the runtime lifetime)
-│   ├── runtime-start.lock               # Serializes on-demand runtime start by CLI commands
+│   ├── runtime-start.lock               # Serializes on-demand runtime start by CLI commands (the CLI's only lock)
 │   │                                    # Machine store locks, one sibling lock per renamed store,
 │   │                                    # acquired alphabetically after all scope locks:
 │   ├── build-slots.lock                 # state/build-slots.json
@@ -177,14 +177,14 @@ Git-tracked orchestrator state (`.marshall/orchestrator/**`) is edited only in o
     ├── audit.jsonl                      # Append-only audit (mode 0600); locked directly, leaf lock
     ├── audit-<first_event_id>.jsonl     # Rotated audit files, closed by a checkpoint record
     ├── audit-index.jsonl                # Hash-chained index of rotated audit files
-    ├── audit.head                       # HMAC-anchored head: file, record count, last event_id, head hash
-    └── jobs/                            # Subprocess execution logs by job ID
-        └── <job_id>.log
+    └── audit.head                       # HMAC-anchored head: file, record count, last event_id, head hash
 ----
 
-The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `projects/` (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The Landlock read set of jobs excludes `<PM_MCP_BASE>/run/`, so no job reads the runtime token (link:job-runtime.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]).
+The Linux Landlock write set of a job contains only its own project root (with its worktrees and `.marshall/local/temp/`), the declared toolchain caches, `/tmp`, and `/dev`; it never contains `<PM_MCP_BASE>`, including `projects/`, or another enrolled project's root (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The Landlock read set of jobs is the whole filesystem except all of `<PM_MCP_BASE>`, so no job reads the runtime token, a credential file, an enrolment, or another project's machine store; the installation directory `<PM_MCP_HOME>` stays readable (link:job-runtime.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]).
 
 === File Permissions & Security Attributes
+
+The runtime creates every file under `<PM_MCP_BASE>` with mode `0600` and every directory with mode `0700`. At start it checks only `<PM_MCP_BASE>`, `enrolments/`, and `run/` (owned by the effective UID, mode `0700`) and the files in `state/` (mode `0600`); enrolment and credential files are checked on every use (`PM-SEC-4`). The `0700` base directory is what protects the rest.
 
 [cols="2,1,3"]
 |===
@@ -212,7 +212,7 @@ The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `
 
 |`<PM_MCP_BASE>/projects/` and every `<project_id>/` below it
 |`0700` (`drwx------`)
-|Covered by the `<PM_MCP_BASE>` rules: owned by the effective UID, never in the job Landlock write set, and behind the host deny rules for `<PM_MCP_BASE>/**`. The store digest sidecars still detect out-of-band edits by a host shell (link:store-schemas.adoc#store-digest-verification[Store Schemas Specification]).
+|Covered by the `<PM_MCP_BASE>` rules: owned by the effective UID, never in a job's Landlock read or write set, and behind the host deny rules for `<PM_MCP_BASE>/**`. The store digest sidecars still detect out-of-band edits by a host shell (link:store-schemas.adoc#store-digest-verification[Store Schemas Specification]).
 
 |`<PM_MCP_BASE>/locks/*.lock` and `<PM_MCP_BASE>/projects/<project_id>/locks/*.lock`
 |`0600` (`-rw-------`)
@@ -238,7 +238,7 @@ The Linux Landlock write set of jobs never contains `<PM_MCP_BASE>`, including `
 [#machine-store]
 == Per-Project Machine Store (`<PM_MCP_BASE>/projects/<project_id>/`)
 
-All server-owned state of one project lives in its per-project machine store `<PM_MCP_BASE>/projects/<project_id>/`, where `<project_id>` is the project's enrolment identifier, the name of its enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (the same key that names project-scoped credentials, `PM-CRED-3`): assigned by the operator, unique per machine, and identical for the main checkout and all its worktrees. `pm-mcp operator enrol` creates the store; `pm-mcp operator release-project` leaves it readable (<<coexistence-lifecycle>>).
+All server-owned state of one project lives in its per-project machine store `<PM_MCP_BASE>/projects/<project_id>/`, where `<project_id>` is the project's enrolment identifier, the name of its enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (the same key that names project-scoped credentials, `PM-CRED-3`): assigned by the operator, unique per machine, and identical for the main checkout and all its worktrees. `pm-mcp operator enrol` creates the store and records its `project_root` in `store.json` (link:store-schemas.adoc#project-store-identity[Store Schemas Specification, Project Store Identity]); `pm-mcp operator release-project` leaves it readable (<<coexistence-lifecycle>>), and `pm-mcp operator unenrol` leaves it untouched: its removal is a retention purge of `pm-mcp operator sweep` (link:store-schemas.adoc#evidence-based-removal-sweeps[Store Schemas Specification, Evidence-Based Removal Sweeps]).
 
 [source,text]
 ----
@@ -258,10 +258,10 @@ All server-owned state of one project lives in its per-project machine store `<P
 │       ├── quality-report.json          # Post-run quality report (plan-retrospective)
 │       ├── change-ledger.jsonl          # Append-only worktree_sha-stamped build/change/job ledger
 │       ├── references.json
-│       ├── sessions.jsonl               # Append-only session log; the last row is the current identity
+│       ├── sessions.jsonl               # Session log (append-only except last_seen_at of the last row); last row = current identity
 │       └── mcp/
 │           ├── digests.json             # Store size/SHA-256 sidecar (out-of-band edit detection)
-│           ├── mailbox.jsonl           # Append-only event log: messages from the parent epic
+│           ├── mailbox.jsonl            # Append-only event log: messages from the parent epic (own leaf lock)
 │           ├── status.json              # Hypermedia FSM state, worktree_path & iteration counters
 │           ├── transaction-journal.json # Transaction journal while a write is in flight
 │           └── units/                   # The plan's bound copy of the verified workflow units (Workflow DSL)
@@ -275,9 +275,9 @@ All server-owned state of one project lives in its per-project machine store `<P
 │   └── .transaction-journal.json        # Transaction journal while a lesson write is in flight
 │
 ├── workspace/                           # Workspace scope home
-│   ├── change-ledger.jsonl              # Ledger rows of plan-less service calls (pm_build without plan_id)
+│   ├── change-ledger.jsonl              # Ledger rows of plan-less service calls (pm_build with plan_id NO_PLAN)
 │   ├── findings.jsonl                   # Findings of plan-less builds
-│   ├── sessions.jsonl                   # Append-only session log of the workspace scope
+│   ├── sessions.jsonl                   # Session log of the workspace scope (same append exception)
 │   └── mcp/
 │       ├── digests.json                 # Store size/SHA-256 sidecar
 │       ├── status.json                 # FSM state of the hosted workflows (project-setup)
@@ -286,15 +286,16 @@ All server-owned state of one project lives in its per-project machine store `<P
 ├── epics/                               # Non-tracked state of the epics (the ledger itself is git-tracked)
 │   └── <epic_id>/
 │       ├── digests.json                 # Store size/SHA-256 sidecar
-│       ├── sessions.jsonl               # Append-only session log of the epic scope
+│       ├── sessions.jsonl               # Session log of the epic scope (same append exception)
 │       ├── status.json                  # FSM orchestrator state
 │       └── transaction-journal.json     # Transaction journal while a write is in flight
 │
 ├── pending/                             # Pending entry records of not-yet-created plans
 │   └── <entry_id>.json                  # Written by pm-mcp enter, consumed by pm_start
 │
-├── jobs/                                # Write-ahead job journal (crash recovery)
-│   └── <job_id>.json                    # Job record: written before spawn, replaced at fate
+├── jobs/                                # Write-ahead job journal (crash recovery) and job logs
+│   ├── <job_id>.json                    # Job record: written before spawn, replaced post-spawn (pid) and at fate
+│   └── <job_id>.log                     # Raw job output, next to its record; removed with it by retention
 │
 ├── build-timings.json                   # Learned job budgets keyed by canonical budget key
 │
@@ -308,6 +309,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 │   └── build-timings.lock               # 7. build-timings.json
 │
 ├── derived-facts.json                   # Cache of derived facts (Store Schemas § Derived Facts Store); deletable
+├── store.json                           # Store identity: project_id and the project_root it was created for
 └── local-config.json                    # Operator posture of this project (Store Schemas § Operator Local Configuration)
 ----
 
@@ -319,10 +321,10 @@ All server-owned state of one project lives in its per-project machine store `<P
 [#workspace-home]
 === Workspace Home (`<PM_MCP_BASE>/projects/<project_id>/workspace/`)
 
-Every enrolled project has exactly one workspace scope (`PM-ARCH-4`), addressed as `scope=workspace` and resolved from the `PM-MCP-Workspace` header of the request (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata). Its home is `workspace/` in the project's machine store:
+Every enrolled project has exactly one workspace scope (`PM-ARCH-4`), addressed in a tool call as `plan_id: NO_PLAN` (link:identifiers.adoc#id-no-plan[Identifier Registry, `NO_PLAN`]) and resolved from the `PM-MCP-Workspace` header of the request (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata). Its home is `workspace/` in the project's machine store:
 
 * *No Worktree, No Archive*: The workspace scope has no worktree and no archive; its home stays in the machine store for the life of the enrolment.
-* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup`, link:domain-extensions.adoc[Domain Extensions Specification]), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` without `plan_id`), and `findings.jsonl` (the findings of plan-less builds). Build and job logs stay in `<PM_MCP_BASE>/logs/jobs/` and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status` and `pm://workspace/findings` project the two stores (link:mcp-tools.adoc[MCP Tools Specification]).
+* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup`, link:domain-extensions.adoc[Domain Extensions Specification]), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), and `findings.jsonl` (the findings of plan-less builds). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status` and `pm://workspace/findings` project the two stores (link:mcp-tools.adoc[MCP Tools Specification]).
 * *Lock*: Every write to the workspace home takes `locks/workspace.lock` of the project's machine store, the first lock of the one total order (workspace -> plan locks -> epic locks -> `epics-worktree` -> `lessons` -> `local-config` -> `build-timings` -> machine store locks -> leaf locks, link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification]), and runs as a journaled transaction (`mcp/transaction-journal.json`, link:store-schemas.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]).
 
 [#archives]
@@ -356,7 +358,7 @@ The resolved `project_id` and origin are recorded in the session row (`entered_f
 ** Otherwise the plan does not exist (`scope_not_found`).
 * *Missing Is Not Empty*: Every path and record resolver distinguishes `absent` (the path does not exist) from an existing empty directory or file, and a metadata reader that finds nothing it can parse reports `unreadable`, never an empty record; neither is ever answered as a successful empty result.
 * *Enumeration*: Every enumeration of live plans (`pm_plans`, dedup gates, sibling reads) lists `plans/*` of the project's machine store, one directory, and reports `could_not_look` for an unreadable store, distinct from an empty one.
-* *Stateless Client Scope*: Neither the model nor the MCP client ever passes filesystem paths (`PM-ARCH-4`, `PM-SEC-2`). The client passes only `plan_id` or `epic_id`. The daemon dynamically resolves the canonical real path (`Path.toRealPath()`) and verifies confinement to the project's machine store or workspace before any file I/O.
+* *Stateless Client Scope*: Neither the model nor the MCP client ever passes filesystem paths (`PM-ARCH-4`, `PM-SEC-2`). The client passes only `plan_id` (a plan id, or `NO_PLAN` for the workspace scope) or `epic_id`. The daemon dynamically resolves the canonical real path (`Path.toRealPath()`) and verifies confinement to the project's machine store or workspace before any file I/O.
 
 [#coexistence-lifecycle]
 == Coexistence with plan-marshall, Enrolment & Release (`PM-MIG-1`, `PM-MIG-2`, `PM-MIG-5`)

@@ -56,6 +56,7 @@ _See Requirement link:../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel I
 _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-10[PM-WATCH-TOOL-10], link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-12[PM-WATCH-TOOL-12]_
 
 === Architectural Constraints
+_Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-13[PM-WATCH-TOOL-13]_
 
 1. *Small, Stable Verb Set*: PM-MCP exposes a fixed set of top-level MCP tools (`pm_start`, `pm_state`, `pm_do`, `pm_plans`, `pm_epics`, `pm_build`, `pm_lsp`, `pm_skills`, `pm_skill`, `pm_skill_file`) rather than one tool per workflow step or script. Across all phases and domains, the resident core tool surface remains constant, and privileged operator actions are strictly excluded from the MCP tool surface (`PM-SEC-3`). The only additional tools are the operator-allowlisted upstream pass-through tools (<<_selective_upstream_mcp_proxy_meta_provenance_pm_svc_3>>), which change only with the operator's allowlist and are never part of the core set. The set has no exception: no tool runs legacy `plan-marshall` scripts (<<transitional-legacy-script-tool>>).
 2. *Portable Naming Convention*: Every core tool name conforms to the link:identifiers.adoc#id-core-tool-name[core tool name grammar] and every upstream pass-through tool name to the link:identifiers.adoc#id-upstream-tool-name[upstream tool name grammar] (Identifier Registry), ensuring identical identifiers across Claude Code, OpenCode, Antigravity, Codex, and raw model tool-calling APIs without escaping or translation.
@@ -66,6 +67,7 @@ _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL
 7. *Canonical Identifiers*: Every identifier property (`plan_id`, `epic_id`, `entry_id`, `entity`, `link`, `dispatch_id`, `job_id`, `lesson_id`, `recipe_id`, `plan_slug`, `module`, skill `uri` and `section`) uses the grammar of the link:identifiers.adoc[Identifier Registry] (`plan_id` and `epic_id`: link:identifiers.adoc#id-plan-id[`plan_id`]; the derivation rules stay in link:phase-workflows.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); every `pattern` below equals the registry grammar, and every example in this specification conforms to it.
 8. *Model-Facing Minimality*: Every tool result and error payload, like every representation, carries only fields with an operational purpose for the model (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]). Implementation variants, derivation sources, internal versions and digests, confinement, timing, and audit identifiers (outside `internal_fault` and `file_unreadable`) are recorded in `audit.jsonl`, the job record, or the metrics store and served by `pm-mcp status` or the operator CLI; `ModelFacingFieldAuditTest` checks every result record against the registry of model-facing fields.
 9. *MCP Is Not the Operator or Web Surface*: The MCP endpoint `/mcp` and the Local API `/api/v1` are separate surfaces on the runtime's Unix socket (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). No MCP tool, resource, or link reaches an `/api/v1` operator endpoint, the web device store, pairing, or the web server's lifecycle, and no `pm_do` argument selects one; `/mcp` is never served over TCP and never proxied by the web server (link:cli-and-security.adoc#web-proxy[CLI, Coordination & Security Specification, API Proxy]).
+10. *Explicit Scope on Every Scoped Tool (`NO_PLAN` Sentinel)*: `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skill`, `pm_skills`, and `pm_skill_file` require exactly one of `plan_id` or, where the tool accepts epics, `epic_id`. `plan_id` is a real plan id or the literal `NO_PLAN`, a reserved value that cannot match the `plan_id` grammar (link:identifiers.adoc#id-plan-id[Identifier Registry, `plan_id`]) and addresses the project's workspace scope and its main checkout (workspace-addressed, `PM-ARCH-4`, resolved from the `PM-MCP-Workspace` header). A call without a scope is refused with `invalid_arguments`; no tool infers a scope from an omitted parameter, and no tool takes a `scope: "workspace"` input (the `scope` enum stays in returned representations). The sentinel mirrors `plan-marshall`'s `NO_PLAN` convention, applied to every scoped tool.
 
 == Core Workflow Tool Schemas (`pm_start`, `pm_state`, `pm_do`)
 _See Requirement link:../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_start, pm_state, pm_do)]_
@@ -78,7 +80,7 @@ Creates a new plan directory from exactly one of the six supported initializatio
 [#pm-start-refusal]
 ==== `pm_start` Refusals
 
-A refused `pm_start` (`plan_id_taken`, `epic_pointer_mismatch`, `no_local_changes`, `capability_missing`, `integration_variant_unset`, `config_dirty`, `config_invalid`, `format_outdated`, `format_newer`, `lesson_unavailable`, or a `recipe_params` violation) creates no plan and returns `isError: false` with a scope-less representation: `scope: none`, no `state`, a `rejected` block (`link: pm_start`, closed `reason`, `detail`), `facts` with the server-computed alternatives, and `links[0]` (without a scope there is no `pm_do`). For `plan_id_taken`, `facts` names the existing `plan_id` and where it exists (live or archived) and a free alternative `plan_slug` derived by the server; for `epic_pointer_mismatch`, it names the epic whose `launched` row matched; for `no_local_changes`, it names the base branch the capture compared against; for `capability_missing`, it names the `reason` (`head_not_writable`: the agent identity cannot push to the head branch of the pull request named by `pr_number`, for example a fork) and the pull request; for `integration_variant_unset`, it names the undecided integrations and the operator command that decides them; for `config_dirty`, it names the porcelain state of the dirty files under `.marshall/config/` and the operator's two resolutions (commit or restore); for `config_invalid`, `format_outdated`, and `format_newer`, it names the file and the finding. The pending entry record `<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json` is consumed only by a successful `pm_start`; after a refusal it stays in place, so a retry with a corrected `plan_slug` uses the same `entry_id`, and an abandoned record is removed by the runtime's pending-record sweep.
+A refused `pm_start` (`plan_id_taken`, `epic_pointer_mismatch`, `no_local_changes`, `capability_missing`, `integration_variant_unset`, `config_dirty`, `config_invalid`, `format_outdated`, `format_newer`, `lesson_unavailable`, or `recipe_params_invalid`) creates no plan and returns `isError: false` with a scope-less representation: `scope: none`, no `state`, a `rejected` block (`link: pm_start`, closed `reason`, `detail`), `facts` with the server-computed alternatives, and `links[0]` (without a scope there is no `pm_do`). For `plan_id_taken`, `facts` names the existing `plan_id` and where it exists (live or archived) and a free alternative `plan_slug` derived by the server; for `epic_pointer_mismatch`, it names the epic whose `launched` row matched; for `no_local_changes`, it names the base branch the capture compared against; for `capability_missing`, it names the `reason` (`head_not_writable`: the agent identity cannot push to the head branch of the pull request named by `pr_number`, for example a fork) and the pull request; for `integration_variant_unset`, it names the undecided integrations and the operator command that decides them; for `config_dirty`, it names the porcelain state of the dirty files under `.marshall/config/` and the operator's two resolutions (commit or restore); for `config_invalid`, `format_outdated`, and `format_newer`, it names the file and the finding; for `recipe_params_invalid`, `detail` names the offending parameter. The pending entry record `<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json` is consumed only by a successful `pm_start`; after a refusal it stays in place, so a retry with a corrected `plan_slug` uses the same `entry_id`, and an abandoned record is removed by the runtime's pending-record sweep.
 
 [source,json]
 ----
@@ -134,7 +136,7 @@ A refused `pm_start` (`plan_id_taken`, `epic_pointer_mismatch`, `no_local_change
     "recipe_params": {
       "type": "object",
       "default": {},
-      "description": "Optional recipe parameters, validated by the server against the recipe's own free per-recipe input schema (recipe descriptor parameters_schema; domain-extensions.adoc, Declarative Recipe Descriptor Schema); a violation, or non-empty params for a recipe without a schema, refuses pm_start."
+      "description": "Optional recipe parameters, validated by the server against the recipe's own free per-recipe input schema (recipe descriptor parameters_schema; domain-extensions.adoc, Declarative Recipe Descriptor Schema); a violation, or non-empty params for a recipe without a schema, refuses pm_start with recipe_params_invalid."
     },
     "plan_slug": {
       "type": "string",
@@ -157,7 +159,7 @@ A refused `pm_start` (`plan_id_taken`, `epic_pointer_mismatch`, `no_local_change
 
 === `pm_state` — Query Authoritative Hypermedia State
 
-Returns the current hypermedia representation (`state`, `summary`, `skill` URI, domain `facts`, and valid `links`) for a `plan_id`, an `epic_id`, or the project's workspace scope (`scope: "workspace"`, resolved from the `PM-MCP-Workspace` header, `PM-ARCH-4`; it hosts `project-setup`). When `entity` (and optional `scope: "entity"`) is supplied by a dispatched sub-agent, returns the leaf-scoped representation for that entity (e.g., task envelope `envelope-2` or finding `F-12`) and claims `dispatch_id` if provided.
+Returns the current hypermedia representation (`state`, `summary`, `skill` URI, domain `facts`, and valid `links`) for a `plan_id`, an `epic_id`, or the project's workspace scope (`plan_id: "NO_PLAN"`, resolved from the `PM-MCP-Workspace` header, `PM-ARCH-4`; it hosts `project-setup`). When `entity` (and optional `scope: "entity"`) is supplied by a dispatched sub-agent, returns the leaf-scoped representation for that entity (e.g., task envelope `envelope-2` or finding `F-12`) and claims `dispatch_id` if provided.
 
 [source,json]
 ----
@@ -169,13 +171,13 @@ Returns the current hypermedia representation (`state`, `summary`, `skill` URI, 
   "properties": {
     "scope": {
       "type": "string",
-      "enum": ["plan", "epic", "entity", "workspace"],
+      "enum": ["plan", "epic", "entity"],
       "description": "Optional explicit scope discriminator (inferred from plan_id/epic_id/entity when omitted)."
     },
     "plan_id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Identifier of the target plan scope. Exactly one of plan_id, epic_id, or scope=workspace is required (server-enforced)."
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Identifier of the target plan scope, or the literal NO_PLAN for the project's workspace scope. Exactly one of plan_id or epic_id is required (server-enforced)."
     },
     "epic_id": {
       "type": "string",
@@ -202,7 +204,7 @@ NOTE: Companion discovery tools `pm_plans` (zero-argument, `{"type": "object", "
 === `pm_do` — Follow a Hypermedia Link
 _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-1[PM-WATCH-TOOL-1]_
 
-The sole state transition verb in PM-MCP. Executes the transition identified by `link` from the current representation of `plan_id`, `epic_id`, or the workspace scope (`scope: "workspace"`), passing any judgment parameters in `args`.
+The sole state transition verb in PM-MCP. Executes the transition identified by `link` from the current representation of `plan_id`, `epic_id`, or the workspace scope (`plan_id: "NO_PLAN"`), passing any judgment parameters in `args`.
 
 [source,json]
 ----
@@ -214,13 +216,13 @@ The sole state transition verb in PM-MCP. Executes the transition identified by 
   "properties": {
     "scope": {
       "type": "string",
-      "enum": ["plan", "epic", "entity", "workspace"],
+      "enum": ["plan", "epic", "entity"],
       "description": "Optional explicit scope discriminator."
     },
     "plan_id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Identifier of the target plan scope. Exactly one of plan_id, epic_id, or scope=workspace is required (server-enforced)."
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Identifier of the target plan scope, or the literal NO_PLAN for the project's workspace scope. Exactly one of plan_id or epic_id is required (server-enforced)."
     },
     "epic_id": {
       "type": "string",
@@ -236,7 +238,7 @@ The sole state transition verb in PM-MCP. Executes the transition identified by 
       "type": "string",
       "pattern": "^[a-z][a-z0-9_-]{0,31}(:(decision:)?[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?$",
       "maxLength": 106,
-      "description": "Link identifier from the current representation (e.g., 'push', 'triage:F-12', 'wait:b-2291', 'wait:decision:dec-7f3a', 'returned:dsp-0001-a9f3c2')."
+      "description": "Link identifier from the current representation (e.g., 'push', 'triage:F-12', 'wait:b-7f3a09c4e1d2b865', 'wait:decision:dec-7f3a', 'returned:dsp-0001-a9f3c2')."
     },
     "args": {
       "type": "object",
@@ -275,20 +277,20 @@ Service tools provide deterministic build execution and warm language-server int
 === `pm_build` — Enrolled Build Execution
 _Implementation watch: link:../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-11[PM-WATCH-JOB-11]_
 
-Submits or awaits a build job in the plan's worktree (or the primary repository checkout when `plan_id` is omitted; such a plan-less build is workspace-addressed, `PM-ARCH-4`, and writes its `change-ledger.jsonl` row, findings, and log into the workspace home `<PM_MCP_BASE>/projects/<project_id>/workspace/`) using one of the canonical build verbs (link:job-runtime.adoc#canonical-build-verbs[Job Runtime Specification, Canonical Build Verb Set]; the `command` enum below equals it). The gate scope of the run follows from `module` alone: without `module` the build runs whole-tree, with it only that module. The call blocks for one bounded or progress wait window (link:timeouts.adoc#bounded-wait[Timeouts & Budgets Specification]). The model never supplies shell commands or flags.
+Submits or awaits a build job in the plan's worktree (or the primary repository checkout when `plan_id` is `NO_PLAN`; such a plan-less build is workspace-addressed, `PM-ARCH-4`, and writes its `change-ledger.jsonl` row, findings, and log into the workspace home `<PM_MCP_BASE>/projects/<project_id>/workspace/`) using one of the canonical build verbs (link:job-runtime.adoc#canonical-build-verbs[Job Runtime Specification, Canonical Build Verb Set]; the `command` enum below equals it). The gate scope of the run follows from `module` alone: without `module` the build runs whole-tree, with it only that module. The call blocks for one bounded or progress wait window (link:timeouts.adoc#bounded-wait[Timeouts & Budgets Specification]). The model never supplies shell commands or flags.
 
 [source,json]
 ----
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pm_build",
-  "description": "Execute a canonical project build verb in the plan's worktree (or primary checkout when plan_id is omitted) via the integrated build runner.",
+  "description": "Execute a canonical project build verb in the plan's worktree (or primary checkout when plan_id is NO_PLAN) via the integrated build runner.",
   "type": "object",
   "properties": {
     "plan_id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Optional plan scope whose worktree the build runs in. When omitted, runs in the primary repository checkout as a workspace-addressed request; its ledger row, findings, and log belong to the workspace scope."
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Plan scope whose worktree the build runs in. The literal NO_PLAN runs in the primary repository checkout as a workspace-addressed request; its ledger row, findings, and log belong to the workspace scope."
     },
     "command": {
       "type": "string",
@@ -313,11 +315,11 @@ Submits or awaits a build job in the plan's worktree (or the primary repository 
     },
     "job_id": {
       "type": "string",
-      "pattern": "^b-[0-9a-f]{4,16}$",
+      "pattern": "^b-[0-9a-f]{16}$",
       "description": "Optional job_id of a running build returned earlier by pm_build; the call then continues waiting on that build for one bounded window (PM-TOOL-2, PM-IMPL-4) instead of starting a new one."
     }
   },
-  "required": ["command"],
+  "required": ["plan_id", "command"],
   "additionalProperties": false
 }
 ----
@@ -326,33 +328,34 @@ Submits or awaits a build job in the plan's worktree (or the primary repository 
 
 `pm_build` never returns raw console output. It returns a structured TOON result containing:
 
-* `job_id`: unique build job identifier in the `b-` form of the link:identifiers.adoc#id-job-id[`job_id` grammar] (e.g., `b-2291`)
+* `job_id`: unique build job identifier in the `b-` form of the link:identifiers.adoc#id-job-id[`job_id` grammar] (e.g., `b-7f3a09c4e1d2b865`)
 * `status`: the closed job outcome enum (`succeeded`, `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`; `PM-EXEC-4`, derived by link:job-runtime.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]) plus the non-terminal `running`
+* `expectation`: present only on a terminal result of a call that supplied `expect`: `met` when the outcome matches the declared intent (`succeeded` for `green`; `failed` or `failed_unparsed` for `red`), otherwise `violated`; it never changes `status`
 * `summary`: counts of total/passed/failed/skipped tests and compiler/linter errors
 * `failures`: tabular TOON array of located compiler errors or test failures (`file`, `line`, `column`, `rule_or_test`, `message`)
-* `log_uri`: `pm://plan/{plan_id}/builds/{job_id}/log` (or `pm://workspace/builds/{job_id}/log` when `plan_id` is omitted; accompanied by the last 50 lines / 4 KB tail when `status == "failed_unparsed"`, `PM-IMPL-6`)
+* `log_uri`: `pm://plan/{plan_id}/builds/{job_id}/log` (or `pm://workspace/builds/{job_id}/log` when `plan_id` is `NO_PLAN`; accompanied by the last 50 lines / 4 KB tail when `status == "failed_unparsed"`, `PM-IMPL-6`)
 
 *Recorded, never returned*: The working-tree digest the build ran against (`worktree_sha` with its `worktree_sha_version`, or `unavailable` with its `worktree_sha_failure`; link:job-runtime.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash]) is stamped on the job's `change-ledger.jsonl` row (`kind: "build"`) and in its job record, where the freshness gates read it; the model makes no decision on it. The allocated budget with its `budget_derivation`, the build template source, the job's `confinement`, the build-slot cap and its source, and the job timing are likewise job-record data, shown by `pm-mcp status` (link:hypermedia-format.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 
-*Expected-red runs*: A failing run with `expect: red` is recorded as `expected_red` in the change ledger and files no finding; a passing run with `expect: red` is surfaced as `expected_red_went_green`. An `expect: red` run never satisfies a freshness gate.
+*Expected-red runs*: A failing run with `expect: red` returns `status: failed` with `expectation: met`, is recorded as `expected_red` in the change ledger, and files no finding; a passing run with `expect: red` returns `status: succeeded` with `expectation: violated`, and the change ledger records `expected_red_went_green`. An `expect: red` run never satisfies a freshness gate.
 
 === `pm_lsp` — Warm Language Server Operations
 _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-3[PM-WATCH-TOOL-3]_
 
-Queries or applies verified workspace edits against the session's warm LSP pool keyed by `(worktree, language)`.
+Queries or applies verified workspace edits against the runtime's warm LSP pool keyed by `(worktree, language)`. `plan_id: "NO_PLAN"` addresses the main checkout of the project's workspace scope for the read operations; `rename` with `NO_PLAN` is refused with `invalid_arguments`, because an edit is applied only inside a plan's worktree.
 
 [source,json]
 ----
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pm_lsp",
-  "description": "Execute a language-server operation against the warm LSP pool for a plan's worktree.",
+  "description": "Execute a language-server operation against the warm LSP pool for a plan's worktree or the main checkout.",
   "type": "object",
   "properties": {
     "plan_id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Plan scope identifying the target worktree."
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Plan scope identifying the target worktree, or the literal NO_PLAN for the main checkout of the workspace scope (refused for rename, server-enforced)."
     },
     "op": {
       "type": "string",
@@ -407,17 +410,18 @@ Queries or applies verified workspace edits against the session's warm LSP pool 
 ==== Warm LSP Pool Lifecycle (`PM-SVC-2`)
 _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-11[PM-WATCH-EXT-11], link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-4[PM-WATCH-TOOL-4]_
 
-* *Pool Keying & Lazy Spawn over `stdio`*: The runtime maintains a warm in-memory pool of LSP server child processes, shared by all host connections, keyed by `(canonical_worktree_path, language_id)` using language servers enrolled in the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json`and managed via `org.eclipse.lsp4j:org.eclipse.lsp4j` over `stdio`. Processes start lazily on the first `pm_lsp` or Axis C symbol-edge query and shut down automatically after the language server idle timeout (`lsp_idle_timeout_seconds` in `machine-config.json`), when the plan worktree is removed, or when the runtime drains or stops; the idle, start, and request timeouts are defined in link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle].
+* *Pool Keying & Lazy Spawn over `stdio`*: The runtime maintains a warm in-memory pool of LSP server child processes, shared by all host connections, keyed by `(canonical_worktree_path, language_id)` using language servers enrolled in the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json`and managed via `org.eclipse.lsp4j:org.eclipse.lsp4j` over `stdio`. They are pool processes, not jobs: started through `pm-mcp-exec` with the job confinement but without a job record, and ended by their closed `stdin` when the runtime crashes. Processes start lazily on the first `pm_lsp` or Axis C symbol-edge query and shut down automatically after the language server idle timeout (`lsp_idle_timeout_seconds` in `machine-config.json`), when the plan worktree is removed, or when the runtime drains or stops; the idle, start, and request timeouts are defined in link:timeouts.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle].
 * *Diagnostics (`diagnostics`)*: When the language server advertises the LSP 3.17 pull-diagnostics capability (`diagnosticProvider`), `pm-mcp` requests the file's current diagnostics with `textDocument/diagnostic`. Otherwise it returns the diagnostics the server last published for that file through the `textDocument/publishDiagnostics` notification, which the pool caches per document, and marks the result `source: published`.
 * *Server-Applied `WorkspaceEdit` (`rename`)*: When `op == "rename"`, `pm-mcp` validates that every target URI in the LSP `WorkspaceEdit` resolves inside the plan's worktree (`PM-SEC-2`), applies the text edits atomically on disk, notifies the warm LSP server (`textDocument/didChange`), and appends all modified file paths to the plan's `references.json` realized footprint. A server answer without a `WorkspaceEdit` is a third outcome, returned as `status: success, applied: false, reason: no_workspace_edit` with nothing changed. A malformed `documentChanges` entry refuses the whole edit instead of being dropped silently, and a rollback is reported as `rolled_back: true` only after the restored bytes, line endings included, are verified identical to the originals.
-* *Corpus Cross-Reference Integrity*: The marketplace corpus language server in the pool exposes cross-reference integrity (links between skills, standards, and documents) through the LSP `documentLink` request, so a broken reference is an LSP-visible fact rather than a separate scan; its per-language cost stays at the warm-pool tier.
+* *Corpus Language Server*: The corpus language server is an enrollable language server of the meta-project domain (`marshall-plugin`, `pm-plugin-development` in `plan-marshall`), served through the existing `definition`, `references`, and `hover` operations with `plan-marshall`'s completeness bound: an empty answer means the index found none. It adds no operation and no pool tier.
+* *Restart Limit*: A language server that crashes is restarted at most the compiled retry limit (link:job-runtime.adoc[Job Runtime Specification]); after the retries are exhausted, `pm_lsp` answers `lsp_unavailable` for that pool instance until its idle eviction or a runtime restart.
 
 === Selective Upstream MCP Proxy & `_meta` Provenance (`PM-SVC-3`)
 _See Requirement link:../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream MCP Proxy & Provenance Tagging]_
 
 `pm-mcp` is the host's single MCP entry point: upstream MCP servers (such as external issue trackers or documentation indexes) are connected once by the runtime and reached through it, and `pm-mcp` acts as their selective filter and provenance boundary:
 
-1. *Operator-Owned Allowlist*: Upstream servers, the tools re-exposed per server, and their credential keys are configured only in `<PM_MCP_BASE>/conf/upstream-mcp.json`, per enrolled project (the operator CLI writes it; `PM-SEC-3`). Repository content, including the team configuration under `.marshall/config/`, never adds a server or a tool.
+1. *Operator-Owned Allowlist*: Upstream servers, the tools re-exposed per server, and their credential keys are configured only in `<PM_MCP_BASE>/conf/upstream-mcp.json`, per enrolled project (written by the runtime on an operator CLI verb; `PM-SEC-3`). Repository content, including the team configuration under `.marshall/config/`, never adds a server or a tool.
 2. *Pass-Through Surface & Schema Narrowing*: Allowlisted tools are listed to the host as `up_<server_id>_<tool>` next to the core `pm_*` tools, with unused optional parameters stripped from their `inputSchema` to conserve resident context budget. The pass-through set is computed per request from the request's `PM-MCP-Workspace` header and the allowlist; it changes only when the operator changes the allowlist, and hosts see the change at their next `tools/list`. Upstream resources and prompts are not passed through, and upstream skills are never re-exposed as PM-MCP vocabulary skills.
 3. *Server-Side Use by Workflow Steps*: A workflow step may call an allowlisted upstream tool server-side; its result enters plan stores only through the untrusted-ingestion validator (`PM-SEC-1`), never verbatim.
 4. *Provenance Tagging (`_meta` key `de.cuioss.pm-mcp/source`)*: Every tool result or resource proxied from an upstream MCP server is wrapped with `_meta: {"de.cuioss.pm-mcp/source": "upstream_mcp:<server_id>", "de.cuioss.pm-mcp/trusted": false}`, using PM-MCP's own `_meta` key prefix (MCP `_meta` key prefix convention) so that provenance never collides with or is overwritten by keys the upstream server sets, and routed through the untrusted-ingestion validator (`PM-SEC-1`) before any candidate data can enter plan stores.
@@ -440,7 +444,7 @@ _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL
 * *Pure Vocabulary Contract (`PM-SKILL-1`)*: All procedural sequencing, CLI invocations, file path templates, and phase transition rules live exclusively in the compiled workflow engine. Vocabulary skills (`skill://pm/<path>/SKILL.md`) contain strictly domain standards, quality rubrics, architectural principles, and judgment criteria.
 * *Server-Generated & Client-Cached Catalogue (`PM-SKILL-2`)*: Vocabulary skills are compiled into the `pm-mcp` binary, filtered by the project's enabled domains (derived, with the overrides of `.marshall/config/domains.json`), and translated on the fly for the active client profile (`PM-CLIENT-2`). Every rendered skill includes a deterministic `_meta.sha256` content digest (`_meta["de.cuioss.pm-mcp/sha256"]`: the SHA-256 of exactly the rendered bytes the client receives, after profile translation and domain filtering, so it changes exactly when those bytes change) enabling client-side caching and invalidation: the runtime is sessionless (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata), so it offers no resource subscriptions and sends no `notifications/resources/updated` or `list_changed`; a client detects a changed skill by its digest, which every catalogue listing and every representation that names the skill carries.
 * *Dynamic State Context Injection (`PM-SKILL-4`)*: Live plan facts (`plan_id`, active task summary, open findings count, and valid `links`) are injected into the turn's TOON hypermedia representation (`skill` + `facts` + `links`), never baked into static `SKILL.md` files.
-* *Core Conduct Vocabulary (`skill://pm/core`)*: The always-loaded core skill states at minimum: (1) a fix covers the whole co-reference population of the defect (derived with `pm_lsp references` or a search before editing), never only the named site; (2) every "only", "all", "none", or "the set is N" claim carries its enumeration and the scope it was derived over; (3) a case outside a closed vocabulary is reported with the vocabulary's out-of-set member, never mapped onto a stand-in member; (4) a re-derived count or coverage figure is checked against its population before it is reported; (5) plan state is read only through `pm_state` and `pm://` resources, never from `.marshall/` files; (6) the correction a rejection names is applied before the call is retried, and a rejected call shape is never resubmitted unchanged; (7) an action taken outside the offered links (a bypass of a sanctioned path, a direct `.marshall/` read or write) is reported with the `report_bypass` link (link:hypermedia-format.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]).
+* *Core Conduct Vocabulary (`skill://pm/core/SKILL.md`)*: The always-loaded core skill states at minimum: (1) a fix covers the whole co-reference population of the defect (derived with `pm_lsp references` or a search before editing), never only the named site; (2) every "only", "all", "none", or "the set is N" claim carries its enumeration and the scope it was derived over; (3) a case outside a closed vocabulary is reported with the vocabulary's out-of-set member, never mapped onto a stand-in member; (4) a re-derived count or coverage figure is checked against its population before it is reported; (5) plan state is read only through `pm_state` and `pm://` resources, never from `.marshall/` files; (6) the correction a rejection names is applied before the call is retried, and a rejected call shape is never resubmitted unchanged; (7) an action taken outside the offered links (a bypass of a sanctioned path, a direct `.marshall/` read or write) is reported with the `report_bypass` link (link:hypermedia-format.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]).
 
 [#vocabulary-skill-rule-classification]
 === Vocabulary Skill Rule Classification
@@ -483,13 +487,13 @@ Fetches a rendered `SKILL.md` document by its canonical `skill://pm/.../SKILL.md
     },
     "plan_id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Optional plan_id scope used to resolve the persisted client profile and project domain configuration."
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Plan scope used to resolve the client profile and project domain configuration, or the literal NO_PLAN for the workspace scope. Exactly one of plan_id or epic_id is required (server-enforced)."
     },
     "epic_id": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Optional epic_id scope used to resolve the persisted client profile."
+      "description": "Epic scope used to resolve the client profile. Mutually exclusive with plan_id."
     }
   },
   "required": ["uri"],
@@ -497,14 +501,15 @@ Fetches a rendered `SKILL.md` document by its canonical `skill://pm/.../SKILL.md
 }
 ----
 
+* *Rendering Scope*: The addressed scope selects the rendering inputs: the client profile of the scope's latest session row and the project's enabled domains. With `NO_PLAN`, the profile comes from the workspace scope's latest session row and the domains from the project configuration.
 * *Section Index & Progressive Loading*: Every `pm_skill` and `pm_skill_file` result carries a section index computed by the server from the rendered document (`sections[]{anchor, title, level, bytes}`). Without `section`, the result carries the whole document beside the index; when the rendered document exceeds the server's inline threshold (one named constant, derived from the measured served-content distribution, link:store-schemas.adoc#metrics-store[Store Schemas Specification, Served-Content Ledger]), it carries the index instead of the body, with the total size, so the caller reads index first, then sections, then the whole document only when needed. With `section`, the result carries that section only, its `bytes`, and the index.
 * *Three Distinct Section Outcomes*: A `section` that the index does not contain returns a tool execution error with `error_code: section_not_found` (naming the available anchors); a document the server cannot read or render returns `error_code: file_unreadable`; a section that exists but has no content returns `bytes: 0` with an empty body. None of the three is ever rendered as a silent empty result.
 * *Served-Content Recording*: Every served read in a plan or epic scope appends a row to the served-content ledger (`uri`, `section`, `bytes`, `plan_id`, `phase`, `dispatch_id`), from which `record-metrics` publishes the per-document consumption. Host file reads are not observable and are never estimated.
 
 === Companion Catalogue, Supporting File Tools & MCP Resource Parity (`pm_skills`, `pm_skill_file`, `resources/read`)
 
-* `pm_skills`: Accepts optional `plan_id` or `epic_id` (`additionalProperties: false`) and returns the tabular TOON catalogue of all vocabulary skills active for the project's enabled domains (`uri`, `name`, `description`, `sha256`). Catalogue descriptions (skills, execution-context variants, and tool descriptions) are single-line and bounded by a length limit derived from the measured distribution of the resident surface (link:client-profiles.adoc[Client Profiles Specification]); a build-time test enforces the bound. A change of description shape (for example from summary-shaped to trigger-shaped) is a separately justified change.
-* `pm_skill_file`: Accepts required `uri` (supporting file form of the link:identifiers.adoc#id-skill-uri[skill URI grammar]) and optional `plan_id`/`epic_id`, `section`, and `dispatch_id` with the same semantics as for `pm_skill` (`additionalProperties: false`) to retrieve progressive-disclosure reference files linked from a `SKILL.md`. Skill `resources/read` returns the whole document and publishes the section index in `_meta`; section reads are served by the two tools.
+* `pm_skills`: Accepts exactly one of `plan_id` (a plan id or `NO_PLAN`) or `epic_id` (`additionalProperties: false`) and returns the tabular TOON catalogue of all vocabulary skills active for the project's enabled domains (`uri`, `name`, `description`, `sha256`). Catalogue descriptions (skills, execution-context variants, and tool descriptions) are single-line and bounded by a length limit derived from the measured distribution of the resident surface (link:client-profiles.adoc[Client Profiles Specification]); a build-time test enforces the bound. A change of description shape (for example from summary-shaped to trigger-shaped) is a separately justified change.
+* `pm_skill_file`: Accepts required `uri` (supporting file form of the link:identifiers.adoc#id-skill-uri[skill URI grammar]), exactly one of `plan_id` (a plan id or `NO_PLAN`) or `epic_id`, and optional `section` and `dispatch_id` with the same semantics as for `pm_skill` (`additionalProperties: false`) to retrieve progressive-disclosure reference files linked from a `SKILL.md`. Skill `resources/read` carries no scope argument and renders for the project's workspace scope (as `NO_PLAN`); it returns the whole document and publishes the section index in `_meta`; section reads are served by the two tools.
 * *Standard MCP Resource Template Parity (`PM-SKILL-3`)*: `pm-mcp` simultaneously exposes the RFC 6570 templates `skill://pm/{+path}/SKILL.md` and `skill://pm/{+path}/{file}` (`{+path}` = one or more `/`-separated lowercase segments) via standard MCP `resources/templates/list` and `resources/read`. Unadopted draft custom RPC methods (`skills/list`, `skills/get`) are not exposed.
 
 [#transitional-legacy-script-tool]
@@ -579,7 +584,7 @@ _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WA
 |`pm://workspace/builds/{job_id}/log`
 |`text/plain`
 |Workspace
-|Raw console log of a plan-less `pm_build` job run in the primary checkout (no `plan_id`); same query parameters.
+|Raw console log of a plan-less `pm_build` job run in the primary checkout (`plan_id: "NO_PLAN"`); same query parameters.
 
 |`pm://plan/{plan_id}/diagram`
 |`text/markdown`
@@ -605,14 +610,14 @@ _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WA
 |`pm://epic/{epic_id}/inbox` +
 `pm://epic/{epic_id}/inbox/{message_id}`
 |`text/toon`
-|Epic / Plan
-|The epic inbox as the fold of its event log (`inbox.jsonl`): every message with its current state (`pending`, `claimed`, `processed`), or one message by its store-assigned `message_id`. The epic scope reads all messages; a plan scope reads only the messages it sent (link:dispatch-and-effort.adoc#plan-scope-outbox-link[Dispatch & Effort Specification, Plan-Scope Outbox Link]). `message_id` must match the link:identifiers.adoc#id-message-id[`message_id` grammar]; a separator or traversal is refused with `path_traversal_rejected`; reading never changes a message's state.
+|Epic
+|The epic inbox as the fold of its event log (`inbox.jsonl`): every message with its current state (`pending`, `claimed`, `processed`), or one message by its store-assigned `message_id`. A plan's representation points at the messages it sent (link:dispatch-and-effort.adoc#plan-scope-outbox-link[Dispatch & Effort Specification, Plan-Scope Outbox Link]). `message_id` must match the link:identifiers.adoc#id-message-id[`message_id` grammar]; a separator or traversal is refused with `path_traversal_rejected`; reading never changes a message's state.
 
 |`pm://plan/{plan_id}/mailbox` +
 `pm://plan/{plan_id}/mailbox/{message_id}`
 |`text/toon`
 |Plan
-|The plan's own mailbox (`mcp/mailbox.jsonl`, messages from its parent epic) with `mailbox_state`, `delivery_state`, and per-message consumption; readable only by that plan's scope (link:dispatch-and-effort.adoc#plan-mailbox[Dispatch & Effort Specification, Plan Mailbox]).
+|The plan's own mailbox (`mcp/mailbox.jsonl`, messages from its parent epic) with `mailbox_state`, `delivery_state`, and per-message consumption (link:dispatch-and-effort.adoc#plan-mailbox[Dispatch & Effort Specification, Plan Mailbox]).
 
 |`pm://project/config`
 |`text/toon`
@@ -668,7 +673,7 @@ _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WA
 |`pm://architecture/drift`
 |`text/toon`
 |Project
-|Structural drift report comparing current build descriptors against the project architecture snapshot `.marshall/project-architecture/_project.json` (with its per-module `{module}/derived.json`; file names as in `plan-marshall`'s `manage-architecture`): `changed[]` and `indeterminate[]{module, reason}`; a comparison the hash surface cannot certify is `indeterminate`, never `changed`.
+|Structural drift report comparing current build descriptors against the structural module snapshot, the derived fact `module_discovery` of the project's `derived-facts.json` (link:domain-extensions.adoc[Domain Extensions Specification]): `changed[]` and `indeterminate[]{module, reason}`; a comparison the hash surface cannot certify is `indeterminate`, never `changed`.
 
 |`skill://pm/{+path}/SKILL.md`
 |`text/markdown`
@@ -678,7 +683,7 @@ _Implementation watch: link:../implementation-watch/domain-extensions.adoc#PM-WA
 
 *Resource Contract*: Every resource template documents its arguments, its payload, and its zero-result and error semantics (the `pm://architecture/*` details are in link:domain-extensions.adoc[Domain Extensions Specification]). A resource that returns no rows states what it examined, so an empty result is distinguishable from a result that could not be computed; an unknown scope or entity is answered with the JSON-RPC resource error `-32002` (resource not found) whose `data` carries `error_code: scope_not_found` (sanitized as in <<protocol-errors-vs-domain-workflow-failure-states>>; the refusal is audited, its `audit_id` is not returned), never with an empty payload; a resource path resolving outside its permitted root is answered the same way with `error_code: path_traversal_rejected`. `ReadResourceResult` has no `isError`, so resource errors are always JSON-RPC errors.
 
-*Epic Read Access*: An epic scope may read `pm://plan/{plan_id}/findings` and `pm://plan/{plan_id}/status` of the plans in its queue that are `launched`, `running`, or `blocked`, read-only.
+*Read Access Within the Project*: Every resource is readable, read-only, by every scope of its own project; the project boundary (`PM-SEC-2`) is the only access boundary, and there are no per-scope read restrictions on inbox, mailbox, or findings resources. Representations still point each scope at its own resources.
 
 [#protocol-errors-vs-domain-workflow-failure-states]
 == Protocol Errors, Tool Execution Errors (`isError: true`) & Domain Workflow Failure States (`isError: false`)
@@ -735,7 +740,7 @@ A foundational invariant of PM-MCP is that *domain failures and transition rejec
 |JSON-RPC `error` object (`-32700`, `-32600`, or `-32602`) with its fixed message; no `CallToolResult`.
 |Fix the tool invocation.
 
-|Tool arguments violate the input schema or a server-enforced argument rule (type, pattern, unknown property, mutually exclusive scope parameters, alternative plan sources, per-operation required parameters)
+|Tool arguments violate the input schema or a server-enforced argument rule (type, pattern, unknown property, missing or mutually exclusive scope parameters, alternative plan sources, per-operation required parameters)
 |`isError: true`
 |MCP `CallToolResult` with `isError: true`, `error_code: invalid_arguments`, `parameter`, and `rule`.
 |Correct the named parameter and call again.
@@ -749,6 +754,11 @@ A foundational invariant of PM-MCP is that *domain failures and transition rejec
 |`isError: true`
 |MCP `CallToolResult` with `isError: true` and `error_code: runtime_recovering`; nothing of the call was executed.
 |Retryable: repeat the same call.
+
+|`pm_lsp` addresses a language server whose restart retries are exhausted
+|`isError: true`
+|MCP `CallToolResult` with `isError: true` and `error_code: lsp_unavailable`.
+|Continue without semantic navigation (search instead); the instance returns after its idle eviction or a runtime restart.
 
 |`pm_skill` / `pm_skill_file` names a section the document does not contain, or a document that cannot be read or rendered
 |`isError: true`
@@ -841,6 +851,9 @@ _Implementation watch: link:../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL
 |`lesson_unavailable`
 |`pm_start` with `lesson_id` names a lesson that is already claimed by another plan, retired, or not resolved `found` (link:store-schemas.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]); `detail` names the lesson state and, for a claim, the claiming `plan_id`.
 
+|`recipe_params_invalid`
+|`pm_start` with `recipe_id` carries `recipe_params` that violate the recipe's `parameters_schema`, or non-empty `recipe_params` for a recipe without a schema (link:domain-extensions.adoc[Domain Extensions Specification], Declarative Recipe Descriptor Schema); `detail` names the offending parameter.
+
 |`plan_id_taken`
 |The `plan_id` derived by `pm_start` already names a live or archived plan (link:phase-workflows.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); an archived `plan_id` is never reused.
 
@@ -883,6 +896,7 @@ Closed `error_code` enumeration for `isError: true`:
 * `section_not_found` — `pm_skill` or `pm_skill_file` named a `section` that the document's section index does not contain; the message lists the available anchors.
 * `file_unreadable` — The requested skill document or supporting file exists in the catalogue but cannot be read or rendered.
 * `runtime_recovering` — Retryable. The call addresses a project whose per-project recovery after a runtime start has not finished within the project recovery wait (link:runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery], link:timeouts.adoc#project-recovery-wait[Timeouts & Budgets Specification]); nothing of the call was executed, recovery continues, and the same call repeated later is served.
+* `lsp_unavailable` — `pm_lsp` addressed a language server pool instance whose restart retries are exhausted (link:job-runtime.adoc[Job Runtime Specification]); the instance stays unavailable until its idle eviction or a runtime restart, so repeating the call at once returns the same code.
 * `upstream_timeout` — An upstream pass-through tool call (`up_*`) exceeded its connect or read timeout (link:timeouts.adoc[Timeouts & Budgets Specification]); the call can be retried.
 * `internal_fault` — Unexpected server exception, including a lock acquisition the lock manager refuses as out of order (`lock_order_violation`, link:store-schemas.adoc#lock-free-snapshot-reads[Store Schemas Specification]); full diagnostics are written exclusively to `audit.jsonl` under `audit_id`.
 
@@ -899,7 +913,13 @@ All MCP tool schemas, resource templates, progress notifications, and STDIO stre
 
 === End-to-End STDIO Integration Testing (`McpStdioTestClient` in `*IT.java`)
 
-Failsafe integration tests (`*IT.java`) spawn the packaged `pm-mcp` runner JAR or GraalVM native executable as a real child process over `stdin`/`stdout` via `McpAssured.newStdioClient()`:
+Protocol integration tests run at three levels, each in Failsafe `*IT.java` classes under the integration-tests profile (`PM-TEST-3`, `PM-TEST-4`, `PM-TECH-2`):
+
+* *Daemon (`pm-mcp-server`)*: the integration tests exercise the packaged daemon `pm-mcpd` over MCP Streamable HTTP on its Unix socket.
+* *Relay (`pm-mcp-cli`)*: the integration tests exercise the `pm-mcp serve` STDIO relay over real `stdin`/`stdout` with `McpAssured.newStdioClient()`, against a reactor-built `pm-mcpd` staged into a temporary `PM_MCP_HOME/bin`.
+* *Release shape (`pm-mcp-e2e`)*: the module `pm-mcp-e2e` (in `pm-mcp-modules`) stages all four binaries (`pm-mcp`, `pm-mcpd`, `pm-mcp-exec`, `pm-mcp-web`) in the release layout and runs end-to-end scenarios through the whole chain: relay, daemon, and jobs launched by `pm-mcp-exec`.
+
+The relay and release-shape tests spawn `pm-mcp serve` as a real child process:
 
 [source,java]
 ----
@@ -909,7 +929,9 @@ String entryId = runPmMcpEnter(pmMcpBinaryPath, tempWorkspaceRoot);
 McpStdioTestClient client = McpAssured.newStdioClient()
     .setCommand(List.of(pmMcpBinaryPath.toString(), "serve"))
     .setWorkingDirectory(tempWorkspaceRoot)
-    .setEnvironment(Map.of("PM_MCP_BASE", tempPmMcpBase.toString()))
+    .setEnvironment(Map.of(
+        "PM_MCP_BASE", tempPmMcpBase.toString(),
+        "PM_MCP_HOME", tempPmMcpHome.toString())) // bin/ holds the staged pm-mcpd
     .setStderrHandler(stderrAuditBuffer::add)
     .build()
     .connect();
