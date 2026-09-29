@@ -1,6 +1,6 @@
 ---
 name: traced-implementation
-description: Mandatory frame for every concrete implementation in plan-marshall-mcp. Planning traces each task to its requirements (doc/Requirements.adoc), specification sections (doc/Specification.adoc) and implementation watch items (doc/ImplementationWatch.adoc); after implementation, coverage is verified against all three; once verified, the same PR deletes the implemented specification sections and watch items and links each requirement directly to the implementing code and tests.
+description: Mandatory frame for every concrete implementation in plan-marshall-mcp. Planning traces each task to its requirements (doc/Requirements.adoc), specification sections (doc/Specification.adoc) and implementation watch items (doc/ImplementationWatch.adoc); after implementation, coverage is verified against all three; a requirement found wrong is corrected in the same plan; once verified, the same PR deletes the implemented specification sections and watch items and links each requirement directly to the implementing code and tests.
 user-invocable: true
 argument-hint: "[roadmap milestone | specification section | requirement IDs]"
 allowed-tools: Agent, Bash, Read, Edit, Write, Grep, Glob
@@ -86,8 +86,32 @@ Rules:
 - No task without a trace block; no matrix row without a task. A row the slice deliberately does not cover
   is marked `out of slice` with the reason and stays in the documents.
 - Every watch item names the test that will guard it, with its *Fixture* used verbatim.
-- A contradiction between requirement, specification and watch item stops planning: report it to the user
-  (the documents are fixed first, through `/doc-review` or by the user), never resolve it silently in code.
+- A contradiction between requirement, specification and watch item is resolved by a document correction
+  task (§ 1.3) planned ahead of the code tasks it affects, never silently in code.
+
+### 1.3 Correct a requirement that turns out wrong
+
+Implementation is where the documents meet reality: an API does not behave as assumed, a statement is
+untestable, two requirements contradict each other, a bound cannot be met, a case is missing. When planning
+or implementation detects that a requirement (or a specification section or watch item) is incorrect, the
+plan corrects it; the code never diverges from the documents, and the plan does not stop to ask.
+
+- **Add a correction task** to the plan with its own trace block and a `Correction:` field stating the
+  finding, the concrete evidence (failing test, API behaviour, measured value, the contradicting statement),
+  and the corrected wording. Code tasks that depend on the corrected statement come after it. A finding in
+  stage 2 adds the task then; the affected code tasks are re-run against the corrected text.
+- **Correct at the source**: edit the requirement bullet in `doc/requirements/NN-*.adoc` itself: keep the
+  requirement ID and SMART form ("The system must …", measurable), change only what the evidence shows to be
+  wrong. A requirement is never deleted; one that is wholly obsolete is rewritten to what the system must
+  actually do.
+- **Carry the correction through**: every remaining specification section, watch item, roadmap entry and
+  other requirement that restates or depends on the corrected statement is adapted in the same task, so the
+  documents stay consistent for the slices still to come. The trace matrix rows switch to the corrected text.
+- **Scope bound**: a correction fixes what this slice proves wrong. A correction that would change the
+  product's intent (drop a capability, change a security or trust boundary, change an operator-visible
+  contract beyond the slice) is still made in the plan, but flagged as `intent change` in the PR body so
+  the reviewer decides on it when approving the PR.
+- Every correction is listed in the PR body (§ PR) and is reviewed with the PR.
 
 ## Stage 2 — Implement, then verify against all three
 
@@ -199,6 +223,9 @@ One PR contains code, tests, requirement links and the deletions. The PR body co
 - **Coverage**: the table from `coverage.md` (condensed to one row per requirement, specification section
   and watch item).
 - **Removed**: the deleted specification sections and files, and the deleted watch items (IDs).
+- **Requirement corrections**: per correction the requirement ID, the old and new wording (or a diff
+  excerpt), the evidence, the adapted specification/watch/roadmap places, and the `intent change` flag
+  where § 1.3 requires it.
 - **Remaining**: the `out of slice` rows that stay in the documents, with reasons.
 
 Follow the Git workflow in `CLAUDE.md` for branch, commit, CI and review comments.
@@ -208,7 +235,7 @@ Follow the Git workflow in `CLAUDE.md` for branch, commit, CI and review comment
 - Nothing is deleted from the specification or watch without a `covered` row naming code and test.
 - Nothing normative is lost: after deletion, every statement from the removed text is findable in the
   requirements, the code or the tests.
-- Requirements are never deleted or weakened by this skill; a requirement that turns out wrong is changed
-  through `/doc-review` or by the user.
-- Contradictions between the three documents are reported to the user, never resolved in code.
+- Requirements are never deleted. A requirement that turns out wrong is corrected in the same plan and PR,
+  backed by evidence (§ 1.3); code never deviates from the documents.
+- Contradictions between the three documents are resolved by a planned correction task, never in code.
 - Temporary files go into the session scratchpad.

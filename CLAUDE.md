@@ -105,7 +105,8 @@ analyses and variants into `doc/discussions/`. Don't create new documents withou
 Every concrete implementation follows the project skill `traced-implementation`: each planned task traces
 to its requirements, specification sections and watch items (the _Implementation watch_ line below a
 heading, plus `doc/implementation-watch/cross-cutting.adoc`); after implementation, coverage is verified
-against all three; the same PR then deletes the implemented specification sections and watch items and
+against all three; a requirement the implementation proves wrong is corrected (with evidence) in the same
+plan, never worked around in code; the same PR then deletes the implemented specification sections and watch items and
 links each requirement to its implementing classes and tests (`Implementation:` / `Verified by:` lines).
 
 ## Git Workflow
