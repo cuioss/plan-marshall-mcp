@@ -102,9 +102,11 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 AsciiDoc (`.adoc`) for all project documentation. Requirements go into `doc/requirements/`,
 technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`),
 analyses and variants into `doc/discussions/`. Don't create new documents without asking.
-Before planning or implementing a specification section, read its Implementation watch items (the
-_Implementation watch_ line below the section heading) and `doc/implementation-watch/cross-cutting.adoc`;
-a watch item is closed by naming its guarding test (`doc/ImplementationWatch.adoc` § Lifecycle).
+Every concrete implementation follows the project skill `traced-implementation`: each planned task traces
+to its requirements, specification sections and watch items (the _Implementation watch_ line below a
+heading, plus `doc/implementation-watch/cross-cutting.adoc`); after implementation, coverage is verified
+against all three; the same PR then deletes the implemented specification sections and watch items and
+links each requirement to its implementing classes and tests (`Implementation:` / `Verified by:` lines).
 
 ## Git Workflow
 

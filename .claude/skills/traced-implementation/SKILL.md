@@ -1,0 +1,214 @@
+---
+name: traced-implementation
+description: Mandatory frame for every concrete implementation in plan-marshall-mcp. Planning traces each task to its requirements (doc/Requirements.adoc), specification sections (doc/Specification.adoc) and implementation watch items (doc/ImplementationWatch.adoc); after implementation, coverage is verified against all three; once verified, the same PR deletes the implemented specification sections and watch items and links each requirement directly to the implementing code and tests.
+user-invocable: true
+argument-hint: "[roadmap milestone | specification section | requirement IDs]"
+allowed-tools: Agent, Bash, Read, Edit, Write, Grep, Glob
+---
+
+# Traced Implementation — plan-marshall-mcp
+
+The specification (`doc/Specification.adoc`, `doc/specification/`) and the implementation watch
+(`doc/ImplementationWatch.adoc`, `doc/implementation-watch/`) are scaffolding for code that does not exist
+yet. The requirements (`doc/Requirements.adoc`, `doc/requirements/`) are permanent. An implementation
+therefore goes through three stages, all inside one PR:
+
+1. **Plan with the trace**: every task names the requirements, specification sections and watch items it
+   implements.
+2. **Verify against all three**: every requirement statement, every normative specification statement and
+   every watch item in scope is covered by code and a test.
+3. **Replace**: the implemented specification sections and watch items are deleted, and each requirement
+   links to the code and tests that now carry them.
+
+A PR that implements specified behaviour and leaves the specification or watch text of that behaviour in
+place is incomplete. A PR that deletes specification or watch text that is not verifiably covered is wrong.
+
+This is the procedure behind `doc/Specification.adoc` § Specification Lifecycle Governance and
+`doc/ImplementationWatch.adoc` § Lifecycle: implemented content is removed, not marked (there is no
+`IMPLEMENTED` status and no closed-item record). `PLANNED` and `IN PROGRESS` apply to what remains.
+
+Use it together with the plan-marshall workflow (`/plan-marshall`): stage 1 belongs in outline and task
+planning (phases 3–4), stage 2 in verification (phase 5), stage 3 before the PR is created (phase 6).
+
+## Inputs
+
+- **Slice**: what is implemented, given as an argument: a roadmap milestone (`doc/roadmap.adoc`), a
+  specification document or section, or a list of requirement IDs. Without an argument, ask the user.
+- **Traceability checker**: `python3 .claude/skills/doc-review/scripts/trace.py` (broken links and anchors,
+  requirement ↔ specification links, index, roadmap coverage, watch counts and backlinks).
+- **Working files**: the session scratchpad (`trace-matrix.md`, `coverage.md`, `trace-baseline.txt`,
+  `trace-after.txt`).
+
+## Stage 1 — Plan with the trace
+
+### 1.1 Build the trace matrix
+
+Resolve the slice into three sets, reading every document in full (not by grep excerpts):
+
+- **Requirements**: every `PM-*` requirement the slice implements. A roadmap milestone lists them; a
+  specification lists them in its `== Traceability` section. Record each requirement **bullet by bullet**:
+  a requirement is often implemented only in part by one slice.
+- **Specification sections**: every section (heading with anchor) of `doc/specification/<spec>.adoc` and its
+  parts `doc/specification/<spec>/NN-*.adoc` that the slice implements. Also record the sections the slice
+  only **depends on** (for example values from `timeouts.adoc`, grammars from `identifiers.adoc`, states from
+  `state-catalogue.adoc`): they are read and honoured, but deleted only if the slice implements them.
+- **Watch items**, from three sources:
+  - the watch document `doc/implementation-watch/<spec>.adoc` of each specification in scope, filtered to
+    the items whose *Anchor* lies in the slice;
+  - every `doc/implementation-watch/cross-cutting.adoc` (`PM-WATCH-GEN-*`) item anchored to a section or
+    requirement in the slice;
+  - every item in any other watch document whose *Anchor* names a section or requirement in the slice
+    (search all watch documents for the anchors; the _Implementation watch_ lines under the requirement and
+    section headings list them).
+
+Write the matrix to `<scratchpad>/trace-matrix.md`, one row per element:
+
+| Kind | ID / anchor | Link | Statement (short) | Task(s) |
+|---|---|---|---|---|
+| REQ | `PM-TOOL-1` bullet 3 | `requirements/04-tools.adoc#PM-TOOL-1` | `pm_state` returns TOON of plan/epic/workspace/entity | T-2 |
+| SPEC | `mcp-tools/01-core-workflow-tools.adoc#_pm_state` | … | closed input schema, … | T-2 |
+| WATCH | `PM-WATCH-TOOL-13` | `implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-13` | guard: … | T-2 |
+
+### 1.2 Plan every task with its trace
+
+Every deliverable and task of the plan carries a trace block in its description:
+
+```
+Trace:
+  Requirements: PM-TOOL-1 (bullets 1, 3), PM-ARCH-4 (bullet 2)
+  Specification: mcp-tools/01-core-workflow-tools.adoc#_pm_state, identifiers.adoc#plan-id
+  Watch: PM-WATCH-TOOL-1, PM-WATCH-TOOL-13, PM-WATCH-GEN-35
+  Guarding tests (planned): PmStateToolTest, PlanIdGrammarTest
+```
+
+Rules:
+
+- No task without a trace block; no matrix row without a task. A row the slice deliberately does not cover
+  is marked `out of slice` with the reason and stays in the documents.
+- Every watch item names the test that will guard it, with its *Fixture* used verbatim.
+- A contradiction between requirement, specification and watch item stops planning: report it to the user
+  (the documents are fixed first, through `/doc-review` or by the user), never resolve it silently in code.
+
+## Stage 2 — Implement, then verify against all three
+
+### 2.1 Carry the knowledge into the code
+
+The specification and watch text is deleted in stage 3, so everything normative in it must live in code,
+tests or the requirements by then:
+
+- Schemas, enums, grammars, values, state tables, error outcomes: in code (types, constants, schema
+  resources) with Javadoc naming the requirement ID (`PM-TOOL-1`), never a specification or watch anchor.
+- Design rationale worth keeping: in the Javadoc of the type or its `package-info.java`.
+- Watch items: the guarding test's Javadoc states the hazard in one or two sentences and uses the fixture
+  verbatim, so the test explains itself after the watch document is gone. It names the requirement ID, not
+  the `PM-WATCH-*` ID.
+- Log messages go to `PmMcpLogMessages` and `doc/LogMessages.adoc` as usual (that document stays).
+
+### 2.2 Verify coverage
+
+Build `<scratchpad>/coverage.md` from the matrix. For every row:
+
+| Kind | ID / anchor | Covered by (main) | Verified by (test) | Status |
+|---|---|---|---|---|
+
+- **REQ** bullet: the class(es) that implement it and a test that asserts the observable behaviour.
+- **SPEC** section: each normative statement (every "must", every schema field, enum value, grammar rule,
+  edge case, failure outcome) maps to code and a test. Check statement by statement, not section by section.
+- **WATCH** item: the guard is implemented, the named test exists, fails without the guard (state how that
+  was checked), and uses the fixture.
+
+Status is `covered`, `gap` or `out of slice`. Use parallel read-only agents for large slices (one per
+specification document), then check their tables yourself against the code; an agent's "covered" without
+file and test names does not count.
+
+Then run the build gates of `CLAUDE.md` (quality gate, full verify, coverage, integration tests where the
+module has them). Every gate green and every row `covered` or `out of slice` is the precondition for
+stage 3. A `gap` is implemented or, with the user's consent, moved to `out of slice`; it is never removed
+from the documents.
+
+## Stage 3 — Replace the specification and watch with links to the implementation
+
+Run `python3 .claude/skills/doc-review/scripts/trace.py > <scratchpad>/trace-baseline.txt` first.
+
+### 3.1 Link the requirements to the implementation
+
+In the requirement module (`doc/requirements/NN-*.adoc`), each requirement in the slice gets (or extends)
+an `Implementation:` line where its "See the … Specification … for implementation details." sentence
+stands. Paths are relative to `doc/` (the modules are included into `doc/Requirements.adoc`, like the
+existing `link:specification/…` links):
+
+```
+Implementation: link:../pm-mcp-core/src/main/java/de/cuioss/pm/mcp/core/state/StateRenderer.java[StateRenderer],
+link:../pm-mcp-server/src/main/java/de/cuioss/pm/mcp/server/tool/PmStateTool.java[PmStateTool]
+
+Verified by: link:../pm-mcp-server/src/test/java/de/cuioss/pm/mcp/server/tool/PmStateToolTest.java[PmStateToolTest],
+link:../pm-mcp-server/src/test/java/de/cuioss/pm/mcp/server/PmStateIT.java[PmStateIT]
+```
+
+- Link types (classes, test classes), not methods or line numbers.
+- The "See the … Specification" sentence keeps only the specification links that still point at
+  remaining sections; with none left, it is removed.
+- The requirement's _Implementation watch_ line loses the removed items; with none left, it is removed.
+- A partially implemented requirement keeps its remaining specification and watch links beside the new
+  `Implementation:` line.
+
+### 3.2 Delete the implemented specification
+
+- Delete every specification section marked `covered` in the matrix.
+- A part `doc/specification/<spec>/NN-*.adoc` left without normative sections is deleted and dropped from
+  the index's `== Parts` list. A specification whose parts and sections are all gone is deleted entirely
+  (index file and directory), together with its row in `doc/Specification.adoc` § Technical Specification
+  Index and the prefix table references in `doc/Requirements.adoc`.
+- A specification with remaining sections gets `Status: IN PROGRESS`, and its `== Traceability` section
+  keeps only the requirements that still have specified content in it.
+
+### 3.3 Delete the covered watch items
+
+- Delete every watch item marked `covered`. Numbers are never reused or renumbered.
+- A `cross-cutting.adoc` item anchored to several specifications loses only the anchors that were
+  implemented; it is deleted when no anchor remains, and its guard must be covered for every anchor removed.
+- Update the item count in `doc/ImplementationWatch.adoc` § Watch Documents and in the Specification index.
+  A watch document left without items is deleted together with its row.
+
+### 3.4 Leave no dangling reference
+
+Search the whole repository (not only `doc/`) for every deleted file, anchor and `PM-WATCH-*` ID:
+`doc/roadmap.adoc`, other specification and watch documents, `doc/discussions/`, `doc/later-improvements.adoc`,
+`CLAUDE.md`, skills under `.claude/skills/`, and code comments. Each reference is re-pointed to the
+requirement (or, in code, to the requirement ID), or removed if it only pointed at the deleted text. In the
+roadmap, the milestone's delivered items are checked off and their specification links become requirement
+links.
+
+When the last specification document is gone, `doc/Specification.adoc`, `doc/specification/`,
+`doc/ImplementationWatch.adoc` and `doc/implementation-watch/` are deleted, and the references to them in
+`CLAUDE.md`, `doc/Requirements.adoc` § Overview and the `doc-review` skill are removed. That final step is
+confirmed with the user before it is done.
+
+### 3.5 Check the documents
+
+Run `trace.py > <scratchpad>/trace-after.txt` and compare with the baseline. The only permitted new
+findings are "requirement without specification" for requirements whose specified content is now fully
+implemented and which carry an `Implementation:` line. Every broken link or anchor is fixed. Verify every
+`link:../…java[…]` target exists on disk.
+
+## PR
+
+One PR contains code, tests, requirement links and the deletions. The PR body contains:
+
+- **Slice**: milestone / specification / requirements.
+- **Coverage**: the table from `coverage.md` (condensed to one row per requirement, specification section
+  and watch item).
+- **Removed**: the deleted specification sections and files, and the deleted watch items (IDs).
+- **Remaining**: the `out of slice` rows that stay in the documents, with reasons.
+
+Follow the Git workflow in `CLAUDE.md` for branch, commit, CI and review comments.
+
+## Rules
+
+- Nothing is deleted from the specification or watch without a `covered` row naming code and test.
+- Nothing normative is lost: after deletion, every statement from the removed text is findable in the
+  requirements, the code or the tests.
+- Requirements are never deleted or weakened by this skill; a requirement that turns out wrong is changed
+  through `/doc-review` or by the user.
+- Contradictions between the three documents are reported to the user, never resolved in code.
+- Temporary files go into the session scratchpad.
