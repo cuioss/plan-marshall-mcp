@@ -1,6 +1,6 @@
 ---
 name: doc-review
-description: Adversarial review of the concept documents (requirements, specifications, roadmap, implementation watch) for correctness against a ground-truth repository, completeness, consistency and traceability. Applies fixes that are certain, then walks through every open point with the operator one by one in plain text (progress count, background, issue with its concrete damage, where, numbered options minimal-first, recommendation with rationale), records each decision, applies the decisions in batches through parallel editors plus a reconcile pass, keeps specification files small, verifies traceability, and commits on request.
+description: Adversarial review of the concept documents (requirements, specifications, roadmap, implementation watch) for correctness against a ground-truth repository, completeness, consistency and traceability. Applies fixes that are certain (100%), decides open points itself where it is at least 95% confident of the recommendation, then walks through every remaining open point with the operator one by one in plain text (progress count, background, issue with its concrete damage, where, numbered options minimal-first, recommendation with rationale), records each decision, applies the decisions in batches through parallel editors plus a reconcile pass, keeps specification files small, verifies traceability, and commits on request.
 user-invocable: true
 argument-hint: "[scope or focus] [ground-truth repo path]"
 allowed-tools: Agent, Bash, Read, Edit, Write, Grep, Glob
@@ -8,7 +8,8 @@ allowed-tools: Agent, Bash, Read, Edit, Write, Grep, Glob
 
 # Adversarial Document Review — plan-marshall-mcp
 
-A review is a conversation, not a report. Findings you are certain about are fixed without asking; everything
+A review is a conversation, not a report. Findings you are certain about (100%) are fixed without asking; open points
+whose recommendation you hold with at least 95% confidence you decide yourself and report (Phase 3a); everything
 else is decided by the operator, one point at a time, and nothing is applied on a guess.
 
 ## Inputs
@@ -102,9 +103,32 @@ first and to skip and report it when the text does not match the claim) or direc
 `trace.py` and compare with the baseline. Report the applied fixes to the operator in a short list before starting
 the discussion, including the editor interpretations worth a look.
 
+## Phase 3a — Reviewer decisions at 95% confidence
+
+Two confidence levels apply. Phase 2/3 fixes without asking only what is **certain** (100%: exactly one correct
+resolution). After that, formulate the options and a recommendation for every open point (the same analysis a Phase 4
+message would contain, verified against the documents and the ground truth), and take a second pass over the list:
+
+- Decide an open point yourself when you are **at least 95% confident** that the recommendation is what the operator
+  would choose: it follows from an existing operator decision or principle, the alternatives are clearly worse under
+  the project principles, and the point changes no product-level scope or guarantee on its own. Verify the facts the
+  confidence rests on (read the cited text) before deciding.
+- Present everything else in Phase 4: design choices with close options, product-level consequences (host support,
+  dropped features, new dependencies, new operator burden), reversals of earlier operator decisions, and anything whose
+  facts you could not verify.
+- Record each reviewer decision like an operator decision, marked as delegated: an agenda line
+  (`D<n> L opt<k>: <decision>`), and in a proposal document a `* *Decision*:` line whose text starts with "decided by
+  the reviewer under the operator's delegation (at least 95% confidence)". Tell the operator in one short list which
+  points you decided and on what basis, before presenting the first open point; the operator may reopen any of them.
+- The same second pass applies to the `Zx-n` items of a redesign topic (Phase 5) and to the `F-n` follow-ups of a batch
+  (Phase 6), and to editor questions during a batch: resolve the ones that follow from decisions (recorded as "LEAD"
+  resolutions in the reconcile notes), present the rest.
+- Principle-level questions (`Zx-0`, `Zx-A`, …) and anything flagged as reversing an operator decision are always
+  presented.
+
 ## Phase 4 — One-by-one discussion (the core of this skill)
 
-Present **exactly one open point per message**, in plain text — never `AskUserQuestion` or any other control.
+Present **exactly one open point per message** (the points left after Phase 3a), in plain text — never `AskUserQuestion` or any other control.
 Use this shape:
 
 ```
