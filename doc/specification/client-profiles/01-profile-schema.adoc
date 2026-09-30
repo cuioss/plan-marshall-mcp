@@ -13,7 +13,7 @@ _See Requirement link:../../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned
 
 _See Requirement link:../../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
 
-_See Requirement link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Dispatch Envelopes, Return Observability & Effort Role Resolution]_
+_See Requirement link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Task Envelopes, Model Job Accounting & Effort Role Resolution]_
 
 Client profiles are declarative JSON documents compiled into `pm-mcp-core` under `classpath:/profiles/<client_id>.json` (`claude.json`, `opencode.json`, `antigravity.json`, `codex.json`, `neutral.json`) and validated against the following JSON Schema (Draft 2020-12):
 
@@ -23,7 +23,7 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/client-profile-v1.json",
   "title": "ClientProfile",
-  "description": "Declarative runtime profile governing on-the-fly skill rendering, sub-agent dispatch, and bundle generation.",
+  "description": "Declarative runtime profile governing on-the-fly skill rendering, model-job launch, and bundle generation.",
   "type": "object",
   "properties": {
     "schema_version": {
@@ -56,7 +56,6 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
         "find_files": { "type": "string" },
         "run_shell": { "type": "string" },
         "ask_user": { "type": "string" },
-        "spawn_agent": { "type": ["string", "null"] },
         "idioms": {
           "type": "object",
           "additionalProperties": {
@@ -77,8 +76,7 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
         "search_code",
         "find_files",
         "run_shell",
-        "ask_user",
-        "spawn_agent"
+        "ask_user"
       ],
       "additionalProperties": false
     },
@@ -101,56 +99,114 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
         "preload_tools": {
           "type": "array",
           "items": { "type": "string", "pattern": "^pm_[a-z0-9_]+$" },
-          "default": ["pm_start", "pm_state", "pm_do"]
+          "default": ["pm_state", "pm_do"]
         }
       },
       "required": ["mode", "load_directive_template", "schema_residency", "preload_tools"],
       "additionalProperties": false
     },
-    "dispatch": {
-      "type": "object",
+    "headless": {
+      "type": ["object", "null"],
+      "description": "Launch contract of the harness's headless CLI for model jobs (job kind llm); null when the harness runs no model jobs in v1 (antigravity, neutral). Nothing is installed: the server composes every launch per job.",
       "properties": {
-        "supported": {
-          "type": "boolean",
-          "description": "True if the host's sub-agents inherit MCP server access and can execute entity-scoped links."
+        "executable": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Name of the harness CLI; the operator enrols its absolute path per machine (pm-mcp operator enrol-harness), never looked up through PATH at launch."
         },
-        "host_tool": {
-          "type": ["string", "null"],
-          "description": "Name of the host's sub-agent invocation tool (e.g. 'Agent', 'task', 'invoke_subagent', 'spawn_agent')."
+        "supported_versions": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Version range of the harness CLI (for example '>=2.1.0 <3.0.0'), probed with identity.version_probe; a self-updated harness inside the range is accepted and audited, outside it every model job is refused harness_version_unsupported."
         },
-        "agent_variants": {
+        "agent_mode": {
+          "type": "string",
+          "enum": ["inline", "flags"],
+          "description": "inline: the server renders a per-job named agent definition into the {{agent}} slot (claude: --agents JSON; opencode: agent in OPENCODE_CONFIG_CONTENT); flags: the job is composed by per-call flags only (codex)."
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Argument-vector template after the executable. Each item is a literal or contains typed slots of the closed set {{prompt_file}}, {{model}}, {{effort}}, {{mcp_config}}, {{result_schema}}, {{tools}}, {{cwd}}, {{agent}}; a slot whose value is absent for the job removes its item."
+        },
+        "class_args": {
           "type": "object",
-          "description": "Host sub-agent profile names per effort level for the worker and reader families, as installed by the client bundle (plan-marshall naming).",
+          "description": "Additional argument templates appended per job class (writer, read_only, zero_tool), with the same slots; a class without an entry is not runnable on this harness.",
           "properties": {
-            "worker_level_template": { "type": "string", "const": "execution-context-level-{level}" },
-            "worker_inherit": { "type": "string", "const": "execution-context" },
-            "reader_level_template": { "type": "string", "const": "execution-context-reader-level-{level}" },
-            "reader_inherit": { "type": "string", "const": "execution-context-reader" },
-            "name_prefix": { "type": "string", "description": "Host namespace prefix of the installed agent names, e.g. 'plan-marshall-' (claude); never the legacy plan-marshall plugin namespace 'plan-marshall:'." }
+            "writer": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "read_only": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "zero_tool": { "type": "array", "items": { "type": "string", "minLength": 1 } }
           },
-          "required": ["worker_level_template", "worker_inherit", "reader_level_template", "reader_inherit"],
           "additionalProperties": false
         },
-        "params_template": {
+        "env": {
           "type": "object",
-          "description": "Key-value template for host_tool parameters using {{agent_variant}} and {{model}} placeholders."
+          "additionalProperties": { "type": "string" },
+          "description": "Environment variables the launch sets, with the same slots (for example OPENCODE_CONFIG_CONTENT: '{{agent}}'); PM_MCP_JOB_TOKEN and PM_MCP_JOB_ID are set by the server and never declared here."
         },
-        "token_usage_components": {
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["per_call_mcp", "tool_allowlist", "zero_tools", "result_schema", "ephemeral", "usage_fields", "cost_field", "exit_reliable", "project_settings_control"]
+          },
+          "description": "Declared capabilities; a role runs on this harness only when every capability its job class needs is declared."
+        },
+        "model_efforts": {
+          "type": "object",
+          "description": "Effort values the harness accepts per model, in ascending order; key * applies to every model without its own entry. A resolved effort outside the list narrows to the nearest lower listed value (dispatch-and-effort.adoc, Effort Resolution, Narrowing); an empty list means the model takes no effort flag.",
+          "additionalProperties": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "format": { "type": "string", "enum": ["json", "stream_json", "jsonl"] },
+            "result_pointer": {
+              "type": ["string", "null"],
+              "description": "JSON Pointer to the structured result in the final output; null: the result is parsed from the final message against the result schema, fail-closed."
+            }
+          },
+          "required": ["format", "result_pointer"],
+          "additionalProperties": false
+        },
+        "usage": {
+          "type": "object",
+          "description": "JSON Pointers into the final output for each usage figure; null: not reported by the harness (recorded unmeasured, reason not_reported_by_harness).",
+          "properties": {
+            "input_tokens": { "type": ["string", "null"] },
+            "output_tokens": { "type": ["string", "null"] },
+            "cache_read": { "type": ["string", "null"] },
+            "cache_creation": { "type": ["string", "null"] },
+            "cost_usd": { "type": ["string", "null"] },
+            "tool_uses": { "type": ["string", "null"] }
+          },
+          "required": ["input_tokens", "output_tokens", "cache_read", "cache_creation", "cost_usd", "tool_uses"],
+          "additionalProperties": false
+        },
+        "writable_paths": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^~/[A-Za-z0-9_./-]+$" },
+          "description": "Harness home directories (home-relative, for example ~/.claude) added to the job's write set."
+        },
+        "env_passthrough": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+          "description": "Authentication variables (for example ANTHROPIC_API_KEY) passed to the job only when set in the operator's harness enrolment capture."
+        },
+        "session_residue": {
           "type": "string",
-          "enum": ["all", "total_only", "none"],
-          "description": "Which sub-agent token figures the host can report on returned:<dispatch_id>: the total and the four components, the total only, or none. Declared once per target, never per row."
-        },
-        "reports_tool_uses": {
-          "type": "boolean",
-          "description": "Whether the host reports the sub-agent's tool-call count (tool_uses) on returned:<dispatch_id>."
+          "enum": ["ephemeral", "persisted"],
+          "description": "ephemeral: the launch always passes the harness's no-persistence flag; persisted: the harness keeps session files, reported by pm-mcp status."
         },
         "context_budget_tokens": {
           "type": "integer",
           "minimum": 10000,
-          "description": "Sub-agent context budget of the host's worker variants; the per-envelope packing budget is derived from it (Dispatch & Effort, Cost Sizing), compiled fallback 400000 when absent, operator override envelope_budget_tokens in local-config.json."
+          "description": "Context budget of a model job on this harness; the per-envelope packing budget is derived from it (Model Jobs & Effort, Cost Sizing), compiled fallback 400000 when absent, operator override envelope_budget_tokens in local-config.json."
         }
       },
-      "required": ["supported", "host_tool", "agent_variants", "params_template", "token_usage_components", "reports_tool_uses"],
+      "required": ["executable", "supported_versions", "agent_mode", "argv", "class_args", "env", "capabilities", "output", "usage", "writable_paths", "env_passthrough", "session_residue"],
       "additionalProperties": false
     },
     "commands": {
@@ -162,6 +218,7 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
         "project_dir": { "type": ["string", "null"] },
         "entries": {
           "type": "object",
+          "description": "Host entry command of each entry kind, rendered by the placeholders {{command:plan}}, {{command:epic}}, {{command:workspace}}; every entry command passes an optional id, --from-epic <epic_id>, and the user's free text to pm-mcp enter in one argument syntax on every host.",
           "properties": {
             "plan": { "type": "string" },
             "epic": { "type": "string" },
@@ -176,7 +233,7 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
     },
     "models": {
       "type": "object",
-      "description": "Compiled default effort ladder (level-1..level-7) for this client; the effort_ladder of the machine-local operator file <PM_MCP_BASE>/projects/<project_id>/local-config.json overrides it (see Dispatch & Effort Specification). inherit needs no entry.",
+      "description": "Compiled default effort ladder (level-1..level-7) for this client; the effort_ladder of the machine-local operator file <PM_MCP_BASE>/projects/<project_id>/local-config.json overrides it (see Model Jobs & Effort Specification). inherit needs no entry.",
       "properties": {
         "level-1": { "$ref": "#/$defs/modelPin" },
         "level-2": { "$ref": "#/$defs/modelPin" },
@@ -209,22 +266,12 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
         "progress_resets_timeout": {
           "type": "boolean"
         },
-        "elicitation_supported": {
-          "type": "boolean",
-          "description": "Whether the host answers MCP elicitation (elicitation/create). Elicitation is used only where the calling connection declared support: for the delivery of question records (questions.delivery defaults to elicitation there, otherwise session, resolved per question and recorded as the answer's channel) and for the operator-channel choices the server asks directly (setup choices that write operator configuration). Without it no condition is raised: a question is delivered in the session, and an operator choice names its pm-mcp operator command."
-        },
-        "durable_cwd": {
-          "type": "boolean",
-          "description": "Whether the host's shell working directory persists across tool calls."
-        }
       },
       "required": [
         "transport",
         "idle_timeout_seconds",
         "bounded_wait_seconds",
-        "progress_resets_timeout",
-        "elicitation_supported",
-        "durable_cwd"
+        "progress_resets_timeout"
       ],
       "additionalProperties": false
     },
@@ -263,7 +310,7 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
     "min_daemon_version",
     "tools",
     "skill_loading",
-    "dispatch",
+    "headless",
     "commands",
     "models",
     "connection",
@@ -284,11 +331,10 @@ Client profiles are declarative JSON documents compiled into `pm-mcp-core` under
 }
 ----
 
-`dispatch.token_usage_components` and `dispatch.reports_tool_uses` are the profile's usage-reporting capability. The server renders on the `returned:<dispatch_id>` link only the usage parameters the profile declares (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification], Normative Schema for `returned:<dispatch_id>`); a figure the host cannot report is recorded `unmeasured` with reason `not_reported_by_client`, and the model is never asked for a figure its host does not expose. The values are verified per host in Milestone 1 like the other _(provisional)_ host facts.
+[#headless-block]
+`headless` is the harness's launch contract for model jobs; the host never starts a sub-agent. How the server selects the harness, which capabilities each job class (`writer`, `read_only`, `zero_tool`) needs, the support rule (`precondition_unmet` naming the missing capability and `model_jobs.harness`, no inline fallback in the main session), the composition per `agent_mode`, the harness enrolment, and the working directory are specified in link:../dispatch-and-effort/05-model-job-launch.adoc#model-job-launch[Model Jobs & Effort Specification, Model Job Launch]. `antigravity` (no per-call MCP, system prompt, or tool allowlist) and `neutral` declare `headless: null` and run no model jobs in v1. Usage and cost are read from the harness output through `headless.usage`, never asked from a model. Every value is _(provisional)_ like the other host facts and verified per harness in the Milestone 1 host spikes.
 
-`connection.idle_timeout_seconds`, `connection.bounded_wait_seconds`, and `connection.progress_resets_timeout` are the host's timing facts; their values, the rule that keeps the bounded wait below the host idle timeout (enforced by profile validation for the compiled profile and every override), and their Milestone 1 verification are defined in link:../timeouts/03-retention-host-config.adoc#host-integration[Timeouts & Budgets Specification, Host Integration] and link:../timeouts/01-job-budgets-and-waits.adoc#bounded-wait[Bounded Wait Window].
-
-`connection.durable_cwd` records whether the host keeps its shell working directory across tool calls. When it is `false`, rendered dispatch prompts and vocabulary skills carry the directive to address files in the plan's worktree by absolute path, because a working directory set by an earlier call cannot be relied on.
+`connection.idle_timeout_seconds`, `connection.bounded_wait_seconds`, and `connection.progress_resets_timeout` are the host's timing facts; their values, the rule that keeps the bounded wait below the host idle timeout (enforced by profile validation for the compiled profile and every override), and their Milestone 1 verification are defined in link:../timeouts/03-retention-host-config.adoc#host-integration[Timeouts & Budgets Specification, Host Integration] and link:../timeouts/01-job-budgets-and-waits.adoc#bounded-wait[Bounded Wait Window]. Whether a host answers MCP elicitation is not a profile fact: it is taken from the capabilities the calling connection declared in its `initialize` request (link:../runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]), which are authoritative.
 
 === Profile Override Hierarchy
 
@@ -297,4 +343,4 @@ At runtime, `pm-mcp` resolves a client profile by merging two layers in order of
 1. *Compiled Binary Baseline* (`classpath:/profiles/<client_id>.json`): Authoritative defaults compiled into the runtime binary (`pm-mcpd`).
 2. *Machine-Wide Operator Overrides* (`<PM_MCP_BASE>/conf/profiles/<client_id>.json`): Optional partial JSON override allowing the operator to customize connection settings such as `connection.bounded_wait_seconds` across all repositories on the workstation. Model pins are not overridden here.
 
-Model pins are resolved separately from the machine-local effort ladder (`effort_ladder` of the operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), with the profile's `models` as compiled default (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification]). No git-tracked configuration carries client profile overrides or model pins (ADR-021); the closed team schemas admit no such key, so a `client_profiles` block in a team file is the finding `unknown_config_key` (`config_invalid`).
+Model pins are resolved separately from the machine-local effort ladder (`effort_ladder` of the operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), with the profile's `models` as compiled default (link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification]); a model job resolves its role to a level and the level to the ladder entry of its harness, rendered into the `{{model}}` and `{{effort}}` slots of `headless`, and an operator model for the role (`model_jobs.roles.<role>.model` in `local-config.json`) replaces the ladder's model. A ladder change applies to the next job; nothing is re-installed. No git-tracked configuration carries client profile overrides or model pins (ADR-021); the closed team schemas admit no such key, so a `client_profiles` block in a team file is the finding `unknown_config_key` (`config_invalid`).

@@ -1,4 +1,4 @@
-= Job Runtime Specification: Build Output Parsers, Timeouts & Gate Honesty
+= Job Runtime Specification: Build Output Parsers, Timeouts, Gate Honesty & Ingestion Validator
 :toc: left
 :toclevels: 3
 :toc-title: Table of Contents
@@ -6,7 +6,7 @@
 :source-highlighter: highlight.js
 :nofooter:
 
-link:../../Specification.adoc[Specification] » link:../job-runtime.adoc[Job Runtime Specification] » Build Output Parsers, Timeouts & Gate Honesty
+link:../../Specification.adoc[Specification] » link:../job-runtime.adoc[Job Runtime Specification] » Build Output Parsers, Timeouts, Gate Honesty & Ingestion Validator
 
 == Native Build Output Parsers
 _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-10[PM-WATCH-JOB-10], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-12[PM-WATCH-JOB-12], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-18[PM-WATCH-JOB-18]_
@@ -125,11 +125,11 @@ All four are persisted in the gate's job record (`gate_facts`, link:../store-sch
 === Evidence Gathering per Failure Class
 _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-26[PM-WATCH-JOB-26]_
 
-Every remediation unit starts with a gather state: one server-side gathering job per failure class, which hands the model structured failures and never raw logs (`PM-SEC-1`). The model receives the failures as failure envelopes (`{failure_id, class, kind, source, file?, line?, message, fingerprint, excerpt_uri?}`, link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory & Failure Envelope]); logs and excerpts are stored in the plan's evidence directory as untrusted, redacted resources (`pm://plan/{plan_id}/evidence/{evidence_id}`) and never inlined beyond `message`.
+Every remediation unit starts with a gather state: one server-side gathering per failure class, which hands the model structured failures and never raw logs (`PM-SEC-1`). A class whose gathering reads only server stores (`build`, `review`, `qgate`, `spend`) gathers inside the gather state's own transaction, without a job, and its failure records carry `gather_job_id: null`; a class that calls a provider or git (`ci`, `analysis`, `merge_conflict`) gathers through its gathering job, whose `job_id` its records carry. The model receives the failures as failure envelopes (`{failure_id, class, kind, source, file?, line?, message, fingerprint, excerpt_uri?}`, link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory & Failure Envelope]); logs and excerpts are stored in the plan's evidence directory as untrusted, redacted resources (`pm://plan/{plan_id}/evidence/{evidence_id}`) and never inlined beyond `message`.
 
 [cols="1,3,2"]
 |===
-|Class |Gathering job |Kinds
+|Class |Gathering |Kinds
 
 |`ci`
 |Fetches the failed checks' logs through the provider module (a `ci` job), parses each with the domain's `log_parser` worker (a `project_script` of worker kind `log_parser`, link:../domain-extensions/05-recipes-and-extension-points.adoc#_out_of_process_project_script_jobs_project_script_domain_workers[Domain Extensions Specification, Project Script Jobs & Domain Workers]) or the native build output parsers, else a generic tail parser yielding `unknown`; fetches the base result of the same checks for the baseline proof in the same job.
@@ -160,7 +160,22 @@ Every remediation unit starts with a gather state: one server-side gathering job
 |`overrun`
 |===
 
-The `fingerprint` (class, kind, file, normalized message) lets the server recognise a repeated failure (`retry_not_applicable`) and the baseline proof. Every envelope states whether its gate is waivable and names the gate; a non-waivable failure (a security finding, a footprint breach) is marked `waivable: false`. Untrusted content (CI logs, bot comments, analysis messages) passes the deterministic ingestion validator before it is stored.
+The `fingerprint` (class, kind, file, normalized message) lets the server recognise a repeated failure (`retry_not_applicable`) and the baseline proof. Every envelope states whether its gate is waivable and names the gate; a non-waivable failure (a security finding, a footprint breach) is marked `waivable: false`. Untrusted content (CI logs, bot comments, analysis messages) passes the ingestion validator (<<ingestion-validator>>) before it is stored; externally authored text (bot comments, analysis messages) is in addition gathered into one batch per firing and screened (link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batch-v1[Model Jobs & Effort Specification, Batch Format]), while CI logs and build excerpts, the server's own job output, pass the validator only.
+
+[#ingestion-validator]
+=== Ingestion Validator (Level 1, `PM-SEC-1`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-27[PM-WATCH-JOB-27]_
+
+Every surface that admits external text into a server store or a representation runs it through one deterministic validator first: issue and pull-request titles and bodies, review comments and bot findings, analysis-provider messages, upstream MCP results, and CI log and build excerpts. The validator is the containment boundary of the two-level guard (link:../dispatch-and-effort/06-untrusted-text-screening.adoc#two-level-guard[Model Jobs & Effort Specification, Two-Level Guard]); it runs in-process on the JDK and `org.commonmark:commonmark` (0.30.0), the one library added for it, and uses the URL validation pipelines of `cui-http` (`de.cuioss.http.security`). Its stages run in this order:
+
+1. *Unicode, to a fixpoint*: removes the Unicode tag block (`U+E0000`–`U+E007F`), variation selectors, every code point of the general categories `Cf`, `Co`, and `Cn`, the `Cc` controls except line feed and tab, lone surrogates, and ANSI escape sequences; normalizes the content to NFC and keeps an NFKC copy for detection only (never delivered). The stage repeats until a pass changes nothing, bounded by a compiled pass limit; a text that does not settle within it is refused.
+2. *Markdown AST*: parses the text with `commonmark` and renders it back from the tree: images are removed; a link whose target lies outside the allowlist (the origins of the project's push remote provider and of its configured analysis providers, all server-derived) is neutralized to inert text; raw HTML blocks, inline HTML, and HTML comments are removed; URLs shaped for exfiltration (long encoded query or path segments, `data:` and non-`https` schemes, credentials in the authority) are flagged; every URL extracted from the tree passes the `cui-http` URL validation pipelines (encoding and traversal attacks), and a failing URL is neutralized.
+3. *Bounds*: the per-field length, line, and item bounds of the record's closed schema; an over-long value is clamped, never truncated silently.
+4. *Rule table*: a compiled table of injection-shaped patterns evaluated on the NFKC detection copy (instructions addressed to a model, role and tool-call markers, prompt delimiters). A hit is a risk signal recorded as a finding of the item and handed to the screener as context; it never blocks the text on its own.
+5. *Spotlighting at delivery*: wherever the cleaned text reaches a model (a representation, a screener or triage prompt), it is enclosed in delimiters with a per-delivery random nonce that the text is checked not to contain, and marked untrusted.
+
+*Every change is reported*: each stage appends to the item's change report what it removed, neutralized, clamped, or flagged, with counts and positions; nothing is dropped silently, and an item whose report is not empty says so wherever it is delivered. The structured fields of every ingested record are validated against their closed schema (`additionalProperties: false`, `maxLength`, `maxItems`, `pattern`); a structural violation refuses the record. The validator detects no semantic injection: that is the screener's task (level 2), and a local classifier is deferred.
 
 [#worktree-sha]
 == Working-Tree Hash (`worktree_sha`, `PM-SVC-1`)
@@ -182,6 +197,6 @@ The `pm-mcp-core` and `pm-mcp-server` verification suite enforces automated adve
 1. *Workspace & Symlink Escape Rejection (`PM-SEC-2`)*: Adversarial fixtures containing `..` segments, URL-encoded path traversal, and intra-worktree symlinks pointing outside `<workspace-root>` must be rejected (`path_traversal_rejected`: job outcome `refused` for a job, `rejected.reason` for a `pm_do` argument) before any file descriptor or subprocess is opened.
 2. *Tampered Binary & Wrapper Rejection (`PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`)*: Modifying 1 byte of an enrolled `mvnw`, `gradlew`, `pw`, one of a wrapper's `pinned_files` (wrapper jar, wrapper properties, `.mvn/maven.config`, `.mvn/jvm.config`, `gradle.properties`), host binary, or `project_script` without operator re-enrolment, or adding a pinned build configuration file after enrolment, must fail the SHA-256 preflight check with `refused` and emit a `security` event in `audit.jsonl`.
 3. *Argument Vector Injection & Environment Sanitization (`PM-EXEC-1`, `PM-SEC-5`)*: Passing shell metacharacters (`; rm -rf`, `$(...)`, backticks) or non-allowlisted flags (`-Dexec.executable=...`, `--init-script`) in job parameters must be rejected at schema validation, and spawned child environments must never contain `GITHUB_TOKEN` or `SONAR_TOKEN`.
-4. *Untrusted Reader Containment (`PM-SEC-1`)*: Sub-agent dispatches targeting `execution-context-reader` are verified to emit zero MCP tool permissions and pass all ingested candidate structs through the deterministic Java validator before writing to `.marshall/` stores.
+4. *Ingestion Validator & Model Job Containment (`PM-SEC-1`, `PM-SEC-5`)*: The ingestion validator (<<ingestion-validator>>) is run as JUnit fixtures over the attack generators of `cui-http` and over prompt-injection corpora (garak, promptfoo): every tag-block, variation-selector, bidirectional, and ANSI payload is removed within the pass limit, every image, raw HTML fragment, and non-allowlisted link is removed or neutralized, and each change appears in the change report. A screener job is launched with zero tools and no MCP configuration, and an unparseable or incomplete verdict makes its items `suspicious`. A request with a job token that names another scope or entity is refused `job_scope_mismatch`, a link into a `job llm` state is refused on a job connection, and a request with the token of an ended job is refused `job_ended`. On a Landlock-capable kernel a model job cannot read `<PM_MCP_BASE>` (the runtime token included) and writes only its project root, its job-private directory, and its declared harness homes; its environment holds no runtime token and no undeclared credential variable (matched positive controls as in item 5).
 5. *Landlock Read and Write Sets (`PM-SEC-5`)*: On a Landlock-capable kernel, a job that reads a credential file under `<PM_MCP_BASE>/credentials/` (or any other path under `<PM_MCP_BASE>`, `run/runtime.token` included) fails with a permission error, while a matched positive control reads a file of its own project root and a binary of `<PM_MCP_HOME>/bin/`. A job that writes its project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json` (and any other path under `<PM_MCP_BASE>` or `~/.plan-marshall/`) fails with a permission error and leaves the file unchanged, and so does a job that writes into the root of a second enrolled project; a matched positive control writes inside the job's own project root.
 6. *Enrolment Tampering (`PM-EXEC-2`)*: Editing a project's enrolment file out of band without the operator CLI makes the next job of that project refuse with `enrolment_tampered` and an `audit.jsonl` `security` record, while a job of a second enrolled project on the same runtime still runs (matched control); the same edit re-baselined through the operator CLI is accepted.

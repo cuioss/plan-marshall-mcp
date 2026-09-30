@@ -12,20 +12,20 @@ link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store
 == Metrics Store (`metrics.json`)
 _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-26[PM-WATCH-STORE-26], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-35[PM-WATCH-STORE-35]_
 
-The plan's `metrics.json` holds the dispatch and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:../dispatch-and-effort.adoc[Dispatch & Effort Specification], Post-Return Integrity Invariants). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
+The plan's `metrics.json` holds the model-job and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification], Post-Return Integrity Invariants). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
 
-* *Rows*: One row per dispatch (`dispatch_id`, `phase`, `step_id` or null, `envelope_id` or null with its summed `predicted_cost_tokens` and their basis (`uncalibrated` or `calibrated`), `lifecycle_state` (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#_dispatch_id_generation_lifecycle_states[Dispatch & Effort Specification, Lifecycle States]), `status`, `cause_class`, `spend_class`, `population`, the usage columns of the `returned:<dispatch_id>` link (`token_usage`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`), each a measured integer, `"unmeasured"` (with `not_reported_by_client` where the client profile cannot report it), or, for a step that runs inline by design, `"inline"`, and the server-measured `duration_ms` with its `duration_basis`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:../job-runtime.adoc[Job Runtime Specification], Wait Attribution), one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `boundary` (`closed`, `re_entered`, or `provisional` with `measured_until` and `excluded_steps`), `step_firings` as a map from step id to firing count), and one row per served document read (Served-Content Ledger below).
-* *Served-Content Ledger*: Every `pm_skill`, `pm_skill_file`, and skill `resources/read` served in a plan or epic scope appends `{uri, section?, bytes, plan_id, phase, dispatch_id?, served_at}`; `bytes` is the rendered size served, `0` for an empty section. `dispatch_id` is set when the read carries it (the server renders it into the load directives of a dispatch prompt) and is otherwise null. A read without a scope is attributed to no plan. `record-metrics` publishes from these rows the per-document consumption (reads per URI and section, bytes, repeat reads within one dispatch). It measures only what the server serves; host `Read`/`Grep` of files is not observable.
+* *Rows*: One row per model job (kind `llm`: `job_id`, `role`, `harness`, `model`, `effort`, `phase`, `step_id` or null, `envelope_id` or null with its summed `predicted_cost_tokens` and their basis (`uncalibrated` or `calibrated`), `fate` (the job record's fate) or `job_incomplete`, `cause_class`, `spend_class`, `population`, the usage columns parsed from the harness output through the client profile's `headless.usage` declaration (`token_usage`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`, `cost_usd`), each a measured value or `"unmeasured"` (with `not_reported_by_harness` where the harness does not report the field, `output_unparsed` where its output could not be parsed), and the server-measured `duration_ms` with its `duration_basis` and the slot-queue time `queued_ms`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:../job-runtime.adoc[Job Runtime Specification], Wait Attribution), one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `boundary` (`closed`, `re_entered`, or `provisional` with `measured_until` and `excluded_steps`), `step_firings` as a map from step id to firing count), and one row per served document read (Served-Content Ledger below). Work the main session does inline (for example Phase 4 authoring or `create-pr`) has no model-job row; its measurements, where the host reports them, carry the population `main_context`.
+* *Served-Content Ledger*: Every `pm_skill`, `pm_skill_file`, and skill `resources/read` served in a plan or epic scope appends `{uri, section?, bytes, plan_id, phase, job_id?, served_at}`; `bytes` is the rendered size served, `0` for an empty section. Every skill document or section the server renders in-band into a model job's prompt file is recorded the same way when the job is spawned. `job_id` is set for a read over a job connection and for an in-band rendering, and is otherwise null. A read without a scope is attributed to no plan. `record-metrics` publishes from these rows the per-document consumption (reads per URI and section, bytes, repeat reads within one job). It measures only what the server serves; a harness's own reads of project files are not observable.
 * *Aggregates*: Every sum (per phase, per cause class, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total; Phase 6, which `record-metrics` measures from inside, is recorded `boundary: provisional` with `measured_until` and its `excluded_steps`.
-* *Populations*: Every token figure carries a `population` stamp (`dispatched` or `main_context`); an absent stamp reads `dispatched`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
+* *Populations*: Every token figure carries a `population` stamp (`model_job` or `main_context`); an absent stamp reads `model_job`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
 * *Re-Entry*: Re-entry is derived from observables (rows timestamped after the phase's recorded `end_time`), never from a close counter. A re-entered phase is labelled `re_entered` and accumulates across closes.
-* *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`, `unconfirmed`) is a total function over the dispatch `status` enum plus `INCOMPLETE_SUBMISSION` and `UNCONFIRMED` (class `unconfirmed`: no observable host reaction, link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#cause-class[Dispatch & Effort Specification, Cause Classes]), and the per-class populations sum to the total dispatch population with an asserted residual of `0`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
-* *Spend Classes*: `spend_class` (`submitted`, `findings_only`, `no_product`, `unmeasured`) is derived by the server from what the dispatch produced (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification, Spend Classes]); it is a separate dimension from `status` and `cause_class`, and waste is read only from `no_product`.
+* *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`) is a total function over the job fate enum plus `job_incomplete` (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#cause-class[Model Jobs & Effort Specification, Cause Classes]); the server observes every end of a model job, so no unconfirmed class exists. The per-class populations sum to the total model-job population with an asserted residual of `0`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
+* *Spend Classes*: `spend_class` (`submitted`, `findings_only`, `no_product`, `unmeasured`) is derived by the server from what the model job produced (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Model Jobs & Effort Specification, Spend Classes]); it is a separate dimension from `fate` and `cause_class`, and waste is read only from `no_product`.
 * *Stall Rate*: A termination with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
-* *Ledger Divergence*: Where two ledgers can diverge (dispatch rows vs audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
+* *Ledger Divergence*: Where two ledgers can diverge (model-job rows vs job records and audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
 * *One Writer per Name*: Every metric name has exactly one writer. A second producer over another population uses a different name.
-* *Raw Components Only*: Rows persist measured token components, never a weighted or priced figure. `priced_units` is derived in views from the rows and one named constant table (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-metrics-and-landing[Phase Workflows Specification, Metric Aggregates]); a change of the weights re-derives every figure, including legacy baselines, from the persisted components.
-* *Session Attribution*: A dispatch row references the host session that rendered the dispatch by its `client_session_id` (the row of the scope's session log, xref:01-format-and-session-log.adoc#scope-session-log[Scope Session Log (`sessions.jsonl`)]; `null` when the host provides none), never by a copy of the client or model identity.
+* *Raw Components Only*: Rows persist measured token components and the harness-reported `cost_usd`, never a weighted or priced figure of the server's own. `priced_units` is derived in views from the rows and one named constant table (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-metrics-and-landing[Phase Workflows Specification, Metric Aggregates]); a change of the weights re-derives every figure, including legacy baselines, from the persisted components.
+* *Session Attribution*: A model-job row references the host session whose call entered the job state by its `client_session_id` (the row of the scope's session log, xref:01-format-and-session-log.adoc#scope-session-log[Scope Session Log (`sessions.jsonl`)]; `null` when the host provides none), never by a copy of the client or model identity; the job's own harness, model, and effort are its launch contract, recorded in the job record.
 
 Aggregates are never persisted; they are derived in views from `rows[]`.
 
@@ -44,7 +44,7 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
       "type": "array",
       "items": {
         "oneOf": [
-          { "$ref": "#/$defs/dispatchRow" },
+          { "$ref": "#/$defs/modelJobRow" },
           { "$ref": "#/$defs/waitRow" },
           { "$ref": "#/$defs/phaseCloseRow" },
           { "$ref": "#/$defs/servedReadRow" }
@@ -54,21 +54,25 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
   },
   "$defs": {
     "measure": {
-      "description": "A measured integer, 'unmeasured', or 'inline' (a step that runs inline by design).",
+      "description": "A measured integer or 'unmeasured'.",
       "oneOf": [
         { "type": "integer", "minimum": 0 },
-        { "type": "string", "enum": ["unmeasured", "inline"] }
+        { "type": "string", "const": "unmeasured" }
       ]
     },
     "phase": { "type": "string", "enum": ["phase-1-init", "phase-2-refine", "phase-3-outline", "phase-4-plan", "phase-5-execute", "phase-6-finalize"] },
-    "dispatchRow": {
+    "modelJobRow": {
       "type": "object",
-      "required": ["kind", "dispatch_id", "phase", "step_id", "envelope_id", "predicted_cost", "lifecycle_state", "status", "cause_class", "spend_class", "population", "token_usage", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "tool_uses", "unmeasured_reason", "duration_ms", "duration_basis", "client_session_id", "recorded_at"],
+      "required": ["kind", "job_id", "role", "harness", "model", "effort", "phase", "step_id", "envelope_id", "predicted_cost", "fate", "cause_class", "spend_class", "population", "token_usage", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "tool_uses", "cost_usd", "unmeasured_reason", "duration_ms", "duration_basis", "queued_ms", "client_session_id", "recorded_at"],
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "dispatch" },
-        "dispatch_id": { "type": "string", "pattern": "^dsp-[0-9]{4}-[0-9a-f]{6}$" },
-        "phase": { "$ref": "#/$defs/phase" },
+        "kind": { "const": "model_job" },
+        "job_id": { "type": "string", "pattern": "^l-[0-9a-f]{16}$" },
+        "role": { "type": "string", "minLength": 1, "description": "Role key of the job (dispatch-and-effort.adoc, Role Registry)." },
+        "harness": { "type": "string", "enum": ["claude", "opencode", "codex"] },
+        "model": { "type": ["string", "null"], "description": "Model passed to the harness; null when the job ran on the harness's own default." },
+        "effort": { "type": ["string", "null"], "description": "Effort passed to the harness after narrowing; null when none was passed." },
+        "phase": { "anyOf": [ { "$ref": "#/$defs/phase" }, { "type": "null" } ], "description": "null for a job of the epic or workspace scope." },
         "step_id": { "type": ["string", "null"] },
         "envelope_id": { "type": ["string", "null"], "pattern": "^envelope-[0-9]+$" },
         "predicted_cost": {
@@ -80,21 +84,22 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
             "basis": { "type": "string", "enum": ["uncalibrated", "calibrated"] }
           }
         },
-        "lifecycle_state": { "type": "string", "description": "Dispatch lifecycle state (dispatch-and-effort.adoc, Lifecycle States)." },
-        "status": { "type": "string", "description": "Dispatch return status, including INCOMPLETE_SUBMISSION and UNCONFIRMED (dispatch-and-effort.adoc)." },
-        "cause_class": { "type": "string", "enum": ["terminal_error", "retryable", "returned_with_findings", "benign", "stall", "unconfirmed"] },
+        "fate": { "type": "string", "enum": ["succeeded", "failed", "failed_unparsed", "timed_out", "cancelled", "killed", "indeterminate", "refused", "job_incomplete"], "description": "The job record's fate; job_incomplete when the job succeeded without its required submit (dispatch-and-effort.adoc)." },
+        "cause_class": { "type": "string", "enum": ["terminal_error", "retryable", "returned_with_findings", "benign", "stall", "refused"] },
         "spend_class": { "type": "string", "enum": ["submitted", "findings_only", "no_product", "unmeasured"] },
-        "population": { "type": "string", "enum": ["dispatched", "main_context"] },
+        "population": { "type": "string", "const": "model_job" },
         "token_usage": { "$ref": "#/$defs/measure" },
         "input_tokens": { "$ref": "#/$defs/measure" },
         "output_tokens": { "$ref": "#/$defs/measure" },
         "cache_read_input_tokens": { "$ref": "#/$defs/measure" },
         "cache_creation_input_tokens": { "$ref": "#/$defs/measure" },
         "tool_uses": { "$ref": "#/$defs/measure" },
-        "unmeasured_reason": { "type": ["string", "null"], "enum": ["not_reported_by_client", "not_returned", null] },
+        "cost_usd": { "oneOf": [ { "type": "number", "minimum": 0 }, { "type": "string", "const": "unmeasured" } ], "description": "Harness-reported cost; unmeasured where the harness reports none." },
+        "unmeasured_reason": { "type": ["string", "null"], "enum": ["not_reported_by_harness", "output_unparsed", null] },
         "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
-        "duration_basis": { "type": "string", "description": "What the server measured duration_ms between (dispatch-and-effort.adoc)." },
-        "client_session_id": { "type": ["string", "null"], "pattern": "^[\\x21-\\x7E]{1,128}$", "description": "Session row of the scope's sessions.jsonl that rendered the dispatch." },
+        "duration_basis": { "type": "string", "const": "process", "description": "Measured by the server from spawn to exit of the job's process; queued time is excluded." },
+        "queued_ms": { "type": ["integer", "null"], "minimum": 0, "description": "Time the job waited for a model slot before spawn (dispatch-and-effort.adoc, Per-Column Usage Persistence); null when it never waited." },
+        "client_session_id": { "type": ["string", "null"], "pattern": "^[\\x21-\\x7E]{1,128}$", "description": "Session row of the scope's sessions.jsonl whose call entered the job state." },
         "recorded_at": { "type": "string", "format": "date-time" }
       }
     },
@@ -130,7 +135,7 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
     },
     "servedReadRow": {
       "type": "object",
-      "required": ["kind", "uri", "bytes", "plan_id", "phase", "dispatch_id", "served_at"],
+      "required": ["kind", "uri", "bytes", "plan_id", "phase", "job_id", "served_at"],
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "served_read" },
@@ -139,7 +144,7 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
         "bytes": { "type": "integer", "minimum": 0 },
         "plan_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
         "phase": { "anyOf": [ { "$ref": "#/$defs/phase" }, { "type": "null" } ] },
-        "dispatch_id": { "type": ["string", "null"], "pattern": "^dsp-[0-9]{4}-[0-9a-f]{6}$" },
+        "job_id": { "type": ["string", "null"], "pattern": "^l-[0-9a-f]{16}$" },
         "served_at": { "type": "string", "format": "date-time" }
       }
     }

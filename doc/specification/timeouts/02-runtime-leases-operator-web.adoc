@@ -36,7 +36,7 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |`drain_timeout_seconds` in `machine-config.json`
 |minimum `0` (`0` terminates running jobs at once)
 |running jobs at `SIGTERM`/`SIGINT` / `pm-mcp drain`; the wait of `pm-mcp drain` for the runtime's exit
-|Remaining job groups are terminated (xref:01-job-budgets-and-waits.adoc#grace-period[Grace period]) and recorded `killed` and their build slots released; warm language servers are shut down; merge-queue and review-bot leases are left in place and handled at the next start like those of a crash (<<leases>>); the runtime exits. `pm-mcp drain` waits for the exit up to the drain timeout plus the xref:01-job-budgets-and-waits.adoc#grace-period[Grace period] plus a fixed `10`, then reports that the runtime is still draining.
+|Remaining job groups are terminated (xref:01-job-budgets-and-waits.adoc#grace-period[Grace period]) and recorded `killed`, their build and model slots released and their job tokens revoked, and `queued` jobs recorded `killed`; warm language servers are shut down; merge-queue and review-bot leases are left in place and handled at the next start like those of a crash (<<leases>>); the runtime exits. `pm-mcp drain` waits for the exit up to the drain timeout plus the xref:01-job-budgets-and-waits.adoc#grace-period[Grace period] plus a fixed `10`, then reports that the runtime is still draining.
 |link:../runtime-model.adoc#_drain_stop_upgrade[Runtime Model, Drain, Stop & Upgrade]
 
 |[[stalled-threshold]]Stalled threshold
@@ -51,8 +51,8 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |`86400`
 |fixed (compiled constant; no legitimate machine difference)
 |—
-|`<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json`
-|Removed and audited, one audit record each, by the project's recovery sweep and by the <<periodic-sweep-interval>> (age is the only evidence; the runtime keeps no connections). `pm_start` does no age check of its own.
+|`<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json`, with the bootstrap state it holds (age since `created_at`)
+|Removed and audited, one audit record each, by the project's recovery sweep and by the <<periodic-sweep-interval>> (age is the only evidence; the runtime keeps no connections); the bootstrap ends without a terminal and a later call naming the `entry_id` is `scope_not_found`. The bootstrap does no age check of its own.
 |link:../runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]; link:../runtime-model.adoc#periodic-sweep[Runtime Model, Periodic Sweep]
 
 |[[periodic-sweep-interval]]Periodic runtime sweep interval
@@ -87,7 +87,7 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |The request is cancelled (`$/cancelRequest`); `pm_lsp` reports a timeout, never an empty result, and an Axis C resolver reports `NOT_RUN` with `TIMEOUT`.
 |link:../domain-extensions.adoc[Domain Extensions] (Explicit Non-Run Reporting)
 
-|Transaction lock acquisition
+|[[lock-wait-threshold]]Transaction lock acquisition
 |No timeout: transaction locks are held for one transaction only (link:../store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas, Transaction Locks]); long-lived claims are leases (<<leases>>). A reporting threshold of `30` watches every wait without aborting it.
 |fixed (the threshold feeds a `PM-MIG-5` trigger, which must not vary per machine)
 |—
@@ -119,7 +119,23 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |The slot is released once its job has settled; a slot whose job was recorded `killed` at a runtime restart is released at once.
 |link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
 
-|Review-bot window claim
+|[[model-slot-lease]]Model slot lease
+|`lease_expires_at = acquired_at + t + 5` (the model job's allocated budget, xref:01-job-budgets-and-waits.adoc#model-job-budget[Model job budget], plus the termination grace period); the machine cap is `model_slots` (compiled default `2`), at most one writer job per plan.
+|cap: `model_slots` in `machine-config.json`
+|cap `1`..`16`
+|`state/model-slots.json`
+|The slot is released once its job has settled; a slot whose job was recorded `killed` at a runtime restart is released at once; the next `queued` job is admitted (xref:01-job-budgets-and-waits.adoc#model-slot-wait[Model slot wait]).
+|link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|[[job-token-lifetime]]Job token lifetime
+|From the model job's spawn to the transaction that records its fate; no time expiry of its own.
+|fixed
+|—
+|the job token of a model job (`PM-MCP-Job-Token`)
+|Revoked with the fate; every later request with it is refused `job_ended`.
+|link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas, Job Record]; link:../identifiers/02-registry-stores-to-web.adoc#id-job-token[Identifier Registry, Job Token]
+
+|[[review-bot-window-claim]]Review-bot window claim
 |`reset_at` of the window (xref:01-job-budgets-and-waits.adoc#review-bot-windows[Review bot windows]).
 |—
 |—
@@ -127,8 +143,8 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |—
 |link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
 
-|Orphaned lease release
-|Positive evidence only: owning scope terminal, archived, or gone; or `lease_expires_at` passed without adoption; or (build slot) its job recorded `killed`.
+|[[orphaned-lease-release]]Orphaned lease release
+|Positive evidence only: owning scope terminal, archived, or gone; or `lease_expires_at` passed without adoption; or (build or model slot) its job recorded `killed`.
 |—
 |—
 |every lease marked `orphaned_at`
@@ -151,15 +167,15 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |===
 |Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
 
-|Waiver
-|No time expiry and not bound to `HEAD`: a `met` waiver applies to every evaluation of its gate until the plan ends or `unwaive` revokes it (refused once consumed).
+|[[waiver-expiry]]Waiver
+|No time expiry and not bound to `HEAD`: a `met` waiver can be set until the gate's fallback is taken and applies to every later evaluation of its gate until the plan ends or `unwaive` revokes it (refused once consumed); a revoked `raise` lowers the ceiling from the next budget check.
 |—
 |—
 |`waivers.jsonl`
 |—
 |link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-record[Store Schemas, Waiver Record]
 
-|Waiver request
+|[[waiver-request-expiry]]Waiver request
 |`expires_at = requested_at + waiver_wait_seconds` (xref:01-job-budgets-and-waits.adoc#waiver-wait[Waiver wait]).
 |as waiver wait
 |as waiver wait
@@ -167,21 +183,21 @@ link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts &
 |Recorded `expired`; the hand-back comment names it.
 |link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-request-record[Store Schemas, Waiver Request Record]
 
-|Integrity pause
-|No expiry: an `integrity_breach` condition ends only by `accept-edit` (re-baseline and re-verification) or, for a plan or epic scope, the operator's `abort`; a workspace breach ends only by `accept-edit`.
+|[[integrity-pause]]Integrity pause
+|No expiry: an `integrity_breach` condition ends only by `accept-edit` (re-baseline and re-verification) or, for a plan or epic scope, the operator's `abort`; a workspace breach and a lesson breach end only by `accept-edit`; a breached pending entry record ends by `accept-edit` or by the pending-record sweep.
 |—
 |—
-|plan, epic, and workspace scopes (a tampered enrolment pauses every running plan of the project)
+|plan, epic, and workspace scopes, single lessons, and single bootstrap entities (a tampered enrolment pauses every running plan of the project)
 |—; the deadlines of a pending question or waiver request are held and processed after the pause ends.
 |link:../cli-and-security/02-credentials-and-operator.adoc#operator-integrity-pause[CLI & Security, Integrity Pause]
 
-|`dispatch_id`
-|No time expiry: a `dispatch_id` becomes stale only when superseded (`redispatch:<entity>`) or returned.
+|[[access-grant-lifetime]]Access grant
+|No time expiry: a grant holds until the plan ends.
 |—
 |—
-|dispatch claims
+|`grants.jsonl` of a plan
 |—
-|link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#_dispatch_id_generation_lifecycle_states[Dispatch & Effort, Dispatch ID Lifecycle]
+|link:../store-schemas/15-screening-and-grants.adoc#grant-record[Store Schemas, Access Grant Record]
 
 |[[credential-expiring-window]]Credential expiry warning window
 |`14` days before `expires_at`.

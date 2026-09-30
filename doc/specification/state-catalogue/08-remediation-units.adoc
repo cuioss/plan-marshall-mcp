@@ -28,7 +28,7 @@ The self-remedy of a failure class is a sub-workflow unit per class (`scope subw
 
 |`remediation.review-findings`
 |`remediation-review`
-|`finalize.remediate-review`, `finalize.remediate-barrier`, `finalize.remediate-settle-findings`
+|`finalize.remediate-review`, `finalize.remediate-barrier`, `finalize.remediate-security-audit`, `finalize.remediate-self-review`
 
 |`remediation.build-failure`
 |`remediation-build`
@@ -47,7 +47,7 @@ The self-remedy of a failure class is a sub-workflow unit per class (`scope subw
 |`finalize.remediate-spend`
 |===
 
-*Contract*: Parameters `retry_budget`, `fix_budget`, `waiver_wait_seconds`, and `actions` (the subset of `retry`, `fix`, `loop_back` the call admits; the plan instance's composition rules may narrow it, for example `actions=[retry]` for a `land` plan), bounded by the compiled hard caps (retry `5`, fix `5`, waiver wait `86400` s); the plan instance carries the effective ceilings with their source. Budgets are counted per plan and class, persisted, and never reset (link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]). The exit contract is the subset of the domain outcomes `resolved`, `waived`, `exhausted`, `fix_requested` the unit can reach, plus the control outcome `stepped_out`: `waived` only where the class has a waivable gate, `fix_requested` only where the fix runs in the caller. The gather state records the evidence as failure envelopes behind untrusted resources (link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory]); `decide` asks for one judgment, the remedy, and offers the implicit `step_out`, never guarded by a budget. A nested `git.commit_and_push` that returns `stepped_out` routes back to `decide`, and the uncommitted fix is not charged. No primitive writes a waiver: the waived path exists only as the `waived` terminal, produced by the gather state (`waiver.lookup`) or the waiver wait.
+*Contract*: Parameters `retry_budget`, `fix_budget`, `waiver_wait_seconds`, and `actions` (the subset of `retry`, `fix`, `loop_back` the call admits; the plan instance's composition rules may narrow it, for example `actions=[retry]` for a `land` plan), bounded by the compiled hard caps (link:../timeouts/01-job-budgets-and-waits.adoc#retry-budget[retry], link:../timeouts/01-job-budgets-and-waits.adoc#fix-budget[fix], link:../timeouts/01-job-budgets-and-waits.adoc#waiver-wait[waiver wait]); the plan instance carries the effective ceilings with their source. Budgets are counted per plan and class, persisted, and never reset (link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]). The exit contract is the subset of the domain outcomes `resolved`, `waived`, `exhausted`, `fix_requested` the unit can reach, plus the control outcome `stepped_out`: `waived` only where the class has a waivable gate, `fix_requested` only where the fix runs in the caller. The gather state records the evidence as failure envelopes behind untrusted resources (link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory]); a unit that ingests externally authored text (review comments and bot findings, analysis-provider messages) builds one `batch-v1` batch of the firing's new items after level-1 validation and screens its uncached items in one screener job, and an item the screener flags `suspicious` is withheld: only its structured fields are delivered, it stays pending, and the unit ends through its budget and fallback unless a `met` waiver covers it (the hand-back report lists withheld items); `decide` asks for one judgment, the remedy, and offers the implicit `step_out`, never guarded by a budget. A nested `git.commit_and_push` that returns `stepped_out` routes back to `decide`, and the uncommitted fix is not charged; a server step-out of cause `condition` never reaches `decide`, because it unwinds every frame to the plan's fallback. No primitive writes a waiver: the waived path exists only as the `waived` terminal, produced by the gather state (`waiver.lookup`) or the waiver wait.
 
 *`decide` validation* (common to every unit): `retry` (`submit`, `reason: enum[flaky|infra|timeout]`) is refused with `retry_not_applicable` when the same failure fingerprints already failed after a retry with the same reason; `fix` is charged only when its commit or revised artifact exists, and an empty commit or unchanged artifact is refused with `fix_unchanged`; `loop_back` (`submit`, `summary`) returns `fix_requested` and is charged like `fix`; `request_waiver` (`submit`, `rationale: text[1..2000]`, files a waiver request, not a decision) is offered only while `waiver_wait_seconds > 0` and the failing gate is waivable. Each link is offered only when the call's `actions` admit it and its budget is left.
 
@@ -63,7 +63,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |[[state-remediation.budget-check]]`remediation-<class>.budget-check`
 |inherit
 |`auto`
-|The unit's gather state (`failures`, `over`, `cancelled`), triage state (`triaged_with_fix`), or waiver wait (`raised`).
+|The unit's gather state (`failures`, `over`, `cancelled`), screen state (`remediation-analysis`), triage state (`triaged_with_fix`), or waiver wait (`raised`).
 |`auto remediation.check-budgets` against the effective ceilings; precedes `decide`, so `decide` is never entered without a remedy link.
 |`budget_left` -> the unit's `decide` (not in `remediation-spend`, which has none); `exhausted_wait` (only in a unit with a waiver wait: `waiver_wait_seconds > 0` and the gate waivable; the server files the waiver request) -> `remediation-<class>.waiver-wait`; `exhausted` -> `remediation-<class>.exhausted`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_remediation_policy_calls[Phase Workflows Specification, Remediation Policy Calls]
@@ -73,8 +73,16 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |`composite_job`
 |The unit's `decide` (`request_waiver`); `remediation-<class>.budget-check` (`exhausted_wait`).
 |`remediation.await-waiver`: a server timer bounded by `waiver_wait_seconds` plus a watch of the plan's waiver store (awaited events `OPERATOR_WAIVER`, `TIME`); no model turn; survives a gone host session; held by an integrity pause. The request is announced per the waiver-request channels and listed by `pm-mcp operator waivers --pending`.
-|`raised` (an operator `--raise` of this class's budget) -> `remediation-<class>.budget-check` (`remediation-spend`: its gather state); `waived` (a `met` waiver of the failing gate) -> `remediation-<class>.waived`; `expired` -> `remediation-<class>.exhausted` (the request named in the hand-back comment); `interrupted` -> `remediation-<class>.budget-check`; `cancelled` (a followed `cancel:` link) -> `remediation-<class>.exhausted`.
+|`raised` (an operator `--raise` of this class's `retry_budget` or `fix_budget`; never in `remediation-spend`, whose ceiling is not raisable) -> `remediation-<class>.budget-check`; `waived` (a `met` waiver of the failing gate) -> `remediation-<class>.waived`; `expired` -> `remediation-<class>.exhausted` (the request named in the hand-back comment); `interrupted` -> `remediation-<class>.budget-check`; `cancelled` (a followed `cancel:` link) -> `remediation-<class>.exhausted`.
 |link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-request-record[Store Schemas Specification, Waiver Request Record]
+
+|[[state-remediation.screen]]`remediation-<class>.screen`
+|inherit
+|`job`
+|The unit's gather state, when the firing's `batch-v1` batch holds items with no cached verdict (`remediation-analysis.gather` `failures`, `remediation-review.gather` `untriaged`).
+|`job llm screen role screen.effort`: the zero-tool screener over the batch's uncached items (split above the screening split bound), in an empty job-private directory without project files; verdicts cached per scope by the SHA-256 of the cleaned text; an unparseable or missing verdict counts as `suspicious`. A launch the harness cannot serve raises `precondition_unmet` (`harness_capability_missing`).
+|`clean`, `suspicious` (the flagged items withheld: only their structured fields and `withheld: flagged by screener` are delivered) -> the unit's judgment: `remediation-analysis.budget-check`, `remediation-review.triage`.
+|link:../dispatch-and-effort/06-untrusted-text-screening.adoc#screener[Model Jobs & Effort Specification, Screener Job]; link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batch-v1[Batch Format]
 
 |[[state-remediation.resolved]]`remediation-<class>.resolved`
 |inherit
@@ -88,7 +96,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |inherit
 |`terminal`
 |The unit's gather state (`all_waived`: every failure covered by a `met` waiver, consumption logged) or waiver wait (`waived`).
-|Declared `terminal waived success`; the caller completes its begun step `waived` with the waiver id.
+|Declared `terminal waived success`; the caller completes its begun step `waived` with the waiver id (`remediation-spend`: the caller's `merge.gate-entry` reads and consumes the `spend` waiver).
 |The caller's `waived` transition.
 |link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-record[Store Schemas Specification, Waiver Record]
 
@@ -104,7 +112,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |inherit
 |`terminal`
 |The unit's `decide` (`loop_back`; for `remediation-build` and `remediation-qgate` also `fix`).
-|Declared `terminal fix_requested unsettled`; the fix runs in the caller (an authoring re-dispatch, a task revision, or Phase 5 remediation tasks), which calls the unit again after the next verification on the same counter.
+|Declared `terminal fix_requested unsettled`; the fix runs in the caller (a new authoring job, a task revision, or Phase 5 remediation tasks), which calls the unit again after the next verification on the same counter.
 |The caller's `fix_requested` transition.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_remediation_policy_calls[Phase Workflows Specification, Remediation Policy Calls]
 |===
@@ -147,7 +155,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |-
 |-
 |x
-|-
+|x
 
 |`exhausted`
 |x
@@ -165,6 +173,15 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |x
 |-
 |x
+|-
+
+|`screen`
+|-
+|x
+|x
+|-
+|-
+|-
 |-
 |===
 
@@ -220,14 +237,14 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |`composite_job`
 |`call` (start state); `remediation-analysis.await-analysis` (`failed`, `interrupted`).
 |`remediation.gather-analysis-evidence`: every failing provider's quality-gate conditions and new-code issues, tagged by provider; `undecidable` is its own kind. A constituent fate other than success yields a failure of kind `undecidable`.
-|`failures` -> `remediation-analysis.budget-check`; `none` -> `remediation-analysis.resolved`; `all_waived` (`analysis_gate:<provider>`, `findings:<provider>`) -> `remediation-analysis.waived`; `cancelled` -> `remediation-analysis.budget-check`.
+|`failures` -> `remediation-analysis.screen` (the providers' messages; a batch whose items are all cached settles the screen at once); `none` -> `remediation-analysis.resolved`; `all_waived` (`analysis_gate:<provider>`, `findings:<provider>`) -> `remediation-analysis.waived`; `cancelled` -> `remediation-analysis.budget-check`.
 |link:../hypermedia-format/03-composite-wait-and-encoder.adoc#analysis-status[Hypermedia Format Specification, `analysis_status`]
 
 |[[state-remediation-analysis.decide]]`remediation-analysis.decide`
 |inherit
 |`link`
 |`remediation-analysis.budget-check` (`budget_left`); `remediation-analysis.commit-fix` (`stepped_out`, or `done` without a commit).
-|`facts`: the failure envelopes by provider. `retry` (`do remediation.rescan`: re-scan or re-trigger the provider, the remedy for `undecidable`), `fix`, `request_waiver` (per provider); implicit `step_out`. Skill `pm/finalize/analysis-triage`.
+|`facts`: the failure envelopes by provider, withheld messages as structured fields only. `retry` (`do remediation.rescan`: re-scan or re-trigger the provider, the remedy for `undecidable`), `fix`, `request_waiver` (per provider); implicit `step_out`. Skill `pm/finalize/analysis-triage`.
 |`retry` -> `remediation-analysis.await-analysis`; `fix` -> `remediation-analysis.commit-fix`; `request_waiver` -> `remediation-analysis.waiver-wait`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_remediation_policy_calls[Phase Workflows Specification, Remediation Policy Calls]
 
@@ -259,17 +276,17 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |inherit
 |`composite_job`
 |`call` (start state); `remediation-review.await-review`.
-|`remediation.gather-review-evidence`: the open findings of the ledger (bot comments, the barrier re-fetch, structural refusals, security-audit and self-review findings) and, for a required bot without evidence, a failure of kind `evidence_missing` (`not_wired` checked first).
-|`untriaged` -> `remediation-review.triage`; `failures` (findings dispositioned `FIX`, or evidence missing) -> `remediation-review.budget-check`; `none` -> `remediation-review.resolved`; `all_waived` (`findings:<class>`, `review_evidence[:<bot>]`) -> `remediation-review.waived`; `cancelled` -> `remediation-review.budget-check`.
+|`remediation.gather-review-evidence`: the open findings of the ledger (bot comments, the barrier re-fetch, structural refusals, security-audit and self-review findings) and, for a required bot without evidence, a failure of kind `evidence_missing` (`not_wired` checked first); the firing's new externally authored texts form its `batch-v1` batch.
+|`untriaged` -> `remediation-review.screen` (a batch whose items are all cached settles the screen at once); `failures` (findings dispositioned `FIX`, or evidence missing) -> `remediation-review.budget-check`; `none` -> `remediation-review.resolved`; `all_waived` (`findings:<class>`, `review_evidence[:<bot>]`) -> `remediation-review.waived`; `cancelled` -> `remediation-review.budget-check`.
 |link:../hypermedia-format/03-composite-wait-and-encoder.adoc#bot-status-mapping[Hypermedia Format Specification, Per-Bot State Mapping]
 
 |[[state-remediation-review.triage]]`remediation-review.triage`
 |inherit
-|`link`
-|`remediation-review.gather` (`untriaged`); itself (`open_remaining`).
-|One `triage:<finding_id>` per link (`submit`, `do findings.triage`; `disposition` `FIX` / `SUPPRESS` / `ACCEPT`, `reply_text:text[1..4000]`, optional `requirement_refs`, `population` for `FIX`), refused when the disposition contradicts the finding's classification; a refutation sub-state for producers with a `verification_profile`; `FIX` refused for terminus findings, and the only disposition of a dependency-delta finding. `facts.findings`: every open finding's essentials. Implicit `step_out`. Skill `pm/finalize/triage`.
-|`open_remaining` -> this state; `triaged_with_fix` -> `remediation-review.budget-check`; `triaged_without_fix` -> `remediation-review.resolved`.
-|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Unified Triage Hook]
+|`job`
+|`remediation-review.screen` (`clean`, `suspicious`).
+|`job llm triage role plan.phase-6-finalize.effort.triage` (read-only class), one job per gather firing over every open finding that is not withheld, grouped by `(domain, rule_id)`: the entity submits `submit:triage-groups` with one disposition per group (`FIX` / `SUPPRESS` / `ACCEPT`, `reply_text:text[1..4000]`, optional `requirement_refs`, `population` for `FIX`) and per-finding exceptions, written per finding by `findings.triage`; a disposition that contradicts a finding's classification is refused; a refutation step for producers with a `verification_profile`; `FIX` refused for terminus findings, and the only disposition of a dependency-delta finding. Withheld findings stay pending. Skill `pm/finalize/triage`.
+|`triaged_with_fix` -> `remediation-review.budget-check`; `triaged_without_fix` -> `remediation-review.resolved`; a group left without a disposition -> the `job_incomplete` condition.
+|link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batched-triage[Model Jobs & Effort Specification, Batched Triage]; link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Unified Triage Hook]
 
 |[[state-remediation-review.decide]]`remediation-review.decide`
 |inherit
@@ -371,7 +388,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |inherit
 |`link`
 |`remediation-qgate.budget-check` (`budget_left`).
-|`facts.qgate_findings`. `fix` (the caller re-dispatches the authoring phase or offers the task revision; an unchanged artifact is refused `fix_unchanged` at its re-submission), `request_waiver`; implicit `step_out`. Skill `pm/qgate/remediation`.
+|`facts.qgate_findings`. `fix` (the caller runs a new authoring job or offers the task revision; an unchanged artifact is refused `fix_unchanged` at its re-submission), `request_waiver`; implicit `step_out`. Skill `pm/qgate/remediation`.
 |`fix` -> `remediation-qgate.fix-requested`; `request_waiver` -> `remediation-qgate.waiver-wait`.
 |link:../phase-workflows/03-q-gate-and-execute.adoc#_q_gate_validation_loop[Phase Workflows Specification, Q-Gate Validation Loop]
 |===
@@ -379,7 +396,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 [#state-catalogue-remediation-spend]
 === `remediation.spend`
 
-A degenerate unit: no `retry`, no `fix`, and no resting link state (so it never returns `stepped_out`); spend is raise-only.
+A degenerate unit: no `retry`, no `fix`, and no resting link state (so it never returns `stepped_out`). The spend ceiling is not raisable: only a `met` waiver of the gate `spend` lets the plan pass, and `merge.gate-entry` is the single point that reads it; the unit's waiver wait, when bound, only waits for that waiver.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -388,8 +405,8 @@ A degenerate unit: no `retry`, no `fix`, and no resting link state (so it never 
 |[[state-remediation-spend.gather]]`remediation-spend.gather`
 |inherit
 |`auto`
-|`call` (start state); `remediation-spend.waiver-wait` (`raised`).
-|`remediation.gather-spend-report`: cumulative finalize spend (`finalize.spend-ratio`) against the effective `spend` ceiling.
-|`within_ceiling` -> `remediation-spend.resolved`; `over` -> `remediation-spend.budget-check`.
-|link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Dispatch & Effort Specification, Spend Accounting]
+|`call` (start state).
+|`remediation.gather-spend-report`: cumulative finalize spend (`finalize.spend-ratio`) against the `spend` ceiling; it performs no waiver lookup.
+|`within_ceiling` -> `remediation-spend.resolved`; `over` -> `remediation-spend.budget-check` (whose `exhausted_wait` enters the waiver wait only while `waiver_wait_seconds > 0`).
+|link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Model Jobs & Effort Specification, Spend Accounting]
 |===

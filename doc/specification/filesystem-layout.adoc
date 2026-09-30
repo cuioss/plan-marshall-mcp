@@ -95,7 +95,7 @@ _Implementation watch: link:../implementation-watch/filesystem-layout.adoc#PM-WA
 A plan never moves (`PM-ARCH-5`). Its worktree is only a git checkout, created for execute and finalize and removed afterwards; the plan's `mcp/status.json` records the worktree's presence as `worktree_path` (link:store-schemas.adoc[Store Schemas Specification], Workflow State Store):
 
 * *Creation*: `execute.worktree-init` (or `land.worktree-init` of the `land` lane) creates the plan's feature branch and the git worktree (`finalize.adopt-pr` of the `adopt` lane creates the worktree on the adopted pull request's existing head branch) at `.marshall/local/worktrees/<plan_id>/`, then records the canonical absolute path of the worktree root (`Path.toRealPath()`) as `worktree_path` in one journaled transaction under the plan lock. The plan directory stays in the machine store; nothing is moved or copied into the worktree.
-* *Use*: While `worktree_path` is set, the plan's jobs run with the worktree root as working directory (link:job-runtime.adoc[Job Runtime Specification], Working Directory Selection), dispatch prompts carry it as `WORKTREE`, and every server-owned repository write of the plan happens in the worktree, never in the main checkout.
+* *Use*: While `worktree_path` is set, the plan's jobs, its model jobs included, run with the worktree root as working directory (link:job-runtime.adoc[Job Runtime Specification], Working Directory Selection), so project instructions and skills load natively in a model job; without a worktree they run in the project checkout. Every server-owned repository write of the plan happens in the worktree, never in the main checkout.
 * *Removal*: `default:branch-cleanup` removes the worktree (`git worktree remove`, run by a job whose working directory is the main checkout, never inside the worktree) and sets `worktree_path` to `null` in the same transaction that records the removal. A removal that timed out is recorded only after the partial-removal re-check (link:timeouts/01-job-budgets-and-waits.adoc#worktree-remove-recheck[Timeouts & Budgets Specification]) found positive evidence that it completed; it is never retried with `--force`. No store keeps pointing at a removed worktree: every post-merge step, and a resume after branch-cleanup, reads `worktree_path: null` and either runs against the main checkout or refuses fail-closed-clean, never on a stale path.
 * *Crash Consistency*: Creation and removal are idempotent and reconciled under the plan lock on retry and on the first call after a runtime start: a recorded `worktree_path` whose worktree no longer exists is cleared with an audit record, never silently followed, and a worktree of the plan's branch that exists but is not recorded is adopted by the creating step. A plan whose worktree was deleted with `.marshall/local/` gets it recreated from its branch by the next step that needs one.
 * *Baseline Scratch Worktrees*: Baseline re-runs of a failing whole-tree gate (link:job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime Specification, Gate Honesty Verification]) use one scratch worktree per plan and merge base, `.marshall/local/worktrees/baseline-<plan_id>-<sha12>/`, where `<sha12>` is the first 12 hex digits of the merge-base SHA. It never carries plan state and is never recorded in `worktree_path`:
@@ -127,7 +127,9 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
 [source,text]
 ----
 ~/.plan-marshall-mcp/                    # <PM_MCP_BASE>: PM-MCP instance directory (mode 0700)
-├── machine-config.json                  # Build slot caps, warm LSP pool defaults, project_defaults (mode 0600)
+├── machine-config.json                  # Build and model slot caps, warm LSP pool defaults, project_defaults (mode 0600)
+├── harnesses.json                       # Enrolled harness CLIs of model jobs: path, digest, version (mode 0600)
+├── harnesses.json.hmac                  # HMAC-SHA-256 sidecar of harnesses.json (mode 0600)
 ├── enrolments/                          # Operator enrolments, one file per project (mode 0700)
 │   ├── <project_id>.json                # Root, wrappers, tools, templates, scripts, budgets (mode 0600)
 │   └── <project_id>.json.hmac           # HMAC-SHA-256 sidecar of that file, written with every enrolment write (mode 0600)
@@ -148,6 +150,7 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
 ├── state/                               # Persistent cross-session operational state
 │   ├── install-records.json             # Client bundle ownership & SHA-256 manifest records
 │   ├── build-slots.json                 # Active PID-keyed build concurrency leases
+│   ├── model-slots.json                 # Model-job slot leases and the FIFO of queued model jobs
 │   ├── merge-queue.json                 # Per-repo FIFO merge admission queues & active holders
 │   ├── review-bot-windows.json          # Per-bot cross-plan rate-window claims
 │   ├── web-devices.json                 # Paired web devices: device_id, label, secret hash, timestamps (mode 0600)
@@ -172,9 +175,11 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
 │   ├── build-slots.lock                 # state/build-slots.json
 │   ├── enrolments/
 │   │   └── <project_id>.lock            # enrolments/<project_id>.json and its .hmac (lexicographic by project_id)
+│   ├── harnesses.lock                   # harnesses.json and its .hmac
 │   ├── install-records.lock             # state/install-records.json
 │   ├── machine-config.lock              # machine-config.json
 │   ├── merge.lock                       # state/merge-queue.json (merge leases)
+│   ├── model-slots.lock                 # state/model-slots.json
 │   ├── review-bot.lock                  # state/review-bot-windows.json
 │   ├── web-devices.lock                 # state/web-devices.json
 │   └── web.lock                         # Web server singleton (held for the pm-mcp-web lifetime)
@@ -187,7 +192,12 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
     └── audit.head                       # HMAC-anchored head: file, record count, last event_id, head hash
 ----
 
-The Linux Landlock write set of a job contains only its own project root (with its worktrees and `.marshall/local/temp/`), the declared toolchain caches, `/tmp`, and `/dev`; it never contains `<PM_MCP_BASE>`, including `projects/`, or another enrolled project's root (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); `pm-mcp-web` writes only its own files, which are not stores: its process record `run/web.json` and its TLS material in `web/tls/` (link:store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]). The Landlock read set of jobs is the whole filesystem except all of `<PM_MCP_BASE>`, so on Linux with Landlock ABI >= 2 no job reads the runtime token, a credential file, an enrolment, or another project's machine store; on macOS and on Linux without Landlock a job can read `<PM_MCP_BASE>` like any process of the user; the installation directory `<PM_MCP_HOME>` stays readable (link:job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]).
+The Linux Landlock write set of a job contains only its own project root (with its worktrees and `.marshall/local/temp/`), the declared toolchain caches, `/tmp`, and `/dev`, and for a model job (kind `llm`) additionally the harness home directories its client profile declares (`headless.writable_paths`, for example `~/.claude` or `~/.codex`), with network access allowed; it never contains `<PM_MCP_BASE>`, including `projects/`, or another enrolled project's root (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); `pm-mcp-web` writes only its own files, which are not stores: its process record `run/web.json` and its TLS material in `web/tls/` (link:store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]). The Landlock read set of jobs is the whole filesystem except all of `<PM_MCP_BASE>`, so on Linux with Landlock ABI >= 2 no job reads the runtime token, a credential file, an enrolment, or another project's machine store; on macOS and on Linux without Landlock a job can read `<PM_MCP_BASE>` like any process of the user; the installation directory `<PM_MCP_HOME>` stays readable (link:job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]). A model job reaches the runtime only through its job relay `pm-mcp serve --job`, which connects to the runtime socket (`run/runtime.sock` or its fallback path) with the job token from its environment and never reads `run/runtime.token` (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]).
+
+[#job-private-directories]
+=== Job-Private Directories (`$TMPDIR/pm-mcp-job-<job_id>/`)
+
+Every model job gets one job-private directory `$TMPDIR/pm-mcp-job-<job_id>/` (the system temporary directory, inside every job's write set; mode `0700`, owned by the effective UID; created by the runtime at the job's spawn and removed after its fate is recorded, and removed by the project's recovery for a job recorded `killed`). It holds only what the server composes for the launch, never state: the system-prompt file (the core conduct skill, the role and state skills in-band, and the contract envelope), the result schema, and, except for the screener, the MCP configuration that starts the job relay (mode `0600`). The screener's working directory is the empty subdirectory `cwd/` of it, outside every project tree, so no project or user instruction file of the harness reaches it; every other model job runs in the plan worktree or the project checkout (<<worktree-lifecycle>>).
 
 === File Permissions & Security Attributes
 
@@ -212,6 +222,10 @@ The runtime creates every file under `<PM_MCP_BASE>` with mode `0600` and every 
 |`<PM_MCP_BASE>/enrolments/<project_id>.json` and `<project_id>.json.hmac`
 |`0600` (`-rw-------`)
 |Operator-verified project root, pinned tool and wrapper digests, command templates, and project scripts (`PM-EXEC-2`). A file with permissions broader than `0600` blocks only its project (`enrolment_insecure`), like a tampered one. Every write of it (by the runtime, on an operator verb) also writes the file's HMAC-SHA-256 sidecar, verified before the project is first served after a runtime start and before every verify-not-resolve check (`enrolment_tampered` on mismatch, link:cli-and-security/02-credentials-and-operator.adoc#enrolment-integrity[CLI, Coordination & Security Specification]).
+
+|`<PM_MCP_BASE>/harnesses.json` and `harnesses.json.hmac`
+|`0600` (`-rw-------`)
+|Enrolled harness CLIs of model jobs (path, digest, version, captured authentication variables), written only by the runtime on `pm-mcp operator enrol-harness` and on an accepted self-update, verified with its HMAC sidecar before every model-job spawn (link:store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]).
 
 |`<PM_MCP_BASE>/state/enrolment-hmac.key`
 |`0600` (`-rw-------`)
@@ -258,6 +272,9 @@ All server-owned state of one project lives in its per-project machine store `<P
 │       ├── waivers.jsonl                # Append-only operator waivers (written only by the operator verbs)
 │       ├── waiver-consumptions.jsonl    # Append-only waiver consumptions (written only by waiver.lookup)
 │       ├── questions.jsonl              # Append-only question records of the plan scope
+│       ├── grants.jsonl                 # Append-only operator access grants to other projects (written only by the operator verb)
+│       ├── screen-verdicts.jsonl        # Screen verdict cache of the plan scope (SHA-256 of cleaned text -> verdict)
+│       ├── landing-envelope.json        # Undelivered landing envelope kept while the epic linkage is indeterminate
 │       ├── evidence/                    # failures.jsonl (failure envelopes) and <evidence_id>.log excerpts (untrusted)
 │       ├── tasks/
 │       │   ├── TASK-001.json
@@ -265,7 +282,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 │       ├── findings.jsonl
 │       ├── assessments.jsonl            # Append-only component assessments (never findings)
 │       ├── review-participation.jsonl   # Per-round review-bot participation records
-│       ├── metrics.json                 # Dispatch and phase measurements (record-metrics)
+│       ├── metrics.json                 # Model-job and phase measurements (record-metrics)
 │       ├── quality-report.json          # Post-run quality report (plan-retrospective)
 │       ├── change-ledger.jsonl          # Append-only worktree_sha-stamped build/change/job ledger
 │       ├── references.json
@@ -275,7 +292,8 @@ All server-owned state of one project lives in its per-project machine store `<P
 │           ├── mailbox.jsonl            # Append-only event log: messages from the parent epic (own leaf lock)
 │           ├── status.json              # Hypermedia FSM state, worktree_path, instance version, policy counters, gaps
 │           ├── transaction-journal.json # Transaction journal while a write is in flight
-│           └── units/                   # Bound copies of the verified sub-units the plan instance calls, by digest
+│           └── units/                   # Bound copies of the verified sub-units the plan instance calls
+│               └── <digest>.pmwf        # Content-addressed by SHA-256, immutable, digest-covered
 │
 ├── archive/                            # Archived plans (archive-plan, step 1100)
 │   └── <plan_id>/                       # Same layout as a plan directory; read-only, resolvable by plan_id
@@ -289,22 +307,24 @@ All server-owned state of one project lives in its per-project machine store `<P
 │   ├── change-ledger.jsonl              # Ledger rows of plan-less service calls (pm_build with plan_id NO_PLAN)
 │   ├── findings.jsonl                   # Findings of plan-less builds
 │   ├── questions.jsonl                  # Question records of the workspace scope (setup choices of team configuration)
+│   ├── screen-verdicts.jsonl            # Screen verdict cache of the workspace scope and its bootstrap entities
 │   ├── sessions.jsonl                   # Session log of the workspace scope (same append exception)
 │   └── mcp/
-│       ├── digests.json                 # Store size/SHA-256 sidecar
-│       ├── status.json                 # FSM state of the hosted workflows (project-setup)
+│       ├── digests.json                 # Store size/SHA-256 sidecar (pending entry records included)
+│       ├── status.json                 # FSM state of the hosted workflows (project-setup, lessons)
 │       └── transaction-journal.json     # Transaction journal while a write is in flight
 │
 ├── epics/                               # Non-tracked state of the epics (the ledger itself is git-tracked)
 │   └── <epic_id>/
 │       ├── digests.json                 # Store size/SHA-256 sidecar
 │       ├── questions.jsonl              # Question records of the epic scope
+│       ├── screen-verdicts.jsonl        # Screen verdict cache of the epic scope
 │       ├── sessions.jsonl               # Session log of the epic scope (same append exception)
 │       ├── status.json                  # FSM orchestrator state
 │       └── transaction-journal.json     # Transaction journal while a write is in flight
 │
-├── pending/                             # Pending entry records of not-yet-created plans
-│   └── <entry_id>.json                  # Written by pm-mcp enter, consumed by pm_start
+├── pending/                             # Pending entry records of not-yet-created plans and epics
+│   └── <entry_id>.json                  # Written by pm-mcp enter; state of the entry's bootstrap; deleted at its terminal
 │
 ├── jobs/                                # Write-ahead job journal (crash recovery) and job logs
 │   ├── <job_id>.json                    # Job record: written before spawn, replaced post-spawn (pid) and at fate
@@ -319,14 +339,15 @@ All server-owned state of one project lives in its per-project machine store `<P
 │   ├── epics-worktree.lock              # 4. Git operations on the shared epic worktree
 │   ├── lessons.lock                     # 5. Lesson id allocation and every lesson store write
 │   ├── local-config.lock                # 6. local-config.json
-│   └── build-timings.lock               # 7. build-timings.json
+│   ├── derived-facts.lock               # 7. derived-facts.json
+│   └── build-timings.lock               # 8. build-timings.json
 │
 ├── derived-facts.json                   # Cache of derived facts (Store Schemas § Derived Facts Store); deletable
 ├── store.json                           # Store identity: project_id and the project_root it was created for
 └── local-config.json                    # Operator posture of this project (Store Schemas § Operator Local Configuration)
 ----
 
-* *Never Moved*: A plan directory is created by `pm_start` in `plans/<plan_id>/` and stays there until `archive-plan` moves it to `archive/<plan_id>/` (a rename within the same store directory) or `delete-plan` removes it. No worktree creation, worktree removal, or finalize step moves it.
+* *Never Moved*: A plan directory is created by the done transaction of the plan bootstrap in `plans/<plan_id>/` and stays there until `archive-plan` moves it to `archive/<plan_id>/` (a rename within the same store directory) or `delete-plan` removes it. No worktree creation, worktree removal, or finalize step moves it.
 * *Scope Directories*: The FSM state of a scope lives in its scope metadata directory: `plans/<plan_id>/mcp/`, `epics/<epic_id>/`, and `workspace/mcp/`. For an epic the metadata directory is `epics/<epic_id>/` itself, which holds nothing else; where the specifications name a scope's `mcp/` files (`mcp/status.json`, `mcp/digests.json`, `mcp/transaction-journal.json`), an epic's are these files in `epics/<epic_id>/`. Every scope's session log `sessions.jsonl` lies directly in the scope directory (`plans/<plan_id>/`, `epics/<epic_id>/`, `workspace/`; link:store-schemas/01-format-and-session-log.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]). The epic ledger (`epic.json`, queue, inbox, landings, spec) stays git-tracked in `.marshall/orchestrator/<epic_id>/` of the shared epic worktree; `epics/<epic_id>/` holds only what is not tracked.
 * *Locks*: The scope locks live in `locks/`, outside the directories they protect (link:store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification, Transaction Locks]); the machine-wide store locks stay in `<PM_MCP_BASE>/locks/`.
 * *Writers*: Only the runtime writes the store (operator verbs included, which reach it through the runtime's local API), always through the stores' transactions; jobs never write it, and the model reaches it only through server links and resources (`pm://plan/…`, `pm://epic/…`, `pm://workspace/…`), never through file paths.
@@ -337,8 +358,8 @@ All server-owned state of one project lives in its per-project machine store `<P
 Every enrolled project has exactly one workspace scope (`PM-ARCH-4`), addressed in a tool call as `plan_id: NO_PLAN` (link:identifiers/01-general-rules-and-registry.adoc#id-no-plan[Identifier Registry, `NO_PLAN`]) and resolved from the `PM-MCP-Workspace` header of the request (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata). Its home is `workspace/` in the project's machine store:
 
 * *No Worktree, No Archive*: The workspace scope has no worktree and no archive; its home stays in the machine store for the life of the enrolment.
-* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup`, link:domain-extensions.adoc[Domain Extensions Specification]), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), `findings.jsonl` (the findings of plan-less builds), and `questions.jsonl` (the question records of team-configuration setup choices). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status`, `pm://workspace/findings`, and `pm://workspace/questions` project the three stores (link:mcp-tools.adoc[MCP Tools Specification]).
-* *Lock*: Every write to the workspace home takes `locks/workspace.lock` of the project's machine store, the first lock of the one total order (workspace -> plan locks -> epic locks -> `epics-worktree` -> `lessons` -> `local-config` -> `build-timings` -> machine store locks -> leaf locks, link:store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]), and runs as a journaled transaction (`mcp/transaction-journal.json`, link:store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]).
+* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup` and the lesson maintenance `lessons`, link:domain-extensions.adoc[Domain Extensions Specification]; the bootstrap entities it hosts keep their state in their pending entry records in `pending/`), `screen-verdicts.jsonl` (the screen verdict cache of the workspace scope and its bootstrap entities), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), `findings.jsonl` (the findings of plan-less builds), and `questions.jsonl` (the question records of team-configuration setup choices). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status`, `pm://workspace/findings`, and `pm://workspace/questions` project the three stores (link:mcp-tools.adoc[MCP Tools Specification]).
+* *Lock*: Every write to the workspace home takes `locks/workspace.lock` of the project's machine store, the first lock of the one total order (workspace -> plan locks -> epic locks -> `epics-worktree` -> `lessons` -> `local-config` -> `derived-facts` -> `build-timings` -> machine store locks -> leaf locks, link:store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]), and runs as a journaled transaction (`mcp/transaction-journal.json`, link:store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]).
 
 [#archives]
 === Plan & Epic Archives
@@ -349,7 +370,7 @@ Archived records keep their identity and stay readable by it (`PM-WF-13`):
 * *Plan Archive*: `archive-plan` (step `1100`) moves the plan directory from `plans/<plan_id>/` to `archive/<plan_id>/` of the project's machine store. The path carries no date, so a `plan_id` present in the archive is never allocated again (link:phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]). Archived plans are purged only by the operator's retention setting (`retention.archived_plans_days` of the machine-local `local-config.json`, link:timeouts/03-retention-host-config.adoc#retention-days[Timeouts & Budgets Specification]) through an evidence-based removal sweep (link:store-schemas/13-leases-integrity-testing.adoc#evidence-based-removal-sweeps[Store Schemas Specification]). Archiving already lands machine-side, so there is no separate export: the archive never leaves the workstation (`PM-ARCH-2`).
 * *Epic Archive*: When an epic reaches a terminal state, the epic workflow moves its directory inside the shared epic worktree from `.marshall/orchestrator/<epic_id>/` to `.marshall/archived-orchestrators/<epic_id>-<YY-MM-DD>/` (UTC archival date), and the move reaches the default branch through the epic landing. The archived `epic.json` keeps `epic_id`; the dated suffix is never parsed for identity, and a title is never an identity. The epic archive is git-tracked and has no retention purge; the epic's non-tracked `epics/<epic_id>/` stays in the machine store, read-only.
 * *Enumeration*: Every enumeration of epics (`pm_epics`, sibling-epic enumeration, re-grounding reads) covers the active root `.marshall/orchestrator/` and, where it reads history, the archived root, and reports per root `root`, `exists`, `listed`, `entries_scanned`, and `unreadable`, so "zero epics" is distinguishable from "root not scanned". Sibling-epic enumeration excludes every archived snapshot whose `epic_id` equals the enumerating epic's own.
-* *Read-Only Access by ID*: An archived record answers read requests by its id; mutating calls are rejected with its terminal representation. A project reads only its own machine store; reading another project's archived plans requires the operator-approved cross-project escalation (`PM-SEC-2`).
+* *Read-Only Access by ID*: An archived record answers read requests by its id; mutating calls are rejected with its terminal representation. A project reads only its own machine store; a plan reads another project's archived plans only under an operator access grant (`pm-mcp operator grant-access`, link:store-schemas/15-screening-and-grants.adoc#grant-record[Store Schemas Specification, Access Grant Record]; `PM-SEC-2`).
 
 [#plan-worktree-resolution]
 === Plan & Worktree Resolution

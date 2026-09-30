@@ -91,7 +91,19 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
       }
     },
     "phase": { "type": ["string", "null"], "enum": ["phase-2-refine", "phase-3-outline", "phase-4-plan", "phase-5-execute", "phase-6-finalize", null], "description": "Phase the finding was filed against; required for qgate findings. A write addressed to a phase the plan has left is refused with phase_closed." },
-    "dispatch_id": { "type": ["string", "null"], "description": "Claimed dispatch whose entity call filed the finding; null for findings the server files itself. Feeds the spend class findings_only." },
+    "job_id": { "type": ["string", "null"], "pattern": "^l-[0-9a-f]{16}$", "description": "The model job (kind llm) whose entity call filed the finding; null for findings the server files itself. Feeds the spend class findings_only." },
+    "batch_id": { "type": ["string", "null"], "pattern": "^BT-[0-9]+$", "description": "The screening batch (batch-v1) of the gather or source firing that ingested the finding's external text; null for a finding without external text (server-filed, self_review, qgate)." },
+    "screen": {
+      "type": ["object", "null"],
+      "description": "Level-2 screen of the finding's external text (summary and body), taken from the scope's screen verdict cache or the batch's screener job; null when the finding has no external text.",
+      "required": ["verdict", "withheld"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "type": "string", "enum": ["clean", "suspicious"], "description": "A missing, extra, or unparseable verdict item is recorded suspicious (fail-closed)." },
+        "withheld": { "type": "boolean", "description": "true iff verdict is suspicious: the text is never delivered to a model; only the structured fields (author, file, line, kind) and 'withheld: flagged by screener' are rendered, and the finding stays pending until a met waiver of its gate or the unit's fallback." },
+        "spans": { "type": "array", "items": { "type": "object", "required": ["start", "end", "reason"], "additionalProperties": false, "properties": { "start": { "type": "integer", "minimum": 0 }, "end": { "type": "integer", "minimum": 0 }, "reason": { "type": "string", "maxLength": 200 } } }, "description": "Flagged spans of a suspicious text; operator and audit data only." }
+      }
+    },
     "requirement_refs": {
       "type": ["array", "null"],
       "items": { "type": "string", "minLength": 1, "maxLength": 120 },
@@ -100,7 +112,7 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
     "severity": { "type": "string", "enum": ["blocker", "critical", "major", "minor", "info"] },
     "blocking": { "type": "boolean", "description": "Set at write time from the producer's declared class for this finding type; later changed only by triage." },
     "status": { "type": "string", "enum": ["open", "triaged_fix", "triaged_dismiss", "triaged_accept", "resolved", "carried"] },
-    "disposition": { "type": ["string", "null"], "enum": ["FIX", "SUPPRESS", "ACCEPT", null], "description": "The triage disposition submitted by the model (triage:F-n)." },
+    "disposition": { "type": ["string", "null"], "enum": ["FIX", "SUPPRESS", "ACCEPT", null], "description": "The triage disposition submitted by the triage job of the gather firing (submit:triage-groups: one disposition per (domain, rule_id) group, with per-finding exceptions); written per finding by the server." },
     "resolution": {
       "type": "string",
       "enum": ["pending", "fixed", "suppressed", "accepted", "taken_into_account", "rejected"],
@@ -122,7 +134,7 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
     "file_path": { "type": ["string", "null"] },
     "line": { "type": ["integer", "null"], "minimum": 1 },
     "summary": { "type": "string", "minLength": 1 },
-    "body": { "type": ["string", "null"], "description": "Promoted full text of the finding (review comment text, Sonar message). Stored verbatim and treated as untrusted content." },
+    "body": { "type": ["string", "null"], "description": "Promoted full text of the finding (review comment text, Sonar message), stored as the level-1 validator cleaned it (every change reported) and treated as untrusted content; delivered only while screen.withheld is false." },
     "author": { "type": ["string", "null"], "description": "Structured provider author login of a review comment; never parsed from comment text." },
     "bot_kind": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{0,31}$", "description": "Review-bot registry key resolved from author (<<review-bot-registry>>)." },
     "raised_at_head": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "description": "HEAD the finding was raised against; required for self_review, qgate, code_review, security_audit, arch_gate, and ci findings (for ci the head SHA of the checked run)." },
@@ -178,7 +190,8 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
 * *What Is Not a Finding*: Refusals, rate-limit or budget notices, the server's own posted comments and triggers, and participation-only artifacts (summary cards, trigger acknowledgements) are never filed as findings; they update the review participation record only (<<review-participation>>).
 * *Self-Reports*: A `self_report` finding is filed by the server, never by a step, when the model follows `report_bypass` (link:../hypermedia-format/01-representation-and-link-forms.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]); it carries the reported action as `summary`, the reason as `body`, `severity: major`, and `blocking: false`, and its paired audit record shares its timestamp. It names a sanctioned path that was missing or bypassed so the gap is fixed, and it is triaged like any other finding.
 * *Structured Reviewer Identity*: `author` and `bot_kind` come from the provider's structured author field, never from comment text. A comment whose structured author and self-declared bot identity disagree is itself filed as a finding with the provider's `source`. A comment's identity is `(bot_kind, provider_ref.comment_id)` plus `edit_marker`; an edited comment is new information.
-* *Server-Written Resolution*: The model submits only `disposition` (`FIX`, `SUPPRESS`, `ACCEPT`); the triage link grammar has no resolution parameter. The server writes `resolution` from recorded evidence, so a refuted claim, a valid finding that was dismissed, and a finding that is not this plan's concern stay distinguishable:
+* *Screened External Text*: A gather firing that ingests external text (review comments, bot findings, analysis-provider messages) builds one screening batch over its new items; the server writes `batch_id` and `screen` per finding from the scope's screen verdict cache or the batch's screener job (xref:15-screening-and-grants.adoc#screen-verdict-cache[Screen Verdict Cache]) before any model job receives the text. The triage job of the firing receives only findings whose `screen.withheld` is `false`; a withheld finding is delivered with its structured fields only and stays `pending`.
+* *Server-Written Resolution*: The model submits only `disposition` (`FIX`, `SUPPRESS`, `ACCEPT`); the triage submission (`triage-groups`) has no resolution parameter. The server writes `resolution` from recorded evidence, so a refuted claim, a valid finding that was dismissed, and a finding that is not this plan's concern stay distinguishable:
 +
 [cols="1,3,1"]
 |===
@@ -196,7 +209,7 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
 `scope_class` is computed by the server at triage from `file_path` against the plan's effective footprint (`declared_files ∪ realized_files`, which includes the recorded unplanned changes, xref:13-leases-integrity-testing.adoc#three-way-footprint[Three-Way File Footprint Reconciliation (`references.json`)]). No operator triage exists: the operator's only lever over findings is a waiver of the gate. `pending` is the only non-terminal resolution: the Blocking Findings Guard and the pre-merge barrier count it, and a `FIX` whose fix has not landed is still `pending`. Every report and landing figure over findings is keyed by `resolution` with every member tallied (stated zeros); the false-positive count of a source is its `rejected` count and never includes `suppressed`. *Deliberate change vs. `plan-marshall`*: `plan-marshall` lets the model choose one of the six resolutions directly; `PM-MCP` keeps the three model dispositions and derives the six-value resolution from evidence the server holds.
 * *Evidence Symmetry*: A resolution rests on evidence of the same kind whichever way it goes: `rejected` requires a concrete `evidence.ref` as a `FIX` requires a landed change, and a disposition that lowers severity cites an executed check.
 * *Re-Disposition of a Transmitted Finding*: A finding whose `transmit_outcome` is `sent` may be re-dispositioned only together with a new `reply_text`; the server then resets `transmit_outcome` to `pending`, re-derives `resolution`, and transmits again. A bare re-disposition (same or no reply) is refused with `invalid_link_args`.
-* *Late Findings Are Carried Out*: After the merge gate (order `> 70`) no step refuses on findings. A blocking finding still `pending` after the merge (filed after the barrier evaluated) is carried out by the server: appended to the parent epic inbox as a `process_finding` message, or, for a plan without an epic, seeded as a lesson (category `bug`, title from `summary`, body from `body`); while the epic linkage is `indeterminate` the message is kept with the undelivered landing envelope and delivered with it. The finding is set to status `carried` with `carried_to`; its `resolution` stays `pending`, so the carried debt remains visible (link:../phase-workflows.adoc[Phase Workflows Specification], rows `1000` and `1100`).
+* *Late Findings Are Carried Out*: After the merge gate (order `> 70`) no step refuses on findings. A blocking finding still `pending` after the merge (filed after the barrier evaluated) is carried out by the server: appended to the parent epic inbox as a `process_finding` message, or, for a plan without an epic, seeded as a lesson (category `bug`, title from `summary`, body from `body`); while the epic linkage is `indeterminate` the message is appended to the kept landing envelope `landing-envelope.json` (xref:04-epic-and-change-ledger.adoc#kept-landing-envelope[Kept Landing Envelope]) and delivered with it. The finding is set to status `carried` with `carried_to`; its `resolution` stays `pending`, so the carried debt remains visible (link:../phase-workflows.adoc[Phase Workflows Specification], rows `1000` and `1100`).
 * *Transmit Reasons*: `transmit_reason` is one closed vocabulary shared by every provider: `no_provider_address` (no thread, comment id, or Sonar issue key to answer on), `pr_number_unrecorded` and `belongs_to_other_pr` (the finding cannot be shown to belong to this pull request; deferred, never dropped), `nothing_to_transmit` (the disposition carries no reply), `reply_failed` and `resolve_failed` (the provider call for the reply or for the thread resolution failed), `provider_unreachable`, and `provider_rejected`. Provider error text is never packed into the reason. *Deliberate change vs. `plan-marshall`*: the GitHub, GitLab, and Sonar integrations each report their own free-text skip reasons (`no_resolution_detail`, `no thread_id or resolution_detail`, `no issue key in detail`, `thread-reply failed: <error>`; verified at `plan-marshall` `b1a9a89fa`), so one condition has three spellings.
 * *Transmission and Resolution Are Separate*: Before the provider call the server persists `transmit_outcome: pending` with the `transmit_disposition` it sends. `responded_at` is stamped after the provider accepted the reply and before the thread is resolved; `resolve_state` is persisted separately, so a resolve-only retry never re-sends the reply. After a crash, a `pending` transmission is reconciled by looking up the reply on the provider before any re-send.
 
@@ -204,7 +217,7 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
 == Component Assessment Record (`assessments.jsonl`)
 _Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-40[PM-WATCH-GEN-40], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-8[PM-WATCH-STORE-8]_
 
-Read-only workers persist component assessments through their entity `submit` (link:../dispatch-and-effort.adoc[Dispatch & Effort Specification]). Assessments are a second schema beside findings: they are never written to `findings.jsonl`, and no finding histogram or count reads this store (`PM-WF-11`).
+Read-only model jobs persist component assessments through their entity `submit` (link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification]). Assessments are a second schema beside findings: they are never written to `findings.jsonl`, and no finding histogram or count reads this store (`PM-WF-11`).
 
 [source,json]
 ----
@@ -221,7 +234,7 @@ Read-only workers persist component assessments through their entity `submit` (l
     "component": { "type": "string", "minLength": 1, "description": "Repository-relative path or module id." },
     "certainty": { "type": "string", "enum": ["include", "exclude", "uncertain"] },
     "confidence": { "type": "integer", "minimum": 0, "maximum": 100 },
-    "agent": { "type": "string", "description": "dispatch_id or step id that produced the assessment." },
+    "agent": { "type": "string", "description": "job_id of the model job, or the step id, that produced the assessment." },
     "evidence": { "type": ["string", "null"] },
     "effective_from": { "type": "string", "format": "date-time" },
     "recorded_at": { "type": "string", "format": "date-time", "description": "Stamped by the server when the record is appended; never taken from the submitting worker." },

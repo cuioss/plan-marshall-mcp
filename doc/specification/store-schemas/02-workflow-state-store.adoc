@@ -51,13 +51,13 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     },
     "origin": {
       "type": "object",
-      "description": "Plan scopes only: immutable provenance stamped once by pm_start for every source. Never rewritten by re-entry.",
+      "description": "Plan scopes only: immutable provenance stamped once by the done transaction of the plan bootstrap (bootstrap-plan) from its source record. Never rewritten by re-entry.",
       "required": ["source", "stamped_at"],
       "additionalProperties": false,
       "properties": {
-        "source": { "type": "string", "enum": ["request", "issue", "lesson", "recipe", "local_changes", "pr"] },
-        "source_ref": { "type": ["string", "null"], "description": "Issue number, lesson_id, recipe_id, or the adopted pull request's number (source pr); null for a free-text request and for local_changes." },
-        "epic_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Copied by pm_start from the consumed pending entry record's from_epic; the single carrier of epic membership of an existing plan (session rows carry none); pm_start has no epic parameter." },
+        "source": { "type": "string", "enum": ["request", "issue", "lesson", "recipe", "local_changes", "pr", "epic_row"] },
+        "source_ref": { "type": ["string", "null"], "description": "Issue number, lesson_id, recipe_id, the adopted pull request's number (source pr), or the plan_id of the bound epic queue row (source epic_row, equal to the plan's own id); null for a free-text request and for local_changes." },
+        "epic_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Copied by the done transaction of the plan bootstrap from the pending entry record's from_epic (required for source epic_row, whose queue row the same transaction sets running); the single carrier of epic membership of an existing plan (session rows carry none); no tool parameter carries epic membership." },
         "stamped_at": { "type": "string", "format": "date-time" }
       }
     },
@@ -85,7 +85,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     "instance_version": {
       "type": ["integer", "null"],
       "minimum": 1,
-      "description": "Plan scopes only: the plan instance version in force (instance/plan.v<N>.pmwf, Plan Instance); written by the transaction that composed it and effective from the next transition. Null only for epic and workspace scopes."
+      "description": "Plan scopes only: the plan instance version in force (instance/plan.v<N>.pmwf, Plan Instance); written by the transaction that composed it. A version composed by an operator or configuration event (config_adopted, waiver) is in force from the next transition; a version composed by a server event (outline, plan, fallback, empty_harvest, deliverable_removed) is in force for the rest of its composing chain, from the transition that enters its target state (Store Schemas, Plan Instance). Null only for epic and workspace scopes."
     },
     "setup_run": {
       "type": ["string", "null"],
@@ -119,11 +119,11 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     },
     "worktree_path": {
       "type": ["string", "null"],
-      "description": "Plan scopes only: worktree presence. Canonical absolute path (Path.toRealPath()) of the plan's worktree root, rendered unchanged as WORKTREE in dispatch prompts; set in the transaction that records the worktree's creation and set to null in the same transaction that records its removal, so no store points at a removed worktree. Null (or absent) while the plan has no worktree: Phases 1-4 and Phase 6 after branch-cleanup. The plan directory itself never moves. Loop-back transitions are permitted only while it is non-null (in_worktree guard); jobs run in it while it is non-null."
+      "description": "Plan scopes only: worktree presence. Canonical absolute path (Path.toRealPath()) of the plan's worktree root, the working directory of the plan's jobs (model jobs included); set in the transaction that records the worktree's creation and set to null in the same transaction that records its removal, so no store points at a removed worktree. Null (or absent) while the plan has no worktree: Phases 1-4 and Phase 6 after branch-cleanup. The plan directory itself never moves. Loop-back transitions are permitted only while it is non-null (in_worktree guard); jobs run in it while it is non-null."
     },
     "entry_baseline": {
       "type": ["object", "null"],
-      "description": "Plan scopes only: main-checkout porcelain state recorded once by pm_start. A path of the main checkout outside .marshall/local/ that is absent from it or whose digest changed is a hard error in every phase (the transition raises the footprint_violation condition, attributed to the plan); baseline paths are rendered as facts.baseline_dirty, never block, and are never offered for revert. A reader that finds it null counts every dirty path as new (fail-closed).",
+      "description": "Plan scopes only: main-checkout porcelain state recorded once in the plan's creation transaction (the done transaction of the plan bootstrap). A path of the main checkout outside .marshall/local/ that is absent from it or whose digest changed is a hard error in every phase (the transition raises the footprint_violation condition, attributed to the plan); baseline paths are rendered as facts.baseline_dirty, never block, and are never offered for revert. A reader that finds it null counts every dirty path as new (fail-closed).",
       "required": ["recorded_at", "head_sha", "paths"],
       "additionalProperties": false,
       "properties": {
@@ -148,7 +148,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
       "type": "string",
       "enum": ["stop_at_phase_boundary", "stop_on_issue_only"],
       "default": "stop_at_phase_boundary",
-      "description": "Operator continuation policy, the plan's only autonomy setting: initialised by pm_start from the operator's local-config.json continuation.default_policy (then machine-config.json project_defaults, then the compiled default stop_at_phase_boundary), changed only by the operator verb pm-mcp operator continuation-policy (no link changes it); rendered in every representation's facts and in every dispatch prompt."
+      "description": "Operator continuation policy, the plan's only autonomy setting: initialised at plan creation from the operator's local-config.json continuation.default_policy (then machine-config.json project_defaults, then the compiled default stop_at_phase_boundary), changed only by the operator verb pm-mcp operator continuation-policy (no link changes it); rendered in every representation's facts."
     },
     "merge_outcome": {
       "type": ["string", "null"],
@@ -238,7 +238,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     },
     "metadata": {
       "type": "object",
-      "description": "Plan-level metadata including planning_lane (light, deep, land for source local_changes, or adopt for source pr; land and adopt are fixed at pm_start and outside the ratchet), lane_escalated and escalation_trigger (the one-way light -> deep ratchet), phase_2_mode (full, or collapsed_light while a light plan's Phase 2 is folded into the light envelope; phase-workflows.adoc, Planning Lanes), complexity, domains, recipe_id, scope_estimate, the immutable scope_estimate_pre_route, scope_estimate_provenance[] (phase-workflows.adoc, Deterministic Init Classifiers), pr_title, and pr_title_stale ({transition, at} of the scope-shrinking transition that made the title stale, or null; cleared by the retitle submission in create-pr)."
+      "description": "Plan-level metadata including planning_lane (light, deep, land for source local_changes, or adopt for source pr; land and adopt are fixed at plan creation and outside the ratchet), lane_escalated and escalation_trigger (the one-way light -> deep ratchet), phase_2_mode (full, or collapsed_light while a light plan's Phase 2 is folded into the light envelope; phase-workflows.adoc, Planning Lanes), complexity, domains, recipe_id, scope_estimate, the immutable scope_estimate_pre_route, scope_estimate_provenance[] (phase-workflows.adoc, Deterministic Init Classifiers), pr_title, and pr_title_stale ({transition, at} of the scope-shrinking transition that made the title stale, or null; cleared by the retitle submission in create-pr)."
     },
     "freshness_reconcile": {
       "type": ["object", "null"],
@@ -255,7 +255,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
     },
     "amendments": {
       "type": "array",
-      "description": "Append-only intent changes after refinement: question answers that change intent (user answers through any delivery, model self-answers and a parent model's task-question answer, recorded assumptions on expiry or in questions.mode none), the narrowed continuation of a refuted hypothesis, and in-triage refutations that redefine intent.",
+      "description": "Append-only intent changes after refinement: question answers that change intent (user answers through any delivery, model self-answers and the main-session model's task-question answer, recorded assumptions on expiry or in questions.mode none), the narrowed continuation of a refuted hypothesis, and in-triage refutations that redefine intent.",
       "items": {
         "type": "object",
         "required": ["amendment_id", "at", "phase", "source", "text"],
@@ -264,7 +264,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
           "amendment_id": { "type": "string", "pattern": "^A-[0-9]+$" },
           "at": { "type": "string", "format": "date-time" },
           "phase": { "type": "string" },
-          "source": { "type": "string", "enum": ["user", "model", "assumption", "refutation"], "description": "user: a human answer (channel user_relayed, elicitation, web); model: a model answer (channel model) or a model judgment such as continue_narrowed; assumption: the recommended option or default_assumption applied; refutation: an in-triage refutation or the lesson-premise continue of init." },
+          "source": { "type": "string", "enum": ["user", "model", "assumption", "refutation"], "description": "user: a human answer (channel user_relayed, elicitation, web); model: a model answer (channel model) or a model judgment such as continue_narrowed; assumption: the recommended option or default_assumption applied; refutation: an in-triage refutation, or the premise evidence of a lesson source carried from the bootstrap (continue of the source-lesson premise state), written by the plan's creation transaction." },
           "question_id": { "type": ["string", "null"], "pattern": "^Q-[0-9]{3,6}$", "description": "The question record the answer belongs to; null for an amendment without a question." },
           "text": { "type": "string", "minLength": 1 },
           "supersedes": { "type": ["string", "null"], "pattern": "^A-[0-9]+$" }
@@ -282,7 +282,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
           "outcome": { "type": "string", "enum": ["unverified", "running", "done", "failed", "skipped", "waived", "indeterminate"], "description": "running while a firing is open; waived when a remediation policy's waived terminal completed the step (replaces the former skipped_by_operator)." },
           "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
           "work_performed": { "type": ["boolean", "null"] },
-          "landing_delivery": { "type": ["string", "null"], "enum": ["verified", "incomplete", "failed", "pending", null], "description": "emit-landing only: read-back verification of the appended landing envelope; pending when the envelope is kept in the plan directory because the epic linkage is indeterminate." },
+          "landing_delivery": { "type": ["string", "null"], "enum": ["verified", "incomplete", "failed", "pending", null], "description": "emit-landing only: read-back verification of the appended landing envelope; pending when the envelope is kept in the plan directory as landing-envelope.json (Kept Landing Envelope) because the epic linkage is indeterminate." },
           "skip_reason": { "type": ["string", "null"] },
           "waiver_ref": { "type": ["string", "null"], "pattern": "^W-[0-9]+$", "description": "waived only: the waiver whose consumption admitted the step's gate (Waiver Record)." },
           "skip_basis": {
@@ -310,7 +310,7 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
                 "fired_at": { "type": "string", "format": "date-time" },
                 "cause": { "type": "string", "enum": ["first", "loop_back", "failure", "error", "input_changed"] },
                 "loop_back_iteration": { "type": "integer", "minimum": 0 },
-                "dispatch_id": { "type": ["string", "null"] },
+                "job_id": { "type": ["string", "null"], "pattern": "^[bcglrp]-[0-9a-f]{16}$", "description": "The model job (kind llm) of the firing, when the step runs one; null otherwise." },
                 "outcome": { "type": "string", "enum": ["running", "done", "failed", "skipped", "waived", "indeterminate"], "description": "running from the firing's opening until its single completion (Rule 9 per firing); re-entry continues an open firing." },
                 "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
                 "productive": { "type": ["boolean", "null"], "description": "The firing produced a commit or filed a finding (server-derived); null while the firing runs." },
@@ -327,11 +327,12 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
         "type": "object",
         "required": ["job_id", "kind", "status", "started_at"],
         "properties": {
-          "job_id": { "type": "string", "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
-          "kind": { "type": "string", "enum": ["build", "git", "ci", "project_script", "bot_poll"] },
+          "job_id": { "type": "string", "pattern": "^[bcglrp]-[0-9a-f]{16}$" },
+          "kind": { "type": "string", "enum": ["build", "git", "ci", "project_script", "bot_poll", "llm"] },
           "status": {
             "type": "string",
-            "enum": ["queued", "running", "succeeded", "failed", "failed_unparsed", "refused", "cancelled", "timed_out", "killed", "indeterminate"]
+            "enum": ["queued", "running", "succeeded", "failed", "failed_unparsed", "refused", "cancelled", "timed_out", "killed", "indeterminate"],
+            "description": "The job record's status while it is queued or running (queued: waiting for a build or model slot, its budget not yet started), else its fate."
           },
           "started_at": { "type": "string", "format": "date-time" }
         }
@@ -344,16 +345,16 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
       "additionalProperties": false,
       "properties": {
         "state_id": { "type": "string", "description": "The job or composite_job state the job is bound to; equals state while set." },
-        "job_id": { "type": "string", "pattern": "^([bcgrp]-[0-9a-f]{16}|[a-z][a-z0-9_-]{0,31}(\\.[a-z][a-z0-9_-]{0,31})*)$", "description": "The bound job_id (identifiers.adoc, job_id), or the composite identifier (the state_id) of a composite_job state." }
+        "job_id": { "type": "string", "pattern": "^([bcglrp]-[0-9a-f]{16}|[a-z][a-z0-9_-]{0,31}(\\.[a-z][a-z0-9_-]{0,31})*)$", "description": "The bound job_id (identifiers.adoc, job_id), or the composite identifier (the state_id) of a composite_job state." }
       }
     },
     "pending_condition": {
       "type": ["object", "null"],
-      "description": "Engine-owned condition overlay on the current state (state-catalogue.adoc, Conditions; workflow-dsl.adoc, Condition Overlays). While set, state, phase, and call_stack are unchanged, the representation carries condition: <kind>, and only the condition's links are offered (none for integrity_breach, which rejects every pm_do with integrity_paused). precondition_unmet is an engine-raised precondition a bounded retry re-checks (facts.reason: credential_missing, credential_check_failed, credentials_file_insecure, config_changed, ledger_unreadable, format_outdated, format_newer), with facts.operator_command naming the operator verb that removes the cause. At most one per scope; null when none.",
+      "description": "Engine-owned condition overlay on the current state (state-catalogue.adoc, Conditions; workflow-dsl.adoc, Condition Overlays). While set, state, phase, and call_stack are unchanged, the representation carries condition: <kind>, and only the condition's links are offered (none for integrity_breach, which rejects every pm_do with integrity_paused). precondition_unmet is an engine-raised precondition a bounded retry re-checks (facts.reason: credential_missing, credential_check_failed, credentials_file_insecure, config_changed, ledger_unreadable, format_outdated, format_newer, grant_missing for a cross-project access without an operator grant, harness_capability_missing for a model job whose harness lacks a capability its job class needs, harness_unsupported for a model job refused harness_not_enrolled or harness_version_unsupported or on a harness without a headless template, prompt_composition_failed, push_remote_indeterminate), with facts.operator_command naming the operator verb that removes the cause. At most one per scope; null when none.",
       "required": ["kind", "facts", "raised_at"],
       "additionalProperties": false,
       "properties": {
-        "kind": { "type": "string", "enum": ["integrity_breach", "footprint_violation", "dispatch_incomplete", "config_drift", "guard_indeterminate", "precondition_unmet"] },
+        "kind": { "type": "string", "enum": ["integrity_breach", "footprint_violation", "job_incomplete", "config_drift", "guard_indeterminate", "precondition_unmet"] },
         "remedy_attempts": { "type": "integer", "minimum": 0, "default": 0, "description": "Self-remedy attempts of this condition instance, bounded by the compiled condition budget (timeouts.adoc, Remediation Budgets); on exhaustion the phase's fallback is taken with the condition as the gap. Not counted for integrity_breach, which has no self-remedy." },
         "integrity": {
           "type": ["object", "null"],
@@ -384,9 +385,9 @@ Tracks the authoritative state machine position, phase, persisted sub-workflow `
 ----
 
 * *Step Records Count Firings*: Every firing of a step appends to its `firings[]`; a re-fire never replaces the history. When `VerdictCurrencyEvaluator` decides to re-fire, the step's `outcome` is set to `unverified` before the step runs and is then replaced by the new firing's terminal outcome, so a prior `done` never survives a re-fire. The current `outcome` and `head_at_completion` are always those of the last firing; no force flag exists. A requested outcome change that the engine refuses appends a firing with `refused` set and leaves no stale outcome silently current. Re-fire counts per cause are `firings` minus one, grouped by `cause`, never counted from log lines. A record without `assurance_verdict` reads `unadjudicated`, never as a pass.
-* *Origin and Epic Linkage*: Epic membership has one carrier, `origin.epic_id`: `pm-mcp enter --from-epic` writes `from_epic` into the pending entry record (xref:01-format-and-session-log.adoc#scope-session-log[Scope Session Log (`sessions.jsonl`)]), and `pm_start` copies it into `origin.epic_id`; `pm_start` accepts no epic parameter, and no session row carries epic membership. Every consumer (landing emission, outbox link offering, epic observation) reads epic membership from `origin.epic_id` through one resolver, which derives `epic_linkage`: `not_orchestrated` iff `origin.epic_id` is null, `indeterminate` iff it is set but the epic's header `epic.json` (xref:04-epic-and-change-ledger.adoc#epic-header[Epic Header (`epic.json`)]) is absent or unreadable, otherwise `orchestrated`. `indeterminate` is never read as `not_orchestrated`.
+* *Origin and Epic Linkage*: Epic membership has one carrier, `origin.epic_id`: `pm-mcp enter --from-epic` writes `from_epic` into the pending entry record (xref:01-format-and-session-log.adoc#pending-entry-record[Pending Entry Record]), `source-epic-row` verifies the queue row, and the done transaction of the plan bootstrap copies it into `origin.epic_id`; no tool parameter and no session row carries epic membership. Every consumer (landing emission, outbox link offering, epic observation) reads epic membership from `origin.epic_id` through one resolver, which derives `epic_linkage`: `not_orchestrated` iff `origin.epic_id` is null, `indeterminate` iff it is set but the epic's header `epic.json` (xref:04-epic-and-change-ledger.adoc#epic-header[Epic Header (`epic.json`)]) is absent or unreadable, otherwise `orchestrated`. `indeterminate` is never read as `not_orchestrated`.
 * *Amendments*: Every intent-changing answer after refinement appends an `amendments[]` entry with its `question_id`; every later representation that renders the request (outline review, `create-pr`, landing) includes the amendments in order.
-* *No Operator Decision State*: The store holds no pending operator decision and no merge authorization: the operator acts only through waivers (xref:14-plan-instance-waivers-questions.adoc#waiver-record[Waiver Record]), `abort`, `delete-plan`, and the integrity resolutions, none of which waits in this store.
+* *No Operator Decision State*: The store holds no pending operator decision and no merge authorization: the operator acts only through waivers (xref:14-plan-instance-waivers-questions.adoc#waiver-record[Waiver Record]), cross-project access grants (xref:15-screening-and-grants.adoc#grant-record[Access Grant Record]), `abort`, `delete-plan`, and the integrity resolutions, none of which waits in this store.
 
 [#merge-outcome-mapping]
 === Merge Outcome Mapping

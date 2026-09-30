@@ -32,8 +32,13 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
     "argv": {
       "type": "array",
       "minItems": 1,
-      "description": "Argument vector; an element may contain the typed placeholder {module} (the only placeholder; build profiles are named literally), validated at job time; shell metacharacters and the forbidden free flags are refused at enrolment.",
-      "items": { "type": "string", "minLength": 1 }
+      "description": "Argument vector; the typed placeholder {module} (the only placeholder; build profiles are named literally) may appear only inside the one optional nested array, the module-argument group, which a whole-tree job omits (domain-extensions.adoc, Optional Module-Argument Group); validated at job time; shell metacharacters and the forbidden free flags are refused at enrolment.",
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "The module-argument group; at most one per vector." }
+        ]
+      }
     }
   },
   "properties": {
@@ -166,8 +171,8 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
     },
     "command_budgets": {
       "type": "object",
-      "description": "Operator budgets in seconds per budget key (<build_system>:<verb>[@<module_id>], git:<operation>, ci:<operation>); clamped up to the engine floor, may exceed the escalation cap, recorded as budget_derivation operator (timeouts.adoc, Job Budgets).",
-      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9-]*(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?$" },
+      "description": "Operator budgets in seconds per budget key (<build_system>:<verb>[@<module_id>], git:<operation>, ci:<operation>, llm:<role_key>); clamped up to the engine or role floor, may exceed the escalation cap, recorded as budget_derivation operator (timeouts.adoc, Job Budgets).",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9.-]*(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?$" },
       "additionalProperties": { "type": "integer", "minimum": 1 }
     },
     "write_paths": {
@@ -189,7 +194,7 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
 === Project Store Identity (`<PM_MCP_BASE>/projects/<project_id>/store.json`)
 _Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-23[PM-WATCH-CLI-23]_
 
-The per-project machine store records the main checkout it belongs to. `pm-mcp operator enrol` writes `store.json` once, when it creates the store; nothing changes it afterwards. `pm-mcp operator unenrol` removes only the enrolment file and its sidecar and leaves the store with this record in place (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). Enrolling the same `project_id` again reuses the store only when the new `project_root` equals the recorded one; otherwise the enrolment is refused (`project_store_root_mismatch`), naming both roots.
+The per-project machine store records the main checkout it belongs to. `pm-mcp operator enrol` writes `store.json` once, when it creates the store, under the project's workspace lock (`locks/workspace.lock`); nothing changes it afterwards. `pm-mcp operator unenrol` removes only the enrolment file and its sidecar and leaves the store with this record in place (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). Enrolling the same `project_id` again reuses the store only when the new `project_root` equals the recorded one; otherwise the enrolment is refused (`project_store_root_mismatch`), naming both roots.
 
 [source,json]
 ----
@@ -205,6 +210,52 @@ The per-project machine store records the main checkout it belongs to. `pm-mcp o
     "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Equals the store directory name." },
     "project_root": { "type": "string", "minLength": 1, "description": "Canonical absolute path of the main checkout at the enrolment that created the store." },
     "created_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+[#harness-enrolment-store]
+== Harness Enrolment Store (`<PM_MCP_BASE>/harnesses.json`)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-33[PM-WATCH-DISP-33]_
+
+One machine-wide file holds the harness CLIs that may run model jobs (job kind `llm`, xref:10-job-and-lesson-records.adoc#job-record[Job Record]). A harness is enrolled per machine, not per project, with `pm-mcp operator enrol-harness <client_id>` (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]): the runtime resolves the executable path once (no `PATH` lookup at job time), runs the profile's version probe, and records path, digest, and version. Written only by the runtime on that verb, under `locks/harnesses.lock`, with the HMAC sidecar `harnesses.json.hmac` of the project enrolments (same key, same verification before every model-job spawn; `enrolment_tampered` on mismatch refuses every model job of the machine).
+
+* *Self-Update Within Range*: Harness CLIs update themselves. At every spawn the runtime re-probes the version and re-digests the executable; a changed digest or version inside the client profile's supported version range (`headless.supported_versions`, link:../client-profiles.adoc[Client Profiles Specification]) is accepted, the record is updated, and an `operator` audit record `harness_updated` names the old and new version and digest. A version outside the range, or a harness not enrolled, refuses the job (`harness_version_unsupported`, `harness_not_enrolled`), and the job state raises `precondition_unmet` (reason `harness_unsupported`) naming the operator command.
+* *Environment Pass-Through*: `env_passthrough` lists the names of the authentication variables the operator captured at enrolment, limited to the names the profile declares (`headless.env_passthrough`, for example `ANTHROPIC_API_KEY`, `CODEX_API_KEY`). Their values live only in `PM-MCP`'s credential store, as the global entry of the credential key `harness-<client_id>` (never a project override; xref:12-machine-stores.adoc#credential-store[Credential Store]), written by the runtime on the enrolment verb and read by `pm-mcpd` at each model-job spawn; this file never holds a secret. They are the only operator values a model job's environment receives besides `PM_MCP_JOB_TOKEN` and `PM_MCP_JOB_ID`, and they are registered with the redaction filter and redacted in every log and audit record. A harness that authenticates through its own login in its home directory needs none.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/harnesses.json",
+  "title": "HarnessEnrolmentStore",
+  "type": "object",
+  "required": ["format_version", "harnesses"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "harnesses": {
+      "type": "object",
+      "propertyNames": { "enum": ["claude", "opencode", "codex"], "description": "client_id of a profile with a headless template (antigravity and neutral have none in v1)." },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["executable_path", "sha256", "version", "enrolled_at", "updated_at", "env_passthrough"],
+        "additionalProperties": false,
+        "properties": {
+          "executable_path": { "type": "string", "minLength": 1, "description": "Resolved absolute path." },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Digest of the executable at the last accepted probe." },
+          "version": { "type": "string", "minLength": 1, "description": "Version printed by the profile's version probe at the last accepted probe." },
+          "enrolled_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time", "description": "Last accepted self-update (equals enrolled_at before the first)." },
+          "env_passthrough": {
+            "type": "array",
+            "uniqueItems": true,
+            "description": "Names of the captured authentication variables, limited to the profile's headless.env_passthrough names; the values are held in the credential store under credential key harness-<client_id>, never here.",
+            "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" }
+          }
+        }
+      }
+    }
   }
 }
 ----

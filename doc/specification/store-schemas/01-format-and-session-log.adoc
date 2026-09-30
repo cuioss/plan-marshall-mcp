@@ -15,7 +15,7 @@ _Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WAT
 [[_format_versioning_atomic_write_discipline]]
 1. *Version Envelope*: Every persisted JSON root object and every JSONL header/record must declare `"format_version": 1` (positive integer, one sequence per file kind): the server-owned stores, the git-tracked team configuration files `.marshall/config/*.json` (xref:07-project-configuration.adoc#project-configuration-store[Project Configuration (`.marshall/config/`, `local-config.json`, Effective Configuration; `PM-EXT-6`, `PM-EXT-7`)]), and the operator files (`local-config.json`, `machine-config.json`, enrolments, credential files). A workflow unit (`*.pmwf`) declares its DSL format in its header (`workflow <id> version <n> format <f>`, link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL Specification]). Exempt are Markdown documents (checked by their parsers), plain-text logs, OS primitives, and the raw HMAC key.
 +
-*Accept exactly one, refuse, never rewrite*: Before 1.0 a binary accepts exactly the current `format_version` of each file kind; there is no migration chain and no startup migration. A reader returns `absent`, `unreadable` (including a missing `format_version`), `format_outdated{file, found, current}`, `format_newer{file, found, current}`, or `parsed`; no reader tolerates an older shape. An outdated or newer file is never modified by a reader: a scope store raises the `precondition_unmet` condition on its scope (reason `format_outdated` or `format_newer`) with the operator command; a team configuration file or workflow unit refuses every `pm_start` and phase handshake of the project with `format_outdated` or `format_newer` naming the file (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[MCP Tools Specification, Closed Rejection Reasons]); an operator file is refused by the CLI naming the file and the changed keys. *Upgrade path*: a `format_version` bump is listed with the changed keys in the release notes; in-flight scopes follow the drain rule (`pm-mcp drain` reports live scopes; the operator finishes them before upgrading), and the project setup workflow offers the new binary's default changes (a diff for workflow units, a server-rendered rewrite for JSON configuration files, link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Configuration Upgrades]). The migration mechanism for 1.0 and later is decided at 1.0.
+*Accept exactly one, refuse, never rewrite*: Before 1.0 a binary accepts exactly the current `format_version` of each file kind; there is no migration chain and no startup migration. A reader returns `absent`, `unreadable` (including a missing `format_version`), `format_outdated{file, found, current}`, `format_newer{file, found, current}`, or `parsed`; no reader tolerates an older shape. An outdated or newer file is never modified by a reader: a scope store raises the `precondition_unmet` condition on its scope (reason `format_outdated` or `format_newer`) with the operator command; a team configuration file or workflow unit refuses every scope creation of a bootstrap (re-checked in the bootstrap's `done` transaction) and every phase handshake of the project with `format_outdated` or `format_newer` naming the file (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[MCP Tools Specification, Closed Rejection Reasons]); an operator file is refused by the CLI naming the file and the changed keys. *Upgrade path*: a `format_version` bump is listed with the changed keys in the release notes; in-flight scopes follow the drain rule (`pm-mcp drain` reports live scopes; the operator finishes them before upgrading), and the project setup workflow offers the new binary's default changes (a diff for workflow units, a server-rendered rewrite for JSON configuration files, link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Configuration Upgrades]). The migration mechanism for 1.0 and later is decided at 1.0.
 2. *Atomic Write-and-Rename*: All JSON file updates are written to a sibling temporary file (`<filename>.tmp.<uuid>`), flushed to disk (`FileChannel.force(true)`), and atomically renamed over the target file (`StandardCopyOption.ATOMIC_MOVE`, `StandardCopyOption.REPLACE_EXISTING`). A store replaced this way is guarded by a sibling lock file, never by a lock on the store file itself (xref:13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Lock-Free Snapshot Reads, Transaction Locks & Leases (`PM-IMPL-7`)]). Every write to a plan, epic, or workspace store runs as a journaled transaction (<<transaction-journal>>).
 3. *Single Writer Set*: Every writer of a `PM-MCP` store runs inside the one `PM-MCP` runtime and serializes through its own locks. Legacy `plan-marshall` never touches `.marshall/` or `<PM_MCP_BASE>`, and `PM-MCP` never writes `.plan/` or `~/.plan-marshall/` (`PM-MIG-2`), so no store is shared and no cross-runtime lock protocol exists.
 4. *Absent vs Unparseable*: Every store and document reader returns one of `absent`, `empty`, `parsed`, or `unreadable` (with the failing line or offset). An input that yields no parsable content is `unreadable`, never an empty record and never `absent`. Consumers handle `unreadable` explicitly: they fail closed or report `indeterminate`.
@@ -82,8 +82,9 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
 
 * *Appended by `pm-mcp enter`*: Every `pm-mcp enter` on an existing scope appends one row (link:../cli-and-security/01-cli-and-installer.adoc#_entry_identity_recording_pm_mcp_enter[CLI, Coordination & Security Specification, Entry Identity Recording]).
 * *Appended by the server*: When a scope-addressed call carries a `PM-MCP-Client-Session` header (link:../runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]) whose value differs from the `client_session_id` of the scope's last row, the server appends a row for that session in a short transaction under the scope lock, outside any snapshot read. Such a row keeps the declared `client` of the previous row (a declaration is only ever made by `pm-mcp enter`), takes `client_detected` from the connection's MCP `clientInfo.name`, and records `client_build: null` (the version probe runs only in `pm-mcp enter`).
+* *Job Connections Append Nothing*: A request authenticated by a job token (`PM-MCP-Job-Token`, sent by the job relay `pm-mcp serve --job` of a model job, link:../runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]) never appends a row, never refreshes `last_seen_at`, and never triggers a client handover: it takes its client profile from its job record (xref:10-job-and-lesson-records.adoc#job-record[Job Record]), and its audit records carry the `job_id`.
 * *`last_seen_at`*: The server refreshes `last_seen_at` of the last row at most once per refresh interval per scope (link:../timeouts/02-runtime-leases-operator-web.adoc#session-last-seen-refresh[Timeouts & Budgets Specification, Session Row `last_seen_at` Refresh Interval]), by a journaled replace of the file in which every earlier row stays byte-identical; no other field of any row is ever changed, and no earlier row is ever touched.
-* *Pending Entry Record*: When the entered plan does not exist yet, `pm-mcp enter` writes a pending entry record `pending/<entry_id>.json` of the per-project machine store and prints the `entry_id`. `pm_start(entry_id, ...)` consumes it inside the plan initialization transaction: its `session` becomes the first row of the new plan's `sessions.jsonl`, its `from_epic` is copied into the plan's `mcp/status.json` `origin.epic_id` (the single carrier of epic membership, xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store (`mcp/status.json`)]), and the pending file is deleted. A consumed `entry_id` no longer exists, so each pending record starts at most one plan.
+* *Pending Entry Record*: When `pm-mcp enter … plan|epic` names no live scope, it writes a pending entry record `pending/<entry_id>.json` of the per-project machine store and prints the `entry_id` (<<pending-entry-record>>). The record is the state store of that entry's bootstrap (`bootstrap-plan` or `bootstrap-epic`, the entity `<entry_id>` hosted by the workspace scope). In the bootstrap's `done` transaction the engine creates the scope from it: its `session` becomes the first row of the new scope's `sessions.jsonl`, and for a plan its `from_epic` is copied into `mcp/status.json` `origin.epic_id` (the single carrier of epic membership, xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store (`mcp/status.json`)]). The record is deleted in the transaction that enters a terminal of the bootstrap. A deleted `entry_id` no longer exists, so each pending record creates at most one scope.
 * *History in the Log*: The session history of a scope is the log itself. A row whose declared `client` differs from the previous row's additionally appends an `identity` audit record (`event: entry_handover`, `details` with the previous and the new `client` and `client_session_id`, xref:12-machine-stores.adoc#audit-log[Security & Transition Audit Log (`<PM_MCP_BASE>/logs/audit.jsonl`, `PM-SEC-6`)]).
 * *Integrity*: `sessions.jsonl` follows the JSONL append discipline (<<format-versioning>> item 6, including its single stated exception for the `last_seen_at` refresh) and is covered by the scope's digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]).
 
@@ -179,7 +180,16 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
 }
 ----
 
-The pending entry record wraps one session row:
+[#pending-entry-record]
+=== Pending Entry Record (`pending/<entry_id>.json`)
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-42[PM-WATCH-STORE-42]_
+
+The pending entry record carries what the user named at `pm-mcp enter` and the state of the entry's bootstrap until a terminal of the bootstrap deletes it:
+
+* *Written under the workspace lock*: `pm-mcp enter` (through the runtime) creates the record, and every bootstrap transition replaces it, each as a journaled transaction of the workspace scope under `locks/workspace.lock` (<<transaction-journal>>); the record is covered by the workspace scope's digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]). A digest mismatch pauses only that bootstrap entity (`integrity_breach`, kind `store_tampered`), ended by `pm-mcp operator accept-edit workspace pending/<entry_id>.json` or by the pending-record sweep; no other entry and no workspace workflow is affected.
+* *What the user named, unvalidated*: `kind`, `requested_id`, and `hint` are recorded as given; `start.resolve` and the source units validate them. `hint` is the user's own words, relayed by the host entry command; it is shown to the model as facts of the bootstrap and never parsed by the server into a source.
+* *Bootstrap state*: `bootstrap` holds the entity's state position, its call frames (the called source unit), its condition overlay, the source record a source unit returned with `done`, the commit options chosen in `start.ready`, and the reason of the last refused re-check of the `done` transaction. A source record keeps the fetched external text only in its level-1-cleaned form with its screen verdict (xref:15-screening-and-grants.adoc#screen-verdict-cache[Screen Verdict Cache]); a `suspicious` item is used only after the audited `accept` of its link state.
+* *Addressing*: The model addresses the entry as `pm_state` / `pm_do` with `plan_id: NO_PLAN` and `entity: <entry_id>`; a call naming a deleted or swept `entry_id` is `scope_not_found`. The pending-record sweep removes records older than the maximum age (link:../timeouts/02-runtime-leases-operator-web.adoc#pending-entry-max-age[Timeouts & Budgets Specification, Pending Entry Record Maximum Age]).
 
 [source,json]
 ----
@@ -188,18 +198,77 @@ The pending entry record wraps one session row:
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/pending-entry.json",
   "title": "PendingEntryRecord",
   "type": "object",
-  "required": ["format_version", "entry_id", "from_epic", "created_at", "session"],
+  "required": ["format_version", "entry_id", "kind", "requested_id", "hint", "from_epic", "created_at", "updated_at", "session", "bootstrap"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "entry_id": { "type": "string", "description": "Identifier printed by pm-mcp enter (identifiers.adoc, entry_id)." },
+    "entry_id": { "type": "string", "pattern": "^ent-[0-9a-f]{8,32}$", "description": "Identifier printed by pm-mcp enter and the entity id of the bootstrap (identifiers.adoc, entry_id)." },
+    "kind": { "type": "string", "enum": ["plan", "epic"], "description": "Selects the bootstrap unit: bootstrap-plan or bootstrap-epic." },
+    "requested_id": { "type": ["string", "null"], "maxLength": 64, "description": "The id named at pm-mcp enter, as given; start.resolve validates it against the plan_id grammar and routes a live id to resume, an archived or unknown one to start.choose. null when none was named." },
+    "hint": { "type": ["string", "null"], "maxLength": 4000, "description": "The user's free-text words passed by the host entry command; untrusted, level-1 cleaned before it is rendered; null when none." },
     "from_epic": {
       "type": ["string", "null"],
       "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "Parent epic when the entry command came from emit:<plan_id> (pm-mcp enter --from-epic); pm_start copies it into mcp/status.json origin.epic_id."
+      "description": "kind plan only: the parent epic when the entry command came from an epic emission (pm-mcp enter --from-epic); routes start.resolve to source-epic-row; the done transaction copies it into mcp/status.json origin.epic_id."
     },
     "created_at": { "type": "string", "format": "date-time" },
-    "session": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/session-row.json" }
-  }
+    "updated_at": { "type": "string", "format": "date-time" },
+    "session": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/session-row.json" },
+    "bootstrap": {
+      "type": "object",
+      "required": ["state", "call_stack", "facts", "source", "options", "pending_condition", "last_refusal"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "type": "string", "description": "Fully qualified state id of the bootstrap entity (for example start.choose, or source-issue.screen inside a called source unit)." },
+        "call_stack": { "type": "array", "maxItems": 4, "items": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/status.json#/properties/call_stack/items" }, "description": "Call frames of the called source unit (same frame shape as the Workflow State Store)." },
+        "facts": { "type": "object", "description": "State facts of the bootstrap (candidate listings, setup state, premise evidence, flagged spans)." },
+        "source": {
+          "type": ["object", "null"],
+          "description": "The source record a source unit returned with done; null until one returned.",
+          "required": ["kind", "ref", "payload"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "type": "string", "enum": ["request", "issue", "lesson", "recipe", "local_changes", "pr", "epic_row"] },
+            "ref": { "type": ["string", "null"], "description": "Issue or pull request number, lesson_id, recipe_key, or the epic row's plan_id; null for request and local_changes." },
+            "payload": { "type": "object", "description": "Source-specific gathered content: the request text; the issue or pull request title and body (level-1 cleaned); the lesson premise evidence; the validated recipe_params; the local-changes preview; the epic row's spec section anchor." },
+            "screen": {
+              "type": "array",
+              "description": "One entry per external text item of the payload: its SHA-256, the screen verdict, and for a suspicious item the audited acceptance.",
+              "items": {
+                "type": "object",
+                "required": ["item_id", "sha256", "verdict", "accepted_at"],
+                "additionalProperties": false,
+                "properties": {
+                  "item_id": { "type": "string", "minLength": 1 },
+                  "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                  "verdict": { "type": "string", "enum": ["clean", "suspicious"] },
+                  "accepted_at": { "type": ["string", "null"], "format": "date-time", "description": "suspicious only: the audited accept of the bootstrap's link state; null otherwise." }
+                }
+              }
+            }
+          }
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Commit options chosen in start.ready (kind plan): plan_slug (re-derives the plan id), posture, review_outline, base_branch; kind epic: title, parallelization_scope, epic_slug.",
+          "properties": {
+            "plan_slug": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+){0,7}$", "maxLength": 64 },
+            "posture": { "type": "string", "enum": ["minimal", "standard", "full"] },
+            "review_outline": { "type": "boolean" },
+            "base_branch": { "type": "string", "pattern": "^[A-Za-z0-9_./-]+$", "maxLength": 128 },
+            "epic_slug": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+){0,7}$", "maxLength": 64 },
+            "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "parallelization_scope": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "pending_condition": { "type": ["object", "null"], "description": "Condition overlay of the bootstrap entity (same shape as the Workflow State Store's pending_condition)." },
+        "last_refusal": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]*$", "description": "Reason of the last refused re-check of the done transaction (for example plan_id_taken, lifecycle_closed, config_invalid, integration_variant_unset, config_dirty, no_local_changes, lesson_unavailable); rendered in the facts of start.ready as commit_refused; null otherwise." }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "kind": { "const": "epic" } } }, "then": { "properties": { "from_epic": { "const": null } } } }
+  ]
 }
 ----

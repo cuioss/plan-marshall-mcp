@@ -11,9 +11,9 @@ link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[Sta
 [#state-catalogue-git]
 == Sub-Workflow `git.commit_and_push`
 
-Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-worktree`). Every state declares `phase inherit`: the phase value is the caller's. Callers: `execute.chain-tail-commit`, `execute.remediation-commit`, `finalize.settle-commit`, `finalize.push-barrier`, `setup.land-changes`, `epic.commit-ledger`, and the `commit-fix` states of the remediation units.
+Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-worktree`). Every state declares `phase inherit`: the phase value is the caller's. Callers: `execute.chain-tail-commit`, `execute.remediation-commit`, `finalize.settle-commit`, `finalize.push-barrier`, `setup.land-changes`, `epic.commit-ledger`, `epic.commit-decomposition`, and the `commit-fix` states of the remediation units.
 
-*Exit contract* (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Rule 6]): `done` with the result record `{commit: sha?, pushed: bool, clean: bool}`, where `pushed` means that the remote branch holds `HEAD` after the call (so a branch already in sync is `{commit: null, pushed: true, clean: true}`), and the control outcome `stepped_out {by: model | server, cause, reason}`. Callers branch on the result by guards (`guard result.pushed`). The model's `step_out` is the implicit link of every resting `link` state below; the server steps out after a spent commit-attempt cap or oracle retry, or when a rebase could not start (`git.stepped-out`). Internal cases are handled by the unit's own states: a hook failure is never bypassed (`git.commit-fix`), a rebase conflict is resolved by the model (`git.resolve-conflicts`), and a lease-protected force push to the plan's own branch after a server rebase is routine (`git.push-with-lease`); any other force push is refused. Every link state asks for one judgment through one link naming its skill section.
+*Exit contract* (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Rule 6]): `done` with the result record `{commit: sha?, pushed: bool, landed: bool, clean: bool}`, where `pushed` means that the remote branch holds `HEAD` after the call (so a branch already in sync is `{commit: null, pushed: true, landed: false, clean: true}`) and `landed` that the remote branch is gone because its pull request merged (`pushed: false`), and the control outcome `stepped_out {by: model | server, cause, reason}`. Callers branch on the result by complementary guards (`guard result.pushed`, `guard result.landed`). The model's `step_out` is the implicit link of every resting `link` state below; the server steps out after a spent attempt cap of a model loop or oracle retry (the compiled caps in link:../timeouts/01-job-budgets-and-waits.adoc#remediation-budgets[Timeouts & Budgets Specification, Remediation Budgets]), when a rebase could not start, or when the remote state of the branch cannot be established (`git.stepped-out`). An indeterminate derived fact `push_remote` raises `precondition_unmet` (`push_remote_indeterminate`) with its bounded retry; a spent condition budget unwinds every frame to the plan's fallback. Internal cases are handled by the unit's own states: a hook failure is never bypassed (`git.commit-fix`), a rebase conflict is resolved by the model (`git.resolve-conflicts`), and a lease-protected force push to the plan's own branch after a server rebase is routine (`git.push-with-lease`); any other force push is refused. Every link state asks for one judgment through one link naming its skill section.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -48,7 +48,7 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |`link`
 |`git.detect-artifacts`, `git.artifact-escalate` (`uncertain_or_prohibited`); itself (`prohibited_remaining`).
 |`confirm_cleanup` (`next`, `submit`, `action` `delete_uncertain` / `keep_tracked`, optional `paths`); implicit `step_out`. Skill `pm/git/artifact-cleanup`. For a dirty tree at an exit barrier the review separates build leftovers from real changes.
-|`resolved` -> `git.resolve-message`; `prohibited_remaining` -> this state.
+|`resolved` -> `git.resolve-message`; `prohibited_remaining` (attempt cap left) -> this state; `attempts_exhausted` (the compiled attempt cap of this loop spent) -> `git.stepped-out` (cause `attempts_exhausted`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
 
 |[[state-git.resolve-message]]`git.resolve-message`
@@ -87,7 +87,7 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |inherit
 |`auto`
 |`git.inspect-worktree` (`clean_needs_push_check`), `git.stage-and-commit`, `git.commit-fix` (`ok`).
-|Evaluates `push_mode` with the derived fact `push_remote` (no push remote: nothing is pushed) and, for `post_pr_conditional`, the `order` of the persisted `settle_trigger` (`> 20`).
+|Evaluates `push_mode` with the derived fact `push_remote` (no push remote: nothing is pushed) and, for `post_pr_conditional`, the `order` of the persisted `settle_trigger` (`> 20`). An indeterminate `push_remote` is no outcome: it raises the `precondition_unmet` condition (`reason: push_remote_indeterminate`) on this state, whose `retry` re-derives the fact within the condition budget; a spent budget takes the plan's fallback (xref:01-conventions-generic-conditions.adoc#condition-precondition_unmet[Condition precondition unmet]).
 |`skip_push` -> `git.done`; `push_required` -> `git.verify-freshness`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 5]
 
@@ -104,7 +104,7 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |`link`
 |`git.verify-freshness` (`stale_or_undecidable`); `git.freshness-build-running` (every non-success outcome).
 |`run_verification_build` (`fix`, `noop`); implicit `step_out`. Never a push under a stale verdict. Skill `pm/finalize/push-barrier`; `facts`: `stale_reason`, `admitted_causes`, required notations, scope.
-|`started` -> `git.freshness-build-running`.
+|`started` -> `git.freshness-build-running`; `attempts_exhausted` (the compiled attempt cap of the freshness loop spent) -> `git.stepped-out` (cause `attempts_exhausted`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 5]
 
 |[[state-git.freshness-build-running]]`git.freshness-build-running`
@@ -119,8 +119,8 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |inherit
 |`auto`
 |`git.verify-freshness` (`fresh_or_exempt`).
-|`git.push-barrier-decision`: `first_push` when `branch_pushed_at` is unset; `rewritten_by_rebase` when the recorded last push (`branch_pushed_at`) is no ancestor of `HEAD` because a server rebase rewrote the plan's own branch; otherwise `git.branch-sync-state` (fetched) with `refire` only for `ahead` and for `never_pushed` (a `remote_absent_unverified` branch for which `ci.pr-find` found no pull request); a merged pull request makes it `remote_absent_landed`.
-|`first_push`, `refire` -> `git.execute-push`; `rewritten_by_rebase` -> `git.push-with-lease`; `skip` -> `git.done`.
+|`git.push-barrier-decision`: `first_push` when `branch_pushed_at` is unset; `rewritten_by_rebase` when the recorded last push (`branch_pushed_at`) is no ancestor of `HEAD` because a server rebase rewrote the plan's own branch; otherwise `git.branch-sync-state` (fetched) with `refire` only for `ahead` and for `never_pushed` (a `remote_absent_unverified` branch for which `ci.pr-find` found no pull request). Only `synced` (the remote branch holds `HEAD`) returns `pushed: true`; a merged pull request makes the branch `remote_absent_landed` (`pushed: false`, `landed: true`); `remote_absent_unverified` with a pull request, and every unrecognised sync state, cannot be established.
+|`first_push`, `refire` -> `git.execute-push`; `rewritten_by_rebase` -> `git.push-with-lease`; `synced`, `landed` -> `git.done`; `push_state_unknown` -> `git.stepped-out` (cause `push_state_unknown`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
 
 |[[state-git.execute-push]]`git.execute-push`
@@ -144,7 +144,7 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |`link`
 |`git.execute-push`, `git.push-with-lease` (`rejected_non_ff`, `rejected_lease`).
 |`sync_rebase` (`fix`, `noop`, `git.rebase-onto-upstream`); implicit `step_out`. Skill `pm/git/sync-recovery`; `facts`: `git.branch-divergence`.
-|`rebased` -> `git.verify-freshness`; `conflict` -> `git.resolve-conflicts`; `rebase_failed` (the fetch or the rebase could not start) -> `git.stepped-out` (cause `rebase_failed`).
+|`rebased` -> `git.verify-freshness`; `conflict` -> `git.resolve-conflicts`; `rebase_failed` (the fetch or the rebase could not start) -> `git.stepped-out` (cause `rebase_failed`); `attempts_exhausted` (the compiled attempt cap of the sync loop spent, counted over push rejections) -> `git.stepped-out` (cause `attempts_exhausted`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
 
 |[[state-git.resolve-conflicts]]`git.resolve-conflicts`
@@ -152,13 +152,13 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |`link`
 |`git.sync-required` (`conflict`); itself (`conflict`).
 |The model resolves the conflicted files in the checkout. `continue_rebase` (`fix`, `noop`, `git.rebase-continue`); implicit `step_out` (the server aborts the interrupted rebase, restoring the pre-rebase branch, before the frame unwinds). Skill `pm/git/sync-recovery`; `facts`: `git.rebase-conflict` (the conflicted paths).
-|`rebased` -> `git.verify-freshness`; `conflict` -> this state.
+|`rebased` -> `git.verify-freshness`; `conflict` (attempt cap left) -> this state; `attempts_exhausted` (the compiled attempt cap of the conflict loop spent; the server aborts the rebase first) -> `git.stepped-out` (cause `attempts_exhausted`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_declarative_dsl_definition_classpathworkflowsgit_commit_and_push_pmwf[Workflow DSL Specification, DSL Definition]
 
 |[[state-git.done]]`git.done`
 |inherit
 |`terminal`
-|`git.inspect-worktree` (`clean_skip_push`); `git.evaluate-push-policy` (`skip_push`); `git.check-branch-parity` (`skip`); `git.execute-push`, `git.push-with-lease` (`pushed`, `up_to_date`).
+|`git.inspect-worktree` (`clean_skip_push`); `git.evaluate-push-policy` (`skip_push`); `git.check-branch-parity` (`synced`, `landed`); `git.execute-push`, `git.push-with-lease` (`pushed`, `up_to_date`).
 |Returns outcome `done` (class `success`) with the result `{commit, pushed, clean}` of the path taken.
 |The caller's `done` transition.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
@@ -166,8 +166,8 @@ Declared in `git-commit-and-push.pmwf` (`scope subworkflow`, start `git.inspect-
 |[[state-git.stepped-out]]`git.stepped-out`
 |inherit
 |`terminal`
-|`git.commit-fix` (`attempts_exhausted`); `git.artifact-escalate` (`exhausted`); `git.sync-required` (`rebase_failed`).
+|`git.commit-fix`, `git.artifact-review`, `git.freshness-blocked`, `git.sync-required`, `git.resolve-conflicts` (`attempts_exhausted`); `git.artifact-escalate` (`exhausted`); `git.sync-required` (`rebase_failed`); `git.check-branch-parity` (`push_state_unknown`).
 |Returns the control outcome `stepped_out {by: server, cause, reason}`; it only leaves the sub-workflow and never ends the calling scope. The model's `step_out` returns the same outcome from any resting link state without entering this state.
-|The caller's `stepped_out` transition: `finalize.hand-back` from the plan callers, the remediation unit's `remediation-<class>.decide`, `setup.commit-changes`, `epic.active`.
+|The caller's `stepped_out` transition: `finalize.hand-back` from the plan callers, the remediation unit's `remediation-<class>.decide`, `setup.commit-changes`, `epic.active`, `epic.decompose`. A server step-out of cause `condition` is not returned here: it unwinds every frame to the plan's fallback.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
 |===

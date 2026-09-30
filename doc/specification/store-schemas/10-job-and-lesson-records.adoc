@@ -12,15 +12,18 @@ link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store
 == Job Record (`<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.json`)
 _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-22[PM-WATCH-JOB-22], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-23[PM-WATCH-JOB-23]_
 
-The write-ahead job journal: one record per job, written at three points, each an atomic replace under the lock of the scope that owns the job (the plan lock, or the workspace lock for a job without a plan):
+The write-ahead job journal: one record per job, written at three points (four for a job that waits for a slot), each an atomic replace under the lock of the scope that owns the job (the plan or epic lock, or the workspace lock for a job without a plan or epic):
 
+. *Queued*: a job that must wait for a build slot or a model slot (xref:13-leases-integrity-testing.adoc#machine-lease-stores[Machine Lease Stores]) is recorded first with `status: queued`, `spawned_at: null`; its budget has not started. It becomes `running` in the transaction that acquires its slot.
 . *Write-ahead*: before `ProcessBuilder.start()`, with `status: running`, `pid: null`, and `process_started_at: null` (for an in-process `git` or `ci` operation of the native variant, before the operation starts; link:../job-runtime/01-pipeline-and-subprocesses.adoc#in-process-operations[Job Runtime Specification, In-Process Operations]).
 . *Post-spawn*: mandatory for a `process` job: the launcher reports its PID before `execve`, and the record is replaced with `pid`, `process_started_at`, and `spawned_at` before the job counts as running (before it enters `active_jobs` or a result reports it `running`).
 . *Fate*: replaced at fate (link:../domain-extensions/06-configuration.adoc#_tier_3_adaptive_build_timeouts_crash_replay_state[Domain Extensions Specification, Tier 3], link:../job-runtime/01-pipeline-and-subprocesses.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]).
 
-*Write order at job end*: the job record's fate, then the change-ledger row (xref:04-epic-and-change-ledger.adoc#_change_ledger_record_change_ledger_jsonl[Change Ledger Record (`change-ledger.jsonl`)]), then the timing observation (xref:09-derived-facts-and-build-timings.adoc#build-timings-store[Build Timings Store (`<PM_MCP_BASE>/projects/<project_id>/build-timings.json`)]), then the build-slot release (xref:13-leases-integrity-testing.adoc#machine-lease-stores[Machine Lease Stores (`merge-queue.json`, `review-bot-windows.json`, `build-slots.json`)]). A crash in between loses at most a freshness mark (the build runs again) or a timing sample; no marker records the progress and nothing is re-derived.
+*Write order at job end*: the job record's fate, then the change-ledger row (xref:04-epic-and-change-ledger.adoc#_change_ledger_record_change_ledger_jsonl[Change Ledger Record (`change-ledger.jsonl`)]), then the timing observation (xref:09-derived-facts-and-build-timings.adoc#build-timings-store[Build Timings Store (`<PM_MCP_BASE>/projects/<project_id>/build-timings.json`)]), then the slot release (a build slot, or the model slot of a job of kind `llm`, xref:13-leases-integrity-testing.adoc#machine-lease-stores[Machine Lease Stores]). A model job's token is revoked in the transaction that records its fate. A crash in between loses at most a freshness mark (the build runs again) or a timing sample; no marker records the progress and nothing is re-derived.
 
-*Recovery*: The project's recovery after a runtime restart reads every record left `running` (link:../runtime-model.adoc#_startup_sequence[Runtime & Interaction Model Specification, Startup]): a record whose `spawned_at` lies before the system boot time is marked `killed` and nothing is signalled; a record with `pid: null` is marked `killed` with the audit note `orphan unidentifiable` and nothing is signalled; every other record gets the same-boot process-group probe and termination (link:../job-runtime.adoc[Job Runtime Specification]). Retention removes records with their logs after `job_logs_days`. The raw log is `<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.log`, next to the record.
+*Recovery*: The project's recovery after a runtime restart marks every record left `queued` `killed` without signalling (it never started), and reads every record left `running` (link:../runtime-model.adoc#_startup_sequence[Runtime & Interaction Model Specification, Startup]): a record whose `spawned_at` lies before the system boot time is marked `killed` and nothing is signalled; a record with `pid: null` is marked `killed` with the audit note `orphan unidentifiable` and nothing is signalled; every other record gets the same-boot process-group probe and termination (link:../job-runtime.adoc[Job Runtime Specification]). Retention removes records with their logs after `job_logs_days`. The raw log is `<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.log`, next to the record.
+
+*Model Jobs*: A job of kind `llm` runs the enrolled harness CLI (xref:11-enrolment-store.adoc#harness-enrolment-store[Harness Enrolment Store]) with the launch contract recorded in `model_job` (its composed argument vector is digested in `argv_digest` like every job's), in the plan worktree, else the project checkout, and the screener in an empty job-private directory (link:../filesystem-layout.adoc#job-private-directories[Filesystem Layout Specification, Job-Private Directories]). Its raw output is the job log; the server parses the result and the usage from it into the metrics row (xref:05-metrics-and-quality-report.adoc#metrics-store[Metrics Store]). The job token is valid only while `status` is `running` and is revoked in the fate transaction; a call over a revoked token is refused `job_ended`.
 
 [source,json]
 ----
@@ -29,12 +32,12 @@ The write-ahead job journal: one record per job, written at three points, each a
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/job-record.json",
   "title": "JobRecord",
   "type": "object",
-  "required": ["format_version", "job_id", "kind", "execution", "scope", "budget_key", "budget_seconds", "budget_derivation", "argv_digest", "status", "fate", "pid", "process_started_at", "confinement", "landlock_abi", "created_at", "spawned_at", "ended_at", "exit_code", "signal", "outcome_row", "refusal_reason", "cancel_before_group", "self_report_contradiction", "clamped_values", "gate_facts"],
+  "required": ["format_version", "job_id", "kind", "execution", "scope", "model_job", "budget_key", "budget_seconds", "budget_derivation", "argv_digest", "status", "fate", "pid", "process_started_at", "confinement", "landlock_abi", "created_at", "spawned_at", "ended_at", "exit_code", "signal", "outcome_row", "refusal_reason", "cancel_before_group", "self_report_contradiction", "clamped_values", "gate_facts"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
-    "job_id": { "type": "string", "pattern": "^[bcgrp]-[0-9a-f]{16}$" },
-    "kind": { "type": "string", "enum": ["build", "ci", "git", "bot_poll", "project_script"] },
+    "job_id": { "type": "string", "pattern": "^[bcglrp]-[0-9a-f]{16}$" },
+    "kind": { "type": "string", "enum": ["build", "ci", "git", "bot_poll", "project_script", "llm"], "description": "llm: a model job, a harness CLI launched by the server for one role and entity (dispatch-and-effort.adoc, job lifecycle)." },
     "execution": { "type": "string", "enum": ["process", "in_process"], "description": "in_process only for git and ci operations of the native variant; their process fields (argv_digest, pid, process_started_at, spawned_at, exit_code, signal) are null and confinement is not_applicable." },
     "scope": {
       "type": "object",
@@ -45,6 +48,25 @@ The write-ahead job journal: one record per job, written at three points, each a
         "id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "null for the workspace scope." }
       }
     },
+    "model_job": {
+      "type": ["object", "null"],
+      "description": "Required (non-null) iff kind == llm: the launch contract and the job-bound connection of a model job; null for every other kind.",
+      "required": ["harness", "harness_version", "role", "job_class", "model", "effort", "prompt_digest", "entity", "job_token_sha256", "connected_at"],
+      "additionalProperties": false,
+      "properties": {
+        "harness": { "type": "string", "enum": ["claude", "opencode", "codex"], "description": "The harness whose headless CLI runs the job: the detected client of the scope's last session row, or local-config.json model_jobs.harness; its client profile serves the job's connection." },
+        "harness_version": { "type": "string", "minLength": 1, "description": "Version probed at spawn; within the profile's supported version range of the enrolled harness (Harness Enrolment Store)." },
+        "role": { "type": "string", "minLength": 1, "description": "Role key of the job site (Role Registry)." },
+        "job_class": { "type": "string", "enum": ["writer", "read_only", "zero_tool"], "description": "writer: write tools, at most one per plan at a time; read_only: read tools plus the PM tools; zero_tool: the screener, no tools and no MCP connection." },
+        "model": { "type": ["string", "null"], "description": "Model passed to the harness (model_jobs.roles.<role>.model, else the ladder entry); null for the harness default." },
+        "effort": { "type": ["string", "null"], "description": "Effort passed after narrowing to the nearest value the harness and model support; null when none was passed." },
+        "effort_narrowed_from": { "type": ["string", "null"], "description": "The resolved effort when it was narrowed; null otherwise." },
+        "prompt_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the server-composed prompt file of the job (dispatch-and-effort.adoc, Prompt File & Contract Envelope)." },
+        "entity": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", "description": "The entity the job is bound to; every call of its connection must address this scope and entity (job_scope_mismatch otherwise); null for a scope-level job." },
+        "job_token_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the 256-bit job token the relay sends as PM-MCP-Job-Token; the token itself is never stored. Valid only while status == running; null for the screener, which gets no connection." },
+        "connected_at": { "type": ["string", "null"], "format": "date-time", "description": "First request of the job's connection; null while it never connected." }
+      }
+    },
     "budget_key": { "type": "string" },
     "budget_seconds": { "type": "integer", "minimum": 1 },
     "budget_derivation": {
@@ -52,13 +74,13 @@ The write-ahead job journal: one record per job, written at three points, each a
       "required": ["kind"],
       "additionalProperties": false,
       "properties": {
-        "kind": { "type": "string", "enum": ["learned", "escalated", "operator", "floor_default"], "description": "A project_script job records operator (its enrolled max_timeout_seconds)." },
+        "kind": { "type": "string", "enum": ["learned", "escalated", "operator", "floor_default"], "description": "A project_script job records operator (its enrolled max_timeout_seconds). The budget of every job starts at spawn; queued time is outside it." },
         "observations": { "type": "integer", "minimum": 0, "description": "learned only." }
       }
     },
     "argv_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the verified argument vector; null for an in_process operation." },
-    "status": { "type": "string", "enum": ["refused", "running", "ended"], "description": "running is never a fate." },
-    "fate": { "type": ["string", "null"], "enum": ["succeeded", "failed", "failed_unparsed", "timed_out", "cancelled", "killed", "indeterminate", "refused", null], "description": "null iff status == running." },
+    "status": { "type": "string", "enum": ["queued", "refused", "running", "ended"], "description": "queued: waiting for a build or model slot, not spawned, budget not started; queued and running are never fates." },
+    "fate": { "type": ["string", "null"], "enum": ["succeeded", "failed", "failed_unparsed", "timed_out", "cancelled", "killed", "indeterminate", "refused", null], "description": "null iff status is queued or running." },
     "pid": { "type": ["integer", "null"], "minimum": 1, "description": "Job PID, equal to its process-group id, set by the mandatory post-spawn replace; null in the write-ahead record, for a refused job, and for an in_process operation. A running record with pid null after a restart is killed as an unidentifiable orphan." },
     "process_started_at": { "type": ["string", "null"], "format": "date-time", "description": "OS process start instant, set with pid by the post-spawn replace; with pid the liveness identity." },
     "confinement": { "type": "string", "pattern": "^(confined|partial\\(abi=1\\)|unavailable|not_applicable)$" },
@@ -68,8 +90,8 @@ The write-ahead job journal: one record per job, written at three points, each a
     "exit_code": { "type": ["integer", "null"] },
     "signal": { "type": ["string", "null"], "description": "Terminating signal, if any." },
     "landlock_abi": { "type": ["integer", "null"], "minimum": 2, "description": "Landlock ABI version of the ruleset applied to the job (Linux, confinement confined); null when no ruleset was applied (partial(abi=1), unavailable, not_applicable, macOS)." },
-    "outcome_row": { "type": ["integer", "null"], "minimum": 1, "maximum": 10, "description": "Row of the closed outcome derivation table (job-runtime.adoc#outcome-derivation) that decided the fate; null iff status == running." },
-    "refusal_reason": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]*$", "description": "The refusal reason (for example enrolment_tampered, build_config_changed, path_traversal_rejected); non-null iff fate == refused." },
+    "outcome_row": { "type": ["integer", "null"], "minimum": 1, "maximum": 10, "description": "Row of the closed outcome derivation table (job-runtime.adoc#outcome-derivation) that decided the fate; null iff status is queued or running." },
+    "refusal_reason": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]*$", "description": "The refusal reason (for example enrolment_tampered, build_config_changed, path_traversal_rejected, harness_not_enrolled, harness_version_unsupported); non-null iff fate == refused." },
     "cancel_before_group": { "type": "boolean", "description": "true when a termination signal met ESRCH before the launcher called setpgid and was sent to the PID directly (job-runtime.adoc Process Termination, step 4)." },
     "self_report_contradiction": {
       "type": ["object", "null"],
@@ -144,7 +166,10 @@ The write-ahead job journal: one record per job, written at three points, each a
         }
       }
     }
-  }
+  },
+  "allOf": [
+    { "if": { "properties": { "kind": { "const": "llm" } } }, "then": { "properties": { "model_job": { "type": "object" }, "execution": { "const": "process" } } }, "else": { "properties": { "model_job": { "type": "null" } } } }
+  ]
 }
 ----
 
@@ -158,7 +183,7 @@ Lessons live in the project's lesson store in the per-project machine store and 
 * *Lock*: Lesson id allocation and every write, claim, release, or retirement in the lesson store run under the lesson store lock `locks/lessons.lock` of the per-project machine store (xref:13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Lock-Free Snapshot Reads, Transaction Locks & Leases (`PM-IMPL-7`)]), each as one journaled transaction (xref:01-format-and-session-log.adoc#transaction-journal[Transaction Journal (`mcp/transaction-journal.json`)]), so two concurrent sessions never allocate the same `lesson_id` and never claim the same lesson.
 * *File Format*: A lesson file starts with a line `---`, followed by the front matter, a line `---`, and the Markdown body. The front matter is YAML restricted to the JSON data model (YAML 1.2 core schema; anchors, aliases, tags, and multiple documents are refused) and is validated against the `LessonFrontMatter` schema below, including `format_version`, on every read and write; a write with missing or invalid front matter is rejected, and a file without parseable front matter lists as `present_unreadable`. The body is free Markdown; the `title` lives only in the front matter.
 * *Revisions*: A change of the body replaces it wholesale and increments `revision`; the new body carries its own `sources[]` (the evidence it was regenerated from), and `revisions[]` appends `{n, at, sources, body_sha256}` for the new revision. Old bodies are not kept; `revisions[]` keeps their digests and sources, so the derivation of every revision stays stated. A body is never edited in part (`PM-WATCH-STORE-17`).
-* *Lesson-Store Digest*: Every server write, claim, release, or retirement in the lesson store records the size and SHA-256 of the lesson file in `.digests.json` (the sidecar format of xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]) in the same transaction as the lesson write. On read, a lesson whose file differs from its entry raises `integrity_breach` (kind `store_tampered`) for that lesson only; a lesson file that disappeared while its entry remains is reported as `deleted_out_of_band`, and a file without an entry is reported as `untracked`. None of these states is ever read as `absent`, and an out-of-band edit is accepted only with `pm-mcp operator accept-edit lesson <lesson_id>`, which shows the path and the recorded and current size and SHA-256 before confirmation, re-baselines that lesson's entry, and records the action in `audit.jsonl`.
+* *Lesson-Store Digest*: Every server write, claim, release, or retirement in the lesson store records the size and SHA-256 of the lesson file in `.digests.json` (the sidecar format of xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]) in the same transaction as the lesson write. On read, a lesson whose file differs from its entry raises `integrity_breach` (kind `store_tampered`) for that lesson only; a lesson file that disappeared while its entry remains is reported as `deleted_out_of_band`, and a file without an entry is reported as `untracked`. None of these states is ever read as `absent`, and an out-of-band edit is accepted only with `pm-mcp operator accept-edit lesson <lesson_id>`, which shows the path and the recorded and current size and SHA-256 before confirmation, re-baselines that lesson's entry, and records the action in `audit.jsonl`. The breach of a lesson ends only by that `accept-edit` (no abort applies to the lesson store); until then the lesson is not listed as a candidate, `source-lesson` fails for it with `lesson_unavailable` (state `store_tampered`), and no claim, release, or retirement touches it.
 
 [source,json]
 ----
@@ -248,9 +273,23 @@ Lessons live in the project's lesson store in the per-project machine store and 
     },
     "golden_label": { "type": "string", "enum": ["correct", "incorrect", "partially_correct", "not_applicable"], "description": "Optional; written only by the operator labelling action; absent means unlabelled (PM-WATCH-STORE-19)." },
     "labelled_at": { "type": "string", "format": "date-time", "description": "Present iff golden_label is present." },
+    "merged_from": {
+      "type": "array",
+      "description": "Lessons merged into this one by lessons.review (submit merge), in order; each merged lesson is retired with verdict merged and into naming this lesson, and the merge is a new revision of this lesson whose sources include the merged lessons (kind lesson).",
+      "items": {
+        "type": "object",
+        "required": ["lesson_id", "at", "by"],
+        "additionalProperties": false,
+        "properties": {
+          "lesson_id": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{3,}$" },
+          "at": { "type": "string", "format": "date-time" },
+          "by": { "type": "string", "description": "job_id of the lessons.review model job whose judgment the server applied, or the operator principal." }
+        }
+      }
+    },
     "claim": {
       "type": ["object", "null"],
-      "description": "Set when a plan starts from the lesson (pm_start source lesson); the lesson file stays in the store.",
+      "description": "Set by the done transaction of a plan bootstrap with source lesson; the lesson file stays in the store.",
       "required": ["plan_id", "claimed_at"],
       "additionalProperties": false,
       "properties": {
@@ -265,8 +304,9 @@ Lessons live in the project's lesson store in the per-project machine store and 
       "additionalProperties": false,
       "properties": {
         "at": { "type": "string", "format": "date-time" },
-        "by": { "type": "string", "minLength": 1, "description": "Step id, plan_id, or operator principal that retired the lesson." },
-        "verdict": { "type": "string", "enum": ["applied", "completely_covered", "redundant", "superseded", "obsolete"] },
+        "by": { "type": "string", "minLength": 1, "description": "Step id, plan_id, entry_id of the bootstrap whose lesson premise retired it, lessons.review, or operator principal that retired the lesson." },
+        "verdict": { "type": "string", "enum": ["applied", "completely_covered", "redundant", "superseded", "merged", "obsolete"] },
+        "into": { "type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{3,}$", "description": "merged and superseded: the lesson it was merged into or superseded by; null otherwise." },
         "reason": { "type": "string", "minLength": 1 },
         "covering_clause": { "type": ["string", "null"] },
         "covering_input": { "type": ["string", "null"] },
@@ -280,12 +320,13 @@ Lessons live in the project's lesson store in the per-project machine store and 
 
 * *One Resolver, Four States*: Listing and lookup use one resolver over the lesson store. Every listed lesson resolves by the exact id it is listed under to one of `found`, `absent`, `present_unreadable` (front matter missing or invalid; listed with its path, never omitted), or `empty_shell` (valid front matter, empty body). `present_unreadable` is never reported as `absent`, and `empty_shell` is never a content verdict. A lesson write without valid front matter is rejected.
 * *Lifecycle*: `status` is `active`, `upstream_pending`, or `retired`; the lifecycle is binary (live or retired) and carries no moving confidence value, mirroring `plan-marshall`. Whether a lesson is being applied is its `claim`, never the location of its file.
-* *Claim*: `pm_start` with source `lesson` claims the lesson in the plan initialization transaction (plan lock, then lesson store lock): it sets `claim{plan_id, claimed_at}`; a lesson that is already claimed, retired, or not resolved `found` is refused (`lesson_unavailable`, naming the state and, for a claim, the claiming plan). The claim ends with the plan: when the plan reaches `completed` with a merge, the lesson is retired with verdict `applied` (`by`: the `plan_id`); when the plan closes the lesson as obsolete (`init.lesson-premise` `close`), with verdict `obsolete`; when the plan is aborted or deleted (`delete-plan`), the claim is released (`claim: null`) and the lesson stays `active`. A claim whose plan is terminal, archived, or no longer resolvable while the claim is still set is a *stale claim*: listed as such (the `stalled_lessons` harvester population), never released without one of the above events or an operator action.
-* *arch-constraint Recurrence*: An add whose `rule` matches an active `arch-constraint` lesson reinforces it (increments `recurrence_count`, refreshes `last_seen`) instead of allocating a new lesson. A quiet-window retirement retires every active `arch-constraint` lesson whose `last_seen` is older than the window (`retention.arch_constraint_quiet_days` of the operator's `local-config.json`, link:../timeouts/03-retention-host-config.adoc#retention-days[Timeouts & Budgets Specification]).
-* *Retirement*: A retirement (supersede, remove, quiet-window retirement, or the end of a claim) sets `retired{at, by, verdict, reason, …}` and `status: retired` in the front matter in one transaction; the file stays in place, so no separate tombstone exists. Every retirement other than the claim outcomes requires a `verdict` from the closed set, with no default. `completely_covered` also requires `covering_clause` and a concrete `covering_input` that the clause's worked example resolves; a whitespace-only value counts as missing. A retirement acts only on a lesson resolved `found`, or on a `present_unreadable` lesson through an explicit operator action, which replaces the unparseable front matter by a minimal valid one (`lesson_id` from the file name, `title` and `component` `unknown`, `retired.lesson_state: present_unreadable`) and keeps the original file bytes as the body; in every other state it changes nothing and reports the state. Retention purges only the body of a retired lesson after `superseded_lessons_days` and keeps its front matter.
+* *Claim*: The done transaction of a plan bootstrap with source `lesson` claims the lesson (workspace lock, plan lock, then lesson store lock): it sets `claim{plan_id, claimed_at}`; a lesson that is already claimed, retired, not resolved `found`, or in an integrity breach is refused (`lesson_unavailable`, naming the state and, for a claim, the claiming plan), and the bootstrap returns to `start.ready` with the reason. The claim ends with the plan: when the plan ends with outcome `merged`, the lesson is retired with verdict `applied` (`by`: the `plan_id`); when the plan ends `returned`, `handed_back`, `no_change`, or `aborted`, or is deleted (`delete-plan`), the claim is released (`claim: null`) and the lesson stays `active`. An obsolete lesson never reaches a plan: the premise state of `source-lesson` retires it with verdict `obsolete` (`by`: the `entry_id`) before any plan exists. A claim whose plan is terminal, archived, or no longer resolvable while the claim is still set is a *stale claim*: listed as such (the `stalled_lessons` harvester population), never released without one of the above events or an operator action.
+* *arch-constraint Recurrence*: An add whose `rule` matches an active `arch-constraint` lesson reinforces it (increments `recurrence_count`, refreshes `last_seen`) instead of allocating a new lesson. The quiet-window retirement, performed by `pm-mcp operator sweep` beside the retention purges (xref:13-leases-integrity-testing.adoc#evidence-based-removal-sweeps[Evidence-Based Removal Sweeps]), retires every active `arch-constraint` lesson whose `last_seen` is older than the window (`retention.arch_constraint_quiet_days` of the operator's `local-config.json`, link:../timeouts/03-retention-host-config.adoc#retention-days[Timeouts & Budgets Specification]) with verdict `obsolete`.
+* *Retirement*: A retirement (supersede, merge, remove, quiet-window retirement, the premise `retire` of a lesson source, or the end of a claim) sets `retired{at, by, verdict, reason, …}` and `status: retired` in the front matter in one transaction; the file stays in place, so no separate tombstone exists. Every retirement other than the claim outcomes requires a `verdict` from the closed set, with no default. `completely_covered` also requires `covering_clause` and a concrete `covering_input` that the clause's worked example resolves; a whitespace-only value counts as missing. A retirement acts only on a lesson resolved `found`, or on a `present_unreadable` lesson through an explicit operator action, which replaces the unparseable front matter by a minimal valid one (`lesson_id` from the file name, `title` and `component` `unknown`, `retired.lesson_state: present_unreadable`) and keeps the original file bytes as the body; in every other state it changes nothing and reports the state. Retention purges only the body of a retired lesson after `superseded_lessons_days` and keeps its front matter.
+* *Lesson Maintenance*: The workspace unit `lessons.pmwf` writes the judgments of its `lessons.review` model job only through the server: `submit merge (ids, into)` appends the merged lessons to `merged_from[]` of `into`, replaces its body as a new revision, and retires each merged lesson (verdict `merged`, `into`); `submit supersede (id, by)` retires `id` with verdict `superseded` and `into: by`; `submit retire (id, verdict)` retires with the given verdict. Each is one transaction under the lesson store lock and acts only on lessons resolved `found` and unclaimed; a claimed lesson is refused `lesson_unavailable`.
 * *No Bulk Mutation*: The lesson store is never wiped or bulk-mutated; no bulk-mutation verb exists. A removal answering `absent` is not proof that the lesson never existed and is never retried automatically; it is reported together with the store-resolution discriminator.
 * *Version Provenance*: The runtime stamps `tool_version` from its own release version (`PM-DIST-1`) at creation; it is never a `submit` parameter. An operator override is stored in `tool_version_override` beside the stamped value.
-* *Provenance*: Every new lesson records `provenance` (`run_artifact`, `tool_return`, or `operator_action`); the server sets it where the creating transition determines it (a recurring-exemption lesson of `lessons-capture` is `run_artifact`) and otherwise requires it as a `submit` parameter.
+* *Provenance*: Every new lesson records `provenance` (`run_artifact`, `tool_return`, or `operator_action`); the server sets it where the creating transition determines it (a recurring-waiver lesson of `lessons-capture` is `run_artifact`) and otherwise requires it as a `submit` parameter.
 * *Audience Classification*: A lesson's `audience` is `upstream` iff its `component` names a component shipped by the `pm-mcp` distribution (a built-in skill, recipe, or finalize-step identifier from the compiled-in catalogue); every other component, including a project-prefixed one (`api-sheriff:maven-build`) and one without a bundle prefix (`integration-tests`), is `local`. The classification never inspects the repository layout. An operator override of the classification is persisted on the lesson in `audience_override` in addition to its audit record, so a lesson admitted by an override is never indistinguishable from a classified one. *Deliberate change vs. `plan-marshall`*: `manage-lessons add` decides ownership by the existence of `marketplace/bundles/{prefix}`, which misfiles a consumer's own prefixed component as foreign.
 * *Upstream Release (`PM-ARCH-2`)*: An `upstream` lesson is created `upstream_pending` and stays in the local store; nothing transmits it automatically. It leaves the workstation only through the operator action `pm-mcp operator lesson release --lesson <lesson_id>`, which renders the issue body for review and either hands it to the operator to file or, on the operator's explicit confirmation, runs a filing job through the enrolled CI provider. A `local` lesson is never offered this action; naming one is refused with `audience_mismatch`, which states the lesson's audience and leaves it unchanged. A successful filing records the issue in `promotions[]` (`kind: issue`) and returns the lesson to `active`.
 ** *Rendering*: The issue body is rendered from the stored record only: body, `component`, producing `plan_id`, and the recorded `tool_version`, never values sampled at filing time.
