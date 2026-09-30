@@ -27,7 +27,7 @@ One release delivers four native binaries, each with one direction (`PM-TECH-3`,
 
 |`pm-mcpd`
 |Quarkus native
-|The runtime (daemon). Started on demand by the CLI (<<Start Modes>>) or by the per-user service manager; opens no TCP or UDP listener.
+|The runtime (daemon). Started on demand by the CLI (<<Start Modes>>) or by the per-user service manager; opens no TCP or UDP listener, apart from the loopback listener fallback of <<Transport Endpoint>>.
 
 |`pm-mcp-exec`
 |plain GraalVM native image
@@ -35,7 +35,7 @@ One release delivers four native binaries, each with one direction (`PM-TECH-3`,
 
 |`pm-mcp-web`
 |Quarkus native
-|The optional web server, a client of the <<local-api>> like the CLI; started by `pm-mcp web enable` and stopped by `pm-mcp web disable`; the only process that may open a TCP listener (link:cli-and-security.adoc[CLI, Coordination & Security Specification]).
+|The optional web server, a client of the <<local-api>> like the CLI; started by `pm-mcp web enable` and stopped by `pm-mcp web disable`; the only process that may open a TCP listener, apart from the runtime's loopback listener fallback (<<Transport Endpoint>>; link:cli-and-security.adoc[CLI, Coordination & Security Specification]).
 |===
 
 The binaries are installed side by side in `<PM_MCP_HOME>/bin/`; a binary starts a sibling by its path in that directory, never through `PATH`.
@@ -60,6 +60,14 @@ _See Requirements:_
 * _See Requirement link:../Requirements.adoc#PM-DIST-5[PM-DIST-5: Multi-Host Concurrent Coexistence on One Machine]_
 
 == Status: PLANNED
+
+== Modules
+
+Implemented in (link:module-structure.adoc[Module Structure Specification]):
+
+* link:module-structure.adoc#module-pm-mcp-server[`pm-mcp-server`]: the runtime, its lifecycle, the local adapter and the MCP endpoint
+* link:module-structure.adoc#module-pm-mcp-api[`pm-mcp-api`]: the Local API contract
+* link:module-structure.adoc#module-pm-mcp-cli[`pm-mcp-cli`]: the `pm-mcp serve` relay and the direct file reads
 
 == Terminology
 
@@ -149,7 +157,7 @@ _Implementation watch: link:../implementation-watch/runtime-model.adoc#PM-WATCH-
 
 === Transport Endpoint
 
-* The runtime's only listener is the Quarkus/Vert.x HTTP server bound exclusively to the Unix domain socket (`quarkus.http.domain-socket-enabled=true`, `quarkus.http.domain-socket=<socket_path>`, `quarkus.http.host-enabled=false`), created under `umask 077` so the socket has mode `0600`. Unix domain sockets in Vert.x require the Netty native transport (`kqueue` on macOS, `epoll` on Linux); this dependency is approved for the runtime. The Quarkus management interface is disabled. No TCP or UDP listener exists in any production profile (`PM-SEC-4`).
+* The runtime's only listener is the Quarkus/Vert.x HTTP server bound exclusively to the Unix domain socket (`quarkus.http.domain-socket-enabled=true`, `quarkus.http.domain-socket=<socket_path>`, `quarkus.http.host-enabled=false`), created under `umask 077` so the socket has mode `0600`. Unix domain sockets in Vert.x require the Netty native transport (`kqueue` on macOS, `epoll` on Linux); this dependency is approved for the runtime. The Quarkus management interface is disabled. No TCP or UDP listener exists in any production profile (`PM-SEC-4`), apart from listener fallback (1) below.
 * The socket serves two endpoints: MCP (`2026-07-28`) at `/mcp` over the Streamable HTTP transport of `io.quarkiverse.mcp:quarkus-mcp-server-http` for the relays, and the <<local-api>> at `/api/v1` for the CLI and `pm-mcp-web`. Every request on either endpoint carries the runtime token (<<runtime-token>>); a request without it, or with a wrong one, is answered `401` and audited.
 * The peer UID (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` / `getpeereid` on macOS) is checked in addition where the listener exposes it cheaply; a mismatch is refused and logged. It is never required: the runtime token carries the same-user proof.
 * *Listener fallback order*: The Milestone 1 spike verifies the Quarkus domain-socket listener under native image on macOS and Linux (SSE streaming, stale-socket handling, the path-length fallback). If it is not viable, the fallback is, in this order: (1) a loopback TCP listener on `127.0.0.1` with the same runtime token, rejecting every request whose `Host` is not the loopback address and port or that carries an `Origin` header, never bound to another interface; (2) an own JDK `ServerSocketChannel` on `UnixDomainSocketAddress` (virtual threads) bridging requests in process to the Quarkus router. The listener in use is recorded in `runtime.json` and reported by `pm-mcp status`; fallback (1) is the only case in which the runtime opens a TCP listener (`PM-SEC-4`).
@@ -401,7 +409,7 @@ _Implementation watch: link:../implementation-watch/runtime-model.adoc#PM-WATCH-
 * *Startup order tests*: A second runtime started against a live one exits `0` at once and leaves `<PM_MCP_BASE>` byte-identical (no audit record, `runtime.json` and the socket unchanged); a stale socket and `runtime.json` left by a killed runtime are removed only after the lock is acquired; a restarted runtime writes a new `runtime.token` before its socket accepts a connection; a call addressing a project whose recovery exceeds the project recovery wait returns `runtime_recovering`, and the repeated call after recovery is served.
 * *Socket path fallback tests*: A `PM_MCP_BASE` long enough to push `run/runtime.sock` over the platform `sun_path` limit binds `$TMPDIR/pm-mcp-<hash>/runtime.sock`, records it in `runtime.json`, and the relay connects through it; a fallback directory owned by another UID, or with a mode other than `0700`, makes the start refuse.
 * *Cold-start measurement (`PM-TECH-3`)*: The ≤ 50 ms target is measured from process start to the socket accepting connections (step 7 of <<Startup Sequence>>) on a clean state (empty `PM_MCP_BASE` apart from a valid enrolment, no stale files, no projects to recover), excluding every per-project recovery.
-* *Isolation tests (`PM-TEST-5`)*: Verify that the runtime opens no TCP/UDP listener, that the socket, `runtime.token`, and their directory have modes `0600`/`0600`/`0700`, that a client refuses a `run/` directory or token file with a foreign owner, a broader mode, or a symlink, that `/api/v1` and `/mcp` refuse a request without the runtime token, that the token appears in no log, audit record, or job environment, that a job cannot read `run/runtime.token` under Landlock, and that every line the relay writes to `stdout` is a valid JSON-RPC 2.0 message.
+* *Isolation tests (`PM-TEST-5`)*: Verify that the runtime opens no TCP/UDP listener (under listener fallback (1) only the loopback listener of <<Transport Endpoint>>), that the socket, `runtime.token`, and their directory have modes `0600`/`0600`/`0700`, that a client refuses a `run/` directory or token file with a foreign owner, a broader mode, or a symlink, that `/api/v1` and `/mcp` refuse a request without the runtime token, that the token appears in no log, audit record, or job environment, that a job cannot read `run/runtime.token` under Landlock, and that every line the relay writes to `stdout` is a valid JSON-RPC 2.0 message.
 * *CLI availability tests*: With no runtime running, `pm-mcp status` reports "not running", `pm-mcp hook session-start` prints its pointer, and `pm-mcp client status` reports the install records, all without starting a runtime or writing a file; `pm-mcp drain` exits `0`; every other command starts the runtime on demand and reports `running` only after an authenticated round trip; `pm-mcp drain` never signals a process whose start instant differs from `runtime.json`.
 * *Stalled tests*: An aged fixture (a non-terminal plan without pending condition or awaited event whose last transition is older than the stalled threshold) is reported `stalled` by `pm-mcp status` and the event stream, produces exactly one `plan_stalled` record per episode, and changes no model-facing representation.
 * *Technical verification (Milestone 1)*:

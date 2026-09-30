@@ -240,7 +240,7 @@ implementation details." sentence stands. Paths are relative to `doc/` (the modu
 `doc/Requirements.adoc`, like the existing `link:specification/…` links):
 
 ```
-Implementation: link:../pm-mcp-core/src/main/java/de/cuioss/pm/mcp/core/state/StateRenderer.java[StateRenderer],
+Implementation: link:../pm-mcp-modules/pm-mcp-workflow/src/main/java/de/cuioss/pm/mcp/workflow/state/StateRenderer.java[StateRenderer],
 link:../pm-mcp-server/src/main/java/de/cuioss/pm/mcp/server/tool/PmStateTool.java[PmStateTool]
 
 Verified by: link:../pm-mcp-server/src/test/java/de/cuioss/pm/mcp/server/tool/PmStateToolTest.java[PmStateToolTest],
@@ -266,6 +266,11 @@ link:user/mcp-tools.adoc#_pm_state[User Guide § pm_state]
   Index and the prefix table references in `doc/Requirements.adoc`.
 - A specification with remaining sections gets `Status: IN PROGRESS`, and its `== Traceability` section
   keeps only the requirements that still have specified content in it.
+- Keep the module links in step (`doc/Specification.adoc` § Traceability Requirements, item 4): a deleted
+  part or specification is dropped from the *Specified in* column of
+  `doc/specification/module-structure.adoc`, and its `== Modules` section goes with it. When the module
+  structure itself is implemented, its listing moves into the developer documentation's module map, and the
+  remaining `== Modules` sections link there instead.
 
 ### 3.3 Delete the covered watch items
 

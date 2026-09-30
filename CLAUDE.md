@@ -23,15 +23,11 @@ the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specifi
 | `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
 
 Roadmap Milestone 0 creates the target module structure in one step (PM-IMPL-1 in
-`doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus
-daemon assembly, including the release profile), beside the aggregator `pm-mcp-modules` with
-`pm-mcp-api` (client contract, Jackson only), `pm-mcp-exec` (job launcher), `pm-mcp-core` (plain
-Java), the nested aggregator `pm-mcp-providers` (`pm-mcp-git`, `pm-mcp-ci`, `pm-mcp-findings`,
-`pm-mcp-analysis`, `pm-mcp-github`, `pm-mcp-gitlab`, `pm-mcp-sonar`), and `pm-mcp-conformance`,
-and the aggregator `pm-mcp-clients` with `pm-mcp-cli` (picocli, depends on `pm-mcp-api` only),
-`pm-mcp-web-server` (Quarkus) and `pm-mcp-web-app` (SvelteKit, `frontend-maven-plugin`). The
-release packages four native binaries: `pm-mcp` (CLI), `pm-mcpd` (daemon), `pm-mcp-exec`,
-`pm-mcp-web`. Every module gets minimal real code and tests, never an empty shell. The table above
+`doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus daemon
+assembly), beside the aggregators `pm-mcp-modules` (library modules, with the nested `pm-mcp-providers`)
+and `pm-mcp-clients`. The only listing of the modules, their dependencies and the specification each
+implements is `doc/specification/module-structure.adoc`; name modules from there and never repeat the
+listing elsewhere. Every module gets minimal real code and tests, never an empty shell. The table above
 and the build commands below change with that milestone.
 
 ## Development Notes
