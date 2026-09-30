@@ -175,8 +175,9 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 
 [#state-catalogue-bootstrap-epic]
 == Bootstrap of an Epic: `bootstrap-epic`
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-38[PM-WATCH-DISP-38]_
 
-`pm-mcp enter … epic [<epic_id>]` records a pending entry of kind `epic`. The unit gathers the epic's header and vision; its `create` link creates the epic scope in one transaction: the machine store `epics/<epic_id>/`, the session row, `status.json` at `epic.decompose`, `epic.json` (title, `parallelization_scope`, lifecycle), the ledger directory in the shared epic worktree, and the vision section of `spec.md`.
+`pm-mcp enter … epic [<epic_id>]` records a pending entry of kind `epic`. The unit gathers the epic's header and vision; its `create` link creates the epic scope in one transaction: the machine store `epics/<epic_id>/`, the session row, `status.json` at `epic.decompose`, `epic.json` (title, `parallelization_scope`, lifecycle), the ledger directory in the shared epic worktree, and the vision section of `spec.md`. An epic whose git-tracked ledger exists (`.marshall/orchestrator/<epic_id>/` with `epic.json`, read through the Epic Ledger Resolution Seam, link:../filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification, Shared Epic Worktree]) but has no machine scope (`epics/<epic_id>/` absent, for example after a clone on another machine) is adopted instead: the ledger is the durable truth, and the adoption creates only the machine scope from it and never rewrites it.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -186,8 +187,8 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 |inherit (`workspace`)
 |`auto`
 |The pending entry record of kind `epic` (the unit's start state); `start-epic.setup-required` (`recheck`).
-|`auto start-epic.resolve`: the setup predicates of `start.resolve`, then the requested id: a live epic, an archived epic (fact `archived`), or an unknown id (the slug proposal).
-|`setup_required` -> `start-epic.setup-required`; `live` -> `start-epic.resumed`; `define` -> `start-epic.define`.
+|`auto start-epic.resolve`: the setup predicates of `start.resolve`, then the requested id: a live epic, an adoptable ledger (a git-tracked ledger without machine scope), an archived epic (fact `archived`), or an unknown id (the slug proposal).
+|`setup_required` -> `start-epic.setup-required`; `live` -> `start-epic.resumed`; `adopt` (the one requested id names an adoptable ledger) -> `start-epic.adopt`; `define` -> `start-epic.define`.
 |link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
 
 |[[state-start-epic.setup-required]]`start-epic.setup-required`
@@ -201,9 +202,9 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 |[[state-start-epic.define]]`start-epic.define`
 |inherit (`workspace`)
 |`link`
-|`start-epic.resolve` (`define`); `start-epic.source-issue` (`done`, `stepped_out`); `start-epic.ready` (`back`).
-|`facts`: the hint, the slug proposal, the live epics (count and at most ten, full list `pm_epics`), a fetched and screened issue. Links: `define` (`submit`: `epic_slug`, `title: text[1..200]`, `vision: text[1..32768]`, `parallelization_scope?`, compiled default `1`); `from_issue` (`submit`, `issue_number`); `abandon`.
-|`define` -> `start-epic.ready`; `from_issue` -> `start-epic.source-issue`; `abandon` -> `start-epic.abandoned`.
+|`start-epic.resolve` (`define`); `start-epic.source-issue` (`done`, `stepped_out`); `start-epic.ready` (`back`); `start-epic.adopt-failed` (`back`).
+|`facts`: the hint, the slug proposal, the live epics (count and at most ten, full list `pm_epics`), the adoptable ledgers (count and at most ten: `epic_id`, title), a fetched and screened issue. Links: `define` (`submit`: `epic_slug`, `title: text[1..200]`, `vision: text[1..32768]`, `parallelization_scope?`, compiled default `1`); `from_issue` (`submit`, `issue_number`); `adopt_epic:<epic_id>` per adoptable ledger; `abandon`.
+|`define` -> `start-epic.ready`; `from_issue` -> `start-epic.source-issue`; `adopt_epic` -> `start-epic.adopt`; `abandon` -> `start-epic.abandoned`.
 |link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
 
 |[[state-start-epic.source-issue]]`start-epic.source-issue`
@@ -222,10 +223,26 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 |`create` (`start.create-scope`, re-checking the identifier, the lifecycle gate, and the configuration state): `created` -> `start-epic.committed`; `refused{reason}` -> this state. `set_slug` -> this state; `back` -> `start-epic.define`; `abandon` -> `start-epic.abandoned`.
 |link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
 
+|[[state-start-epic.adopt]]`start-epic.adopt`
+|inherit (`workspace`)
+|`auto`
+|`start-epic.resolve` (`adopt`); `start-epic.define` (`adopt_epic`); `start-epic.adopt-failed` (`retry`).
+|`auto start-epic.adopt`: reads the ledger through the seam and validates `epic.json` and every queue row against their schemas (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-ledger-records[Store Schemas Specification, Epic Ledger Records]); a `terminal` header is not adoptable. Its `done` transaction (`start.create-scope`, re-checking that `epics/<epic_id>/` is still absent, the lifecycle gate, and the configuration state) creates only the machine scope: `epics/<epic_id>/` with the session row and `status.json` at `epic.decompose` when the ledger has no queue row, otherwise at `epic.active`. It writes nothing under `.marshall/orchestrator/`: the header's `lifecycle` and the rows stay as read.
+|`adopted` -> `start-epic.committed`; `adopt_failed{reason}` (`ledger_unreadable` with the failing file, `ledger_invalid`, `ledger_terminal`, or a refused re-check) -> `start-epic.adopt-failed`.
+|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+
+|[[state-start-epic.adopt-failed]]`start-epic.adopt-failed`
+|inherit (`workspace`)
+|`link`
+|`start-epic.adopt` (`adopt_failed`).
+|`facts.reason` and `facts.detail` (the file and the failure). Links: `retry` (`noop`, after the ledger was repaired through git); `back`; `abandon`.
+|`retry` -> `start-epic.adopt`; `back` -> `start-epic.define`; `abandon` -> `start-epic.abandoned`.
+|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+
 |[[state-start-epic.committed]][[state-start-epic.resumed]][[state-start-epic.abandoned]]`start-epic.committed`, `start-epic.resumed`, `start-epic.abandoned`
 |inherit (`workspace`)
 |`terminal`
-|`start-epic.ready` (`created`); `start-epic.resolve` (`live`); `abandon` links.
+|`start-epic.ready` (`created`); `start-epic.adopt` (`adopted`); `start-epic.resolve` (`live`); `abandon` links.
 |`links[0]`. Declared `terminal committed success`, `terminal resumed success`, `terminal abandoned failure`; `facts` name the epic to continue with (`pm_state(epic_id)`).
 |—
 |link:../workflow-dsl/02-units-jobs-decisions.adoc#workflow-definition-units[Workflow DSL Specification, Workflow Definition Units]
