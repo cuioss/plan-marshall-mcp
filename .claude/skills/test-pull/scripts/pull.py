@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""Driver of the pull-mechanism verifications V1 to V10 (roadmap Milestone 0, Part A).
+
+Usage:
+  pull.py setup                                   check the runner jar and the three harnesses
+  pull.py consent-agy                             show and accept the change to the Antigravity user config
+  pull.py selfcheck [--seconds N] [--silent]      prove the stub holds one call for N seconds (default 3600),
+                                                  with progress frames or, with --silent, without any
+  pull.py run <v1..v10> <claude|opencode|agy> <headless|interactive>
+              [--cell NAME|all] [--model M] [--smoke] [--cycles N] [--wait S] [--reps N] [--rounds N]
+              [--variant ID|all] [--fresh]
+  pull.py status [RUN]                            progress of one run, or the list of runs
+  pull.py stop <RUN>                              stop the server and the harness of a run
+  pull.py report [v1..v10] [--run RUN]            metrics and verdicts as AsciiDoc table rows
+  pull.py cleanup                                 stop every run, remove the Antigravity server entry
+
+Run data: .plan/temp/pull-spike/runs/<run>/ (scenario.json, events.jsonl, harness-*.jsonl, result.json).
+A run is driven by a detached supervisor process, so it survives the calling shell.
+"""
+import argparse
+import json
+import os
+import pathlib
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import analyze  # noqa: E402
+import harness as hx  # noqa: E402
+import mcpclient  # noqa: E402
+import scenarios  # noqa: E402
+
+ROOT = pathlib.Path(__file__).resolve().parents[4]
+BASE = ROOT / ".plan" / "temp" / "pull-spike"
+RUNS = BASE / "runs"
+JAR = ROOT / "plan-marshall-mcp" / "target" / "quarkus-app" / "quarkus-run.jar"
+BUILD = ('python3 .plan/execute-script.py plan-marshall:build-maven:maven run '
+         '--command-args "package -pl plan-marshall-mcp -am -DskipTests"')
+AGY_CONSENT = BASE / "agy-consent"
+AGY_LOCK = BASE / "agy.lock"
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    pathlib.Path(path).write_text(json.dumps(data, indent=2))
+
+
+# --- server -------------------------------------------------------------------------------------------
+
+def start_server(run_dir, scenario):
+    """Starts the stub for one run; returns (process, url)."""
+    if not JAR.exists():
+        sys.exit(f"runner jar missing: {JAR}\nbuild it with: {BUILD}")
+    write_json(run_dir / "scenario.json", scenario)
+    port, management = free_port(), free_port()
+    argv = ["java", f"-Dpm.spike.scenario={run_dir / 'scenario.json'}", f"-Dpm.spike.run-dir={run_dir}",
+            f"-Dquarkus.http.port={port}", f"-Dquarkus.management.port={management}",
+            "-Dquarkus.http.host=127.0.0.1",
+            # the server must never end a held call itself: both limits default to 30 minutes
+            "-Dquarkus.http.idle-timeout=6H", "-Dquarkus.mcp.server.connection-idle-timeout=6H",
+            "-jar", str(JAR)]
+    log = open(run_dir / "server.log", "ab")
+    process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT, start_new_session=True)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if process.poll() is not None:
+            sys.exit(f"stub exited with {process.returncode}, see {run_dir / 'server.log'}")
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            return process, f"http://127.0.0.1:{port}/mcp"
+        except OSError:
+            time.sleep(0.3)
+    process.kill()
+    sys.exit("stub did not open its port within 60 s")
+
+
+def kill_group(pid, sig=signal.SIGTERM):
+    try:
+        os.killpg(pid, sig)
+    except (OSError, TypeError):
+        pass
+
+
+# --- supervisor ---------------------------------------------------------------------------------------
+
+class Worker:
+    """One harness process whose output lines are stored with their arrival time."""
+
+    def __init__(self, run_dir, tag, argv, env, cwd):
+        self.tag = tag
+        self.started_ms = now_ms()
+        self.out = open(run_dir / f"harness-{tag}.jsonl", "a")
+        self.lock = threading.Lock()
+        self.process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, env=env, cwd=cwd, start_new_session=True)
+        self.threads = [threading.Thread(target=self._pump, args=(stream, name), daemon=True)
+                        for stream, name in ((self.process.stdout, "out"), (self.process.stderr, "err"))]
+        for thread in self.threads:
+            thread.start()
+
+    def _pump(self, stream, name):
+        for raw in stream:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            with self.lock:
+                self.out.write(json.dumps({"t_ms": now_ms(), "s": name, "line": line}) + "\n")
+                self.out.flush()
+
+    def wait(self, timeout):
+        try:
+            code = self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        for thread in self.threads:
+            thread.join(5)
+        return code
+
+    def summary(self, **extra):
+        return {"tag": self.tag, "pid": self.process.pid, "started_ms": self.started_ms,
+                "exit_code": self.process.returncode, **extra}
+
+
+class Supervisor:
+    def __init__(self, run_dir):
+        self.run_dir = pathlib.Path(run_dir)
+        self.meta = read_json(self.run_dir / "meta.json")
+        self.plan = self.meta["plan"]
+        self.ws = self.run_dir / "ws"
+        self.url = None
+        self.result = {"workers": []}
+        self.count = 0
+
+    def events(self):
+        return analyze.load_events(self.run_dir)
+
+    def wait_event(self, predicate, timeout, after=0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for index, event in enumerate(self.events()):
+                if index >= after and predicate(event):
+                    return index, event
+            if (self.run_dir / "stop").exists():
+                return None, None
+            time.sleep(0.5)
+        return None, None
+
+    def launch(self, prompt, resume=None, extra_tools=()):
+        """Starts one headless harness process; its worker id is its tag, `w001`, `w002`, ..."""
+        self.count += 1
+        tag = f"w{self.count:03d}"
+        prompt = prompt.replace("{worker}", tag)
+        argv, env = hx.headless(self.meta["harness"], self.ws, self.url, prompt, self.meta["model"],
+                                raised=self.plan.get("raised", False), resume=resume, extra_tools=extra_tools)
+        if self.count == 1:
+            self.meta["command"] = [part if part != prompt else "<prompt>" for part in argv]
+            self.meta["prompt"] = prompt
+            write_json(self.run_dir / "meta.json", self.meta)
+        return Worker(self.run_dir, tag, argv, env, self.ws)
+
+    def stopped(self):
+        return (self.run_dir / "stop").exists()
+
+    def wait_worker(self, worker, timeout):
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self.stopped():
+            code = worker.wait(2)
+            if code is not None:
+                return code
+        kill_group(worker.process.pid, signal.SIGKILL)
+        worker.wait(10)
+        return None
+
+    # plans ------------------------------------------------------------------------------------------
+
+    def loop(self):
+        worker = self.launch(scenarios.LOOP_PROMPT)
+        code = self.wait_worker(worker, self.plan["deadline_s"])
+        self.result["workers"].append(worker.summary(ended_ms=now_ms(), timed_out=code is None))
+
+    def interactive(self):
+        deadline = time.time() + self.plan["deadline_s"]
+        while time.time() < deadline and not self.stopped():
+            time.sleep(2)
+
+    def fresh(self):
+        prompt = scenarios.ONE_TASK_PROMPT
+        if self.plan.get("representative"):
+            filler = (ROOT / "doc" / "specification" / "hypermedia-format" /
+                      "01-representation-and-link-forms.adoc").read_text()[:30000]
+            prompt += "\n\nReference material (not needed for the decision):\n" + filler
+        for _ in range(self.plan["count"]):
+            if self.stopped():
+                break
+            time.sleep(self.plan.get("gap_s", 0))
+            worker = self.launch(prompt)
+            code = self.wait_worker(worker, 600)
+            self.result["workers"].append(worker.summary(ended_ms=now_ms(), timed_out=code is None))
+
+    def sigterm(self):
+        worker = self.launch(scenarios.LOOP_PROMPT)
+        _, event = self.wait_event(lambda e: e["event"] == self.plan["at"], 300)
+        if event is None:
+            self.result["error"] = f"no {self.plan['at']} event within 300 s"
+            kill_group(worker.process.pid, signal.SIGKILL)
+            return
+        time.sleep(self.plan.get("delay_s", 0))
+        sent = now_ms()
+        os.kill(worker.process.pid, signal.SIGTERM)
+        code = worker.wait(60)
+        exited = now_ms()
+        time.sleep(2)
+        orphans = subprocess.run(["pgrep", "-g", str(worker.process.pid)], capture_output=True, text=True).stdout.split()
+        if code is None:
+            kill_group(worker.process.pid, signal.SIGKILL)
+        kill_group(worker.process.pid, signal.SIGKILL)
+        self.result["workers"].append(worker.summary(
+            sigterm_ms=sent, exit_after_ms=None if code is None else exited - sent, orphans=len(orphans)))
+
+    def resume(self):
+        first = self.launch(scenarios.LOOP_PROMPT)
+        self.wait_worker(first, 300)
+        records = analyze.load_harness_file(self.run_dir / f"harness-{first.tag}.jsonl")
+        session = hx.session_id(records)
+        self.result["workers"].append(first.summary(session_id=session))
+        if not session:
+            self.result["error"] = "no session id in the harness output"
+            return
+        started = now_ms()
+        second = self.launch(scenarios.RESUME_PROMPT, resume=session)
+        self.wait_worker(second, 300)
+        text = (self.run_dir / f"harness-{second.tag}.jsonl").read_text()
+        self.result["workers"].append(second.summary(resume_ms=now_ms() - started,
+                                                     nonce_recalled=self.plan["nonce"] in text))
+
+    def kill_trials(self):
+        live, trials, seen = {}, [], 0
+
+        def start():
+            worker = self.launch(scenarios.LOOP_PROMPT)
+            live[worker.tag] = worker
+            return worker
+
+        workers = [start(), start()]
+        for _ in range(self.plan["trials"]):
+            index, event = self.wait_event(
+                lambda e: e["event"] == "wait_end" and e.get("outcome") == "task" and e["connection"] in live,
+                600, seen)
+            if event is None:
+                break
+            seen = index + 1
+            victim = live.pop(event["connection"])
+            kill_group(victim.process.pid, signal.SIGKILL)
+            victim.wait(10)
+            delivered = [e for e in self.events()[:index + 1]
+                         if e["event"] == "delivery" and e["connection"] == event["connection"]]
+            task_id = delivered[-1]["task_id"] if delivered else None
+            trials.append({"task_id": task_id, "connection": event["connection"], "killed_ms": now_ms()})
+            workers.append(start())
+            self.wait_event(lambda e: e["event"] == "submit" and e.get("task_id") == task_id, 300, seen)
+            seen = len(self.events())
+        self.result["trials"] = trials
+        deadline = time.time() + 900
+        while time.time() < deadline and not self.stopped() and any(w.process.poll() is None for w in live.values()):
+            time.sleep(2)
+        for worker in workers:
+            kill_group(worker.process.pid, signal.SIGKILL)
+            self.result["workers"].append(worker.summary())
+
+    def run(self):
+        self.ws.mkdir(exist_ok=True)
+        server, self.url = start_server(self.run_dir, self.meta["scenario"])
+        self.meta.update(url=self.url, server_pid=server.pid, supervisor_pid=os.getpid(), started_ms=now_ms())
+        agy = self.meta["harness"] == "agy"
+        try:
+            if agy:
+                AGY_LOCK.write_text(str(os.getpid()))
+                self.meta["agy_register"] = hx.agy_register(self.url)
+            if self.meta["mode"] == "interactive":
+                self.meta["launch"] = hx.interactive(self.meta["harness"], self.ws, self.url,
+                                                     self.plan.get("raised", False), scenarios.POINTER)
+                write_json(self.run_dir / "meta.json", self.meta)
+                self.interactive()
+            else:
+                write_json(self.run_dir / "meta.json", self.meta)
+                getattr(self, self.plan["kind"])()
+        finally:
+            if agy:
+                self.result["agy_unregister"] = hx.agy_unregister()
+                AGY_LOCK.unlink(missing_ok=True)
+            kill_group(server.pid, signal.SIGTERM)
+            self.result["ended_ms"] = now_ms()
+            write_json(self.run_dir / "result.json", self.result)
+
+
+# --- verbs --------------------------------------------------------------------------------------------
+
+def cmd_setup(_args):
+    BASE.mkdir(parents=True, exist_ok=True)
+    report = {"jar": str(JAR), "jar_present": JAR.exists(),
+              "java": subprocess.run(["java", "-version"], capture_output=True, text=True).stderr.splitlines()[0],
+              "harnesses": {h: hx.version(h) for h in hx.HARNESSES},
+              "models": hx.DEFAULT_MODEL, "raised_timeout_knobs": hx.RAISED,
+              "agy_consent": AGY_CONSENT.exists()}
+    write_json(BASE / "setup.json", report)
+    print(json.dumps(report, indent=2))
+    if not JAR.exists():
+        print(f"\nBuild the runner jar first:\n  {BUILD}")
+        return 1
+    return 0
+
+
+def cmd_consent_agy(args):
+    print("Antigravity has no per-call MCP configuration. Every agy run will execute\n"
+          f"  agy mcp add {hx.SERVER} http://127.0.0.1:<port>/mcp\n"
+          "which writes the server entry into your Antigravity user configuration (~/.gemini/config),\n"
+          f"and `agy mcp remove {hx.SERVER}` when the run ends or on `pull.py cleanup`.\n"
+          "agy runs are therefore sequential.")
+    if not args.yes:
+        print("\nRe-run with --yes to accept.")
+        return 1
+    BASE.mkdir(parents=True, exist_ok=True)
+    AGY_CONSENT.write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    print("\nAccepted.")
+    return 0
+
+
+def cmd_selfcheck(args):
+    run_dir = RUNS / f"selfcheck-{time.strftime('%m%d-%H%M%S')}"
+    run_dir.mkdir(parents=True)
+    scenario = {"wait_seconds": args.seconds, "progress_seconds": 0 if args.silent else 5,
+                "steps": [scenarios.wait(1), scenarios.DONE]}
+    server, url = start_server(run_dir, scenario)
+    try:
+        client = mcpclient.McpClient(url, timeout=args.seconds + 120)
+        client.initialize()
+        started = time.time()
+        result, notifications = client.call("pull_wait", progress_token=None if args.silent else "selfcheck")
+        held = time.time() - started
+        text = result.get("result", {}).get("content", [{}])[0].get("text", "")
+        ok = "wait_again" in text and held >= args.seconds
+        print(json.dumps({"run": run_dir.name, "held_s": round(held, 1), "requested_s": args.seconds,
+                          "progress_frames": len(notifications), "answer": text, "ok": ok}, indent=2))
+        return 0 if ok else 1
+    finally:
+        kill_group(server.pid)
+
+
+def cmd_run(args):
+    if args.harness == "agy":
+        if not AGY_CONSENT.exists():
+            sys.exit("Antigravity runs change your user configuration; run `pull.py consent-agy` first.")
+        owner = read_json(AGY_LOCK)
+        if owner and alive(owner):
+            sys.exit("another agy run is active; agy runs are sequential (one server entry in the user config)")
+    cells = scenarios.CELLS.get(args.v, [None])
+    if args.cell and args.cell != "all":
+        if args.cell not in cells:
+            sys.exit(f"unknown cell {args.cell!r} for {args.v}; choose from {cells} or all")
+        cells = [args.cell]
+    elif args.cell != "all" and cells != [None]:
+        sys.exit(f"{args.v} needs --cell: one of {cells} or all")
+    variants = [None]
+    if args.v == "v8":
+        known = [x["id"] for x in scenarios.injections()["variants"]]
+        variants = known if args.variant in (None, "all") else [args.variant]
+    if args.harness == "agy" and len(cells) * len(variants) > 1:
+        sys.exit("agy runs are sequential: start one cell or variant at a time")
+    started = []
+    for cell in cells:
+        for variant in variants:
+            started.append(_start_run(args, cell, variant))
+    for run_dir in started:
+        print(f"run {run_dir.name}")
+        if args.mode == "interactive":
+            _print_checklist(run_dir)
+    print("\nfollow with: pull.py status <run>   |   pull.py report " + args.v)
+    return 0
+
+
+def _start_run(args, cell, variant):
+    opts = {"cell": cell or "", "smoke": args.smoke, "cycles": args.cycles, "wait": args.wait, "reps": args.reps,
+            "rounds": args.rounds, "variant": variant, "fresh": args.fresh}
+    scenario, plan = scenarios.build(args.v, opts)
+    if args.mode == "interactive":
+        plan = {**plan, "kind": "interactive", "deadline_s": max(plan["deadline_s"], 3600) + 1800}
+    parts = [args.v, args.harness, args.mode[0], cell, variant, "fresh" if args.fresh else None,
+             "smoke" if args.smoke else None, time.strftime("%m%d-%H%M%S")]
+    run_dir = RUNS / "-".join(part for part in parts if part)
+    run_dir.mkdir(parents=True)
+    meta = {"v": args.v, "harness": args.harness, "mode": args.mode, "cell": cell, "variant": variant,
+            "fresh": args.fresh, "smoke": args.smoke, "model": args.model or hx.DEFAULT_MODEL[args.harness],
+            "harness_version": hx.version(args.harness), "scenario": scenario, "plan": plan,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    write_json(run_dir / "meta.json", meta)
+    log = open(run_dir / "supervisor.log", "ab")
+    subprocess.Popen([sys.executable, __file__, "_supervise", str(run_dir)], stdout=log, stderr=subprocess.STDOUT,
+                     stdin=subprocess.DEVNULL, start_new_session=True, cwd=ROOT)
+    return run_dir
+
+
+def _print_checklist(run_dir):
+    deadline = time.time() + 90
+    meta = read_json(run_dir / "meta.json")
+    while time.time() < deadline and "launch" not in meta:
+        time.sleep(1)
+        meta = read_json(run_dir / "meta.json")
+    if "launch" not in meta:
+        print(f"  the stub did not come up, see {run_dir / 'supervisor.log'}")
+        return
+    lines = [f"Operator checklist for {run_dir.name}",
+             f"1. In a new terminal: {meta['launch']}",
+             f"2. Approve the MCP server `{hx.SERVER}` if the harness asks, and confirm it lists pull_wait.",
+             "3. Paste this prompt:", "", scenarios.LOOP_PROMPT.replace("{worker}", scenarios.TUI_WORKER), ""]
+    if meta["v"] == "v10" and not meta["smoke"]:
+        lines += ["4. Near cycle 60 (`pull.py status`): type /clear. Note whether the loop resumes by itself;",
+                  "   if not, type the single word `continue` and note whether the first call is pull_wait.",
+                  "5. Near cycle 120: compact manually (/compact) and note the same two things.",
+                  "6. From cycle 200 the answers carry filler that forces an automatic compaction;",
+                  "   do not type anything, and note whether the loop survives it.",
+                  "7. When the model answers DONE or the loop stops, note what the screen shows, then",
+                  f"   run: pull.py stop {run_dir.name}"]
+    else:
+        lines += [f"4. Leave the session alone. When it answers DONE or the call is aborted, note what the",
+                  f"   screen shows, then run: pull.py stop {run_dir.name}"]
+    text = "\n".join(lines)
+    (run_dir / "checklist.txt").write_text(text + "\n")
+    print(text)
+
+
+def cmd_supervise(args):
+    Supervisor(args.run_dir).run()
+    return 0
+
+
+def _resolve(name):
+    run_dir = RUNS / name
+    if not run_dir.is_dir():
+        sys.exit(f"no such run: {name}")
+    return run_dir
+
+
+def cmd_status(args):
+    if not args.run:
+        for run_dir in sorted(RUNS.glob("*")) if RUNS.is_dir() else []:
+            meta = read_json(run_dir / "meta.json", {})
+            state = "done" if (run_dir / "result.json").exists() else (
+                "running" if alive(meta.get("supervisor_pid")) else "dead")
+            print(f"{state:8} {run_dir.name}")
+        return 0
+    run_dir = _resolve(args.run)
+    meta = read_json(run_dir / "meta.json", {})
+    events = analyze.load_events(run_dir)
+    summary = analyze.progress(events)
+    summary.update(run=run_dir.name, finished=(run_dir / "result.json").exists(),
+                   supervisor_alive=alive(meta.get("supervisor_pid")), server_alive=alive(meta.get("server_pid")))
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_stop(args):
+    run_dir = _resolve(args.run)
+    (run_dir / "stop").write_text("")
+    meta = read_json(run_dir / "meta.json", {})
+    deadline = time.time() + 20
+    while time.time() < deadline and alive(meta.get("supervisor_pid")):
+        time.sleep(1)
+    kill_group(meta.get("supervisor_pid"))
+    kill_group(meta.get("server_pid"))
+    print(f"stopped {run_dir.name}")
+    return 0
+
+
+def cmd_report(args):
+    runs = [_resolve(args.run)] if args.run else sorted(RUNS.glob("v*")) if RUNS.is_dir() else []
+    rows = []
+    for run_dir in runs:
+        meta = read_json(run_dir / "meta.json")
+        if not meta or (args.v and meta["v"] != args.v) or (meta.get("smoke") and not args.smoke and not args.run):
+            continue
+        rows.append(analyze.report(run_dir, meta))
+    print(analyze.render(rows, args.json))
+    return 0
+
+
+def cmd_cleanup(_args):
+    for run_dir in sorted(RUNS.glob("*")) if RUNS.is_dir() else []:
+        meta = read_json(run_dir / "meta.json", {})
+        if alive(meta.get("supervisor_pid")) or alive(meta.get("server_pid")):
+            (run_dir / "stop").write_text("")
+            kill_group(meta.get("supervisor_pid"))
+            kill_group(meta.get("server_pid"))
+            print(f"stopped {run_dir.name}")
+    if AGY_CONSENT.exists():
+        print("agy mcp remove:", hx.agy_unregister())
+        AGY_LOCK.unlink(missing_ok=True)
+    return 0
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="verb", required=True)
+    sub.add_parser("setup").set_defaults(func=cmd_setup)
+    consent = sub.add_parser("consent-agy")
+    consent.add_argument("--yes", action="store_true")
+    consent.set_defaults(func=cmd_consent_agy)
+    selfcheck = sub.add_parser("selfcheck")
+    selfcheck.add_argument("--seconds", type=int, default=scenarios.V1_CAP_SECONDS)
+    selfcheck.add_argument("--silent", action="store_true", help="hold the call without progress frames")
+    selfcheck.set_defaults(func=cmd_selfcheck)
+    run = sub.add_parser("run")
+    run.add_argument("v", choices=sorted(scenarios.BUILDERS, key=lambda v: int(v[1:])))
+    run.add_argument("harness", choices=hx.HARNESSES)
+    run.add_argument("mode", choices=["headless", "interactive"])
+    run.add_argument("--cell")
+    run.add_argument("--model")
+    run.add_argument("--smoke", action="store_true")
+    run.add_argument("--fresh", action="store_true")
+    run.add_argument("--variant")
+    for name in ("cycles", "wait", "reps", "rounds"):
+        run.add_argument(f"--{name}", type=int)
+    run.set_defaults(func=cmd_run)
+    supervise = sub.add_parser("_supervise")
+    supervise.add_argument("run_dir")
+    supervise.set_defaults(func=cmd_supervise)
+    status = sub.add_parser("status")
+    status.add_argument("run", nargs="?")
+    status.set_defaults(func=cmd_status)
+    stop = sub.add_parser("stop")
+    stop.add_argument("run")
+    stop.set_defaults(func=cmd_stop)
+    report = sub.add_parser("report")
+    report.add_argument("v", nargs="?")
+    report.add_argument("--run")
+    report.add_argument("--smoke", action="store_true")
+    report.add_argument("--json", action="store_true")
+    report.set_defaults(func=cmd_report)
+    sub.add_parser("cleanup").set_defaults(func=cmd_cleanup)
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

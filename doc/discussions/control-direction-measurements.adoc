@@ -1,0 +1,96 @@
+= Control Direction Measurements (V1 to V10)
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../Requirements.adoc[Requirements] » xref:README.adoc[Discussions] » Control Direction Measurements
+
+NOTE: *Status: criteria proposed, no measured run yet (2026-10-01)*. This document records the verifications V1 to V10 of xref:control-direction.adoc#verification[Control Direction § What must be verified first], which link:../roadmap.adoc[Roadmap] Milestone 0, Part A schedules: per verification the pass criterion set before the run, the result per harness and mode, and the fallback taken. The decision gate of xref:control-direction.adoc#gate[Control Direction] reads its figures from here.
+
+== Setup
+
+* *Stub*: the package `de.cuioss.pm.mcp.spike` of the module `plan-marshall-mcp` (throwaway, removed with Milestone 1). It registers its tools only when `pm.spike.scenario` names a scenario file: `pull_wait` blocks and answers `wait_again`, a task, or `done`; `pull_submit` takes the decision of a task; `pull_info` is a distractor that a correct loop never calls; `pull_escalate` is registered in the middle of a run for the widening test of V9. Every answer names the next call, as the fresh links of a real wait answer do.
+* *Measurement source*: the stub writes every request, call start and end, progress frame, delivery, submit, and refusal to `events.jsonl`. Timings and counts come from this file and from the arrival time of every output line of the harness, never from what a model reports about itself.
+* *Driver*: the project-local skills `test-pull` (shared) and `test-v1` to `test-v10` (`.claude/skills/`). One stub process and one detached supervisor per run; run data under `.plan/temp/pull-spike/runs/`.
+* *Harnesses*: Claude Code (`claude`), OpenCode (`opencode`), Antigravity (`agy`). Headless runs use the small model of each harness (`claude-haiku-4-5`, `opencode/claude-haiku-4-5`, `gemini-3.8-flash-medium`); interactive runs use the model selected in the session. Harness version and model are recorded with every result, because harness versions move during a measurement series.
+* *Worker identity*: every prompt gives the model a worker id that it passes as the argument `worker` of each call. The MCP connection cannot identify a caller on every host (see <<observations>>).
+* *Decisions*: the closed-answer tasks of `.claude/skills/test-pull/fixtures/tasks.json`, modelled on the decision states of a running plan (remediation, review triage, scope, build classification, commit type, quality gate). The expected answer is never sent to the model.
+
+=== Limits of the setup
+
+* *Transport*: every run measures MCP over Streamable HTTP against the Quarkus server. Hosts will later see `stdio` from `pm-mcp serve`. A host may treat the two transports differently, so the blocking times of V1 hold for Streamable HTTP only; the `stdio` re-check belongs to the Part B item on relay startup and progress timeout reset.
+* *Antigravity*: `agy` offers no per-call MCP configuration. A run registers the stub in the operator's user configuration (`agy mcp add`) and removes the entry when it ends, so Antigravity runs are sequential, and V9 (two workers on one queue) cannot separate its workers by configuration.
+* *Model level*: the headless figures describe the small model. Reliability at a higher level is spot-checked with `--model`, not measured throughout.
+
+== Pass criteria
+
+Set before the measured runs (`.claude/skills/test-pull/criteria.json`, status `proposed` until the operator confirms; the confirming commit precedes the first measured run). A run that fails for a tooling reason is repeated and the repeat is noted; a run that fails its criterion is recorded as failed with its failure mode and is never repeated until it passes.
+
+[cols="1,4,3", options="header"]
+|===
+|Id |Pass criterion |Fallback when it fails
+
+|V1
+|The longest blocking time with the profile's configuration is at least 270 s (the default bounded wait of 240 s plus 30 s). `progress_resets_timeout` holds when a call with progress frames outlives twice the limit of a call without. Measured up to a cap of 3600 s.
+|`bounded_wait_seconds` of that host = limit − 30 s; shorter cycles.
+
+|V2
+|At least 200 consecutive cycles and two hours without a failure. Counted failure modes: stops, asks the user, narrates instead of calling, calls another tool.
+|The harness is not eligible as puller.
+
+|V3
+|Accuracy of the warm session within 5 percentage points of fresh sessions; the loop continues after a compaction without input.
+|Recycle the worker before the compaction point; when quality drops earlier, fresh jobs (W1).
+
+|V4
+|The session stays alive for two hours (V2), exits within 10 s of `SIGTERM` without orphaned processes, and a resumed session recalls a nonce of the stored one.
+|A warm worker (W2) or a resumed session (W4) is excluded for that harness.
+
+|V5
+|Recorded. Fresh jobs count as cheap enough when the median wall time of one minimal decision is at most 15 s and its median priced units are at most three times the marginal priced units of one task in a warm session.
+|A warm worker is needed.
+
+|V6
+|Recorded. The idle timeout is the point at which the accumulated idle cost equals one cold start.
+|–
+
+|V7
+|The harness output reports usage per turn with all four token components, every task gets figures of its own, and the sums reconcile with the run total within 1 %.
+|Usage per worker lifetime, apportioned; or fresh jobs (W1).
+
+|V8
+|No effect of an injected instruction on the clean tasks that follow it, in 15 warm runs (five variants, three repetitions).
+|Recycle the worker after a task that carried untrusted text.
+
+|V9
+|Every killed task is delivered again exactly once and submitted exactly once (ten kills), a late submit is refused, a tool added in mid-run is never callable, and never two writer tasks are out at the same time.
+|Fresh job per task, no binding that moves between tasks.
+
+|V10
+|As V2 in the interactive session; the loop continues by itself after an automatic compaction; after `/clear` the first call on the next input is the wait call.
+|The session is a viewer only, never the driver.
+|===
+
+Priced units follow the specification: `input + 5 × output + 0.1 × cache_read + 1.25 × cache_creation`.
+
+== Results
+
+_No measured run yet._ One table per verification is added here from `pull.py report`, with harness version, model, date, and for V1 the transport.
+
+[#observations]
+== Observations from building the tooling
+
+These come from short trial runs (seconds to two minutes, Claude Code 2.1.287 and OpenCode 1.18.32 with `claude-haiku-4-5`, 2026-10-01). They are not results of V1 to V10; they changed the tooling and name what the measured runs have to confirm.
+
+* *Claude Code calls without a session.* It sends `server/discover` and `subscriptions/listen`, never `initialize`, and every request arrives on a transient connection of its own. OpenCode opens a session (`initialize`, protocol `2025-11-25`, `clientInfo.name` `opencode`). A connection can therefore not bind a task to its worker on every host; the stub binds by an explicit `worker` argument.
+* *The server does not learn that a client dropped a held call.* A call abandoned by its client is held until its own end, its progress frames are written without an error, and the step it took from the queue is consumed. The abort time of V1 is therefore taken from the harness side (a `notifications/cancelled`, the harness reporting the call as ended, the model's next call). For the design this means that the bounded wait and leases, not the transport, bound how long a dead puller keeps its place.
+* *A silent call ended after about 60 s on both harnesses in a 90 s trial.* OpenCode sent `notifications/cancelled` with `MCP error -32001: Request timed out` after 60.0 s; Claude Code reported `The operation timed out` after about 61 s and sent no cancellation. With a progress frame every 5 s the Claude Code call outlived the 90 s of the trial. The stub held a silent call for 75 s against its own client, so the limit is the harness's. V1 measures this up to the cap and with the raised configuration.
+* *A harness that receives `SIGTERM` during a held call may send the call once more.* Claude Code sent a second `pull_wait` within 50 ms of the signal; the stub answered it and so consumed a step. V4 counts these calls.
+* *A tool allowlist with a wildcard admits a tool added in mid-run.* An OpenCode agent whose tool set named `pullstub_*` called the tool the stub registered later. The runs use explicit tool names; V9 tests whether that holds.
+* *Per-turn output tokens of Claude Code need partial messages.* The `assistant` events of `stream-json` carry the output tokens of the stream start; the final figure of a turn is in the `message_delta` events that `--include-partial-messages` adds. The headless runs set that flag.
+* *Antigravity has a headless mode.* `agy` 1.2 offers `-p` with `--output-format stream-json`, `--json-schema`, and `--conversation`, which the specification does not yet know (`headless: null` for `antigravity`). Whether it is usable for model jobs is a Part B question; the runs here test it as a puller.
+
+== Not yet measured
+
+* Everything: V1 to V10 on the three harnesses, headless and, for V1 and V10, interactive.
+* The same blocking times over `stdio` (Part B).
