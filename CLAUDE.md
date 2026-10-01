@@ -22,7 +22,7 @@ the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specifi
 |---|---|
 | `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
 
-Roadmap Milestone 0 creates the target module structure in one step (PM-IMPL-1 in
+Roadmap Milestone 1 creates the target module structure in one step (PM-IMPL-1 in
 `doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus daemon
 assembly), beside the aggregators `pm-modules` (library modules, with the nested `pm-providers`)
 and `pm-clients`. The only listing of the modules, their dependencies and the specification each
