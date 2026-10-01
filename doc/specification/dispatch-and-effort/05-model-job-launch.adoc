@@ -29,8 +29,8 @@ host model (main session)             pm-mcpd (daemon)                          
                                    model slot lease (machine cap, one writer per plan)
                                    pm-mcp-exec (process group, confinement, environment) --> claude -p … / codex exec …
  <-- facts + wait:<job_id> -------                                                            |
- pm_do(wait:<job_id>)                                                                         | pm_state / pm_do(entity) /
-                                   job-bound connection <-------------------------------------+ pm_build / pm_lsp / pm_skill
+ pm_do(wait:<job_id>)                                                                         | tools of the job's class,
+                                   job-bound connection <-------------------------------------+ resources (read-only)
                                    output parsed: result, usage, cost                         |
                                    fate: succeeded | failed | timed_out | killed <------------+ exit
                                    return-evaluation primitive on persisted records
@@ -55,7 +55,7 @@ The server composes the launch of every model job from server-owned inputs only;
 |The `headless` block of that harness's client profile: an argument-vector template with typed slots and declared capabilities (link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Profile Schema]); composed as an inline named agent or by per-call flags (<<agent-composition>>).
 
 |Working directory
-|The plan worktree when it exists, else the enrolled project checkout; for the screener an empty job-private directory (<<job-working-directory>>).
+|The plan worktree when it exists, else the enrolled project checkout; for the screener the empty `cwd/` subdirectory of its job-private directory (<<job-working-directory>>).
 
 |Model and effort
 |Role -> level -> the harness's ladder entry -> CLI flags; an operator model per role replaces the ladder's model (xref:03-escalation-roles-readers.adoc#effort-resolution[Effort Resolution to Harness Flags]).
@@ -85,11 +85,11 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |Class |Tools |Required capabilities
 
 |`writer`
-|The harness's file-reading, file-writing and shell tools, plus the `PM-MCP` tools of <<job-tool-sets>>.
+|The harness's file-reading, file-writing and shell tools and its MCP resource-reading tools (`headless.resource_tools`), plus the `PM-MCP` tools `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skill`, and `pm_skill_file`.
 |`per_call_mcp`, `tool_allowlist`
 
 |`read_only`
-|The harness's file-reading and search tools, plus the `PM-MCP` tools.
+|The harness's file-reading and search tools and its MCP resource-reading tools, plus the `PM-MCP` tools `pm_state`, `pm_do`, `pm_skill`, `pm_skill_file`, and `pm_lsp` limited to its read operations (no `pm_build`).
 |`per_call_mcp`, `tool_allowlist` (with a read-only tool set)
 
 |`zero_tool`
@@ -106,7 +106,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |Harness |`writer` and `read_only` |`zero_tool` (screener) |Notes
 
 |`claude`
-|Inline agent (`--agents '<json>'`, `--agent pm-job`), `--mcp-config` with `--strict-mcp-config`, `--json-schema`, `--no-session-persistence`, `--output-format stream-json`; `read_only` with the tools `Read`, `Grep`, `Glob` plus the `PM-MCP` tools
+|Inline agent (`--agents '<json>'`, `--agent pm-job`), `--mcp-config` with `--strict-mcp-config`, `--json-schema`, `--no-session-persistence`, `--output-format stream-json`; `read_only` with the tools `Read`, `Grep`, `Glob`, the resource-reading tools, and the `PM-MCP` tools of the class
 |`--tools ""`, `--strict-mcp-config`, `--setting-sources ""`, `--max-turns 1`, `--system-prompt-file`, `--json-schema`
 |Full support.
 
@@ -131,7 +131,9 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |No headless template; the support rule applies (`model_jobs.harness`).
 |===
 
-*Harness enrolment*: A harness executable is an enrolled host tool of the machine: `pm-mcp operator enrol-harness <client>` records its absolute path, the version its version probe reports, and its SHA-256 digest (link:../cli-and-security/02-credentials-and-operator.adoc#operator-enrol-harness[CLI, Coordination & Security Specification, Harness Enrolment]; store: link:../store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]). Before every launch the runtime verifies it without resolving (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Verify-Not-Resolve Execution Pipeline]). Because harnesses update themselves, a changed digest whose version probe reports a version within the profile's supported version range is accepted and audited (the new digest is recorded); a version outside the range refuses the job with `harness_version_unsupported`.
+*Harness enrolment*: A harness executable is an enrolled host tool of the machine: `pm-mcp operator enrol-harness <client>` records its absolute path, the version its version probe reports, and its SHA-256 digest (link:../cli-and-security/02-credentials-and-operator.adoc#operator-enrol-harness[CLI, Coordination & Security Specification, Harness Enrolment]; store: link:../store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]). Before every launch the runtime verifies it without resolving (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Verify-Not-Resolve Execution Pipeline]). Because harnesses update themselves, a changed digest whose version probe reports a version within the profile's supported version range is accepted and audited (the new digest is recorded); a version outside the range refuses the job with `harness_version_unsupported`. The enrolment records path, version, and digest only: `PM-MCP` never stores or exports a harness's authentication. The harness must already be logged in by its own login (cached under its home); a harness that is not logged in fails its job, with the fate of any failed job.
+
+*Tampered harness enrolment*: The harness enrolment store `harnesses.json` is verified against its HMAC sidecar before every launch. A mismatch refuses the model job (audit `security` record `enrolment_tampered`), and the job state raises `precondition_unmet` with the reason `harness_tampered`, naming `pm-mcp operator enrol-harness <client>`: the verb shows path, version, and digest and rewrites the file and its sidecar. The scope is not paused.
 
 [#agent-composition]
 === Agent Composition per Harness (`agent_mode`)
@@ -145,7 +147,13 @@ The `headless` block declares `agent_mode: inline | flags`, the typed slots `{{p
 [#job-tool-sets]
 === Tool Sets
 
-The tool set of a job is the class's host tools (<<harness-selection>>) and, for `writer` and `read_only`, the `PM-MCP` tools `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skill`, and `pm_skill_file`, rendered into `{{tools}}` and enforced a second time by the daemon on the job connection (<<job-token>>). Never in a tool set: the harness's sub-agent tool (`Agent`, `task`, `spawn_agent`), a tool that asks the user, the web tools, and every operator action or scope-creating link. The harness allowlist is defence in depth; the containment is the daemon's per-request binding.
+The tool set of a job is the class's host tools (<<harness-selection>>) and the `PM-MCP` tools of its class, rendered into `{{tools}}` and enforced a second time by the daemon on the job connection (<<job-token>>):
+
+* *`writer`*: `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skill`, and `pm_skill_file`.
+* *`read_only`*: `pm_state`, `pm_do`, `pm_skill`, `pm_skill_file`, and `pm_lsp` limited to its read operations: `rename` is refused with `invalid_arguments`. `pm_build` is not in the set.
+* *`zero_tool`*: none.
+
+The host tools of `writer` and `read_only` include the harness's MCP resource-reading tools, which the profile names in `headless.resource_tools` (link:../client-profiles/01-profile-schema.adoc#headless-block[Client Profiles Specification, Profile Schema]; an empty list means the harness offers none and its jobs read no resources); they are never in the `zero_tool` set. Never in a tool set: the harness's sub-agent tool (`Agent`, `task`, `spawn_agent`), a tool that asks the user, the web tools, and every operator action or scope-creating link. The harness allowlist is defence in depth; the containment is the daemon's per-request binding.
 
 [#job-token]
 === Job-Bound Capability & Connection Binding
@@ -154,7 +162,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 A job never receives the runtime token (link:../runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]). It connects back through a capability of its own:
 
 1. *Job token*: At spawn the server mints a random 256-bit job token, stores only its SHA-256 in the job record, and revokes it with the job's fate. The job's MCP configuration starts the relay `pm-mcp serve --job` with the token in the relay's environment variable `PM_MCP_JOB_TOKEN` and the daemon's socket path as a relay argument (a job cannot read `state/runtime.json` under `<PM_MCP_BASE>`, link:../runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); the relay sends it as the header `PM-MCP-Job-Token` instead of the runtime token (link:../runtime-model.adoc[Runtime & Interaction Model Specification]), and the daemon accepts the header on `/mcp` only.
-2. *Per-request binding*: The daemon resolves the job from the token's digest on every request (stateless; no connection state) and enforces: the scope arguments (`plan_id`, `epic_id`, or `NO_PLAN`) and `entity` equal the job's, else `job_scope_mismatch`; `tools/list` and every call are limited to the tool set of <<job-tool-sets>>; `pm_do` admits only links of the job's entity and never a link that enters a `job llm` state. A request carrying the token of an ended job is refused `job_ended`.
+2. *Per-request binding*: The daemon resolves the job from the token's digest on every request (stateless; no connection state) and enforces: the scope arguments (`plan_id`, `epic_id`, or `NO_PLAN`) and `entity` equal the job's, else `job_scope_mismatch`; `tools/list` and every call are limited to the tool set of <<job-tool-sets>>; `resources/list` and `resources/read` work as in a session, read-only, for every resource of the job's own project and `skill://pm/…` (the project boundary is the only read boundary, link:../mcp-tools/03-resource-uris.adoc[MCP Tools Specification, Resource URIs]); `pm_do` admits only links of the job's entity and never a link that enters a `job llm` state. A request carrying the token of an ended job is refused `job_ended`.
 3. *No session*: A job connection appends no session row, triggers no client handover, and takes its client profile from the job record; every audit row it causes carries the `job_id`. The first accepted request records `connected_at` in the job record.
 4. *Strict MCP configuration*: The per-call MCP configuration is exclusive, so only the job relay connects (`--strict-mcp-config`; Codex `-c mcp_servers.<host entry>.enabled=false`; OpenCode an inline configuration that replaces `mcp`). The hooks and entry commands of the `PM-MCP` client bundle exit at once when `PM_MCP_JOB_ID` is set (link:../cli-and-security/01-cli-and-installer.adoc#session-start-hook[CLI, Coordination & Security Specification, Session-Start Hook]), so the host's own integration never starts inside a job.
 
@@ -164,7 +172,7 @@ The Milestone 1 host spikes verify per harness that its local MCP command receiv
 === Working Directory, Project Files & Screener Isolation
 
 * *`writer` and `read_only` jobs*: The process working directory is the plan worktree when the plan has one, else the enrolled project checkout (for the workspace, an epic, and a plan without worktree), by the working-directory rule of every job (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_verify_not_resolve_execution_pipeline[Job Runtime Specification, Working Directory Selection]). The harness loads the project's own instructions and skills natively from there (for example `CLAUDE.md`, `AGENTS.md`, project skill directories). No prompt field names a worktree, and the client profile declares no working-directory property.
-* *The screener*: runs in an empty directory inside its job-private directory (<<job-prompt>>), with project and user settings off where the harness offers it (`--setting-sources ""`; Codex `--ignore-user-config --ignore-rules`; OpenCode an inline configuration that replaces everything), so no project file and no project skill reaches it; its prompt is the server-fixed screener prompt only.
+* *The screener*: runs in the empty `cwd/` subdirectory of its job-private directory (<<job-prompt>>), which it can read and never write, with project and user settings off where the harness offers it (`--setting-sources ""`; Codex `--ignore-user-config --ignore-rules`; OpenCode an inline configuration that replaces everything), so no project file and no project skill reaches it; its prompt is the server-fixed screener prompt only.
 
 [#model-slots]
 === Model Slots & One Writer per Plan
@@ -173,7 +181,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 * *Machine cap*: Model jobs run under a machine lease store `model-slots.json` beside `build-slots.json` (link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas Specification, Machine Lease Stores]), with the cap `model_slots` in `machine-config.json` (link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas Specification, Machine Configuration]; default and bounds: link:../timeouts/02-runtime-leases-operator-web.adoc#model-slot-lease[Timeouts & Budgets Specification, Model slot lease]). Admission is FIFO in submission order; stale slots are reaped in the admission transaction as build slots are.
 * *Queued*: A job waiting for a slot has the job record status `queued`; its budget starts at spawn, so the time in the queue never counts against it (link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]).
 * *One writer per plan*: At most one `writer` job of a plan runs or is queued at a time (serial envelopes: they share one worktree, one chain-tail commit, and one module build, xref:01-task-envelopes.adoc#envelope-early-end[Early End of the Entity]); `read_only` and `zero_tool` jobs of the plan run beside it within the machine cap.
-* *Fan-out*: A state that needs one job per item (architecture enrichment: one job per module) submits all of them at once; the slots bound how many run.
+* *Fan-out*: A `job llm … each …` state (link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States]) starts one job per element of its server-computed list (architecture enrichment: one job per module; a screening batch above the split bound: one job per part) and submits all of them at once; the slots bound how many run.
 
 [#job-prompt]
 === Prompt File & Contract Envelope
@@ -181,7 +189,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 
 The server hands a job everything it needs in one prompt file and decides exactly what the job knows; the job starts working without loading anything.
 
-* *Job-private directory*: The runtime creates `pm-mcp-job-<job_id>/` in the system temporary directory inside the job's write set (mode `0700`) before spawn and removes it when the job settles. It holds the prompt file (`0600`), the rendered result schema, and, for the screener, the empty working directory. The prompt file's SHA-256 is the job record's `prompt_digest`.
+* *Job-private directory*: The runtime creates `<PM_MCP_BASE>/run/jobs/<job_id>/` (mode `0700`, files `0600`; link:../filesystem-layout.adoc[Filesystem Layout Specification, Job-Private Directories]) before spawn and removes it when the job settles. It holds the prompt file, the rendered result schema, the per-call MCP configuration (none for the screener), and, for the screener, the empty working directory `cwd/`. The job reads its own directory, the one exception to the rule that a job never reads `<PM_MCP_BASE>`; no job can write there, so nothing the daemon trusts lies in a job-writable place. The prompt file's SHA-256 is the job record's `prompt_digest`.
 * *Content, in this order*: (1) the core conduct skill `skill://pm/core/SKILL.md`; (2) the persona, flattened by the server from its `composes:` and `profiles:` graph (cycles rejected); (3) the role's skills; (4) the state's `skill` clauses and, for a task envelope, the union of its tasks' `skills[]` (xref:01-task-envelopes.adoc#_deterministic_envelope_packing_algorithm_envelopepacker[Deterministic Envelope Packing Algorithm]); (5) the contract envelope. Skills are rendered in-band up to the compiled prompt in-band bound (link:../timeouts/03-retention-host-config.adoc#prompt-in-band-bound[Timeouts & Budgets Specification, Prompt in-band skill bound], provisional until the Milestone 1 spikes); above it, the remaining skills are rendered as their section index with the URIs that `pm_skill` serves (link:../mcp-tools/02-service-and-skill-tools.adoc[MCP Tools Specification, Service & Skill Tools]).
 * *Contract envelope*: `job_id`; the scope (`plan_id`, `epic_id`, or `NO_PLAN`) and `entity`; the first call (`pm_state` with that scope and entity); the links the entity offers with their named parameter schemas (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]); the job's result schema; and the rule that deliverables are recorded only through the entity's `submit` links.
 * *Result*: The job's final structured output is only `job-result` `{status, display_detail}` (xref:02-dispatch-observability-and-spend.adoc#job-result-schema[Job Result & Usage Parsing]); a deliverable is never taken from it.
@@ -191,6 +199,6 @@ The server hands a job everything it needs in one prompt file and decides exactl
 [#job-environment-and-budget]
 === Environment, Confinement & Budget
 
-A model job is confined like every job of its project (link:../job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification, Linux Filesystem Confinement]): no access to `<PM_MCP_BASE>`, writes only to the project root, the job-private directory in the system temporary directory, and the harness homes its profile declares (`headless.writable_paths`), with network access for the harness's model provider. Its environment holds the rows of every job, the harness authentication variables the profile declares in `headless.env_passthrough` (only when captured at the harness enrolment; their values are read from the credential store entry `harness-<client_id>`), and `PM_MCP_JOB_TOKEN` and `PM_MCP_JOB_ID` as the only `PM-MCP` values (link:../job-runtime/02-confinement-and-environment.adoc#_job_environment_pm_sec_5[Job Runtime Specification, Job Environment]). The job reads the harness's own authentication and never a `PM-MCP` credential.
+A model job is confined like every job of its project (link:../job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification, Linux Filesystem Confinement]): no access to `<PM_MCP_BASE>` beyond read access to its own job-private directory (<<job-prompt>>), and writes only to the write set of every job and the harness sub-paths its profile declares (`headless.writable_paths`), with network access for the harness's model provider. `headless.writable_paths` lists only what a headless harness must write to run (its login or credential file, caches, the session directory) and never a settings or hook file that the bundle manifest manages (link:../client-profiles/01-profile-schema.adoc#headless-block[Client Profiles Specification, Profile Schema]), so a model job cannot change the host's `PM-MCP` integration; the operator's own session and the bundle installer in `pm-mcpd` are not restricted by it. Its environment holds the rows of every job and `PM_MCP_JOB_TOKEN` and `PM_MCP_JOB_ID` as the only `PM-MCP` values (link:../job-runtime/02-confinement-and-environment.adoc#_job_environment_pm_sec_5[Job Runtime Specification, Job Environment]); no harness authentication variable is captured, stored, or exported by `PM-MCP`. The job uses the harness's own login, cached under the harness home, and never a `PM-MCP` credential.
 
 Every model job runs under the job budget of its role, learned per role with a floor default (link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]); budget expiry, `cancel:<job_id>`, and drain end it through the termination protocol of every job (link:../job-runtime/01-pipeline-and-subprocesses.adoc#_process_termination_cancellation_protocol[Job Runtime Specification, Process Termination & Cancellation Protocol]).

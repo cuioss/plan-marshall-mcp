@@ -127,7 +127,7 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
 [source,text]
 ----
 ~/.plan-marshall-mcp/                    # <PM_MCP_BASE>: PM-MCP instance directory (mode 0700)
-├── machine-config.json                  # Build and model slot caps, warm LSP pool defaults, project_defaults (mode 0600)
+├── machine-config.json                  # Slot caps, LSP pool, client-profile connection overrides, proxy, project_defaults (mode 0600)
 ├── harnesses.json                       # Enrolled harness CLIs of model jobs: path, digest, version (mode 0600)
 ├── harnesses.json.hmac                  # HMAC-SHA-256 sidecar of harnesses.json (mode 0600)
 ├── enrolments/                          # Operator enrolments, one file per project (mode 0700)
@@ -135,14 +135,9 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
 │   └── <project_id>.json.hmac           # HMAC-SHA-256 sidecar of that file, written with every enrolment write (mode 0600)
 │
 ├── credentials/                         # Token-lane file credential fallback (PM-CRED-3, mode 0700)
-│   ├── <credential_key>.json            # Global entry (e.g. workflow-integration-sonar.json, mode 0600)
+│   ├── <credential_key>.json            # Global entry (e.g. sonar.json, mode 0600)
 │   └── <project>/
 │       └── <credential_key>.json        # Project-scoped override (mode 0600)
-│
-├── conf/                                # Operator-owned configuration overrides
-│   ├── upstream-mcp.json                # Selective upstream MCP proxy configuration
-│   └── profiles/                        # Optional machine-wide client profile overrides
-│       └── <client_id>.json
 │
 ├── projects/                            # Per-project machine stores (mode 0700, see below)
 │   └── <project_id>/                    # One store per enrolled project: plans, archive, lessons, ...
@@ -155,13 +150,13 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
 │   ├── review-bot-windows.json          # Per-bot cross-plan rate-window claims
 │   ├── web-devices.json                 # Paired web devices: device_id, label, secret hash, timestamps (mode 0600)
 │   ├── enrolment-hmac.key               # Enrolment HMAC key, only on hosts without an OS keyring (mode 0600)
-│   └── runtime.json                     # Runtime record: pid, start instant, version, effective socket path
-│                                        # (default or $TMPDIR fallback), written at socket bind
+│   └── runtime.json                     # Runtime record: pid, start instant, version, listener, socket path; written at socket bind
 │
-├── run/                                 # Runtime directory (mode 0700); like all of <PM_MCP_BASE> outside every job's Landlock read set
+├── run/                                 # Runtime directory (mode 0700); outside every job's Landlock read set, except jobs/<job_id>/ for its own model job
 │   ├── runtime.token                    # Runtime token, rewritten at every runtime start before bind (mode 0600)
-│   ├── runtime.sock                     # Unix domain socket of the runtime (mode 0600); if this path
-│   │                                    # exceeds sun_path, $TMPDIR/pm-mcp-<hash>/runtime.sock instead
+│   ├── runtime.sock                     # Unix domain socket of the runtime (mode 0600); a path over sun_path refuses the start
+│   ├── jobs/                            # Job-private directories of model jobs (mode 0700)
+│   │   └── <job_id>/                    # Server-composed launch files (0600) and cwd/; read-only for its own job, removed at fate
 │   └── web.json                         # Process record of the running web server pm-mcp-web (mode 0600)
 │
 ├── web/                                 # Web server files (mode 0700)
@@ -192,12 +187,12 @@ The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `File
     └── audit.head                       # HMAC-anchored head: file, record count, last event_id, head hash
 ----
 
-The Linux Landlock write set of a job contains only its own project root (with its worktrees and `.marshall/local/temp/`), the declared toolchain caches, `/tmp`, and `/dev`, and for a model job (kind `llm`) additionally the harness home directories its client profile declares (`headless.writable_paths`, for example `~/.claude` or `~/.codex`), with network access allowed; it never contains `<PM_MCP_BASE>`, including `projects/`, or another enrolled project's root (`PM-SEC-5`): jobs never write the machine stores. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); `pm-mcp-web` writes only its own files, which are not stores: its process record `run/web.json` and its TLS material in `web/tls/` (link:store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]). The Landlock read set of jobs is the whole filesystem except all of `<PM_MCP_BASE>`, so on Linux with Landlock ABI >= 2 no job reads the runtime token, a credential file, an enrolment, or another project's machine store; on macOS and on Linux without Landlock a job can read `<PM_MCP_BASE>` like any process of the user; the installation directory `<PM_MCP_HOME>` stays readable (link:job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]). A model job reaches the runtime only through its job relay `pm-mcp serve --job`, which connects to the runtime socket (`run/runtime.sock` or its fallback path) with the job token from its environment and never reads `run/runtime.token` (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]).
+The Linux Landlock write set of a job contains only its own project root (with its worktrees and `.marshall/local/temp/`), the declared toolchain caches, `/tmp`, and `/dev`, and for a model job (kind `llm`) additionally the paths its client profile declares in `headless.writable_paths`: only the sub-paths of the harness home that the headless harness must write to run (its login or credential file, its caches, its session directory; the concrete paths are _(provisional)_ until the Milestone 1 host spikes confirm them), never a settings or hook file that the bundle manifest manages, with network access allowed; it never contains `<PM_MCP_BASE>`, including `projects/` and `run/jobs/`, or another enrolled project's root (`PM-SEC-5`): jobs never write the machine stores, and nothing the daemon trusts lies in a job-writable place. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>`; the CLI and `pm-mcp-web` write none (link:runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]); `pm-mcp-web` writes only its own files, which are not stores: its process record `run/web.json` and its TLS material in `web/tls/` (link:store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]). The Landlock read set of jobs is the whole filesystem except all of `<PM_MCP_BASE>`, with one exception: a model job reads its own job-private directory (<<job-private-directories>>), so on Linux with Landlock ABI >= 2 no job reads the runtime token, a credential file, an enrolment, or another project's machine store; on macOS and on Linux without Landlock a job can read `<PM_MCP_BASE>` like any process of the user; the installation directory `<PM_MCP_HOME>` stays readable (link:job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]). A model job reaches the runtime only through its job relay `pm-mcp serve --job`, which connects to the runtime socket `run/runtime.sock` with the job token from its environment and never reads `run/runtime.token` (link:runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]).
 
 [#job-private-directories]
-=== Job-Private Directories (`$TMPDIR/pm-mcp-job-<job_id>/`)
+=== Job-Private Directories (`<PM_MCP_BASE>/run/jobs/<job_id>/`)
 
-Every model job gets one job-private directory `$TMPDIR/pm-mcp-job-<job_id>/` (the system temporary directory, inside every job's write set; mode `0700`, owned by the effective UID; created by the runtime at the job's spawn and removed after its fate is recorded, and removed by the project's recovery for a job recorded `killed`). It holds only what the server composes for the launch, never state: the system-prompt file (the core conduct skill, the role and state skills in-band, and the contract envelope), the result schema, and, except for the screener, the MCP configuration that starts the job relay (mode `0600`). The screener's working directory is the empty subdirectory `cwd/` of it, outside every project tree, so no project or user instruction file of the harness reaches it; every other model job runs in the plan worktree or the project checkout (<<worktree-lifecycle>>).
+Every model job gets one job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (mode `0700`, its files `0600`, owned by the effective UID; created by the runtime at the job's spawn and removed after its fate is recorded, and removed by the project's recovery for a job recorded `killed`). No job can write it: it lies under `<PM_MCP_BASE>`, outside every Landlock write set. The job it belongs to, and no other job, gets read access to it, the one explicit exception to "jobs never read `<PM_MCP_BASE>`" (link:job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification, Read set]). Nothing of a launch lies in the system temporary directory, which every job can write. It holds only what the server composes for the launch, never state: the system-prompt file (the core conduct skill, the role and state skills in-band, and the contract envelope), the result schema, and, except for the screener, the MCP configuration that starts the job relay (mode `0600`). The screener's working directory is the empty subdirectory `cwd/` of it, read-only for the screener like the rest of the directory and outside every project tree, so no project or user instruction file of the harness reaches it; every other model job runs in the plan worktree or the project checkout (<<worktree-lifecycle>>).
 
 === File Permissions & Security Attributes
 
@@ -225,7 +220,7 @@ The runtime creates every file under `<PM_MCP_BASE>` with mode `0600` and every 
 
 |`<PM_MCP_BASE>/harnesses.json` and `harnesses.json.hmac`
 |`0600` (`-rw-------`)
-|Enrolled harness CLIs of model jobs (path, digest, version, and the names of the captured authentication variables; their values live only in the credential store), written only by the runtime on `pm-mcp operator enrol-harness` and on an accepted self-update, verified with its HMAC sidecar before every model-job spawn (link:store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]).
+|Enrolled harness CLIs of model jobs (path, digest, version, and nothing else: no environment value and no credential), written only by the runtime on `pm-mcp operator enrol-harness` and on an accepted self-update, verified with its HMAC sidecar before every model-job spawn; a mismatch refuses the model job (`harness_tampered` on its state) until `enrol-harness` re-baselines the file (link:store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]).
 
 |`<PM_MCP_BASE>/state/enrolment-hmac.key`
 |`0600` (`-rw-------`)
@@ -245,11 +240,15 @@ The runtime creates every file under `<PM_MCP_BASE>` with mode `0600` and every 
 
 |`<PM_MCP_BASE>/run/runtime.token`
 |`0600` (`-rw-------`), no symlink
-|The runtime token of the running instance (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), written atomically at every start before the socket is bound; format in link:store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification]. Stays in `run/` also when the socket uses the fallback path. Never in a job's Landlock read set, never in a log or job environment.
+|The runtime token of the running instance (link:runtime-model.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), written atomically at every start before the socket is bound; format in link:store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification]. Never in a job's Landlock read set, never in a log or job environment.
 
-|`<PM_MCP_BASE>/run/runtime.sock`, or the fallback `$TMPDIR/pm-mcp-<hash>/runtime.sock`
-|`0600` (`srw-------`) in a `0700` directory owned by the effective UID
-|Only listener of the runtime (`PM-SEC-4`). The fallback is bound when the default path would exceed the platform's `sun_path` limit (104 bytes including NUL on macOS, 108 on Linux); `<hash>` is the first 16 hex characters of SHA-256 of `PM_MCP_BASE`, the directory is refused unless owned by the effective UID with mode `0700`, and the effective path is recorded in `state/runtime.json` (link:runtime-model.adoc#_singleton_discovery[Runtime & Interaction Model Specification, Singleton & Discovery]).
+|`<PM_MCP_BASE>/run/runtime.sock`
+|`0600` (`srw-------`) in the `0700` directory `run/`
+|Only listener of the runtime (`PM-SEC-4`); it has no other location. A path over the platform's `sun_path` limit (104 bytes including NUL on macOS, 108 on Linux) makes the runtime refuse to start with a diagnostic naming the path and telling the operator to choose a shorter `PM_MCP_BASE` (link:runtime-model.adoc#_singleton_discovery[Runtime & Interaction Model Specification, Singleton & Discovery]).
+
+|`<PM_MCP_BASE>/run/jobs/<job_id>/`
+|`0700` (`drwx------`), files `0600`
+|Job-private directory of one model job (<<job-private-directories>>): written only by the runtime, readable by its own job only, writable by no job.
 
 |`<PM_MCP_BASE>/logs/audit.jsonl`
 |`0600` (`-rw-------`)
@@ -306,17 +305,19 @@ All server-owned state of one project lives in its per-project machine store `<P
 ├── workspace/                           # Workspace scope home
 │   ├── change-ledger.jsonl              # Ledger rows of plan-less service calls (pm_build with plan_id NO_PLAN)
 │   ├── findings.jsonl                   # Findings of plan-less builds
+│   ├── metrics.json                     # Model-job and served-content rows of the workspace scope (phase null)
 │   ├── questions.jsonl                  # Question records of the workspace scope (setup choices of team configuration)
 │   ├── screen-verdicts.jsonl            # Screen verdict cache of the workspace scope and its bootstrap entities
 │   ├── sessions.jsonl                   # Session log of the workspace scope (same append exception)
 │   └── mcp/
 │       ├── digests.json                 # Store size/SHA-256 sidecar (pending entry records included)
-│       ├── status.json                 # FSM state of the hosted workflows (project-setup, lessons)
+│       ├── status.json                 # FSM state of project-setup and the sub-workflows it calls (lessons)
 │       └── transaction-journal.json     # Transaction journal while a write is in flight
 │
 ├── epics/                               # Non-tracked state of the epics (the ledger itself is git-tracked)
 │   └── <epic_id>/
 │       ├── digests.json                 # Store size/SHA-256 sidecar
+│       ├── metrics.json                 # Model-job and served-content rows of the epic scope (phase null)
 │       ├── questions.jsonl              # Question records of the epic scope
 │       ├── screen-verdicts.jsonl        # Screen verdict cache of the epic scope
 │       ├── sessions.jsonl               # Session log of the epic scope (same append exception)
@@ -344,7 +345,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 │
 ├── derived-facts.json                   # Cache of derived facts (Store Schemas § Derived Facts Store); deletable
 ├── store.json                           # Store identity: project_id and the project_root it was created for
-└── local-config.json                    # Operator posture of this project (Store Schemas § Operator Local Configuration)
+└── local-config.json                    # Operator posture of this project, upstream MCP allowlist included (Store Schemas § Operator Local Configuration)
 ----
 
 * *Never Moved*: A plan directory is created by the `start.create-scope` transaction of the plan bootstrap in `plans/<plan_id>/` and stays there until `archive-plan` moves it to `archive/<plan_id>/` (a rename within the same store directory) or `delete-plan` removes it. No worktree creation, worktree removal, or finalize step moves it.
@@ -358,7 +359,7 @@ All server-owned state of one project lives in its per-project machine store `<P
 Every enrolled project has exactly one workspace scope (`PM-ARCH-4`), addressed in a tool call as `plan_id: NO_PLAN` (link:identifiers/01-general-rules-and-registry.adoc#id-no-plan[Identifier Registry, `NO_PLAN`]) and resolved from the `PM-MCP-Workspace` header of the request (link:runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata). Its home is `workspace/` in the project's machine store:
 
 * *No Worktree, No Archive*: The workspace scope has no worktree and no archive; its home stays in the machine store for the life of the enrolment.
-* *Contents*: `mcp/status.json` (the FSM state of the workflows the workspace hosts, `project-setup` and the lesson maintenance `lessons`, link:domain-extensions.adoc[Domain Extensions Specification]; the bootstrap entities it hosts keep their state in their pending entry records in `pending/`), `screen-verdicts.jsonl` (the screen verdict cache of the workspace scope and its bootstrap entities), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), `findings.jsonl` (the findings of plan-less builds), and `questions.jsonl` (the question records of team-configuration setup choices). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status`, `pm://workspace/findings`, and `pm://workspace/questions` project the three stores (link:mcp-tools.adoc[MCP Tools Specification]).
+* *Contents*: `mcp/status.json` (the FSM state of the workflow the workspace hosts, `project-setup`, with the lesson maintenance sub-workflow `lessons` it calls, link:domain-extensions.adoc[Domain Extensions Specification]; the bootstrap entities it hosts keep their state in their pending entry records in `pending/`), `screen-verdicts.jsonl` (the screen verdict cache of the workspace scope and its bootstrap entities), `sessions.jsonl` (the session log, appended by `pm-mcp enter … workspace` and by the server), `mcp/digests.json` (the store digest sidecar), `change-ledger.jsonl` (the ledger rows of plan-less service calls, `pm_build` with `plan_id: NO_PLAN`), `findings.jsonl` (the findings of plan-less builds), `metrics.json` (the model-job and served-content rows of the workspace scope, link:store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]), and `questions.jsonl` (the question records of team-configuration setup choices). Build and job logs of the workspace scope lie in `jobs/` of the project's machine store, next to their records, and are addressed as `pm://workspace/builds/{job_id}/log`; `pm://workspace/status`, `pm://workspace/findings`, and `pm://workspace/questions` project the three stores (link:mcp-tools.adoc[MCP Tools Specification]).
 * *Lock*: Every write to the workspace home takes `locks/workspace.lock` of the project's machine store, the first lock of the one total order (workspace -> plan locks -> epic locks -> `epics-worktree` -> `lessons` -> `local-config` -> `derived-facts` -> `build-timings` -> machine store locks -> leaf locks, link:store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]), and runs as a journaled transaction (`mcp/transaction-journal.json`, link:store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas Specification, Transaction Journal]).
 
 [#archives]
@@ -401,5 +402,5 @@ _Implementation watch: link:../implementation-watch/dispatch-and-effort.adoc#PM-
 `PM-MCP` is built out in parallel to legacy `plan-marshall` and shares no state tree with it:
 
 1. *Separate State Trees (`PM-MIG-2`)*: `PM-MCP` owns `.marshall/` per repository and `<PM_MCP_BASE>` (with the per-project machine stores) per machine; legacy `plan-marshall` keeps `.plan/` and `~/.plan-marshall/`. Both may be installed on one machine and used in the same repository. `PM-MCP` runs no legacy script, holds no lock of the legacy tree, and never reads or writes it, without exception; legacy `plan-marshall` never reads or writes the `PM-MCP` trees.
-2. *Clean Slate & Enrolment (`PM-MIG-1`, `PM-MIG-2`)*: `PM-MCP` imports nothing from legacy `plan-marshall`: no configuration, lessons, `project-architecture/`, credentials, or learned build timeouts. `pm-mcp operator enrol` creates the project's machine store and its workspace scope; the first run of the project setup workflow creates `.marshall/` and `.marshall/config/` with the copies of the default workflow units. Legacy plans and epics are never taken over; they finish in `plan-marshall`. The plan lifecycle is offered in an enrolled project once the lifecycle gate has opened (`PM-MIG-4`).
+2. *Clean Slate & Enrolment (`PM-MIG-1`, `PM-MIG-2`)*: `PM-MCP` imports nothing from legacy `plan-marshall`: no configuration, lessons, `project-architecture/`, credentials, or learned build timeouts. `pm-mcp operator enrol` creates the project's machine store and its workspace scope; the first run of the project setup workflow creates `.marshall/` and `.marshall/config/` with the copies of the default workflow units. Legacy plans and epics are never taken over; they finish in `plan-marshall`. The plan lifecycle is offered in an enrolled project once the lifecycle gate is open, a compiled constant of the release (`PM-MIG-4`); while it is closed, only in a project enrolled as a pilot (`pm-mcp operator enrol --pilot`, link:cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification, Lifecycle gate]).
 3. *Release (`PM-MIG-5`)*: `pm-mcp operator release-project` is the operator's switch-off for the `PM-MIG-5` triggers and stops offering the plan lifecycle for a project; plans in flight stay readable in the project's machine store and nothing is converted. The project can continue on legacy `plan-marshall`, whose `.plan/` `PM-MCP` never touched.

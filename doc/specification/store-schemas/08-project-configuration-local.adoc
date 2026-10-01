@@ -94,10 +94,11 @@ _Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM
 
 Operator posture and machine-local bindings of one project, written only through the operator channel (`pm-mcp operator config --project <project_id>`, or an elicitation link of the setup workflow), never by the model. Sparse like the team files; each key of `$defs/settings` falls back to `machine-config.json` `project_defaults` and then to the compiled default. `$defs/settings` is shared with `project_defaults` (xref:12-machine-stores.adoc#machine-config[Machine Configuration Store (`<PM_MCP_BASE>/machine-config.json`)]).
 
-Two keys are per project only, outside `$defs/settings`, with neither a machine-wide default nor a compiled default:
+Three keys are per project only, outside `$defs/settings`, with neither a machine-wide default nor a compiled default:
 
 * `integrations.<integration>.variant` (`native` or `cli`) for the integrations `git`, `github`, and `gitlab`, set in `setup.select-integration-variants` (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions Specification, Integration Variants]). The setup applies `native` without asking unless the derived fact `git_native_capability` finds a feature the project uses that the native variant cannot serve; only then is the choice required, and it is taken through the operator channel only (elicitation where the connection supports it, otherwise `pm-mcp operator config --project <project_id>`, named in the state's `facts`), never as a question record and never from a model-relayed answer. One value holds for every operation of the integration; there is no per-operation or per-family override. An entry that is absent while the choice is required means undecided, and every operation of that integration refuses with `integration_variant_unset`. A `cli` value requires the integration's host tool (`git`, `gh`, `glab`) in the project's enrolment (xref:11-enrolment-store.adoc#enrolment-store[Project Enrolment Store (`<PM_MCP_BASE>/enrolments/<project_id>.json`)]), otherwise the finding `cli_tool_not_enrolled`. Sonar has no entry: it has only the native variant. The effective value carries `source: operator` and enters `config_hash`; it is served on demand by the operator surfaces (`pm-mcp operator config --project <project_id>`, `pm-mcp status`, `pm://project/config`) and never pushed into a representation or tool result (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 * `commit_identity {name, email}`: the author of every server commit (the operator, who is responsible for the change), captured in `setup.select-integration-variants` through the operator channel only, like the variant choice; the committer is the agent identity resolved from the provider credential (derived fact `agent_identity`), else the fixed `plan-marshall-mcp` noreply identity (link:../domain-extensions/04-setup-state-machine.adoc#setup-verify-credentials[Domain Extensions Specification, Credential Verification]). While it is absent, a commit refuses with `identity_missing`. The `commit_trailer` below stays a separate key.
+* `upstream_mcp`: the upstream MCP allowlist of the project (`PM-SVC-3`, link:../mcp-tools/02-service-and-skill-tools.adoc#_selective_upstream_mcp_proxy_meta_provenance_pm_svc_3[MCP Tools Specification, Selective Upstream MCP Proxy]): per `server_id` the server's HTTPS `url`, its credential key `mcp-<server_id>` where the server is authenticated, the re-exposed tools, and the call timeouts. Its only writer is the operator verb `pm-mcp operator upstream allow|deny` (the runtime writes under `local-config.lock`); `pm-mcp operator config` does not change it, and repository content never adds a server or a tool. Upstream servers are remote HTTPS servers reached through `cui-http`; there is no `stdio` subprocess variant. Absent means no upstream server.
 
 [source,json]
 ----
@@ -127,6 +128,30 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
       "properties": {
         "name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^<>\\r\\n]+$" },
         "email": { "type": "string", "maxLength": 254, "pattern": "^[^<>\\s@]+@[^<>\\s@]+$" }
+      }
+    },
+    "upstream_mcp": {
+      "type": "object",
+      "required": ["servers"],
+      "additionalProperties": false,
+      "description": "Upstream MCP allowlist of the project (PM-SVC-3); written only on pm-mcp operator upstream allow|deny; absent means no upstream server.",
+      "properties": {
+        "servers": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9]{0,15}$", "description": "server_id (identifiers.adoc)" },
+          "additionalProperties": {
+            "type": "object",
+            "required": ["url", "tools"],
+            "additionalProperties": false,
+            "properties": {
+              "url": { "type": "string", "format": "uri", "pattern": "^https://", "description": "Remote HTTPS endpoint of the upstream server, called through cui-http; the only transport." },
+              "credential_key": { "type": "string", "pattern": "^mcp-[a-z][a-z0-9]{0,15}$", "description": "Present for an authenticated server and then equal to mcp-<server_id> (identifiers.adoc, credential_key); absent: the server is called without a credential." },
+              "tools": { "type": "array", "uniqueItems": true, "description": "The upstream tools re-exposed as up_<server_id>_<tool>; a tool not listed is not reachable.", "items": { "type": "string", "pattern": "^[a-z0-9_]{1,44}$" } },
+              "connect_timeout_seconds": { "type": "integer", "minimum": 1, "default": 10, "description": "timeouts.adoc, Outbound HTTPS and upstream MCP call timeouts." },
+              "read_timeout_seconds": { "type": "integer", "minimum": 1, "default": 60, "description": "timeouts.adoc, Outbound HTTPS and upstream MCP call timeouts." }
+            }
+          }
+        }
       }
     }
   },
@@ -258,8 +283,8 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
         },
         "derivation_resolvers": {
           "type": "object",
-          "description": "Axis-C resolver enablement; an absent entry means enabled, only an explicit false disables a resolver.",
-          "propertyNames": { "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+          "description": "Axis-C resolver enablement; an absent entry means enabled, only an explicit false disables a resolver. The resolver project-script has no entry: the enrolment of an edge_resolver project script is its enablement.",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9-]{0,31}$", "not": { "const": "project-script" } },
           "additionalProperties": {
             "type": "object",
             "required": ["enabled"],
@@ -274,7 +299,7 @@ Two keys are per project only, outside `$defs/settings`, with neither a machine-
           "properties": {
             "job_logs_days": { "type": "integer", "minimum": 0, "default": 5 },
             "archived_plans_days": { "type": "integer", "minimum": 0, "default": 5 },
-            "superseded_lessons_days": { "type": "integer", "minimum": 0, "default": 0 },
+            "retired_lesson_bodies_days": { "type": "integer", "minimum": 0, "default": 0, "description": "Age after which the body of a retired lesson is purged, whatever the retirement's verdict; its front matter is kept." },
             "arch_constraint_quiet_days": { "type": "integer", "minimum": 0, "default": 90 }
           }
         },

@@ -13,7 +13,7 @@ link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store
 [#machine-config]
 === Machine Configuration Store (`<PM_MCP_BASE>/machine-config.json`)
 
-Configures machine-wide build and model-job concurrency limits, warm LSP pool sizing, the machine-level timeouts and budgets (drain timeout, escalation cap, progress wait bound, language server timeouts, audit rotation age, rotated audit file retention), and `project_defaults`, the machine-wide defaults of the per-project operator keys of `local-config.json` (xref:08-project-configuration-local.adoc#local-config[Operator Local Configuration (`<PM_MCP_BASE>/projects/<project_id>/local-config.json`)], `PM-EXT-6`). The pending entry record age and the lock-wait report threshold are compiled constants (link:../timeouts/02-runtime-leases-operator-web.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]). Written only by the runtime (on `pm-mcp operator config`) under `locks/machine-config.lock`; the CLI reads it directly only for the drain timeout that bounds `pm-mcp drain` (link:../cli-and-security/01-cli-and-installer.adoc#cli-file-reads[CLI, Coordination & Security Specification, Direct File Reads]). The timeout values, their bounds, and their expiry behaviour are defined in link:../timeouts/03-retention-host-config.adoc#configuration-keys[Timeouts & Budgets Specification]; the `default`, `minimum`, and `maximum` values below equal them.
+Configures machine-wide build and model-job concurrency limits, warm LSP pool sizing, the machine-level timeouts and budgets (drain timeout, escalation cap, progress wait bound, language server timeouts, audit rotation age, rotated audit file retention), the machine-wide connection overrides of the client profiles (`client_profiles.<client_id>.connection`, link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification], Machine-Wide Operator Overrides), the outbound proxy (`proxy`), and `project_defaults`, the machine-wide defaults of the per-project operator keys of `local-config.json` (xref:08-project-configuration-local.adoc#local-config[Operator Local Configuration (`<PM_MCP_BASE>/projects/<project_id>/local-config.json`)], `PM-EXT-6`). The pending entry record age and the lock-wait report threshold are compiled constants (link:../timeouts/02-runtime-leases-operator-web.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]). Written only by the runtime (on `pm-mcp operator config`) under `locks/machine-config.lock`; the CLI reads it directly only for the drain timeout that bounds `pm-mcp drain` (link:../cli-and-security/01-cli-and-installer.adoc#cli-file-reads[CLI, Coordination & Security Specification, Direct File Reads]). The timeout values, their bounds, and their expiry behaviour are defined in link:../timeouts/03-retention-host-config.adoc#configuration-keys[Timeouts & Budgets Specification]; the `default`, `minimum`, and `maximum` values below equal them.
 
 [source,json]
 ----
@@ -61,6 +61,38 @@ Configures machine-wide build and model-job concurrency limits, warm LSP pool si
         "retain_days": { "type": "integer", "minimum": 0, "default": 365, "description": "Age in days after which a rotated audit file is a purge candidate of pm-mcp operator sweep --machine; 0 keeps rotated files forever. Index entries are never removed." }
       }
     },
+    "client_profiles": {
+      "type": "object",
+      "description": "Machine-wide operator overrides of a client profile's connection settings, set with pm-mcp operator config; no other profile key can be overridden. An override passes the same profile validation as the compiled value (bounded_wait_seconds at most idle_timeout_seconds - 30; timeouts.adoc, Host Integration).",
+      "propertyNames": { "enum": ["claude", "opencode", "antigravity", "codex", "neutral"], "description": "client_id of the overridden profile." },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["connection"],
+        "additionalProperties": false,
+        "properties": {
+          "connection": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": false,
+            "description": "Each present key replaces the profile's compiled value; an absent key keeps it.",
+            "properties": {
+              "bounded_wait_seconds": { "type": "integer", "minimum": 15, "maximum": 3600, "description": "Bounded wait window (timeouts.adoc, Bounded wait)." },
+              "idle_timeout_seconds": { "type": "integer", "minimum": 45, "maximum": 7200, "description": "Host tool-call idle timeout (timeouts.adoc, Host Integration)." },
+              "progress_resets_timeout": { "type": "boolean", "description": "Whether notifications/progress resets the host's tool-call timer." }
+            }
+          }
+        }
+      }
+    },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional outbound proxy, set with pm-mcp operator config and applied to every cui-http call and to the JGit transport of the native git variant; never taken from a repository value or from the environment. Absent: direct connections.",
+      "properties": {
+        "https_proxy": { "type": "string", "format": "uri", "pattern": "^https?://[^/@]+/?$", "description": "Proxy URL (scheme, host, optional port) without embedded credentials; a URL with user information is refused. Authenticated proxies are not supported (later-improvements.adoc, L-8)." },
+        "no_proxy": { "type": "array", "uniqueItems": true, "description": "Hosts reached directly, without the proxy.", "items": { "type": "string", "minLength": 1, "maxLength": 253 } }
+      }
+    },
     "project_defaults": {
       "description": "Machine-wide defaults of the per-project operator keys; each local-config.json key falls back to this value, then to the compiled default (Operator Local Configuration).",
       "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/local-config.json#/$defs/settings",
@@ -73,7 +105,7 @@ Configures machine-wide build and model-job concurrency limits, warm LSP pool si
 [#credential-store]
 === Permission-Guarded Credential Store (`<PM_MCP_BASE>/credentials/<credential_key>.json`, `PM-CRED-3`)
 
-When OS keychain access (service `de.cuioss.pm-mcp`) is unavailable (e.g., headless Linux SSH session), Token-Lane credentials fall back to user-only `0600` JSON files inside `<PM_MCP_BASE>/credentials/` (`0700` directory; only `PM_MCP_BASE` relocates it). The file format is `PM-MCP`'s own, with `format_version` and a closed schema (xref:01-format-and-session-log.adoc#format-versioning[Format Versioning & Atomic Write Discipline]); the naming keeps the project-scoped tier `<PM_MCP_BASE>/credentials/<project>/<credential_key>.json`, which is resolved before the global file, and files are named by credential key (`github`, `gitlab`, `git-https` for the native git and provider integrations, otherwise the provider skill name without bundle prefix, `PM-CRED-1`). A credential file is written only by `pm-mcp operator credentials` (the secret read from the terminal with echo disabled, the file written atomically with mode `0600`); it is never a template for hand editing. A file with a missing or different `format_version`, an undeclared field, or a field its `auth_type` does not allow is refused with a reason naming the file and the field, and blocks only the step that needs the credential (`credentials_file_invalid`, with the `pm-mcp operator credentials set` command that rewrites it). `PM-MCP` never reads `~/.plan-marshall/credentials/`, `PLAN_MARSHALL_CREDENTIALS_DIR`, or legacy keyring entries (`PM-MIG-2`); credentials enter this store only through `pm-mcp operator credentials`.
+When OS keychain access (service `de.cuioss.pm-mcp`) is unavailable (e.g., headless Linux SSH session), Token-Lane credentials fall back to user-only `0600` JSON files inside `<PM_MCP_BASE>/credentials/` (`0700` directory; only `PM_MCP_BASE` relocates it). The file format is `PM-MCP`'s own, with `format_version` and a closed schema (xref:01-format-and-session-log.adoc#format-versioning[Format Versioning & Atomic Write Discipline]); the naming keeps the project-scoped tier `<PM_MCP_BASE>/credentials/<project>/<credential_key>.json`, which is resolved before the global file, and files are named by credential key (`github`, `gitlab`, `git-https` for the native git and provider integrations, `mcp-<server_id>` for an upstream MCP server, otherwise the key the project configuration names for the integration in its `credential_key`, for example `sonar`; `PM-CRED-1`, link:../identifiers/02-registry-stores-to-web.adoc#id-credential-key[Identifier Registry, `credential_key`]). No entry holds a harness's authentication: a harness CLI uses its own login, which `PM-MCP` neither stores nor exports. A credential file is written only by `pm-mcp operator credentials` (the secret read from the terminal with echo disabled, the file written atomically with mode `0600`); it is never a template for hand editing. A file with a missing or different `format_version`, an undeclared field, or a field its `auth_type` does not allow is refused with a reason naming the file and the field, and blocks only the step that needs the credential (`credentials_file_invalid`, with the `pm-mcp operator credentials set` command that rewrites it). `PM-MCP` never reads `~/.plan-marshall/credentials/`, `PLAN_MARSHALL_CREDENTIALS_DIR`, or legacy keyring entries (`PM-MIG-2`); credentials enter this store only through `pm-mcp operator credentials`.
 
 The allowed origin for a credential is the origin of the `url` of its operator-owned entry (`PM-CRED-5`), plus, for `github` and `gitlab`, the API origin the provider module derives from it by its compiled rule (`https://github.com` -> `https://api.github.com`; every other host: the `url` origin; link:../cli-and-security/02-credentials-and-operator.adoc#agent-credentials[CLI, Coordination & Security Specification, Agent Credentials of the Native Variant]); the native git transport sends the credential only when the effective remote URL has that origin (`remote_origin_mismatch` otherwise). The team configuration (`.marshall/config/project.json` `integrations`) may only reference a credential key and never decides where a token is sent.
 
@@ -84,14 +116,13 @@ The allowed origin for a credential is the origin of the `url` of its operator-o
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/credential-file.json",
   "title": "CredentialFile",
   "type": "object",
-  "required": ["format_version", "credential_key", "auth_type", "written_at", "verified_at"],
+  "required": ["format_version", "credential_key", "url", "auth_type", "written_at", "verified_at"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "credential_key": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Equals the file name (identifiers.adoc, credential_key; PM-CRED-1)." },
-    "url": { "type": "string", "format": "uri", "pattern": "^https://", "description": "Operator-owned; its origin is the only origin the secret is sent to (PM-CRED-5). Required for every auth_type except env." },
-    "auth_type": { "type": "string", "enum": ["token", "basic", "github_app", "env"], "description": "github_app only for credential_key github; basic only for git-https and non-provider keys; env only for harness-<client_id> keys." },
-    "env": { "type": "object", "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" }, "additionalProperties": { "type": "string", "minLength": 1 }, "minProperties": 1, "description": "env only: the harness authentication variables captured by pm-mcp operator enrol-harness, passed to that harness's model jobs (store-schemas/11, Harness Enrolment Store); never sent to an origin." },
+    "url": { "type": "string", "format": "uri", "pattern": "^https://", "description": "Operator-owned; its origin is the only origin the secret is sent to (PM-CRED-5)." },
+    "auth_type": { "type": "string", "enum": ["token", "basic", "github_app"], "description": "github_app only for credential_key github; basic only for git-https and non-provider keys." },
     "token": { "type": "string", "minLength": 1 },
     "token_kind": { "type": "string", "enum": ["github_fine_grained_pat", "github_classic_pat", "gitlab_project_token", "gitlab_group_token", "gitlab_personal_token"], "description": "token only, github and gitlab keys only; determined from the provider by set and verify (ci.whoami), never entered. Every kind is accepted (cli-and-security.adoc, Agent Credentials of the Native Variant)." },
     "client_id": { "type": "string", "minLength": 1, "description": "github_app only: the App's client id, JWT issuer." },
@@ -106,11 +137,6 @@ The allowed origin for a credential is the origin of the `url` of its operator-o
     "verified_at": { "type": ["string", "null"], "format": "date-time", "description": "Last successful pm-mcp operator credentials verify." }
   },
   "allOf": [
-    {
-      "if": { "properties": { "auth_type": { "const": "env" } } },
-      "then": { "required": ["env"], "properties": { "credential_key": { "pattern": "^harness-" } }, "not": { "anyOf": [ { "required": ["url"] }, { "required": ["token"] }, { "required": ["username"] }, { "required": ["password"] }, { "required": ["client_id"] }, { "required": ["private_key"] } ] } },
-      "else": { "required": ["url"], "not": { "required": ["env"] } }
-    },
     {
       "if": { "properties": { "auth_type": { "const": "token" } } },
       "then": { "required": ["token"], "not": { "anyOf": [ { "required": ["username"] }, { "required": ["password"] }, { "required": ["client_id"] }, { "required": ["private_key"] }, { "required": ["installation_id"] } ] } }
@@ -227,7 +253,7 @@ Two single-writer records in `<PM_MCP_BASE>/state/` (mode `0600`), each with `fo
     "start_instant": { "type": "string", "format": "date-time", "description": "OS process start instant (ProcessHandle.info().startInstant()); with pid the liveness identity." },
     "version": { "type": "string", "minLength": 1, "description": "Release version of the running binary." },
     "listener": { "type": "string", "enum": ["domain_socket", "loopback_tcp", "jdk_socket"], "description": "Listener in use: the Quarkus domain socket, fallback (1) loopback TCP, or fallback (2) the own JDK socket listener (Runtime Model, Transport Endpoint); reported by pm-mcp status." },
-    "socket_path": { "type": "string", "minLength": 1, "description": "Effective socket path, default or fallback; for listener loopback_tcp the address 127.0.0.1:<port>." },
+    "socket_path": { "type": "string", "minLength": 1, "description": "The socket path <PM_MCP_BASE>/run/runtime.sock, which has no alternative location (a path over the sun_path limit refuses the start); for listener loopback_tcp the address 127.0.0.1:<port>." },
     "started_at": { "type": "string", "format": "date-time", "description": "Instant the socket was bound." }
   }
 }
@@ -396,7 +422,7 @@ Every state transition, job execution, operator elicitation/CLI action, credenti
 
 *Integration records*: Every git or provider operation, in-process (native variant) or as a job (CLI variant), appends a `job` record whose `details` carry `integration` (`git`, `github`, `gitlab`, `sonar`), `variant` (`native` or `cli`), and `identity`: for the native variant the credential key that authenticated it (`github`, `gitlab`, `git-https`, link:../identifiers/02-registry-stores-to-web.adoc#id-credential-key[Identifier Registry, `credential_key`]; never the secret or a derived token) and the resolved agent identity, for the CLI variant the value `operator_ambient` (link:../cli-and-security/02-credentials-and-operator.adoc#cli-variant-credentials[CLI & Security Specification, Credentials of the CLI Variant]). A native operation refused by the origin check appends a `security` record with `event: remote_origin_mismatch`, `outcome: refused`, and `details{integration, remote, effective_url_host, credential_origin}` (link:../cli-and-security/02-credentials-and-operator.adoc#native-confinement[CLI & Security Specification, Native Operation Confinement]). The operator's selection of a variant in `setup.select-integration-variants` is an `operator` record with `event: integration_variant_selected` and `details{integration, variant}`. These fields are operator and audit data only: they never appear in a model-facing representation, resource, or tool result (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
 
-*Model job, grant, and bootstrap records*: A request over a job connection carries `details.job_id` in every record it causes. `pm-mcp operator enrol-harness` appends an `operator` record `harness_enrolled`, an accepted self-update an `operator` record `harness_updated` (xref:11-enrolment-store.adoc#harness-enrolment-store[Harness Enrolment Store]). Every access grant is mirrored as an `operator` record `access_granted` with `details{plan_id, project_id, access, reason}` (xref:15-screening-and-grants.adoc#grant-record[Access Grant Record]). The `accept` of a screened-suspicious text in a bootstrap appends a `security` record `screen_accepted` with `details{entry_id, item_id, sha256}`. A refused re-check of a bootstrap's `start.create-scope` transaction is scope-less (no plan or epic exists yet): it appends a `transition` record `bootstrap_refused` (`scope_type: workspace`, `details{entry_id, reason}`) and is never counted per plan.
+*Model job, grant, and bootstrap records*: A request over a job connection carries `details.job_id` in every record it causes. `pm-mcp operator enrol-harness` appends an `operator` record `harness_enrolled` (also when it re-baselines a tampered file), an accepted self-update an `operator` record `harness_updated`, and a failed HMAC check of `harnesses.json` a `security` record `enrolment_tampered` naming the file (xref:11-enrolment-store.adoc#harness-enrolment-store[Harness Enrolment Store]). Every access grant is mirrored as an `operator` record `access_granted` with `details{plan_id, project_id, access, reason}` (xref:15-screening-and-grants.adoc#grant-record[Access Grant Record]). The `accept` of a screened-suspicious text in a bootstrap appends a `security` record `screen_accepted` with `details{entry_id, item_id, sha256}`. A refused re-check of a bootstrap's `start.create-scope` transaction is scope-less (no plan or epic exists yet): it appends a `transition` record `bootstrap_refused` (`scope_type: workspace`, `details{entry_id, reason}`) and is never counted per plan.
 
 *Web access records*: A successful pairing appends an `operator` record with `event: web_device_paired`, `outcome: succeeded`, and `details{device_id, label, mode}`; a failed redemption a `security` record with `event: web_pairing_failed`, `outcome: refused`, and `details{failures, pairing_invalidated}` (never the submitted code); a revocation an `operator` record with `event: web_device_revoked`, `outcome: succeeded`, and `details{device_id, reason}` (`reason`: `operator` for `pm-mcp web devices revoke` or a revocation from the web app, `idle_expired` for the device idle expiry, link:../timeouts/02-runtime-leases-operator-web.adoc#device-idle-expiry[Timeouts & Budgets Specification]), including one record per device for `revoke --all`. An action taken through a paired device carries `details.channel: web` and `details.device_id`; one through the CLI `details.channel: cli`. No record carries a device secret, its hash, or the runtime token (link:../cli-and-security/03-web-server.adoc#web-server[CLI, Coordination & Security Specification, Web Server & Pairing]).
 
