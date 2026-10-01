@@ -1,0 +1,319 @@
+= Workflow DSL & Engine Specification: Reference Workflow Excerpt
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Reference Workflow Excerpt
+
+== Reference Workflow DSL Excerpt (`finalize.pmwf`)
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-31[PM-WATCH-PHASE-31], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-22[PM-WATCH-DSL-22]_
+
+Every state the excerpt defines is catalogued in the link:../state-catalogue/04-plan-finalize-terminal.adoc#state-catalogue-finalize[State Catalogue, Phase 6: `finalize`]. The excerpt is a template: a plan executes its composed instance, in which the composition may prune steps, links, and policy actions and binds the effective budgets (xref:09-plan-instance.adoc#plan-instance[Plan Instance]). The remediation units it calls are specified in xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units].
+
+[source,text]
+----
+workflow finalize version 1 format 1
+scope plan
+start finalize.settle-commit
+
+state finalize.settle-commit
+  phase finalize
+  call git.commit_and_push (message_mode=step_or_fallback, push_mode=post_pr_conditional)
+    done                     -> finalize.review-cap-check
+      guard result.pushed
+    done                     -> finalize.next-step
+      guard not result.pushed
+    stepped_out              -> finalize.hand-back
+
+state finalize.sync-baseline
+  phase finalize
+  composite_job finalize.sync-baseline          # fetch, overlap check, rebase attempt
+    up_to_date               -> finalize.next-step
+      completes default:finalize-step-sync-baseline as skipped
+    rebased                  -> finalize.next-step
+      completes default:finalize-step-sync-baseline as done
+    conflict                 -> finalize.remediate-sync-conflict
+    fetch_failed             -> finalize.step-failed
+      completes default:finalize-step-sync-baseline as failed
+    cancelled                -> finalize.step-failed
+      completes default:finalize-step-sync-baseline as failed
+
+state finalize.remediate-sync-conflict
+  phase finalize
+  call remediation.merge-conflict (retry_budget=0, fix_budget=2, waiver_wait_seconds=0, actions=[fix])
+    resolved                 -> finalize.settle-commit
+      completes default:finalize-step-sync-baseline as done
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.pre-push-quality-gate
+  phase finalize
+  composite_job build.quality-gate              # the build and, on red, the baseline comparison
+    passed                   -> finalize.settle-commit
+      completes default:pre-push-quality-gate as done
+    baseline_red             -> finalize.settle-commit
+      completes default:pre-push-quality-gate as done
+    red                      -> finalize.remediate-build
+    no_verdict               -> finalize.remediate-build
+    cancelled                -> finalize.remediate-build
+
+state finalize.remediate-build
+  phase finalize
+  call remediation.build-failure (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix])
+    resolved                 -> finalize.settle-commit
+      completes default:pre-push-quality-gate as done
+    fix_requested            -> finalize.allocate-remediation
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.allocate-remediation
+  phase finalize
+  auto plan.allocate-remediation-tasks
+    allocated                -> execute.envelope-ready
+
+state finalize.push-barrier
+  phase finalize
+  call git.commit_and_push (message_mode=none_assert_clean, push_mode=if_push_remote)
+    done                     -> finalize.merge-gate       # the branch already landed
+      guard result.landed
+      completes default:push as skipped
+    done                     -> finalize.route-push
+      guard not result.landed
+    stepped_out              -> finalize.hand-back
+
+state finalize.route-push
+  phase finalize
+  auto finalize.route-push                      # router: reads the persisted push result
+    pushed                   -> finalize.create-pr
+      completes default:push as done
+    not_pushed               -> finalize.next-step
+      completes default:push as skipped
+
+state finalize.review-cap-check
+  phase finalize
+  auto review.check-structural-caps
+    within_caps              -> finalize.concurrent-wait
+    cap_exceeded             -> finalize.remediate-review
+
+state finalize.concurrent-wait
+  phase finalize
+  composite_job finalize.watch-ci-and-bots
+    all_green                -> finalize.merge-gate
+      completes default:ci-verify as done
+      completes plan-marshall:automatic-review as done
+      completes default:analysis-roundtrip as done
+    ci_failed                -> finalize.remediate-ci
+    analysis_failed          -> finalize.remediate-analysis
+    findings_open            -> finalize.remediate-review
+    bot_refused_structural   -> finalize.remediate-review
+    review_evidence_missing  -> finalize.remediate-review
+    bot_refused_awaitable    -> finalize.review-window-wait
+    bot_no_unreviewed_commit -> finalize.review-full-trigger
+    watch_interrupted        -> finalize.restart-watch
+    cancelled                -> finalize.restart-watch
+
+state finalize.restart-watch
+  phase finalize
+  auto finalize.restart-watch
+    concurrent_restarted     -> finalize.concurrent-wait
+    evidence_restarted       -> finalize.merge-evidence-wait
+    exhausted                -> finalize.hand-back
+
+state finalize.remediate-ci
+  phase finalize
+  call remediation.ci-failure (retry_budget=2, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix,loop_back])
+    resolved                 -> finalize.next-step
+      completes default:ci-verify as done
+    waived                   -> finalize.next-step
+      completes default:ci-verify as waived
+    fix_requested            -> finalize.allocate-remediation
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.remediate-analysis
+  phase finalize
+  call remediation.analysis (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix])
+    resolved                 -> finalize.next-step
+      completes default:analysis-roundtrip as done
+    waived                   -> finalize.next-step
+      completes default:analysis-roundtrip as waived
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.remediate-review
+  phase finalize
+  call remediation.review-findings (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix,loop_back])
+    resolved                 -> finalize.next-step
+      completes plan-marshall:automatic-review as done
+    waived                   -> finalize.next-step
+      completes plan-marshall:automatic-review as waived
+    fix_requested            -> finalize.allocate-remediation
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.remediate-security-audit
+  phase finalize
+  call remediation.review-findings (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,loop_back])
+    resolved                 -> finalize.next-step
+      completes default:finalize-step-security-audit as done
+    waived                   -> finalize.next-step
+      completes default:finalize-step-security-audit as waived
+    fix_requested            -> finalize.allocate-remediation
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.remediate-self-review
+  phase finalize
+  call remediation.review-findings (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,loop_back])
+    resolved                 -> finalize.next-step
+      completes default:pre-submission-self-review as done
+    waived                   -> finalize.next-step
+      completes default:pre-submission-self-review as waived
+    fix_requested            -> finalize.allocate-remediation
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.review-window-wait
+  phase finalize
+  facts review.window-status
+  job review.await-rate-window
+    succeeded                -> finalize.review-retrigger
+    failed                   -> finalize.remediate-review
+    refused                  -> finalize.remediate-review
+    cancelled                -> finalize.remediate-review
+    timed_out                -> finalize.remediate-review
+    killed                   -> finalize.remediate-review
+    indeterminate            -> finalize.remediate-review
+
+state finalize.review-retrigger
+  phase finalize
+  auto review.retrigger-unproven
+    triggered                -> finalize.review-cap-check
+    window_closed            -> finalize.review-window-wait
+
+state finalize.review-full-trigger
+  phase finalize
+  auto review.post-full-trigger
+    triggered                -> finalize.review-cap-check
+    already_triggered        -> finalize.remediate-review
+    window_closed            -> finalize.review-window-wait
+
+state finalize.adr-author
+  phase finalize
+  skill pm/finalize/adr-propose
+  facts finalize.adr-signal
+  link submit adr [submit] (title: text[1..200], tags: list<text>, affects: list<text>, adr_body: text[1..32768])
+    do finalize.record-adr
+      recorded               -> finalize.settle-commit
+        completes default:adr-propose as done
+  link alt decline [noop] ()
+    do finalize.decline-adr
+      declined               -> finalize.next-step
+        completes default:adr-propose as done
+  link abort hand_back [submit] (reason: text[1..2000])
+    do plan.record-hand-back
+      recorded               -> finalize.hand-back
+
+state finalize.merge-gate
+  phase finalize
+  auto merge.gate-entry
+    ready                    -> finalize.merge-lease
+    incomplete               -> finalize.next-step
+    spend_overrun            -> finalize.remediate-spend
+    local_only               -> finalize.hand-back
+      completes default:branch-cleanup as done
+    terminus_review_owed     -> finalize.self-review      # terminus mode, returns to the gate
+
+state finalize.remediate-spend
+  phase finalize
+  call remediation.spend (waiver_wait_seconds=0)
+    resolved                 -> finalize.merge-gate
+    waived                   -> finalize.merge-gate
+    exhausted                -> finalize.hand-back
+    stepped_out              -> finalize.hand-back
+
+state finalize.step-failed
+  phase finalize
+  auto finalize.refire-failed-step
+    refire                   -> finalize.next-step
+    before_merge             -> finalize.hand-back
+    after_merge              -> finalize.next-step
+
+state finalize.hand-back
+  phase finalize
+  auto finalize.hand-back
+    handed_back              -> finalize.next-step
+    returned                 -> finalize.next-step
+
+state finalize.emit-landing
+  phase finalize
+  auto finalize.emit-landing
+    delivered                -> finalize.next-step
+      completes default:emit-landing as done
+    not_orchestrated         -> finalize.next-step
+      completes default:emit-landing as done
+    pending                  -> finalize.next-step        # indeterminate epic linkage: envelope kept
+      completes default:emit-landing as done
+    append_failed            -> finalize.emit-landing-failed
+
+state finalize.emit-landing-failed
+  phase finalize
+  facts finalize.landing-status
+  link retry retry [noop] ()
+    do finalize.retry-emit-landing
+      verified               -> finalize.next-step
+        completes default:emit-landing as done
+      failed                 -> finalize.emit-landing-failed
+      pending                -> finalize.next-step
+        completes default:emit-landing as done
+
+state finalize.archive-plan
+  phase finalize
+  auto finalize.archive-plan
+    merged                   -> completed
+      completes default:archive-plan as done
+    no_change                -> completed
+      completes default:archive-plan as done
+    handed_back              -> handed_back
+      completes default:archive-plan as done
+    returned                 -> returned
+      completes default:archive-plan as done
+    observation_failed       -> finalize.archive-unobserved   # budget left; spent: archives with merge_state unknown
+
+state completed terminal merged success
+  phase completed
+
+state handed_back terminal handed_back failure
+  phase completed
+
+state returned terminal returned failure
+  phase completed
+
+state plan.aborted terminal aborted failure
+  phase aborted
+----
+
+* *Settle commit and `settle_trigger` (`PM-WF-16`)*: `finalize.settle-commit` is the one commit point of Phase 6. Its call routes the exit contract of `git.commit_and_push` (xref:06-reusable-sub-workflows.adoc#_bound_parameter_contract[Bound Parameter Contract]): `done` with `result.pushed` re-enters the wait region through `finalize.review-cap-check`, so CI and review bots re-evaluate the new `HEAD`; `done` without a push continues with `finalize.next-step`; `stepped_out` enters `finalize.hand-back`. The transition that enters the state persists `settle_trigger {step_id, order}` in `mcp/status.json`: the step whose firing is open, or order `0` (never a push) when it is entered from `execute.exit-barrier`, `land.exit-barrier`, or `finalize.adopt-pr`. `push_mode=post_pr_conditional` reads that order, so a loop-back never pushes before the Settle band re-runs.
+* *Step states*: Every default step has one declared template state that the composition includes or prunes (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue]); the excerpt shows `finalize.sync-baseline` (a `composite_job`: the fetch, the overlap check, and the rebase attempt run as one observed job, so a failed fetch re-fired through `finalize.step-failed` never forms an engine-chained cycle, Rule 11a), `finalize.pre-push-quality-gate`, `finalize.push-barrier` with its router `finalize.route-push`, the wait region, `finalize.remediate-security-audit` and `finalize.remediate-self-review` (the Settle-band findings of `security-audit` and `pre-submission-self-review`, one call state per step, each completing its own step), `finalize.adr-author`, `finalize.merge-gate`, `finalize.emit-landing`, and `finalize.archive-plan`. A step state that completes a source-mutating step enters `finalize.settle-commit` with the completion on that transition. `sync-baseline` rebases also over overlapping upstream changes: a clean rebase completes `done` (the plan's gates re-verify later), a conflict calls `remediation.merge-conflict` before the pull request and CI exist.
+* *Shared failure state*: `finalize.step-failed` serves the job failures of Settle-band and project steps. The transition that enters it completes the failed firing `failed`; `refire` (one automatic re-fire per step) lets `finalize.next-step` open a new firing, `before_merge` takes the fallback, and `after_merge` records an owed item and continues: after the merge there is no fallback, and the plan stays `merged`.
+* *Baseline-red is a server rule*: `build.quality-gate` compares every failing diagnostic's fingerprint with the base (the provider's CI result of the base first, a local build of the merge base as fallback); when every failure is baseline-only it writes a `baseline_red` build row bound to `worktree_sha` and settles `baseline_red` (class `SUCCESS`), and the step completes `done` with `assurance_verdict: degraded`. Every other red calls `remediation.build-failure`.
+* *Remediation calls*: Every blocking failure calls its remediation unit, never an operator decision: CI (`remediation.ci-failure`), code analysis over every configured provider (`remediation.analysis`), review findings, structural refusals, and missing review evidence (`remediation.review-findings`), a red quality gate (`remediation.build-failure`), a sync-baseline conflict (`remediation.merge-conflict`), and a spend overrun at `finalize.merge-gate` (`remediation.spend`). Each call site routes the unit's reachable domain outcomes and `stepped_out` (Rule 6): `resolved` completes the class's step `done`, `waived` completes it `waived` with the waiver id (Rule 9), `fix_requested` enters `finalize.allocate-remediation`, which allocates Phase 5 remediation tasks (the `loop_back` form of `fix`, xref:07-loop-back-diagrams-verification.adoc#loop-back-bounds[Worktree-Constrained Loop-Back & Iteration Bounds]), and `exhausted` and `stepped_out` enter `finalize.hand-back`. The two Settle-band call sites `finalize.remediate-security-audit` and `finalize.remediate-self-review` bind `actions=[retry,loop_back]`: no pull request exists yet, so a fix runs only in the `loop_back` form, and its commit is the exit-barrier commit of Phase 5 (`settle_trigger` order `0`), never pushed before the push barrier (`INV-FIN-4`); the in-branch `fix` with its `push_mode=always` commit is bound only at call sites after the pull request exists. The budgets written at the call sites are the template values; the instance carries the effective ceilings with their source, and a `land` plan's composition binds `actions=[retry]` at every call site.
+* *Wait-region order and re-entry*: `finalize.watch-ci-and-bots` hands one failing class at a time to its unit in the fixed order CI -> analysis -> review findings (link:../hypermedia-format/03-composite-wait-and-encoder.adoc#policy-unit-returns[Hypermedia Format Specification, Policy Unit Returns]); a unit's own await state watches only its class at the new `HEAD`. After `resolved` or `waived`, `finalize.next-step` re-enters the region: the steps whose firing is still open continue it, and verdict currency re-fires every class that is stale at the new `HEAD` (Rule 9, completion per firing).
+* *Pre-wait cap gate*: Before `finalize.concurrent-wait` is entered, `finalize.review-cap-check` measures the diff against the structural caps each required review bot declares in the review-bot registry (link:../phase-workflows.adoc[Phase Workflows Specification]). An exceeded cap records the bot as `refused` with mode `size` pre-emptively and files the refusal as a finding, which the review unit's triage job dispositions (`FIX` splits the change, `ACCEPT` accepts the refusal, `SUPPRESS` disables the bot for this pull request).
+* *Review-bot rate windows*: `bot_refused_awaitable` enters `finalize.review-window-wait`, a job that waits for the registered window (the registered interval times the attempt ceiling; a published ETA is a floor that is re-checked, never skipped) and then re-triggers the unproven bots automatically; a trigger is never posted inside a closed window. `bot_no_unreviewed_commit` enters `finalize.review-full-trigger`, which posts the registry's full-review trigger verb once per bot and `HEAD`. Every way the wait cannot produce evidence (hard quota, unproven bot, unestablished roster, a failed window wait, a repeated notice) reaches `remediation.review-findings` with the failure kind `evidence_missing`, whose only ends besides a window-gated re-trigger are a `review_evidence[:<bot_kind>]` waiver or the fallback.
+* *Interrupted watches*: A constituent job of the watch that ends with any fate other than success, and a followed `cancel:finalize.concurrent-wait`, settle the composite as `watch_interrupted {constituent, fate}` or `cancelled`; `finalize.restart-watch` restarts the watch explicitly (an `enqueuesJob()` primitive whose outcome `concurrent_restarted` or `evidence_restarted` names the interrupted wait and binds the new composite job) within the compiled restart budget of `2` per wait-region firing and takes the fallback when it is spent. The engine never restarts a job on its own (xref:02-units-jobs-decisions.adoc#job-state-binding[Job State Entry & Binding]).
+* *Fallback end (`handed_back`)*: `finalize.hand-back` is the one fallback state of Phase 5, the `land` lane, and Phase 6 before the merge. In the transaction that enters it the engine records every begun, unsettled step `failed` (the on-entry rule) and composes the post-run-only instance version (composition event `fallback`, the pruned steps with reason `handed_back` or `returned`), which is in force for the rest of that chain, so `finalize.next-step` selects from it (xref:09-plan-instance.adoc#_versions_composition_events[Versions & Composition Events]). Its primitive settles uncommitted work (commit only, footprint-checked), pushes the branch when a push remote exists, opens the pull request as a draft or marks the existing one, posts the idempotent gap comment and the label `pm-mcp:handed-back`, and removes the worktree; it settles `returned` when the branch holds no commit beyond the base. In its local form (the outcome `local_only` of `finalize.merge-gate`) it keeps the plan branch as the product, records `merge_outcome: local_only`, and carries open findings out as late findings. In its ready form (the pre-merge barrier's outcome `pass_hand_back`, which the barrier returns instead of `pass` when the instance prunes the merge execution with reason `auto_merge_off` under the operator's `merge.auto_merge: false`) it marks the existing pull request ready for review and records `merge_outcome: awaiting_human_merge`. The post-run band then runs, and `finalize.archive-plan` ends the plan in `handed_back` or `returned`.
+* *Model hand-back*: `finalize.adr-author` shows the plan-scope exit of the model: `hand_back (reason)` (rel `abort`, form `submit`) records the reason for the gap comment and the landing record and takes the fallback at once. Each link of the state asks for one judgment and names its skill section (guided step-in).
+* *Review chain terminus*: `terminus_review_owed` (a consumed `review_evidence` waiver covers a `HEAD` no bot reviewed) runs `finalize.self-review` once in terminus mode, which returns to `finalize.merge-gate` (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `8`]).
+* *Spend*: `merge.gate-entry` compares the cumulative finalize spend with the error column of the plan's budget anchor (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Model Jobs & Effort Specification]); an overrun calls the degenerate unit `remediation.spend` (no `retry`, no `fix`), which is not raisable: only a `met` waiver of the gate `spend` passes the check, read and consumed at the single evaluation point `merge.gate-entry` (the unit's `waived`, or a waiver given before the gate, routes back there); with the shipped `waiver_wait_seconds=0` an overrun without a waiver is `exhausted` and hands the plan back. `local_only` (no push remote) completes `default:branch-cleanup` `done` and enters the local form of `finalize.hand-back`.
+* *Merge path*: The merge-path states after `finalize.merge-gate` are not part of the excerpt; they are catalogued in the link:../state-catalogue/04-plan-finalize-terminal.adoc#state-catalogue-finalize[State Catalogue]. Open findings at the pre-merge barrier call `remediation.review-findings`, merge conflicts `remediation.merge-conflict`; `finalize.merge-refused` routes a provider refusal by its reason (`behind`, `conflict`, `checks_*` re-enter `finalize.merge-gate` within the retry budget; a refusal by the protection rules is not waivable and ends `handed_back`); with the operator's `merge.auto_merge: false` the merge execution is pruned and the barrier settles `pass_hand_back` instead of `pass`, which enters the ready form of `finalize.hand-back` (a fact the primitive reads, never a second target of one outcome); both `merged` transitions complete `default:branch-cleanup` as `done`.
+* *Landing delivery*: An indeterminate epic linkage settles `emit-landing` `pending` at once: the envelope is composed and kept in the plan directory with `landing_delivery: pending` for the epic's shipped-without-landing reconciliation, and the step completes `done`. An I/O failure of the `emit-landing` append enters `finalize.emit-landing-failed`. `retry` re-appends and re-verifies the envelope within its retry budget (a primitive awaiting `EXTERNAL_STATE`, Rule 11b); once the budget is spent it settles `pending` (class `SUCCESS`, `landing_delivery: pending`), keeping the envelope in the plan directory for the epic's shipped-without-landing reconciliation. The state never refuses or strands the plan (link:../phase-workflows.adoc[Phase Workflows Specification], validator rule 7).
+* *Unobservable pull request*: `observation_failed` archives nothing and enters `finalize.archive-unobserved`, whose `retry` re-enters `finalize.archive-plan` within the compiled condition budget; once the budget is spent, a failed observation archives the plan with the `merge_outcome` the plan's own records determine and `merge_state: unknown` (counted in the landing's `missing_facts`) and settles the recorded plan `outcome`, so the state never strands the plan (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `1100`]).
+* *Ends*: `finalize.archive-plan` is the only path to the three delivery terminals `completed` (plan `outcome` `merged`, or `no_change` for an empty recipe harvest), `handed_back`, and `returned`; all three carry the phase value `completed`, and the status and landing record's `outcome` field tells them apart. `plan.aborted` is declared here but no transition targets it: it is entered only by the engine-owned operator transitions (`abort`, `delete-plan`, the `abort` resolution of an integrity pause, xref:02-units-jobs-decisions.adoc#waivers-and-integrity[Waivers, Waiver Requests & the Integrity Pause]). The declared outcome id and class of a root terminal are nominal (`completed` is declared `terminal merged success` and also ends a `no_change` plan); the plan's `outcome` field (`merged`, `handed_back`, `returned`, `no_change`, `aborted`), which the landing record carries, is authoritative.
+* *Step completion*: The `completes` clauses name the finalize steps each transition settles, one completion per firing (Rule 9): `default:push` in `finalize.push-barrier` and its router `finalize.route-push` (`done` when the remote branch holds `HEAD` after the call; `skipped` when the branch already landed, `result.landed`, which continues at `finalize.merge-gate`, or when nothing was pushed, which only a local-only run reaches), the two Settle-band remediation calls completing `security-audit` and `pre-submission-self-review` by their own `resolved` or `waived`, the three wait-region steps `default:ci-verify`, `plan-marshall:automatic-review`, and `default:analysis-roundtrip` (entered through `finalize.review-cap-check`) as `done` on `all_green` and each by its own unit's `resolved` (`done`) or `waived` (`waived`), `default:branch-cleanup` on `local_only`, and `default:emit-landing` and `default:archive-plan` in the post-run band. A `fix_requested` or `stepped_out` outcome completes nothing (classes `UNSETTLED` and `STEPPED_OUT`, xref:05-primitives.adoc#primitive-outcome-classes[Outcome Classes & Step Records]); a firing still open when `finalize.hand-back` is entered is recorded `failed` on entry.
+* *Implicit job links*: `finalize.concurrent-wait` is a `composite_job` state and therefore offers `wait:finalize.concurrent-wait` and `cancel:finalize.concurrent-wait` without declaring them (xref:02-units-jobs-decisions.adoc#implicit-job-links[Implicit Links]).
+* *Routing by fact*: The DSL routes an outcome to one target (or twice with complementary result guards at a call site). Where the continuation depends on a plan fact, a lane, or configuration, the primitive returns a distinct outcome per case, and a call or job whose outcome must branch enters a small `auto` router state that reads the persisted fact, as `finalize.route-push` reads the push result.
+* *Cross-file targets*: `execute.envelope-ready` is declared in `execute.pmwf`, `finalize.next-step`, `finalize.create-pr`, `finalize.self-review`, `finalize.merge-lease`, `finalize.merge-evidence-wait`, and `finalize.archive-unobserved` elsewhere in `finalize.pmwf`; the targets are valid because all phase files form one definition unit (xref:02-units-jobs-decisions.adoc#workflow-definition-units[Workflow Definition Units (Multi-File Workflows)]).

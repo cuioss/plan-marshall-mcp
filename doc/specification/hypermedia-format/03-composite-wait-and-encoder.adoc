@@ -1,0 +1,236 @@
+= Hypermedia Format & TOON Encoding Specification: Composite Wait & TOON Encoder
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../hypermedia-format.adoc[Hypermedia Format & TOON Encoding Specification] » Composite Wait & TOON Encoder
+
+== Composite Wait Representation & Short-Circuit Semantics
+_See Requirement link:../../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job Links & Wait Transitions]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+
+During Phase 6 (`finalize`), CI verification, the configured code analysis providers (Sonar, CodeQL, and others behind the code-analysis contract of `pm-core`), and automated PR review bots run concurrently after branch push. Rather than forcing the model to poll separate jobs sequentially, the workflow engine exposes the composite wait state `finalize.concurrent-wait`, the one joint observation of the three classes.
+
+=== `finalize.concurrent-wait` Representation
+
+[source,toon]
+----
+scope: plan
+plan_id: plan-2026-042
+state: finalize.concurrent-wait
+phase: finalize
+summary: "waiting on CI run (running), analysis (running) and review bot (pending)"
+facts:
+  analysis_status: running
+  bot_status: pending
+  bots[1]{bot_kind,roster_class,state,refusal_mode,completion_check,at_head}:
+    coderabbit,required,in_progress,none,pending,false
+  ci_status: running
+  continuation_policy: stop_on_issue_only
+  pr_number: 184
+links[2]{rel,link,form,free}:
+  wait,"wait:finalize.concurrent-wait",wait,""
+  abort,"cancel:finalize.concurrent-wait",noop,""
+----
+
+Both links are the implicit links of the `composite_job` state (link:../workflow-dsl/02-units-jobs-decisions.adoc#implicit-job-links[Workflow DSL Specification]); they are never declared in DSL source. The constituent job identifiers (the CI job, the analysis jobs, and the review-bot job), the per-provider analysis results, the branch, and the elapsed wait time are recorded in the scope's `mcp/status.json` and the job records and shown by `pm-operator status`; they are never rendered, because both links address the composite, not a constituent job (xref:01-representation-and-link-forms.adoc#model-facing-minimality[Model facing minimality]).
+
+=== Closed Status Enumerations in `finalize.concurrent-wait`
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-26[PM-WATCH-PHASE-26]_
+
+* `ci_status`: `running` | `passed` | `failed` | `not_triggered` | `cancelled`. CI evaluation excludes check-runs owned by registered review bots: a review bot is not a build check.
+* [[analysis-status]]`analysis_status`: `running` | `passed` | `gate_failed` | `findings` | `undecidable` | `not_run`, aggregated over every configured analysis provider. Each provider adapter maps its provider's results to one of these values: `passed` (quality gate met, no new issue), `gate_failed` (quality gate conditions failed), `findings` (gate met, new issues open), `undecidable` (the result cannot be established, for example an unverified scan or an unreadable count; it never passes), `not_run` (the provider does not analyse this change, or no provider is configured), `running`. The aggregate is `running` while any provider is `running`; otherwise the first of `gate_failed`, `undecidable`, `findings` that any provider has; otherwise `passed` when at least one provider is `passed` and every other is `not_run`; otherwise `not_run`. A new provider needs only an adapter, never a new value. The analysis dimension is evaluated only after `ci_status: passed`.
+* Per-bot `state` (one row of `facts.bots` per tracked bot, rendered separately from its `completion_check` and `at_head` evidence, because participation, a finished completion check, and a green check prove different things): `participated` | `participated_but_empty` | `participated_stale` | `refused` | `declined` | `absent` | `not_triggered` | `not_wired` | `rereview_silent_failure` | `run_stuck` | `in_progress` | `unproven` | `unreadable` | `silent` | `unsatisfiable` | `unregistered_kind`.
+** `refusal_mode` (set only for `refused`, otherwise `none`): `rate` | `weekly_quota` | `size` | `no_unreviewed_commit` | `unknown`.
+** `completion_check`: `passed` | `pending` | `failed` | `not_declared`; `at_head`: `true` | `false`.
+** The three "nobody reviewed" shapes stay distinct: `not_triggered` (never triggered), `rereview_silent_failure` (a re-review failed silently), and `run_stuck` (the bot's run never left the queue).
+** An exhausted poll yields `unproven`, never `absent`. `unreadable` (the read failed) and `silent` (the read succeeded and nothing was published) are opposite claims and are never merged.
+** `declined` requires review evidence naming a commit that is not the merge candidate; evidence that names no commit resolves `unproven`. A fetch that returns zero comments resolves to exactly one of: no review covering `HEAD` (`absent` or `unproven`), reviewed clean (`participated_but_empty`), or fetch unreachable (`unreadable`).
+* `bot_status` is the aggregate over the required bots only (optional bots are reported in `facts.bots` but never gate): `pending` | `running` | `completed` | `not_configured` | `unestablished` | `refused_awaitable` | `refused_hard` | `refused_structural` | `no_unreviewed_commit` | `unproven`.
+** `pending`: no run of a required bot has been observed yet; `running`: a run of a required bot has been observed and has not finished.
+** `completed`: every required bot is `participated` or `participated_but_empty` for the current `HEAD`.
+** `not_configured`: the required set is empty and the team answered it so (roster aggregate `vacuous`); the merge is recorded with `review_state: vacuous`.
+** `unestablished`: the required set is empty because the roster question was never put or the roster was migrated (roster aggregate `unestablished`); it never passes as reviewed, and only a `review_evidence` waiver or the fallback ends it.
+** `refused_awaitable`: a required bot refused with mode `rate` and the registry classifies its rate limit as an awaitable window.
+** `refused_hard`: a required bot refused with mode `weekly_quota` or `unknown`, or with mode `rate` under a hard or unknown rate-limit class (spend cap, quota exhaustion); waiting cannot recover it.
+** `refused_structural`: a required bot refused with mode `size` (the diff exceeds the bot's structural cap).
+** `no_unreviewed_commit`: a required bot refused with mode `no_unreviewed_commit`.
+** `unproven`: a required bot's evidence is missing and cannot arrive: its poll budget, derived from the bot's registered interval, is exhausted, or its per-bot state fails fast (below).
+** `not_configured` and `unestablished` arise only for an empty required set. When required bots differ, the first matching value in the order `refused_structural`, `refused_hard`, `running`, `pending`, `unproven`, `no_unreviewed_commit`, `refused_awaitable`, `completed` is the aggregate.
+
+[#bot-status-mapping]
+==== Per-Bot State to `bot_status` Mapping
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-8[PM-WATCH-HYP-8], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-32[PM-WATCH-PHASE-32]_
+
+Every per-bot `state` contributes to the aggregate by this closed table; a state absent from it fails the build-time enumeration test:
+
+[cols="3,2,3"]
+|===
+|Per-bot `state` |Contributes |When
+
+|`participated`, `participated_but_empty`
+|satisfied (toward `completed`)
+|For the current `HEAD`.
+
+|`in_progress`
+|`running`
+|A run is observed.
+
+|`absent`, `not_triggered`, `participated_stale`, `rereview_silent_failure`, `run_stuck`, `silent`, `unreadable`
+|`pending`, then `unproven`
+|`pending` while the bot's poll budget remains (for a stale bot after its one trigger and bounded wait); `unproven` once it is exhausted.
+
+|`declined`, `not_wired`, `unsatisfiable`, `unregistered_kind`
+|`unproven` at once
+|Fail fast: waiting cannot produce evidence (`not_wired`: the bot's trigger workflow or app is not installed for the repository).
+
+|`refused`
+|by `refusal_mode`
+|`rate`: `refused_awaitable` or `refused_hard` by the registered rate-limit class; `weekly_quota`, `unknown`: `refused_hard`; `size`: `refused_structural`; `no_unreviewed_commit`: `no_unreviewed_commit`.
+
+|`unproven`
+|`unproven`
+|Already the exhausted form.
+|===
+
+A required bot that ends `unproven` is a review-evidence failure: the composite calls `remediation.review-findings` with the failure kind `evidence_missing` (<<short-circuit-matrix>>). Its `retry` is a window-gated re-trigger of that bot (`review.window-open`) and is never offered for a bot in `unregistered_kind` or `not_wired`, whose only ends are a `review_evidence[:<bot_kind>]` waiver or the fallback.
+
+[#short-circuit-matrix]
+=== Deterministic Evaluation & Immediate Short-Circuit Matrix
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-27[PM-WATCH-PHASE-27], link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-8[PM-WATCH-HYP-8]_
+
+When the model follows `wait:finalize.concurrent-wait`, the daemon monitors the underlying jobs (the CI run, the analysis providers, and the review-bot wait) concurrently and unblocks according to the following transition rules. Rows are evaluated top to bottom and the first matching row wins; together they cover every combination of constituent job fates, `ci_status`, `analysis_status`, and `bot_status`. The composite outcome column names the `finalize.watch-ci-and-bots` outcome declared in the `finalize.pmwf` excerpt (link:../workflow-dsl.adoc[Workflow DSL Specification]); _(keep waiting)_ means the composite job has not settled. Every failing class is handed to its remediation policy unit, one unit at a time in the fixed order CI -> analysis -> review findings, because a code fix for an earlier class invalidates the later observations anyway; the composite outcome of a later class is never evaluated while an earlier class fails.
+
+[cols="1,1,1,1,2,3"]
+|===
+|`ci_status` |`analysis_status` |`bot_status` |Composite Outcome |Target |Engine Action
+
+|_Any_
+|_Any_
+|_Any_
+|`watch_interrupted` / `cancelled`
+|`finalize.restart-watch`
+|A constituent job ended with a fate other than success (`killed`, for example on a runtime restart, `timed_out`, `indeterminate`, `refused`, `failed`): `watch_interrupted`, carrying `{constituent, fate}`. A followed `cancel:finalize.concurrent-wait` settles the composite job itself `cancelled`, routed to the same state. Every other constituent is cancelled, and the `auto` state `finalize.restart-watch` restarts the watch explicitly within the compiled restart budget (default 2 per wait-region firing); exhaustion enters `finalize.hand-back`.
+
+|`failed`
+|_Any_
+|_Any_
+|`ci_failed`
+|`call remediation.ci-failure`
+|*Immediate Short-Circuit*: The daemon immediately unblocks `wait:finalize.concurrent-wait`, cancels the still-pending analysis and review-bot waits, and persists one CI failure finding (source `ci`) per failed check with its `failure_class` and `failure_kind` (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification], step `22`). The unit's gather job fetches the logs through the provider module, parses them with the domain `log_parser`, and fetches the base's CI result of the same checks in the same job: a red that the base shows with the same fingerprints is recorded as baseline-red and never reaches `decide`. Its `decide` state renders the failure envelopes (xref:01-representation-and-link-forms.adoc#remediation-evidence-facts[Remediation Evidence]).
+
+|`not_triggered`
+|_Any_
+|_Any_
+|`ci_failed`
+|`call remediation.ci-failure`
+|*Immediate Short-Circuit*: No CI run was triggered for the pushed `HEAD`, or the provider reports no checks for it; handled as a CI failure with failure class `not_triggered` or `no_checks`, cancelling the other waits as for `failed`.
+
+|`cancelled`
+|_Any_
+|_Any_
+|`ci_failed`
+|`call remediation.ci-failure`
+|The CI run was cancelled externally (every failed required check has failure class `cancelled`); the other waits are cancelled and the unit's `retry` re-runs the checks.
+
+|`passed`
+|`running`
+|_Any_
+|_(keep waiting)_
+|`finalize.concurrent-wait`
+|CI is green and at least one analysis provider has not settled; the daemon keeps waiting and retains a settled bot status in `facts`.
+
+|`passed`
+|`gate_failed` / `undecidable` / `findings`
+|_Any_
+|`analysis_failed`
+|`call remediation.analysis`
+|*Short-Circuit*: The review-bot wait is cancelled. The unit's evidence is every failing provider's gate conditions and new issues, tagged by provider; its `retry` re-scans or re-triggers the provider (the remedy for `undecidable`), its `fix` is in-branch, and its `request_waiver` names `analysis_gate:<provider>` or `findings:<provider>`.
+
+|`passed`
+|`passed` / `not_run`
+|`completed` (every required bot participated at `HEAD`, 0 open findings) / `not_configured` (answered empty required set)
+|`all_green`
+|`finalize.merge-gate`
+|Every concurrent gate succeeded cleanly, or the team answered that no review bot is required (recorded as `review_state: vacuous`); advances directly to the pre-merge barrier.
+
+|`passed`
+|`passed` / `not_run`
+|`completed` ($\ge 1$ open findings)
+|`findings_open`
+|`call remediation.review-findings`
+|Bot review findings were ingested into `findings.jsonl` and their texts passed the two-level guard as one batch of the firing. The unit's triage is one job of the firing over the findings not withheld by the screener, grouped by `(domain, rule_id)`, which submits one disposition per group with per-finding exceptions (`submit:triage-groups`; link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Unified Triage Hook]); its `decide` state then offers the remedy for the findings dispositioned `FIX` or still open, withheld ones included.
+
+|`passed`
+|`passed` / `not_run`
+|`refused_awaitable`
+|`bot_refused_awaitable`
+|`finalize.review-window-wait`
+|CI and analysis passed, but the review bot's rate window is closed. The job state `finalize.review-window-wait` waits for the registered window (its implicit `wait:` link) and then re-triggers the unproven bots automatically; a trigger is never posted inside the closed window, because a trigger extends it.
+
+|`passed`
+|`passed` / `not_run`
+|`refused_structural`
+|`bot_refused_structural`
+|`call remediation.review-findings`
+|The diff exceeds the bot's structural cap; the refusal is filed as a finding, which the unit's triage job dispositions like any finding of the firing (`FIX` splits, `ACCEPT` accepts, `SUPPRESS` disables the bot for this pull request). It never waits.
+
+|`passed`
+|`passed` / `not_run`
+|`refused_hard` / `unproven` / `unestablished`
+|`review_evidence_missing`
+|`call remediation.review-findings`
+|Review evidence is missing and waiting cannot produce it (<<bot-status-mapping>>): failure kind `evidence_missing`. Before the call, the engine checks that each silent required bot's trigger workflow or app is installed for the repository (`not_wired`). The unit's `retry` is a per-bot window-gated re-trigger (one trigger post, then a bounded wait) of a bot of `required ∪ optional` without review evidence for `HEAD` (only the required ones gate), never a shared generic `retry`, and never offered for `unregistered_kind`, `not_wired`, a quota or spend cap, or an `unestablished` roster; the remaining ends are a `review_evidence[:<bot_kind>]` waiver or the fallback. The representation of an `unestablished` roster renders "question never put".
+
+|`passed`
+|`passed` / `not_run`
+|`no_unreviewed_commit`
+|`bot_no_unreviewed_commit`
+|`finalize.review-full-trigger`
+|CI and analysis passed, but the bot reports no unreviewed commit; posts the registry's full-review trigger verb once.
+
+|`passed`
+|`passed` / `not_run`
+|`pending` / `running`
+|_(keep waiting)_
+|`finalize.concurrent-wait`
+|CI and analysis are green and the review bot has not finished; the daemon keeps waiting on the bot. When the wait bound expires, returns updated `finalize.concurrent-wait` with fresh `wait:` / `cancel:` links.
+
+|`running`
+|_Any_
+|`refused_awaitable`
+|_(keep waiting)_
+|`finalize.concurrent-wait`
+|The daemon keeps waiting on CI and records the bot's rate window in the scope's wait record (the per-bot `state` stays rendered in `facts.bots`); the bot outcome is decided only once CI and analysis have passed.
+
+|`running`
+|_Any_
+|_Any other_
+|_(keep waiting)_
+|`finalize.concurrent-wait`
+|Wait bound (bounded or progress window, link:../timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Budgets Specification]) expired while CI is still running; returns updated `finalize.concurrent-wait` with fresh `wait:` / `cancel:` links. Settled analysis and bot statuses are retained in `facts` until CI settles.
+|===
+
+[#policy-unit-returns]
+==== Policy Unit Returns & Verdict Currency
+
+Each `call remediation.*` target routes the unit's reachable domain outcomes and its control outcome `stepped_out` (link:../workflow-dsl/08-remediation-units.adoc#remediation-units[Workflow DSL Specification, Remediation Policy Units]): `resolved` and `waived` re-enter `finalize.next-step`, a `waived` result completing the wait-region step as `waived` with the waiver id; `exhausted` and `stepped_out` enter `finalize.hand-back`. A unit's own await state watches only its class at the new `HEAD` (the CI checks, a re-scan, a bot re-review), never the joint observation. After `resolved` or `waived`, verdict currency re-fires the wait region for every class that is stale at the new `HEAD`, so a CI fix is followed by a fresh analysis and bot observation. The merge path follows the same pattern: failures observed by `finalize.merge-evidence-wait` call the same units in the same order, and merge conflicts call `remediation.merge-conflict`.
+
+== Deterministic Native TOON Encoder Specification
+_See Requirement link:../../Requirements.adoc#PM-IMPL-3[PM-IMPL-3: Deterministic Native TOON Encoder]_
+
+`pm-core` implements a dedicated, zero-reflection Java TOON encoder (`ToonEncoder`) conforming to the official TOON specification for the subset emitted by PM-MCP. The specification version is pinned after verifying the current official specification and its conformance fixtures in Milestone 0 (`PM-IMPL-3`). The rules below restate the official syntax for that subset and add PM-MCP's determinism rules (Rules 1–3), which the official specification permits. Given identical input records, `ToonEncoder` produces byte-for-byte identical UTF-8 output across JVM and GraalVM native image executions.
+
+=== Encoding Rules
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-4[PM-WATCH-HYP-4]_
+
+1. *Character Encoding & Line Endings*: UTF-8 without BOM; line separator is strictly `LF` (`\n`, `0x0A`), and `CR` (`\r`) never appears outside escaped string literals. Every encoded document ends with a single trailing `\n`, and no line may contain trailing spaces (`0x20`).
+2. *Indentation*: Exactly 2 ASCII spaces (`"  "`) per nesting level; tabs (`\t`) are never used for indentation.
+3. *Key Ordering*: Top-level representation keys follow the fixed canonical order defined in xref:01-representation-and-link-forms.adoc#canonical-top-level-fields[Canonical Top-Level Fields]. Java `Record` types serialize components in their declared record component order, dynamic `Map<String, ?>` containers (such as `facts`) sort keys in deterministic ASCII lexicographical order (`String::compareTo`), and keys with `null` or `Optional.empty()` values are omitted completely (never serialized as `key: null`).
+4. *Scalar Formatting & Quoting*: Integers use base-10 ASCII digits (`-?[0-9]+`) with no leading zeroes or thousands separators. A string value is emitted unquoted if and only if it is non-empty, has no leading or trailing whitespace, contains no control characters (`0x00..0x1F`, `0x7F`), contains none of the characters the official specification reserves (such as the active delimiter `,`, `:`, `"`, `\`, brackets, and braces), and does not match `true`, `false`, `null`, or a numeric literal. All other strings, multi-line strings included, are enclosed in `"` using only the official escapes `\\`, `\"`, `\n`, `\r`, and `\t`; there are no block literals. The exact set of characters that forces quoting follows the pinned official specification (minimal quoting).
+5. *Primitive Arrays*: Lists of scalar strings or integers (`List<String>`, `List<Integer>`) serialize inline with a length header as `key[N]: val1,val2,val3`, applying scalar quoting per element.
+6. *Tabular Object Arrays*: Homogeneous lists of records (such as `links` and `failures`) serialize using the official TOON tabular header syntax `<field_name>[<row_count>]{<col_1>,<col_2>,...,<col_k>}:` where `<row_count>` is the exact decimal count of rows (`0` or more), column names are comma-separated with no spaces, and each row is indented 2 spaces deeper with cells quoted per Rule 4 when necessary.

@@ -1,0 +1,433 @@
+= Client Architecture
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../Requirements.adoc[Requirements] » xref:README.adoc[Discussions] » Client Architecture
+
+NOTE: *Status: decided 2026-09-28*: see decision list (<<decisions>>). Where a *Decision* or *Adjusted by* line differs from the recommendation or the proposal body, that line holds. Deferred improvements are recorded in link:../later-improvements.adoc[Later Improvements] (L-1, L-2, L-4).
+
+A proposal for how clients reach `PM-MCP`: a local adapter that trusts local processes of the same OS user without any credential distribution, a separate native CLI binary, a web adapter with one-time-password pairing, and a Svelte web application. It also folds in the client/CLI points collected during the design review (Z1 agenda) and the contradictions found in the current client and transport design.
+
+Research date for all external sources: 2026-09-28. Recheck versions and issue states before relying on them.
+
+[#direction]
+== Operator direction
+
+. An *adapter of the core service* receives requests from separate local CLIs without special configuration or credential distribution. It trusts locally running clients, built on researched secure patterns.
+. A *CLI binary*, started locally, connects to that adapter. It is a separate Java module built into a GraalVM native binary, uses existing libraries for the low-level work where they are native-compatible, is part of the delivery and installation, and starts *very fast*.
+. A new *top-level Maven aggregator for clients*; the CLI is one module in it.
+. A *web adapter* provides REST endpoints and an authentication scheme. First iteration: one-time-password pairing (code entered manually and/or QR code); the CLI onboards a user/browser. Later iterations: OAuth with Token-Sheriff and API-Sheriff.
+. A *web application* module in Svelte (current version) stores the paired secret in the browser and sends it as `Authorization: Bearer`, so an OAuth access token can replace it later.
+
+[#current]
+== Current design (inventory)
+
+* *One native binary* (`pm-mcp`, Quarkus, module `pm-mcp-server`) with subcommands `runtime`, `serve`, `enter`, `client`, `operator`, `status`, `drain`, `hook` and the internal `job-exec` (`PM-IMPL-1`, link:../specification/runtime-model.adoc[Runtime Model]).
+* *Always-on runtime* per machine and `PM_MCP_BASE`, started on demand by the relay; hosts reach it only through the `pm-mcp serve` STDIO relay; sessionless Streamable HTTP over a Unix domain socket `<PM_MCP_BASE>/run/runtime.sock` (0600 in a 0700 directory, `$TMPDIR/pm-mcp-<hash16>/` fallback for `sun_path` length); peer-UID check "where the platform exposes peer credentials"; *zero TCP/UDP listeners* (`PM-SEC-4`, `PM-ARCH-1`).
+* *Trust*: only the OS (directory and socket permissions, peer UID). No token. Any process of the same user can reach the socket; this grants nothing beyond the model's own MCP tool surface.
+* *Operator channel*: MCP elicitation, or `pm-mcp operator <verb>`, which writes stores directly under file locks and never calls the runtime; TTY required, agent environment markers refused, operator credential in the OS keyring, passphrase (PBKDF2) on Linux Secret Service and file store; macOS pty residual risk accepted.
+* *`enter`* and *`hook`* run in the host shell (model-executed), write stores directly and never contact the runtime.
+* *No* web UI, REST API, browser access, pairing or OAuth in the requirements or specifications. `token-sheriff-bom` is imported in Milestone 0 without any user. link:local-endpoint-authentication.adoc[Local Endpoint Authentication] describes a superseded loopback/cookie design.
+
+Contradictions and gaps found (resolved in <<z1-19>>):
+
+[cols="1,6"]
+|===
+|C1 |Runtime start "forward-migrates" machine and project stores (Runtime Model) against "never migrating a store on runtime start" (`PM-ARCH`, `PM-IMPL`, Z3-10).
+|C2 |Requirements fallback makes service start "the only supported start mode" against on-demand start as default.
+|C3 |`PM-SEC-4` refuses runtime start for an insecure enrolment file; the specifications block only that project.
+|C4 |Client Profiles still derives Tier 2 at tool call from "the session's `initialize` handshake" (sessionless transport: relay headers).
+|C5 |No location or schema for the operator passphrase hash/salt and the operator token on file-store hosts (D2b).
+|C6 |The privileged verb list is incomplete (`approve-outline`, `resolve-deviation`, `config`, `continuation-policy`, `discharge-owed`, `lesson release`, `quality-report`, `audit verify`, upstream allowlist writer missing) (D64).
+|C7 |The session-start hook output excludes the drift notice that `PM-DIST-4` requires.
+|C8 |The bundle manifest has no artifact kind for host permission/deny rules (D53).
+|C9 |The manifest has one `scope`, the installer text says one manifest serves both scopes (D88).
+|C10 |`bundle_outdated` compares `bundle_version` with `daemon_version` (D88).
+|C11 |Subcommand lists disagree (`job-exec`), and `enter`/`hook` are called "Operator CLI".
+|C12 |`PM_MCP_HOME`, `conf/pm-mcp.properties` and putting the binary on `PATH` are unspecified.
+|C13 |`token-sheriff-bom` imported, no requirement uses it.
+|C14 |`enrolments.json` (singular file) in `PM-SEC` and roadmap against one enrolment file per project.
+|===
+
+[#target]
+== Target architecture
+
+Updated 2026-09-28 by decision Z1-21 (web server as a separate client process).
+
+----
+ AI host (Claude Code, Codex, ...)        terminal (operator / model shell)           browser (paired device)
+        | stdio (MCP JSON-RPC)                   |                                           | HTTP(S) + Bearer pmw_...
+        v                                        v                                           v
+ +------------- pm-mcp  (CLI, plain GraalVM native, picocli) ------+       +---- pm-mcp-web  (web server, Quarkus native) ----+
+ |  serve (relay) | enter | hook | status | drain | runtime         |       |  serves the SvelteKit app (pm-mcp-web-app)        |
+ |  client ... | web enable|disable|pair|open|devices | operator ...|       |  TLS (--lan), CSP, anti-framing, Host validation  |
+ +-------------------------------+---------------------------------+       |  /pair redemption, proxies /api/v1 incl. SSE      |
+                                 |                                         +------------------------+---------------------------+
+                                 | HTTP/1.1 over Unix domain socket                                  | HTTP/1.1 over Unix domain socket
+                                 | Bearer runtime token (run/runtime.token)                          | runtime token + device secret header
+                                 v                                                                   v
+ +---------------------------------- pm-mcpd  (daemon, Quarkus native, zero TCP listeners) ----------------------------------+
+ |  Local adapter (UDS listener, runtime token):  /mcp  MCP Streamable HTTP (relays)  |  /api/v1/*  REST API (CLI, web server) |
+ |  device store and pairing codes (single writer); device secret checked on every web-originated request                     |
+ |  ----------------------------------------------- core engine, stores, providers ----------------------------------------- |
+ +------------------------------------------------------------------------------------------------------------------------------+
+            ^
+            | exec per job
+ +----------+---------+
+ | pm-mcp-exec        |  confinement launcher (Z1-2)
+ +--------------------+
+----
+
+* *Four binaries.* `pm-mcp` is the interactive and host-facing CLI (fast start, small); `pm-mcpd` is the daemon, started on demand by the CLI; `pm-mcp-exec` is the job launcher; `pm-mcp-web` is the optional web server, started by `pm-mcp web enable` and stopped by `web disable` (<<z1-1>>, <<z1-2>>, <<z1-21>>).
+* *One REST API, two clients.* `/api/v1` exists only on the daemon's Unix socket; the CLI and the web server are its clients. Relays use `/mcp` on the same socket (<<z1-8>>).
+* *Single writer.* All state changes go through the daemon, including the web device store and pairing codes; neither client holds store logic (<<z1-5>>).
+* *Daemon posture unchanged.* The daemon keeps zero TCP listeners (`PM-SEC-4`); every browser-facing concern (listener, TLS, CSP, framing headers, Host validation, static files) lives in `pm-mcp-web`.
+
+[#local-trust]
+== Local adapter: trusting local clients
+
+Research summary (sources in <<sources>>):
+
+* *Unix domain socket as the only local entry* is the established pattern (Docker moved from loopback TCP to a socket because of CSRF; ssh-agent, gpg-agent, D-Bus, rootless Podman). Loopback TCP without authentication is repeatedly exploitable from a browser (DNS rebinding: Ollama CVE-2024-28224, Tailscale CVE-2022-41924; MCP Inspector CVE-2025-49596). Browsers cannot reach a Unix socket.
+* *Mandatory layers*: a 0700 directory owned by the user (checked with `lstat`: owner, mode, no symlink; refused otherwise), socket 0600 created under `umask 077`; the *peer UID* checked right after `accept` (Linux `SO_PEERCRED`, macOS `getpeereid`), a mismatch refused and logged; a `flock` singleton that alone may unlink a stale socket; clients run the same directory check before connecting, so a squatter cannot impersonate the daemon. The directory mode and the UID check protect, not the socket file mode (some systems ignore socket permissions, unix(7)).
+* *Same-user processes cannot be kept out* (ssh-agent and 1Password document the same boundary); PID checks are unreliable (PID reuse). A token file readable by the user adds nothing against them; it matters only for a TCP or Windows fallback. Code-signature checks work only when both ends are signed by the same vendor. The existing statement stays: reaching the socket grants nothing beyond the MCP tool surface; operator actions need the operator session (<<z1-9>>).
+* *Sandboxed agent shells* (Claude Code Seatbelt/bubblewrap) cannot reach Unix sockets unless allowed; the relay runs outside the sandbox. This is the desired boundary.
+* *Runtime token file (operator input)*: a fresh random secret written at start into the 0700 run directory and read by clients (Jupyter token, Tailscale `sameuserproof` file) gives the same boundary as the peer-UID check without reading peer credentials, and works through the standard HTTP authentication seam (<<z1-6>>).
+* *Java*: `jdk.net.ExtendedSocketOptions.SO_PEERCRED` (JDK 16+) returns the peer UID/GID on Linux and macOS through a JDK `SocketChannel` (no PID). *Quarkus/Vert.x over a Unix socket* needs the Netty native transport, has a history of failing in native executables, and exposes no peer credentials. Hence the proposal of an own JDK listener in front of the Quarkus router (<<z1-7>>). Native-image support of `SO_PEERCRED` is unverified: Milestone 1 spike, fallback `junixsocket` (Apache-2.0, native metadata since 2.6).
+
+[#cli]
+== The CLI binary
+
+Research summary:
+
+[cols="2,3,3"]
+|===
+|Concern |Choice |Why
+
+|Runtime
+|Plain GraalVM 25 / Mandrel 25 `native-image` through `org.graalvm.buildtools:native-maven-plugin` (profile `native` of the module)
+|About 3 ms start; no framework bootstrap; Quarkus command mode adds CDI/config bootstrap and binary size for nothing the CLI needs
+
+|Command parsing
+|picocli 4.7.x with the `picocli-codegen` annotation processor
+|Reflection and resource metadata generated at compile time; completion, help, ANSI
+
+|Transport
+|JDK `SocketChannel` + `UnixDomainSocketAddress` with an own minimal HTTP/1.1 and SSE client
+|`java.net.http.HttpClient` cannot use Unix sockets (JDK-8275838); every library alternative (Jetty, Netty, OkHttp+junixsocket, Vert.x) is several MB or needs native transports
+
+|JSON
+|`jackson-core` streaming / tree only, no databind
+|No reflection metadata; reuses the existing Jackson dependency
+
+|QR code
+|Nayuki `qrcodegen` (MIT, no dependencies, no reflection), rendered with Unicode half blocks, 4-module quiet zone, forced black on white
+|Smallest correct encoder; ZXing is larger and decodes too
+
+|Terminal
+|picocli ANSI and `System.console()`; no JLine
+|Line editing is not needed
+|===
+
+Command tree (resolves D64/C6/C11; `[op]` needs the operator session):
+
+----
+pm-mcp serve                               stdio relay for hosts (<= 50 ms to forwarded initialize)
+pm-mcp enter --client <id> <scope> [id]    session row / pending entry (model shell)
+pm-mcp hook session-start --client <id>    pointer + drift notice (host hook)
+pm-mcp status [--plans] [--archived]       runtime, projects, plans, slots, jobs (plan view, minimality figures)
+pm-mcp drain [--timeout]                   graceful stop (SIGTERM to runtime.json pid)
+pm-mcp runtime start|install|uninstall     on-demand start / launchd / systemd --user
+pm-mcp client install|update|remove|status host bundles
+pm-mcp web enable|disable [--lan]  [op]    web adapter listener
+pm-mcp web pair [--label] [--role] [op]    pairing code + URL + QR
+pm-mcp web open                    [op]    pair and open the local browser directly
+pm-mcp web devices list|revoke [op]        paired devices
+pm-mcp operator login|logout               operator session (TTY + passphrase)
+pm-mcp operator <verb> ...         [op]    enrol, unenrol, release-project, config, credentials ..., authorize-merge,
+                                           force-gate, grant-access, delete-plan, drop-capture, accept-edit,
+                                           approve-outline, resolve-deviation, continuation-policy, discharge-owed,
+                                           lesson release, quality-report, audit verify, upstream allow|deny,
+                                           epic-worktree teardown|adopt
+----
+
+[#web]
+== Web adapter and pairing
+
+Research summary:
+
+* *Pairing* follows the device-grant pattern (RFC 8628, Jellyfin Quick Connect, Home Assistant, WhatsApp linked devices): a short one-time code only *authorizes*; the browser receives a *separate per-device secret*. Code: 8 characters of the RFC 8628 alphabet `BCDFGHJKLMNPQRSTVWXZ` shown as `WDJB-MJHT` (~34.5 bits), single use, TTL 5 minutes, at most 5 failed attempts, one open pairing at a time, stored as hash. Device secret: 256 bits from `SecureRandom`, base64url, prefix `pmw_`, opaque (the daemon is issuer and validator, a JWT adds nothing and cannot be revoked instantly), stored as SHA-256 only with `{id, label, role, created_at, last_used_at}`; idle expiry.
+* *QR content*: `http(s)://<host>:<port>/pair#code=WDJBMJHT` — code in the fragment (never sent to the server, not in logs or Referer), cleared by the SPA with `history.replaceState`; `Referrer-Policy: no-referrer`. On the same machine `pm-mcp web open` opens the URL directly (Jupyter pattern), no typing.
+* *Exposure*: loopback `127.0.0.1` is a secure context and not subject to Chrome's Local Network Access prompt for same-origin requests. Mandatory: Host header validation (Quarkus `quarkus.http.host-validation.*`), `Origin` check on the MCP endpoint, no CORS, strict CSP as HTTP header (`default-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'`), `X-Content-Type-Options: nosniff`. A LAN listener (phone scanning the QR) needs TLS: a daemon-generated self-signed certificate whose SHA-256 fingerprint the CLI and the pairing page show (Syncthing model); a local CA is a later option.
+* *CSRF* does not apply: the credential is an explicit `Authorization` header, never an ambient cookie.
+* *Browser storage*: `localStorage` keeps the pairing across restarts; its XSS exposure is accepted and mitigated (no third-party scripts, strict CSP with Trusted Types, no `{@html}`, per-device revocation, idle expiry). An HttpOnly cookie hides the secret but brings back CSRF and does not fit the Bearer/OAuth path. RFC 10017 (BCP 212, browser-based OAuth apps) ranks BFF > token-mediating backend > browser-only client for the later OAuth iteration.
+* *Live updates*: SSE from Quarkus REST (`Multi<T>`); the SPA reads it with `fetch()` and a `ReadableStream`, because `EventSource` cannot send an `Authorization` header (never a token in the URL).
+* *Quarkus*: a custom `HttpAuthenticationMechanism` (Bearer `pmw_…`) plus an `IdentityProvider` (hash lookup) building a `SecurityIdentity` with device id and roles; resources use only `@Authenticated`/`@RolesAllowed`. Token-Sheriff's Quarkus integration is a CDI interceptor (`@BearerAuth`) with injected `JsonWebToken`, not an authentication mechanism, so the OAuth iteration wraps its validation in a mechanism of its own and routes by token shape (`pmw_` opaque vs three-part JWT), keeping paired devices working during the switch. API-Sheriff: no public documentation found — its role is for the operator to define.
+
+[#webapp]
+== Web application
+
+* Svelte 5.57 (runes) is current; SvelteKit 2 is stable, SvelteKit 3 is a release candidate (2026-08-13). For a small SPA (pairing, devices, status, live plan view, decisions) plain *Svelte 5 + Vite* with a small router avoids the Kit 2→3 transition; SvelteKit with `adapter-static` is the alternative.
+* The build produces static files served by the daemon from `META-INF/resources` (works in JVM and native). Options: Quarkus Quinoa (Quarkiverse extension, runs the npm build inside the Quarkus module, proxies the Vite dev server) or `frontend-maven-plugin` in the web-app module producing a resource JAR that `pm-mcp-server` depends on.
+
+[#modules]
+== Module structure
+
+----
+plan-marshall-mcp (root, aggregator)
+├── pm-mcp-modules/
+│   ├── pm-mcp-api            NEW  plain Java: REST resource model (records), link relations, error codes, TOON/JSON codecs
+│   ├── pm-mcp-exec           NEW  plain Java + FFM, native binary `pm-mcp-exec` (job launcher, Z1-2)
+│   ├── pm-mcp-core
+│   ├── pm-mcp-providers/...
+│   └── pm-mcp-conformance
+├── pm-mcp-clients/           NEW  top-level aggregator for clients
+│   ├── pm-mcp-cli            NEW  plain Java + picocli, GraalVM native binary `pm-mcp`; depends on pm-mcp-api only
+│   ├── pm-mcp-web-server     NEW  Quarkus, native binary `pm-mcp-web`: listener, TLS, headers, pairing redemption, /api/v1 proxy;
+│   │                              depends on pm-mcp-api and pm-mcp-web-app only (Z1-21)
+│   └── pm-mcp-web-app        NEW  SvelteKit static SPA, packaged as a resource JAR (META-INF/resources)
+└── pm-mcp-server                  Quarkus assembly, native binary `pm-mcpd`: engine wiring, local adapter (UDS, runtime token),
+                                   device store; release profile packages all four binaries
+----
+
+Dependency direction: `pm-mcp-cli` → `pm-mcp-api`; `pm-mcp-web-server` → `pm-mcp-api`, `pm-mcp-web-app`; `pm-mcp-server` → `pm-mcp-api`, `pm-mcp-core`, providers; `pm-mcp-api` depends on Jackson only. No client module depends on `pm-mcp-core`; only the web server (a server itself) uses Quarkus.
+
+[#decisions]
+== Decisions
+
+[#z1-1]
+=== Z1-1 Binary split
+
+* *Question*: Which binary does what?
+* *Options*: (a) two binaries: `pm-mcp` (CLI: relay, enter, hook, status, drain, runtime, client, web, operator, job-exec) and `pm-mcpd` (daemon); (b) keep the single Quarkus binary for everything and add the CLI for operator and web pairing only; (c) as (a) but the relay stays in the daemon binary.
+* *Recommendation*: (a). Everything hosts and users invoke gets ~3 ms start and a small binary (the relay's 50 ms budget becomes trivial); the daemon binary carries Quarkus only where it is needed. Host configurations keep calling `pm-mcp serve`.
+* *Affected*: `PM-IMPL-1`, `PM-TECH-1`/`-3`, `PM-DIST-*`, Runtime Model (start modes: the CLI spawns `pm-mcpd`), release layout.
+* *Decision*: Operator 2026-09-28: (a) two binaries, `pm-mcp` (CLI) and `pm-mcpd` (daemon, started on demand by the CLI).
+* *Adjusted by Z1-2 and Z1-21*: four binaries — `pm-mcp`, `pm-mcpd`, `pm-mcp-exec`, `pm-mcp-web`.
+* *Adjusted by naming review N2 (2026-10-01)*: the CLI is split by caller into `pm-mcp` (module `pm-relay`: `serve`, `enter`, `hook`) and `pm-operator` (module `pm-operator`: every verb a human runs, without an `operator` sub-level; the host deny rule covers the whole binary `pm-operator`); with N4 the release has four binaries `pm-mcp`, `pm-operator`, `pm-mcpd`, `pm-exec`.
+
+[#z1-2]
+=== Z1-2 Location of `job-exec`
+
+* *Question*: Where does the confinement launcher live?
+* *Options*: (a) hidden subcommand of the CLI binary; (b) its own tiny binary `pm-mcp-exec`; (c) stays in the daemon binary.
+* *Recommendation*: (a). Fast start matters for every job, the launcher needs no Quarkus, and one fewer artifact to digest and install. The FFM code for Landlock/`setpgid` moves into the CLI module.
+* *Affected*: Job Runtime § Launcher, `PM-SEC-5`, release layout.
+* *Decision*: Operator 2026-09-28: (b) own tiny binary `pm-mcp-exec`. Rationale: the CLI is only for interaction — a clear direction per binary. The Z1-1 split reads accordingly: `pm-mcp` interactive/host-facing commands, `pm-mcpd` daemon, `pm-mcp-exec` job launcher.
+* *Adjusted by naming review N1 (2026-10-01)*: the launcher module and binary are named `pm-exec`.
+
+[#z1-3]
+=== Z1-3 Module structure
+
+* *Question*: How are client and shared modules arranged?
+* *Options*: (a) as in <<modules>>: new `pm-mcp-api` under `pm-mcp-modules`, new top-level `pm-mcp-clients` with `pm-mcp-cli` and `pm-mcp-web-app`, adapters as packages of `pm-mcp-server`; (b) as (a) plus a module `pm-mcp-adapters` for the local and web adapter; (c) CLI depends on `pm-mcp-core` (no `pm-mcp-api`).
+* *Recommendation*: (a). The adapters are Quarkus wiring (listeners, security mechanisms, REST resources) and belong to the assembly; `pm-mcp-api` keeps the CLI and web contract free of engine and store code, so native-image cannot reach it.
+* *Affected*: `PM-IMPL-1`, roadmap Milestone 0, CLAUDE.md § Modules.
+* *Decision*: Operator 2026-09-28: (a) `pm-mcp-modules/pm-mcp-api` (contract), `pm-mcp-modules/pm-mcp-exec` (launcher binary, Z1-2), top-level `pm-mcp-clients` with `pm-mcp-cli` and `pm-mcp-web-app`, adapters as packages of `pm-mcp-server`, release profile packages all three binaries.
+* *Adjusted by Z1-21*: `pm-mcp-clients` also contains `pm-mcp-web-server`.
+* *Adjusted by naming review N1 (2026-10-01)*: the `mcp` infix is dropped from module, aggregator and package names (`pm-modules`, `pm-clients`, `pm-providers`, `pm-api`, `pm-core`, `pm-workflow`, `pm-exec`, `pm-e2e`, `pm-conformance`, `pm-web-app`, providers `pm-provider-<x>`, packages `de.cuioss.pm.<module>`); the daemon module stays `pm-mcp-server` (binary `pm-mcpd`) because it is an MCP server; installed paths, environment variables, headers and the product abbreviation keep `PM_MCP` / `PM-MCP`.
+* *Adjusted by naming review N2 (2026-10-01)*: `pm-mcp-cli` is replaced by `pm-relay` and `pm-operator`; the shared socket client lives in `pm-api`.
+* *Adjusted by naming review N4 (2026-10-01)*: there is no `pm-mcp-web-server` module; `pm-web-app` stays in `pm-clients` and becomes a dependency of `pm-mcp-server`, whose package `de.cuioss.pm.mcp.server.web` is the web adapter; the release profile packages the four binaries of Z1-1.
+
+[#z1-4]
+=== Z1-4 CLI technology stack and dependencies
+
+* *Question*: Which stack builds the CLI?
+* *Options*: (a) plain native-image + picocli/picocli-codegen + JDK Unix socket with own HTTP/SSE client + jackson-core + Nayuki qrcodegen, built with `native-maven-plugin`; (b) Quarkus command mode (`quarkus-picocli`) native.
+* *Recommendation*: (a). New dependencies to approve: `info.picocli:picocli` and `picocli-codegen` (Apache-2.0), `io.nayuki:qrcodegen` (MIT), build plugin `org.graalvm.buildtools:native-maven-plugin`.
+* *Affected*: `PM-TECH-*`, `PM-IMPL-1`, Milestone 0.
+* *Decision*: Operator 2026-09-28: (a); dependencies APPROVED: `info.picocli:picocli`, `info.picocli:picocli-codegen`, `io.nayuki:qrcodegen`, build plugin `org.graalvm.buildtools:native-maven-plugin` (also used by `pm-mcp-exec`, without picocli).
+* *Adjusted by naming review N2 (2026-10-01)*: both client binaries `pm-mcp` and `pm-operator` are picocli native images; `qrcodegen` is used by `pm-operator` only; the shared socket client, the on-demand start and the drift checks live in `pm-api`.
+
+[#z1-5]
+=== Z1-5 Single writer: the CLI through the daemon only
+
+* *Question*: May the CLI write stores directly (today: `operator`, `enter`, `hook`)?
+* *Options*: (a) no: every command is a request to the daemon's REST API; the CLI starts the daemon on demand; only `status` (when the daemon is down: reads `runtime.json`) and `drain` (signal) work without it; (b) keep direct store access for operator verbs and `enter` (CLI depends on `pm-mcp-core`).
+* *Recommendation*: (a). One writer means one lock owner, one validation path and one audit path (server-side first); it removes the duplicated store code from the CLI and lets the web app offer the same actions. The cost — the daemon must run for operator actions — is already paid by on-demand start.
+* *Affected*: CLI & Security § Operator CLI ("never calls the runtime"), `PM-DIST-3` ("requires no runtime pre-start"), `enter`, `hook`.
+* *Decision*: Operator 2026-09-28: (a) daemon is the only writer; every CLI command is an API request (daemon started on demand); without the daemon only `status` (reads `runtime.json`, reports not running), `drain` (signal) and `hook session-start` (reads files, never starts the daemon, exits 0) work, none of them writes; a damaged store blocks only its scope/project, so repair verbs run through the daemon.
+* *Adjusted by naming review N2 (2026-10-01)*: `status` and `drain` are verbs of `pm-operator`; `hook` and `enter` of `pm-mcp`.
+
+[#z1-6]
+=== Z1-6 Local trust model
+
+* *Question*: Which layers establish trust on the local adapter?
+* *Operator input 2026-09-28*: "On start it writes a random secret into the filesystem, and the client reads it" (runtime token file, Jupyter/Tailscale `sameuserproof` pattern).
+* *Options*: (a) runtime token file: at every start, before binding, the daemon writes a fresh 256-bit secret atomically to `<PM_MCP_BASE>/run/runtime.token` (0600, directory 0700); every local request carries `Authorization: Bearer <runtime token>`, checked by a Quarkus `HttpAuthenticationMechanism`; clients verify owner, mode and no symlink of directory and file before reading; on `401` a client re-reads the file once (daemon restarted); the secret is in the redaction registry, never in logs, arguments or job environments, and `run/` is outside every job's Landlock read set; the Unix socket stays the listener (0600 under `umask 077`, `flock` singleton), the peer UID is checked additionally where cheaply available and never required; (b) peer UID mandatory, no token (requires an own JDK listener); (c) (a) plus peer UID mandatory.
+* *Recommendation*: (a). Same boundary as the peer-UID check (only the same OS user reads the file; same-user processes are out of reach for either), but an ordinary HTTP authentication through the standard Quarkus seam, identical to the web adapter's bearer tokens, portable to a loopback-TCP fallback (with Host/Origin validation) and to Windows.
+* *Affected*: `PM-SEC-4`, Runtime Model § Transport Endpoint, Filesystem Layout (run directory), CLI & Security § Runtime Secret Redaction, Job Runtime (Landlock read set).
+* *Decision*: Operator 2026-09-28: (a) runtime token file (operator's proposal); peer UID optional, never required.
+
+[#z1-7]
+=== Z1-7 Local adapter implementation
+
+* *Question*: How does the daemon listen locally?
+* *Options*: (a) Quarkus/Vert.x domain socket (`quarkus.http.domain-socket-enabled`, `host-enabled=false`) with the runtime-token mechanism of <<z1-6>>; (b) an own JDK `ServerSocketChannel` (UNIX, virtual threads) bridging requests in-process to the Quarkus router; (c) loopback TCP `127.0.0.1` with the runtime token, Host and Origin validation.
+* *Recommendation*: (a), verified by a Milestone 1 spike (native image on macOS and Linux, SSE streaming, stale-socket handling); fallback (c), then (b). With the token, the listener no longer has to expose peer credentials, which was the reason for (b).
+* *Affected*: `PM-TECH-1`, Runtime Model § Transport Endpoint, roadmap Milestone 1.
+* *Decision*: Operator 2026-09-28: (a) Quarkus/Vert.x domain socket with the runtime-token mechanism, verified by a Milestone 1 spike (native macOS/Linux, SSE, stale socket, path-length fallback); fallback order (c) loopback TCP with token + Host/Origin validation, then (b) own JDK listener.
+* *Adjusted by round-4 D3 (2026-10-01)*: the `$TMPDIR` fallback for a socket path beyond the platform `sun_path` limit is dropped: the daemon refuses to start with a diagnostic naming the path and asking for a shorter `PM_MCP_BASE`.
+
+[#z1-8]
+=== Z1-8 One REST API on both listeners
+
+* *Question*: What do the CLI and the web app talk to?
+* *Options*: (a) one versioned REST API `/api/v1` (JSON, resource model from `pm-mcp-api`) served on the local and the web listener, authorization per listener (local: runtime token, operator verbs need the operator session; web: device bearer and role); `/mcp` only on the local listener; (b) separate local and web APIs.
+* *Recommendation*: (a). One contract, tested once; the web app and the CLI stay feature-equal where roles allow. The MCP endpoint is never exposed on TCP (browser threat model).
+* *Affected*: new specification section (API), `PM-TOOL-*` boundary statement, `PM-SEC-4`.
+* *Decision*: Operator 2026-09-28: (a) one REST API `/api/v1` on both listeners, authorization per listener; `/mcp` only on the local listener.
+* *Adjusted by Z1-21*: `/api/v1` is served only on the daemon's Unix socket; the web server is a proxying client, not a second listener of the daemon.
+* *Adjusted by naming review N4 (2026-10-01)*: the web server process is gone and the daemon has a second listener again: `/api/v1` is served on the Unix socket (runtime token) and, only while the operator enabled web access, on the daemon's TCP listener (device secret, never the runtime token); `/mcp` stays on the Unix socket only. There is no proxy.
+
+[#z1-9]
+=== Z1-9 Operator authentication (replaces D2b)
+
+* *Question*: How is an operator action told apart from a model shell of the same user?
+* *Options*: (a) `pm-mcp operator login` requires a TTY and no agent environment markers, reads the passphrase without echo and sends it over the Unix socket; the daemon verifies it against a PBKDF2-HMAC-SHA256 hash (≥ 600,000 iterations, salt, parameters in `<PM_MCP_BASE>/state/operator.json`, 0600) with the persisted back-off, and issues an *operator session* (random, in memory only, idle timeout 15 minutes, absolute 8 hours, compiled) that the CLI keeps in a 0600 file bound to the terminal session and presents as `Authorization: Bearer`; (b) keep the OS keyring as the operator credential without a passphrase on macOS (today); (c) OS authentication (Touch ID / polkit) — later.
+* *Recommendation*: (a). One mechanism on every platform, an actual user proof on macOS too, and the same session model the web adapter uses (roles). The macOS pty residual risk narrows to "the model watches the operator type": documented, accepted.
+* *Affected*: `PM-SEC-*` operator channel, `PM-CRED-*` (operator entry leaves the credential store), CLI & Security § Operator Channel Isolation, Store Schemas (new `operator.json`), C5.
+* *Decision*: Operator 2026-09-28: new option (e) CLI-only proof for now — operator verbs are accepted when the CLI passes its checks (terminal attached, no agent environment markers, host deny rules as defence in depth); no passphrase. Risk accepted: a model shell that deliberately defeats the checks can run operator verbs. The improvement (passphrase session, later Touch ID/polkit) is recorded as L-1 in link:../later-improvements.adoc[Later Improvements]; OAuth for the web adapter as L-2. C5 is resolved by removing the operator passphrase/keyring entry from the first iteration.
+* *Adjusted by naming review N2 (2026-10-01)*: the operator verbs are the binary `pm-operator`; the host deny rule covers the whole binary instead of the sub-commands `pm-mcp operator` and `pm-mcp web`; the checks of each verb are unchanged.
+
+[#z1-10]
+=== Z1-10 Web adapter exposure
+
+* *Question*: Where does the web adapter listen?
+* *Options*: (a) off by default; `pm-mcp web enable` (or the first `web pair`) opens a loopback listener `127.0.0.1:<port>` over HTTP; `--lan` opens it on the LAN with TLS (daemon-generated self-signed certificate, fingerprint shown by the CLI and the pairing page); Host validation, no CORS, strict CSP; (b) loopback only, no LAN in the first iteration (the QR code then only serves the same machine); (c) LAN with TLS always.
+* *Recommendation*: (a). The QR code is only useful with a second device, which needs LAN; TLS is mandatory there. Off by default keeps "no listener" as the default posture; `PM-SEC-4`/`PM-ARCH-1` change from "zero TCP listeners" to "no TCP listener unless the operator enables the web adapter".
+* *Affected*: `PM-SEC-4`, `PM-ARCH-1`, `PM-ARCH-2` (local only still holds), Runtime Model, `machine-config.json` (listener settings).
+* *Decision*: Operator 2026-09-28: (a) off by default; loopback HTTP on `web enable`/first `web pair`; `--lan` with daemon-generated self-signed TLS and fingerprint; Host validation, no CORS, strict CSP, `/mcp` never on TCP. Local CA for LAN recorded as later improvement (L-2).
+* *Adjusted by Z1-21*: the listener, TLS and headers belong to `pm-mcp-web`, started by `web enable`; the daemon keeps zero TCP listeners, so `PM-SEC-4`/`PM-ARCH-1` are unchanged for the daemon and gain a statement for the optional web server.
+* *Adjusted by naming review N4 (2026-10-01)*: web access is folded into the daemon: there is no `pm-mcp-web` binary and no `pm-mcp-web-server` module. The daemon opens the TCP listener only when the operator enabled web access (`pm-operator web enable [--lan]`, persisted as `web` in `machine-config.json`), routes only the web app and `/api/v1/` there, never `/mcp`, never accepts the runtime token there and checks the device secret itself; the listener, TLS and headers belong to the daemon. Immediate effect of `web enable` / `web disable` is verified by a Milestone 1 spike; the fallback is that the setting takes effect at the next daemon start. `PM-SEC-4` reads "no TCP or UDP listener unless the operator enabled web access".
+
+[#z1-11]
+=== Z1-11 Pairing protocol
+
+* *Question*: What is the one-time password and what does the browser keep?
+* *Options*: (a) one-time *code* (8 chars, base-20, TTL 5 min, single use, 5 attempts, one open pairing, hashed) exchanged at `POST /api/v1/pair` for a per-device secret (`pmw_` + 256 bits, opaque, SHA-256 stored); the browser keeps and sends the device secret; (b) the one-time password itself becomes the bearer (then it must be long and random, cannot be typed from the screen, and is not one-time).
+* *Recommendation*: (a). It keeps "one time" true, makes typing feasible, and gives each browser a revocable identity.
+* *Affected*: new API section, Store Schemas (new `web-devices.json`), identifiers.
+* *Decision*: Operator 2026-09-28: (a) one-time code (8 chars base-20, 5 min, single use, 5 attempts, one open pairing, hashed; QR with code in the URL fragment; `web open` for the same machine) exchanged at `POST /api/v1/pair` for a per-device secret `pmw_` + 256 bits (SHA-256 stored); the browser keeps and sends the device secret as Bearer.
+
+[#z1-12]
+=== Z1-12 Device management and expiry
+
+* *Question*: How are paired devices managed?
+* *Options*: (a) `pm-mcp web devices list|revoke <id>|revoke --all` (operator session); idle expiry 90 days (compiled); `last_used_at` updated at most once per minute; revocation effective immediately; (b) as (a) with absolute expiry and rotation in the first iteration.
+* *Recommendation*: (a); rotation arrives with OAuth.
+* *Affected*: CLI & Security, Store Schemas.
+* *Decision*: Operator 2026-09-28: (a) `web devices list|revoke <id>|revoke --all` (operator verbs, Z1-9 proof), immediate revocation, idle expiry 90 days (compiled), `last_used_at` at most once per minute; rotation with OAuth (L-2).
+
+[#z1-13]
+=== Z1-13 Roles of a paired device
+
+* *Question*: What may a paired browser do?
+* *Options*: (a) roles: `viewer` (default: status, plans, jobs, live view) and `operator` (additionally decisions, grants and operator verbs); `--role operator` requires the operator session at pairing time; (b) viewer only in the first iteration; (c) every device is operator.
+* *Recommendation*: (a). The web app becomes a real operator channel (answering pending decisions without elicitation support) while a phone paired "just to watch" cannot authorize a merge.
+* *Affected*: Operator channel (third channel next to elicitation and CLI), `PM-SEC-*`, Decision Registry delivery, web API.
+* *Decision*: Operator 2026-09-28: (c) every paired device has operator rights (the web app is a third operator channel next to elicitation and CLI); no roles in the first iteration. Roles (viewer/operator) and step-up recorded as later improvement (L-1).
+
+[#z1-14]
+=== Z1-14 Authentication seam for OAuth
+
+* *Question*: How is the first iteration built so OAuth can replace it?
+* *Options*: (a) Quarkus Security: custom `HttpAuthenticationMechanism` + `IdentityProvider` for `pmw_` tokens and for operator sessions, resources only with `@Authenticated`/`@RolesAllowed`; the OAuth iteration adds a mechanism wrapping Token-Sheriff validation and routes by token shape; (b) Token-Sheriff's `@BearerAuth` interceptor style from the start with an own validator for device tokens.
+* *Recommendation*: (a). Standard Quarkus seam, both token kinds coexist during migration. API-Sheriff's role needs the operator's definition.
+* *Affected*: `PM-TECH-*`, C13 (`token-sheriff-bom` stays for the OAuth iteration or is removed until then).
+* *Decision*: Operator 2026-09-28: (a) Quarkus Security seam: one `HttpAuthenticationMechanism` (Bearer), an `IdentityProvider` per token kind (runtime token, `pmw_` device secret), resources only `@Authenticated` (`@RolesAllowed` once roles exist); OAuth adds a Token-Sheriff-wrapping provider routed by token shape; `token-sheriff-bom` stays imported for L-2 (C13 resolved).
+* *Adjusted by Z1-21*: the Bearer mechanism for device secrets runs in `pm-mcp-web`; the daemon authenticates the runtime token and checks the forwarded device secret against its store on every request (instant revocation, no cache).
+* *Adjusted by naming review N4 (2026-10-01)*: the Bearer mechanism for device secrets runs in the daemon, on its TCP listener: the browser sends `Authorization: Bearer pmw_…`, which the daemon checks against the web device store on every request (no cache); no device secret is forwarded in a header, and the runtime token is accepted only on the Unix socket.
+
+[#z1-15]
+=== Z1-15 Browser storage of the secret
+
+* *Question*: Where does the SPA keep the device secret?
+* *Options*: (a) `localStorage` with strict CSP and Trusted Types, no third-party scripts, no `{@html}`; (b) `sessionStorage` (re-pair per tab/restart); (c) HttpOnly cookie.
+* *Recommendation*: (a). Persistence is the purpose of pairing; the XSS exposure is contained by the CSP and revocation; (c) breaks the Bearer path. For OAuth the access token moves to memory (RFC 10017).
+* *Affected*: web app, security headers.
+* *Decision*: Operator 2026-09-28: (a) `localStorage` with strict CSP header plus Trusted Types, no third-party scripts, no `{@html}`, lockfile-pinned dependencies, revocation and idle expiry as recovery; plus explicit anti-framing: CSP `frame-ancestors 'none'` and `X-Frame-Options: DENY` on every web-adapter response. Sender-constrained tokens (non-extractable WebCrypto key, DPoP) recorded in L-2.
+* *Adjusted by Z1-21*: the security headers are set by `pm-mcp-web`.
+* *Adjusted by naming review N4 (2026-10-01)*: the security headers are set by the daemon on its TCP listener.
+
+[#z1-16]
+=== Z1-16 Web application framework
+
+* *Question*: Svelte how?
+* *Options*: (a) Svelte 5 + Vite SPA with a small router, TypeScript; (b) SvelteKit 2 with `adapter-static` (SPA mode); (c) SvelteKit 3 (release candidate).
+* *Recommendation*: (a). Smallest bundle, no SSR concepts to switch off, no Kit 2→3 migration; routing needs are tiny.
+* *Affected*: `pm-mcp-web-app`.
+* *Decision*: Operator 2026-09-28: (c) SvelteKit 3 (release candidate, pinned; moved to 3.0 final when released), built as a static SPA (`adapter-static`, `ssr = false`, fallback page) served by the daemon; TypeScript.
+* *Adjusted by Z1-21*: served by `pm-mcp-web`.
+* *Adjusted by naming review N4 (2026-10-01)*: served by the daemon (`pm-mcp-server`) on its TCP listener, as first decided.
+
+[#z1-17]
+=== Z1-17 Web application build and serving
+
+* *Question*: How is the SPA built and delivered?
+* *Options*: (a) `frontend-maven-plugin` in `pm-mcp-web-app` (pinned Node and npm, `npm ci`, lockfile), output packaged as `META-INF/resources` JAR, served by `pm-mcp-server`; (b) Quarkus Quinoa inside `pm-mcp-server`.
+* *Recommendation*: (a). Keeps the frontend in its own module (the requested client aggregator), no extension in the daemon, same static serving in JVM and native. New build dependency to approve: `com.github.eirslett:frontend-maven-plugin`; npm dependencies (Svelte, Vite, TypeScript) pinned by lockfile.
+* *Affected*: `PM-IMPL-1`, CI (Node toolchain), `PM-DIST-*` (SBOM covers npm packages).
+* *Decision*: Operator 2026-09-28: (a) `frontend-maven-plugin` in `pm-mcp-web-app` (pinned Node/npm, `npm ci`, SvelteKit build, Vitest), static output as `META-INF/resources` JAR served by `pm-mcp-server`; dev server proxies `/api` to the daemon. Dependencies APPROVED: build plugin `com.github.eirslett:frontend-maven-plugin`; npm packages (SvelteKit 3 RC, Svelte 5, Vite, TypeScript, `@sveltejs/adapter-static`, Vitest) pinned by `package-lock.json`, covered by the CycloneDX SBOM.
+* *Adjusted by Z1-21*: `pm-mcp-web` (not the daemon) depends on and serves the `pm-mcp-web-app` resource JAR.
+* *Adjusted by naming review N4 (2026-10-01)*: `pm-mcp-server` depends on and serves the `pm-web-app` resource JAR, as first decided.
+
+[#z1-18]
+=== Z1-18 Live updates
+
+* *Question*: How does the web app see changes?
+* *Options*: (a) SSE endpoints (`/api/v1/events`, per plan) read with `fetch` + `ReadableStream` and Bearer header; (b) polling; (c) WebSocket.
+* *Recommendation*: (a). One-directional, simple, works with the Bearer header; no token in URLs.
+* *Affected*: web API.
+* *Decision*: Operator 2026-09-28: (a) SSE `/api/v1/events` and `/api/v1/plans/{id}/events` from the daemon, streamed unbuffered through `pm-mcp-web` (device check on connect), read by the SPA with `fetch()` + `ReadableStream` and Bearer header; `Last-Event-ID` reconnect; revocation ends the device's open streams; reusable by the CLI (`status --watch`).
+* *Adjusted by naming review N4 (2026-10-01)*: the daemon streams the events to the browser itself on its TCP listener (device check on connect by the daemon); nothing is proxied through a web server process.
+
+[#z1-19]
+=== Z1-19 Contradictions C1–C14 and remaining agenda items
+
+* *Question*: How are the found contradictions and the older Z1 items resolved?
+* *Proposal*: C1 remove start-time migration (Z3-10 holds); C2 fallback wording keeps on-demand as default; C3 insecure enrolment file blocks only its project; C4 Tier 2 from relay headers; C5 by <<z1-9>>; C6/C11 by the command tree in <<cli>>; C7 hook prints pointer and drift notice; C8 manifest kind `permission_rule` with owned array elements (D53); C9 manifest `scopes[]` with per-scope `shared_configs` (D88); C10 compare `bundle_version` with the binary's embedded bundle version (D88); C12 installation layout: `<PM_MCP_HOME>/bin/{pm-mcp,pm-mcpd}`, `pm-mcp.properties` removed (configuration is `machine-config.json`), PATH by symlink or installer instruction; C13 by <<z1-14>>; C14 `enrolments/<project_id>.json`. D86: `status`/`drain` via the API (`stalled` = no progress event within the wait's stall bound). D54, D59, D60 stay host-bundle items for the client-profile milestone. `project_skills`: decided separately. link:local-endpoint-authentication.adoc[Local Endpoint Authentication] is marked superseded.
+* *Affected*: as listed.
+* *Decision C12 (Z1-19.1)*: Operator 2026-09-28: one installation directory `<PM_MCP_HOME>/bin/{pm-mcp,pm-mcpd,pm-mcp-exec,pm-mcp-web}` plus `sbom/` and release notes; `PM_MCP_HOME` defaults to the directory of the running `pm-mcp` (symlinks resolved); sibling binaries started by path from there, never via `PATH`; `pm-mcp.properties` dropped (machine settings in `machine-config.json`); installer places one `pm-mcp` symlink in a user bin directory or prints the line; upgrade by versioned directory plus symlink switch, then `pm-mcp drain`.
+* *Decision C8/D53 (Z1-19.2)*: Operator 2026-09-28: element-level ownership — manifest kinds `permission_rule` (host rule, list deny/ask/allow, enforcement or convenience) and `hook_entry`; owned elements identified by exact normalized value and recorded in `install-records.json`; install appends missing, update replaces recorded, remove deletes recorded only; user-edited recorded element needs interactive `--force`; weakening an enforcement rule keeps the TTY gate.
+* *Decision group A*: Operator 2026-09-28: apply C1 (no start-time migration), C2 (on-demand start stays default), C3 (insecure enrolment file blocks only its project), C4 (Tier 2 from relay headers), C5 (resolved by Z1-9), C6/C11 (command tree, four binaries, `enter`/`hook` host-facing), C7 (hook prints pointer and drift notice), C13 (resolved by Z1-14), C14 (`enrolments/<project_id>.json`).
+* *Decision C9/D88 (Z1-19.3)*: Operator 2026-09-28: one manifest per client; shared artifacts declared once; a `scopes` object (`user`, `project`) with each scope's target root, `shared_configs` (files, owned keys and elements) and scope-only artifacts; `client install --scope` selects the section; install record stores the scope; a single-scope host declares only its section.
+* *Decision C10/D88 (Z1-19.4)*: Operator 2026-09-28: `bundle_outdated` compares the recorded `bundle_version` with the bundle version embedded in the running `pm-mcp` (= release version); `bundle_modified` compares recorded SHA-256 of every installed artifact and owned element with disk (edited/missing listed); both reported by `enter`, the session-start hook and `client status`; fix `client update` (`--force` for modified entries).
+* *Decision D86 (Z1-19.5)*: Operator 2026-09-28: `stalled` = non-terminal, no pending condition, no awaited event, last transition or model call older than 10 minutes (compiled, `timeouts.adoc`); shown in `status`, web app and epic view; recorded once per episode as audit event `plan_stalled` with the idle span; metrics count the gap; nothing in model-facing representations. RUN-1 contradiction resolved by Z1-5 (`status` via API is a round trip; `runtime.json` only for "not running").
+* *Decision D54/D59/D60 (Z1-19.6)*: Operator 2026-09-28: scheduled as explicit roadmap tasks — Milestone 1 host-behaviour spikes (nested-host markers, `AI_AGENT` mapping, Codex/Antigravity config locations); Milestone 13 resolves D54 (user-scope agent variants vs per-project effort ladder), D59 (nested host detection, provisional host facts), D60 (profile override validation, Claude agent naming during coexistence); the broken DISP-12 anchor is fixed now.
+* *Decision project_skills (Z1-19.7)*: Operator 2026-09-28: not now; recorded as later improvement L-4 (project-local skills in `.marshall/skills/`, domain-bound, `project:` namespace, untrusted input); until then project knowledge uses the hosts' own project skills and `CLAUDE.md`/`AGENTS.md`, automation uses recipes and `project_script`.
+* *Adjusted by Z4-1 (roadmap ordering, commit 69ee632)*: Z1-19.6: the claude installer with its client bundle is placed in Milestone 7; Milestone 13 keeps the other hosts and the host-behaviour items listed here; the user-scope agent variants named there no longer exist after Server-Launched Sub-Agents Z7-0 (no installed agents).
+* *Adjusted by naming review N4 (2026-10-01)*: Z1-19.1: there is no `pm-mcp-web` binary; with N1 and N2 the installation directory holds `<PM_MCP_HOME>/bin/{pm-mcp,pm-operator,pm-mcpd,pm-exec}`.
+
+[#z1-20]
+=== Z1-20 Roadmap
+
+* *Question*: Where does this land?
+* *Proposal*: Milestone 0 creates `pm-mcp-api`, `pm-mcp-clients`, `pm-mcp-cli` (native build in CI) and `pm-mcp-web-app` (builds an empty shell page with a test); Milestone 1 spikes: JDK Unix socket + `SO_PEERCRED` in native, the in-process bridge to the Quarkus router with SSE, Host validation; Milestone 2: local adapter, CLI relay/status/drain/runtime, operator session; new milestone "Web adapter & web app" after the finalize milestones: listener, pairing, devices, roles, SPA (pairing, devices, status, live plan view, decisions).
+* *Affected*: roadmap.
+* *Decision*: Operator 2026-09-28: (a) Milestone 0 creates `pm-mcp-api`, `pm-mcp-exec`, `pm-mcp-clients/{pm-mcp-cli,pm-mcp-web-server,pm-mcp-web-app}` (native builds of `pm-mcp`, `pm-mcp-exec`, `pm-mcp-web` in CI, minimal web page with Vitest, release profile packages four binaries); Milestone 1 spikes (Quarkus UDS native + runtime token, SSE, stale socket, path fallback; picocli native + own UDS HTTP/SSE client; SSE proxy and Host validation in `pm-mcp-web`; host-behaviour spikes); Milestone 2 local adapter, CLI (`serve`, `status` incl. `stalled`, `drain`, `runtime`, operator verbs over the API), `pm-mcp-exec`, installation layout; Milestone 13 manifest scopes, element ownership, drift checks, D54/D59/D60; new Milestone 14 "Web Server & Web App" in Platform Services after Milestone 13.
+* *Adjusted by the roadmap ordering decision (commit `69ee632`)*: Milestone 0 also builds `pm-mcpd` natively (operator 2026-09-29).
+* *Adjusted by naming review N4 (2026-10-01)*: Milestone 0 creates no `pm-mcp-web-server` module and builds no `pm-mcp-web`; with N1 and N2 its client modules are `pm-clients/{pm-relay,pm-operator,pm-web-app}` and the native builds are `pm-mcp`, `pm-operator`, `pm-mcpd` and `pm-exec` (the four binaries of the release profile). The Milestone 1 spike "SSE proxy and Host validation in `pm-mcp-web`" becomes a spike of a second Vert.x HTTP server beside the Unix-socket listener in the daemon's native image, with the route restriction and opened and closed while the daemon runs. Milestone 14 delivers the daemon's web listener and the web app.
+
+[#z1-21]
+=== Z1-21 Web server as a separate client process
+
+* *Question* (operator 2026-09-28): Would a custom web server that talks to the daemon through the same endpoints as the CLI simplify matters and keep the daemon leaner?
+* *Proposal*: `pm-mcp-web` (module `pm-mcp-clients/pm-mcp-web-server`, Quarkus native) is a client of the daemon like the CLI. It serves the SvelteKit app, owns the TCP listener (loopback, `--lan` with TLS), the security headers, Host validation and the pairing-redemption endpoint, and proxies `/api/v1` including SSE to the daemon's Unix socket with the runtime token, forwarding the browser's device secret in a header. The daemon keeps the device store and pairing codes (single writer) and checks the forwarded device secret on every request. `pm-mcp web enable|disable` starts and stops the web server; without it no listener exists. The pattern is a backend-for-frontend, the recommended placement for the later OAuth iteration (L-2).
+* *Note*: with the daemon as single writer (Z1-5) and the CLI-only operator proof (Z1-9), any same-user process holding the runtime token can call operator endpoints directly (for example `curl --unix-socket`), not only a model that defeats the CLI checks; this is within the risk accepted for Z1-9 and stated in L-1.
+* *Affected*: Z1-1, Z1-3, Z1-8, Z1-10, Z1-14, Z1-15, Z1-17 (adjusted), `PM-SEC-4`, `PM-IMPL-1`, `PM-DIST-*`.
+* *Decision*: Operator 2026-09-28: adopted.
+* *Adjusted by naming review N4 (2026-10-01)*: this item is reversed: web access is folded into the daemon. There is no `pm-mcp-web` binary and no `pm-mcp-web-server` module, no `/api/v1` proxy and no forwarded device secret, and `web enable` starts no process. The daemon opens the TCP listener only when the operator enabled web access (`pm-operator web enable [--lan]`, persisted as `web` in `machine-config.json`), routes only the web app and `/api/v1/` (pairing redemption `POST /api/v1/pair` included) there, never `/mcp`, never accepts the runtime token there and checks the device secret itself; Host validation, TLS for `--lan` and the security headers are implemented in the daemon. Immediate effect of `web enable` / `web disable` is verified by a Milestone 1 spike; the fallback is that the setting takes effect at the next daemon start. The integration-test layer of the web server is dropped; the web listener and pairing are covered by the `*IT` tests of `pm-mcp-server`. Accepted cost: browser-facing HTTP, TLS and static serving run in the process that holds the credential store and the engine (mitigations: off by default, loopback by default, Host validation, device secrets, route restriction).
+
+[#sources]
+== Sources
+
+* Unix socket peer credentials: https://docs.oracle.com/en/java/javase/25/docs/api/jdk.net/jdk/net/ExtendedSocketOptions.html, https://man7.org/linux/man-pages/man7/unix.7.html, https://man.openbsd.org/ssh-agent, https://dbus.freedesktop.org/doc/dbus-specification.html#auth-mechanisms, https://kohlschutter.github.io/junixsocket/
+* Quarkus/Vert.x Unix sockets: https://quarkus.io/guides/vertx-reference, https://github.com/quarkusio/quarkus/issues/25928
+* Loopback incidents: https://docs.docker.com/engine/security/, https://www.nccgroup.com/research-blog/technical-advisory-ollama-dns-rebinding-attack-cve-2024-28224/, https://tailscale.com/security-bulletins#ts-2022-004, https://www.oligo.security/blog/critical-rce-vulnerability-in-anthropic-mcp-inspector-cve-2025-49596, https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+* Same-user boundary: https://www.1password.dev/cli/app-integration-security/, https://saelo.github.io/presentations/warcon18_dont_trust_the_pid.pdf, https://code.claude.com/docs/en/sandboxing
+* CLI stack: https://picocli.info/picocli-on-graalvm.html, https://github.com/remkop/picocli/blob/main/picocli-codegen/README.adoc, https://bugs.openjdk.org/browse/JDK-8275838, https://openjdk.org/jeps/380, https://github.com/oracle/graal/issues/7713, https://github.com/nayuki/QR-Code-generator, https://graalvm.github.io/native-build-tools/latest/maven-plugin.html
+* Pairing and browser: https://www.rfc-editor.org/rfc/rfc8628, https://jellyfin.org/docs/general/server/quick-connect/, https://developers.home-assistant.io/docs/auth_api/, https://docs.syncthing.net/dev/device-ids.html, https://developer.chrome.com/blog/local-network-access, https://quarkus.io/guides/http-reference/, https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html, https://datatracker.ietf.org/doc/html/rfc10017, https://developer.mozilla.org/en-US/docs/Web/API/EventSource/EventSource
+* Quarkus security and Token-Sheriff: https://quarkus.io/guides/security-customization, https://quarkus.io/guides/security-authentication-mechanisms, https://github.com/cuioss/TokenSheriff
+* Svelte and build: https://svelte.dev/blog, https://svelte.dev/docs/kit/single-page-apps, https://docs.quarkiverse.io/quarkus-quinoa/dev/advanced-guides.html

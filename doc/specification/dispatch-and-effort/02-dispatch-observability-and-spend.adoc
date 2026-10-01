@@ -1,0 +1,173 @@
+= Model Jobs, Effort Resolution & Epic Emission Specification: Model Job Lifecycle & Spend Accounting
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../dispatch-and-effort.adoc[Model Jobs, Effort Resolution & Epic Emission Specification] » Model Job Lifecycle & Spend Accounting
+
+== Model Job Lifecycle & Return Evaluation
+_See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Server-Launched Model Jobs & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Task Envelopes, Model Job Accounting & Effort Role Resolution]_
+
+The server launches every model job (xref:05-model-job-launch.adoc#model-job-launch[Model Job Launch]) and observes its process, its exit, its output, and its usage itself; no host session reports anything about it. The job record is the only record of a model job: there is no separate dispatch record and no return link.
+
+[#model-job-lifecycle]
+=== Job Record, Status & Fate
+
+A model job has a `job_id` of the kind `llm` (link:../identifiers/01-general-rules-and-registry.adoc#id-job-id[Identifier Registry, `job_id`]) and a job record like every job (link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas Specification, Job Record]), which adds the launch contract (`harness`, `role`, `model`, `effort` with `effort_narrowed_from` where the effort was narrowed, `entity`, `prompt_digest`), the SHA-256 of its job token, and `connected_at`. The job record carries no usage: the usage columns of <<job-result-schema>> are the job's metrics row. Every call that names a `job_id` also names its scope; an identifier unknown in the addressed scope is rejected (`rejected.reason: link_not_available`).
+
+* *Status*: `queued` (waiting for a model slot, xref:05-model-job-launch.adoc#model-slots[Model Slots & One Writer per Plan]) -> `running` (spawned) -> `ended`. The job's budget starts at spawn.
+* *Connection*: `connected_at` is the instant of the first request the daemon accepted with the job's token. It is a fact, never a state: a job that never connected (for example because its harness failed to start the relay) ends like any other job and is evaluated on its persisted records.
+* *Fate*: `succeeded`, `failed`, `timed_out`, `killed`, `cancelled`, `indeterminate`, or `refused`, derived by the job runtime from the evidence it observed (link:../job-runtime/01-pipeline-and-subprocesses.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]); the fate is never taken from the job's own report. The runtime settles every job: there is no unconfirmed or superseded job, and a record left `running` by a previous runtime instance is settled `killed` in the per-project recovery.
+* *Budget*: Every model job runs under the job budget of its role (xref:05-model-job-launch.adoc#job-environment-and-budget[Environment, Confinement & Budget]); a `timed_out` job is `no_verdict` in every roll-up (link:../timeouts/01-job-budgets-and-waits.adoc#no-verdict-rule[Timeouts & Budgets Specification, Timed-Out Outcomes Are No-Verdict]).
+* *Token revocation*: The fate revokes the job token; every later request with it is refused `job_ended`.
+
+[#job-completion]
+=== Completion & the `job_incomplete` Condition
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-32[PM-WATCH-DISP-32]_
+
+When a model job settles, the engine evaluates the job state in the transaction that records the fate (link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States]):
+
+1. *Refused*: A job refused before spawn (the harness lacks a capability of the role's class: reason `harness_capability_missing`; `harness_not_enrolled` or `harness_version_unsupported`: reason `harness_unsupported`; a harness enrolment store that fails its HMAC check: reason `harness_tampered`, xref:05-model-job-launch.adoc#harness-selection[Harness Selection & Support Rule]; `prompt_composition_failed`; a failed verify-not-resolve check) raises `precondition_unmet` on the job state, naming the missing item and the operator command that resolves it; the condition's budget and fallback apply.
+2. *Recorded*: When the entity recorded its required submission (or, for a task envelope, one of its early ends, xref:01-task-envelopes.adoc#envelope-early-end[Early End of the Entity]), the return-evaluation primitive of the entity kind decides the outcome (<<return-evaluation>>), whatever the job's fate: a job killed after its `submit` delivered its work.
+3. *Incomplete*: Otherwise the server never synthesizes the missing submission. It logs an attribution defect in the audit log and raises the `job_incomplete` condition on the job state (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-job_incomplete[State Catalogue, Conditions]; the state and `call_stack` stay unchanged). Its `facts` carry the job's fate and the observed partial progress (for example the completed and pending tasks of the envelope, the worktree's `worktree_sha`); its only link `resume:<entity>` (rel `next`, form `noop`, entity-addressed, link:../hypermedia-format/02-link-grammar.adoc#link-identifier-grammar[Hypermedia Format Specification, Link Identifier Grammar]) launches a new model job for the entity's remaining work, bound to the same state, within the condition's self-remedy budget (compiled `3` per condition instance). When the budget is spent, the engine takes the phase's fallback route with the incomplete job recorded as the gap. On a fan-out state (`job llm … each …`, link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States] item 6) the condition is raised once, when the last job of the state has ended, and its only link is the scope-wide `resume`, which relaunches jobs only for the unfinished entities. The engine never relaunches on its own and never re-offers a job on a timeout.
+
+[#job-result-schema]
+=== Job Result & Usage Parsing
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-3[PM-WATCH-DISP-3], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-4[PM-WATCH-DISP-4], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-5[PM-WATCH-DISP-5], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-40[PM-WATCH-DISP-40]_
+
+*Result*: A `writer` or `read_only` job ends with the structured output `job-result`, validated by the server; it is display text and evidence, never the route and never a deliverable:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/job-result-v1.json",
+  "title": "JobResult",
+  "type": "object",
+  "required": ["status", "display_detail"],
+  "additionalProperties": false,
+  "properties": {
+    "status": { "type": "string", "enum": ["success", "error"], "description": "The job's own report; evidence only." },
+    "display_detail": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[\\x20-\\x7E]+(?<!\\.)$",
+      "description": "Concise single-line ASCII summary (1..80 chars) without a trailing period."
+    }
+  }
+}
+----
+
+*Deliberate change vs. `plan-marshall`*: the shape mirrors the legacy `execution-context` return (`status`, and `display_detail` of at most 80 ASCII characters on a single line without a trailing period; `plan-marshall` `marketplace/bundles/plan-marshall/agents/execution-context.md:141-152`), but results travel through the entity-scoped `submit` links, the harness's cancellation is observed by the server as the job's fate, and `blocked` and `loop_back` are not statuses: a job that cannot proceed follows `ask:TASK-NNN`, `infeasible:TASK-NNN`, or `yield:envelope-N`, or records its result through its `submit`; loop-backs are decided by the remediation policies and triage.
+
+*Usage*: The server parses the usage from the harness output through the client profile's `headless.usage` declaration, whose pointers map the harness's output fields to the columns `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`, and `cost_usd` of the job's metrics row (pointer names and their columns: link:../client-profiles/01-profile-schema.adoc#headless-usage[Client Profiles Specification, Usage Pointers]). A column the harness does not report is recorded as `unmeasured` with the reason `not_reported_by_harness`, never as `0`. `headless.usage` has no pointer for the total: for the `model_job` population `total_tokens` is the sum of the four token components (input, output, cache read, cache creation) when all four are measured, otherwise `unmeasured`. The component names mirror the per-dispatch usage columns of `plan-marshall` (`manage-metrics`), each optional and never defaulted to `0`; re-verify them against the latest `plan-marshall` version before implementing. The total keeps its lower bound of `1`, because a job that ran consumed tokens; a measured `0` is legal only for a component, and a derived total of `0` (all four components measured `0`) is recorded `unmeasured`.
+
+[#post-completion-invariants]
+=== Post-Completion Integrity Invariants
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-6[PM-WATCH-DISP-6], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-7[PM-WATCH-DISP-7], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-8[PM-WATCH-DISP-8], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-5[PM-WATCH-GEN-5], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-8[PM-WATCH-GEN-8], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-40[PM-WATCH-DISP-40]_
+
+The workflow engine enforces six non-negotiable invariants when a model job settles:
+
+1. *Unmeasured Usage Never Fabricates Zero*: An unreported usage column is persisted as `"unmeasured"` in the job's metrics row (`metrics.json`), never as `0`, because a zero token count corrupts cost aggregations and masks missing telemetry. Every token total aggregated over model jobs is published as a population-stamped aggregate (`rows`, `rows_unmeasured`, `population_count`, with the population `model_job` beside the measured main session's `main_context`; link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]); when `rows_unmeasured > 0` the total is marked `total_is_floor: true` and never wins a reconciliation against another source.
+2. *No Synthesized Submissions*: A job that ended without its entity's required submission is never completed by the server (<<job-completion>> item 3), whatever it wrote to files or reported in its `job-result`.
+3. *No Blind Relaunch*: A relaunch happens only through `resume:<entity>` of the `job_incomplete` condition, after the server inspected the entity store and the worktree on disk; the new job receives only the remaining work, with the observed partial progress in its `facts`.
+4. *Citations-Only Results for Read-Only Jobs*: `read_only` jobs (Q-Gate validation, triage, enrichment, re-grounding, simplify) persist their findings, component assessments and proposals through entity-scoped `submit` links and end with a short `display_detail`, keeping raw findings out of the main session's context. The server computes the aggregate counts from the submitted records and renders them as `facts` of the job state's next representation; `display_detail` is never read as evidence of a count.
+5. *One Record, One Row*: Every model job record yields exactly one metrics row keyed by its `job_id`, in the `metrics.json` of its scope: a plan's, an epic's (`epics/<epic_id>/`), or the workspace's (`workspace/`); outside a plan the row's `phase` is null. `record-metrics` publishes, per divergence class (`row_absent_from_metrics`, `row_without_job_record`, `phase_re_entered`), the row count and the token mass the divergence hides.
++
+[#cause-class]
+*Cause Classes*: Every model job carries exactly one `cause_class` from the closed set `benign`, `returned_with_findings`, `retryable`, `stall`, `terminal_error`, `refused` (metrics row field, link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]), derived from its fate and its evaluation, never from its `job-result`: `benign` when its entity recorded the required submission without filing a finding, `returned_with_findings` when it filed at least one finding, `retryable` when it raised `job_incomplete`, `stall` when it ended `timed_out` without its submission, `terminal_error` for `failed`, `killed`, `cancelled`, or `indeterminate` without its submission, and `refused` for a job refused before spawn; the first matching class in this order applies. The per-class populations sum to the model job population of the phase and of the plan with an asserted residual of `0`; a job left unclassified fails the assertion and is never dropped from the total.
+6. *Per-Column Usage Persistence & Measured Duration*: The total, each token component, `tool_uses`, and `cost_usd` are persisted independently, each as a measured value or `"unmeasured"`; a column is never derived from another (the total is never split, the components are never summed into a missing total). The one exception is the total of the `model_job` population, which is the sum of the four token components when all four are measured and `"unmeasured"` otherwise (<<job-result-schema>>), because the components are the harness's complete breakdown; a partial sum is never recorded. `duration_ms` is measured by the server from spawn to exit (`duration_basis: process`); the time in the slot queue is recorded apart as `queued_ms`. When every usage column of every model job in a phase is `"unmeasured"`, `record-metrics` reports `instrument_dark: true` for that phase instead of a total.
+
+[#return-evaluation]
+=== Return Evaluation (Job State Outcomes)
+_See Requirement link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Task Envelopes, Model Job Accounting & Effort Role Resolution]_
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-27[PM-WATCH-DISP-27]_
+
+The outcome transitions of a `job llm` state belong to the job's completion: when the job settles with its required records (<<job-completion>> item 2), the engine runs the *return-evaluation primitive* that the entity kind registers; its closed outcome set is checked by Rule 2 like every other primitive's (link:../workflow-dsl.adoc[Workflow DSL Specification]), and it reads only the persisted entity, task, question, and findings records, never the job's fate beyond the item above and never its `job-result`. A job that cannot proceed has already recorded that on its entity (`ask:TASK-NNN`, `infeasible:TASK-NNN`, `yield:envelope-N`, or its `submit`); a loop-back is decided only by a remediation policy or triage.
+
+[cols="2,3,4"]
+|===
+|Entity kind |Return-evaluation primitive and outcomes |Rule
+
+|Task envelope (`envelope-M`)
+|`execute.evaluate-envelope-return`: `question_pending` -> `execute.task-question`; `infeasible_pending` -> `execute.infeasible-review`; `chain_tail` -> `execute.chain-tail-commit`; `continue` -> `execute.envelope-ready`; `all_complete` -> `execute.verify-sweep`
+|Serial envelopes (xref:01-task-envelopes.adoc#envelope-early-end[Early End of the Entity]). When several outcomes apply, the first in the order `question_pending`, `infeasible_pending`, `chain_tail`, `continue`, `all_complete` wins. `infeasible_pending` applies only when no runnable task remains; while independent tasks remain, execution continues (`continue`). The remaining tasks of an envelope that ended early, the asking task included, form the next envelope `envelope-(M+1)`, launched as a new model job; after `execute.task-question` closes the record it carries the answer in its `facts`.
+
+|Q-Gate validation (`refine.qgate`, `outline.qgate`, `plan.qgate`)
+|The phase's Q-Gate verdict primitive: `clean` -> the phase exit; `blocking` -> `call remediation.qgate-findings`
+|A `read_only` job that submits assessments and findings on its entity; the primitive runs the compiled mechanical checks of the phase and decides the verdict from the persisted findings alone (link:../phase-workflows/03-q-gate-and-execute.adoc[Phase Workflows Specification, Q-Gate Validation]).
+
+|Single-submit entities (refine and outline authoring, the triage groups of a gather firing, architecture enrichment (kind `enrich-module`, entity `enrich-<module_id>`), finalize `simplify`, `security-audit` and `lessons-author`, epic `reground`)
+|Declared by the job state's unit, for example `submitted` -> the next state, and for refine and outline authoring `questions_pending` -> the phase's question state
+|The entity runs the generic entity unit (<<entity-units>>); refine and outline authoring keep their `questions` list inside their one `submit`, and the phase's question state serves the records it created.
+
+|Multi-submit entities (epic `decompose`, `lessons-review`)
+|Declared by the job state's unit: `submitted` -> the next state
+|The entity runs the multi-submit entity unit `entity-multi.pmwf` (<<entity-units>>): the repeatable submits are each validated and persisted on their own, and the required submission is the closing submit (`submit:decompose`, `submit:review`). A job that ended without it raises `job_incomplete`; the `resume` relaunch continues from what is persisted.
+
+|Screener (`screen`)
+|The verdict validation of xref:06-untrusted-text-screening.adoc#screener[Screener Job]: `clean` -> the step's next state; `suspicious` -> the step's withheld or acceptance route
+|No entity and no connection; the structured `screen-verdict` output is the only evidence, fail-closed.
+|===
+
+[#entity-units]
+==== Entity Units & the Entity Phase Value
+
+Every model job except the screener works in a real entity state. Task envelopes keep their own unit (`envelope.task.active`, `envelope.completed`); every other entity kind runs one of two generic entity units (`scope entity`). A kind that submits once runs `entity.pmwf`: `entity.active`, which offers the kind's `submit` link (and nothing that waits), and the terminal `entity.completed` (`submitted success`). A kind that submits several times (epic decomposition, lesson review) runs `entity-multi.pmwf`: its active state offers the kind's repeatable submits, each validated and persisted on its own while the entity stays active, and one closing submit that ends the entity (`submitted` -> its completed terminal; link:../state-catalogue/10-entity-units-migrated.adoc#state-catalogue-other[State Catalogue, Entity Units]). Every entity unit declares `phase inherit`, so an entity representation carries the phase of its job state. No entity state waits on a question: a refine or outline entity carries its questions in its `submit`, and an envelope's `ask:TASK-NNN` records the question and ends the entity (link:../state-catalogue.adoc[State Catalogue]).
+
+[#spend-accounting-budget-anchors]
+== Spend Accounting & Budget Anchors
+_See Requirement link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Task Envelopes, Model Job Accounting & Effort Role Resolution]_
+
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-2[PM-WATCH-DISP-2], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-3[PM-WATCH-DISP-3], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-35[PM-WATCH-PHASE-35]_
+
+Measured spend is compared against a fixed anchor table keyed by the plan's `scope_estimate` (`none`, `surgical`, `single_module`, `multi_module`, `broad`, link:../phase-workflows.adoc[Phase Workflows Specification]) and its `ChangeType` (`analysis`, `feature`, `enhancement`, `bug_fix`, `tech_debt`, `verification`, in the priority order of link:../phase-workflows/03-q-gate-and-execute.adoc#_single_writer_change_type_contract[Phase Workflows Specification, Single-Writer `change_type` Contract]). Every pair of the full cross-product is either `anchored` or `fallback`; no pair is left undefined. The Phase 4 budget projection compares the summed predicted task cost with the anchor of the plan's pair.
+
+[cols="2,2,2,2"]
+|===
+|`scope_estimate` |`ChangeType` |Warning (tokens / wall minutes) |Error (tokens / wall minutes)
+
+|`surgical` |`feature`, `tech_debt` |600,000 / 45 |1,000,000 / 75
+|`surgical` |`bug_fix` |500,000 / 30 |800,000 / 45
+|`single_module` |`feature`, `tech_debt` |1,000,000 / 75 |1,600,000 / 120
+|`single_module` |`bug_fix` |800,000 / 60 |1,300,000 / 90
+|`multi_module` |`feature`, `tech_debt` |1,500,000 / 120 |2,500,000 / 180
+|`multi_module` |`bug_fix` |1,200,000 / 90 |2,000,000 / 150
+|`broad` |`feature`, `tech_debt` |2,000,000 / 180 |3,500,000 / 240
+|`broad` |`bug_fix` |1,500,000 / 120 |2,500,000 / 180
+|===
+
+All other pairs (every pair with `scope_estimate` `none`, and every pair with `ChangeType` `enhancement`, `verification`, or `analysis`) are `fallback` pairs. A fallback pair has no absolute anchor and is checked against normalized ceilings instead: tokens per changed file above 50,000, worked seconds per task above 900 (unanchored), a single phase's share of the plan's tokens above 0.50, or tokens per deliverable above 500,000. The canonical reference plan for the table is a surgical bug fix of 958,064 tokens over 2 files.
+
+The anchored values and the fallback ceilings are `plan-marshall`'s (`plan-retrospective/references/plan-efficiency.md` § 2, Calibration anchors table); re-verify them against the latest `plan-marshall` version before implementing. *Deliberate change vs. `plan-marshall`*: its key space adds a seventh change type `feature_breaking` (scored by its planning-lane router, absent from its canonical change-type table), whose rows are all `fallback`; `PM-MCP` keeps the six canonical change types, because breaking-ness is the plan's `compatibility` field, not a change type, so those rows do not exist.
+
+The server applies the anchors at three points, and nowhere else:
+
+* *Planning-Time Projection (advisory)*: At `plan.describe-tasks` the Phase 4 budget projection yields the non-blocking `split_advice` fact (link:../phase-workflows.adoc[Phase Workflows Specification], Deterministic Task Derivation). It never raises a question record or a condition.
+* *Pre-Merge Finalize Spend Check*: Before the pre-merge barrier, the merge-path entry `merge.gate-entry`, the single evaluation point of the check, compares the plan's cumulative finalize spend (the tokens of every Phase 6 model job, each its derived total of <<job-result-schema>>, and of the measured main session in Phase 6, one population per figure) with the error column of the plan's pair; for a fallback pair it compares the finalize phase's share of the plan's tokens with the `0.50` ceiling. Above it, the plan calls the degenerate remediation policy unit `remediation.spend` (no `retry`, no `fix`: its gather job is the spend report, followed by its waiver wait, bounded by `waiver_wait_seconds`, link:../timeouts/01-job-budgets-and-waits.adoc#remediation-budgets[Timeouts & Budgets Specification, Remediation Budgets, Question & Waiver Waits]). Its only way on is a `met` waiver of the gate `spend` (`pm-operator waive <plan_id> spend --reason …`, link:../cli-and-security/02-credentials-and-operator.adoc#operator-waive[CLI, Coordination & Security Specification, Waivers]), which declares the gate met and passes the check at `merge.gate-entry` on its next evaluation; `spend` is no target of `--raise`, whose targets are only `fix_budget` and `retry_budget`. Without the waiver, `exhausted` ends the plan `handed_back`. The ratio (`finalize_spend_ratio`: value, compared column, unit, population) is a landing fact in every case. A finalize spend with unmeasured rows is a floor (`total_is_floor`): a floor above the compared ceiling is an overrun, because the true spend is at least the floor, and calls `remediation.spend` like a measured one; a floor at or below it, and a spend without any measured row, yields `finalize_spend_ratio: not_derivable` and no unit call. Neither is ever read as within budget.
+* *Post-Run Comparison*: `record-metrics` and the post-run quality report render measured spend against the pair's anchor.
+
+*Spend Classes*: Every model job is classified by what it produced, from the entity and findings records the server holds, never from its fate or its `job-result`:
+
+[cols="1,4"]
+|===
+|Class |Condition
+
+|`submitted`
+|The job's entity recorded its required `submit` transition.
+
+|`findings_only`
+|No required `submit` was recorded, but the job filed at least one finding (`FindingRecord.job_id`).
+
+|`no_product`
+|The job ended without a submit and without a filed finding.
+
+|`unmeasured`
+|The job's token usage is unmeasured, whatever it produced (its product is still shown in the cross-tabulation); it is counted by rows, never summed as `0`.
+|===
+
+Every model job belongs to exactly one class; the class token sums add up to the measured total with an asserted residual of `0`, and `unmeasured` rows are reported as a row count beside the sums. The fate (`succeeded`, `failed`, `timed_out`, `killed`, `cancelled`, `indeterminate`) is a separate dimension, rendered as a cross-tabulation with the classes, so a `failed` job that filed real findings is `findings_only`, never waste.

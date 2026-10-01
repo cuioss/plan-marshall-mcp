@@ -1,0 +1,239 @@
+= Model Jobs, Effort Resolution & Epic Emission Specification: Epic Plan Emission & Coordination
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../dispatch-and-effort.adoc[Model Jobs, Effort Resolution & Epic Emission Specification] » Epic Plan Emission & Coordination
+
+== Orchestrator Epic Plan Emission (`emit:<plan>`) & Epic Coordination
+_See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Server-Launched Model Jobs & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Creation, Plan Emission & Cross-Plan Merge Mutex]_
+
+An orchestrator epic (`scope = "epic"`) decomposes a multi-plan initiative into workstreams and staged plan specifications, tracks cross-plan dependencies, keeps the declared surfaces of its own unordered plans disjoint, reconciles landing outcomes, and coordinates shared repository locks. The states of the epic workflow are catalogued in the link:../state-catalogue/06-setup-epic-other.adoc#state-catalogue-epic[State Catalogue, Epic Workflow: `epic`].
+
+[#epic-workflow]
+=== Epic Workflow (`epic.pmwf`)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-38[PM-WATCH-DISP-38], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-39[PM-WATCH-DISP-39]_
+
+The epic workflow is the DSL unit `epic.pmwf` (`scope epic`); its states carry the prefix `epic.` and the phase value `orchestrator` (short form `orchestrate`), and its terminal states are `epic.archived` (phase value `completed`) and `epic.aborted` (phase value `aborted`). An epic comes into existence only through its bootstrap: the `bootstrap-epic` unit of the workspace scope gathers the title, the vision, and `parallelization_scope` (compiled default `1`) from the user's words or a fetched issue, and its `create` link runs the transaction `start.create-scope`, which creates the epic scope (the machine store `epics/<epic_id>/`, the session row, `status.json`, the ledger directory in the shared epic worktree), writes `epic.json` and the vision section of `spec.md`, places the epic at its start state `epic.decompose`, and enters the bootstrap terminal `start-epic.committed`; an abandoned bootstrap leaves no epic (link:../state-catalogue/06-setup-epic-other.adoc#state-catalogue-epic[State Catalogue]). An existing git-tracked ledger without machine scope (`epics/<epic_id>/` absent, for example after a clone) is adopted, never re-created: the bootstrap offers `adopt_epic:<epic_id>` (or routes a requested id that names it directly), and the adoption's `start.create-scope` transaction (outcome `adopted`, entering `start-epic.committed`) creates only the machine scope (session row, `status.json`) from the ledger, the durable truth, which it never rewrites, at `epic.decompose` when the ledger has no queue row, otherwise `epic.active`; an unreadable or invalid ledger ends in a failure state with the reason (link:../state-catalogue/09-bootstrap-and-lessons.adoc#state-start-epic.adopt[State Catalogue, `start-epic.adopt`]). `epic.decompose` writes the workstreams and the staged plan sections, alone or with a drafting model job, and leaves for `epic.active` once at least one row is staged; `epic.active` is the resting state that offers the epic's work and keeps the decomposition links for later additions (except for `launched` and `running` rows, <<server-derived-landing-facts>> item 2); every ledger write commits through `epic.commit-ledger` (from `epic.decompose` through `epic.commit-decomposition`, which returns there); `land-ledger` runs the epic landing (<<epic-landing>>). No link ends the epic: the operator verb `pm-operator abort epic <epic_id> --reason …` moves it to `epic.aborted` in its next transaction, an engine-owned scope-wide transition under the on-entry rule (link:../cli-and-security.adoc[CLI, Coordination & Security Specification]); an unreadable ledger keeps its condition with a bounded `retry` and ends the same way. Excerpt (`emit:<plan_id>` and the ledger-writing links other than those shown, which all continue to `epic.commit-ledger`, and the landing's git internals are abbreviated):
+
+[source,text]
+----
+workflow epic version 1 format 1
+scope epic
+start epic.decompose
+
+state epic.decompose
+  phase orchestrate
+  link submit workstream [submit] (workstream_id: text[2..64], title: text[3..200], order: int[1..999])
+    do epic.write-workstream
+      written           -> epic.commit-decomposition
+  link submit spec_section [submit] (anchor: text[1..128], text: text[1..65536])
+    do epic.write-spec-section
+      written           -> epic.commit-decomposition
+  # submit stage: as in epic.active, continuing to epic.commit-decomposition
+  link next draft [noop] ()
+    do epic.begin-draft
+      started           -> epic.decompose-draft
+  link next decomposed [noop] ()
+    guard predicate:epic.decomposition-ready
+    do epic.finish-decomposition
+      decomposed        -> epic.active
+
+state epic.decompose-draft
+  phase orchestrate
+  job llm decompose role orchestrator.effort.decompose
+    drafted             -> epic.commit-decomposition
+
+state epic.commit-decomposition
+  phase orchestrate
+  call git.commit_and_push (message_mode=step_or_fallback, push_mode=never)
+    done                 -> epic.decompose
+    stepped_out          -> epic.decompose
+
+state epic.active
+  phase orchestrate
+  link submit stage [submit] (plan_slug: text[3..64], spec_section: text[1..128], surface_paths: list<text[1..512]>, surface_modules: list<text[1..128]>?, prerequisites: list<text[1..64]>?, workstream_id: text[1..64]?)
+    do epic.stage-plan
+      staged            -> epic.commit-ledger
+  # submit workstream, submit spec_section: as in epic.decompose, continuing to epic.commit-ledger
+  # emit:<plan_id> (rel emit), submit_landing, reconcile_landing, transfer_offer, mailbox_send: abbreviated
+  link submit ingest:<message_id> [submit] (kind: enum[transferred|re-scoped|left_alone], note: text[1..2000]?)
+    do epic.ingest-message
+      processed         -> epic.commit-ledger
+  link next reground [noop] ()
+    guard predicate:epic.has-ungrounded-row
+    do epic.begin-reground
+      started           -> epic.reground
+  link next land-ledger [noop] ()
+    do epic.enqueue-landing
+      started           -> epic.landing
+  link next archive [noop] ()
+    do epic.archive-ledger
+      archived          -> epic.archived
+
+state epic.reground
+  phase orchestrate
+  job llm reground role orchestrator.effort.analyze
+    regrounded          -> epic.commit-ledger
+
+state epic.commit-ledger
+  phase orchestrate
+  call git.commit_and_push (message_mode=step_or_fallback, push_mode=never)
+    done                 -> epic.active   # result {commit?, pushed, clean, landed}
+    stepped_out          -> epic.active   # the ledger write stays uncommitted
+
+state epic.landing
+  phase orchestrate
+  job epic.land-ledger       # git steps: Epic Landing items 2, 6, 7
+    succeeded           -> epic.active
+    failed              -> epic.active
+    refused             -> epic.active
+    cancelled           -> epic.active
+    timed_out           -> epic.active
+    killed              -> epic.active
+    indeterminate       -> epic.active
+
+state epic.archived terminal archived success
+  phase completed
+
+state epic.aborted terminal aborted failure    # entered only by operator abort or the integrity resolution
+  phase aborted
+----
+
+`stage` is a scope-wide link without entity: `plan_slug` becomes the new row's `plan_id` (same grammar and phantom-ID checks as a plan's, link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]), `spec_section` is the anchor of the row's section in `spec.md`, which must exist, `surface_paths` and `surface_modules` form the declared surface, `prerequisites` lists `plan_id` values of rows of the same epic, and `workstream_id` names the row's workstream; the server assigns the display-only `ordinal`. `workstream` writes one workstream definition of `epic.json`; `spec_section` writes one staged plan section of `spec.md`, whose claim sections are parsed at once (<<server-derived-landing-facts>> item 2) by the link's content validator, which refuses the payload with `invalid_link_args` and names the cause in `detail`: `claim_section_unreadable` for an `unreadable` claim section, `section_too_large` for a section with more than six deliverables (link:../mcp-tools/04-errors-and-testing.adoc#rejection-reasons[MCP Tools Specification, Closed Rejection Reasons & Failure Classes]). `decomposed` is guarded by `epic.decomposition-ready`: at least one row is staged and every staged row's section parses. `ingest:<message_id>` claims and processes one inbox message, including the intake of a transfer offer and the source disposition (<<cross-epic-transfer>>): `kind` is the disposition, `note` an optional rationale. The refusals `surface_overlap` and `surface_undeclared` of `stage` are `rejected` representations of the offering state (<<epic-surface-disjointness>>). The landing job settles `succeeded` only on the observed `merged` outcome; `ejected`, `closed`, and `timed_out` settle it `failed` and leave worktree and branch unchanged, so `land-ledger` resumes (<<epic-landing>> item 8).
+
+*Epic model jobs*: Both epic judgments are batched into one `read_only` model job each (xref:05-model-job-launch.adoc#model-job-launch[Model Job Launch]). `draft` launches `epic.decompose-draft` (role `orchestrator.effort.decompose`), whose entity `decompose` runs the multi-submit entity unit `entity-multi.pmwf` (xref:02-dispatch-observability-and-spend.adoc#entity-units[Entity Units & the Entity Phase Value]): it offers the `workstream`, `spec_section`, and `stage` submits with the same checks as the epic scope's links, each validated and persisted on its own while the entity stays active, and ends with the closing `submit:decompose`; its outcome returns through `epic.commit-decomposition` to `epic.decompose`. `reground` is offered while a staged row's specification was written or last re-grounded before the current `HEAD` (guard `epic.has-ungrounded-row`) and launches `epic.reground` (role `orchestrator.effort.analyze`): one job over every such row, which submits through `submit:reground` a verdict record per claim and a row verdict per row (<<server-derived-landing-facts>> item 2). A job that ends without its submission (for the decomposition draft: without the closing `submit:decompose`) raises `job_incomplete` (xref:02-dispatch-observability-and-spend.adoc#job-completion[Completion & the `job_incomplete` Condition]); a `resume` relaunch of the draft continues from what is persisted. Every epic model job has its metrics row in the epic's `metrics.json` (xref:02-dispatch-observability-and-spend.adoc#post-completion-invariants[Post-Completion Integrity Invariants], item 5).
+
+=== Why Epics Emit Plans Rather Than Running Them
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-22[PM-WATCH-DISP-22]_
+
+A plan (`scope = "plan"`) is a top-level workflow that launches its own leaf model jobs (`scope = "entity"`). Under the single-level leaf constraint (`PM-WF-5`), a model job never starts another model job, and a plan is no model job. Consequently, an epic **must never** start a child plan through a model job or run it inline.
+
+Instead, the epic state machine exposes the **`emit:<plan_id>`** hypermedia link (`rel = "emit"`, `form = "noop"`):
+
+* *Emission Checks Prerequisites and Re-Grounding Only*: Surface disjointness is a modelling invariant of the epic, checked when a plan is staged (<<epic-surface-disjointness>>), never a runtime gate at emission. The epic representation renders an `emit:<plan_id>` link for every `staged` row whose prerequisite rows (`prerequisites[]`) are all in the partition `terminal.shipped` (`merged` or `completed`: the prerequisite's code is on the default branch, so a dependent may emit before the prerequisite's post-run steps finish) and whose row verdict is not `stale` (<<server-derived-landing-facts>> item 2); following it compares no surfaces. A `parked` row is never offered `emit`, and a `stale` row is offered again only after its section was re-submitted through `spec_section`.
+* *Emission Transition (`launched`, Never `running`)*: When the model follows `pm_do(epic_id="<epic_id>", link="emit:<plan_id>", args={})`, the server atomically updates the plan's queue row `.marshall/orchestrator/<epic_id>/queue/<plan_id>.json` to `status: "launched"` (with `emitted_at` timestamp) and returns in `facts.emitted_command` the host entry command of the emitting session's client, rendered from its client profile as `{{command:plan}} <plan_id> --from-epic <epic_id>` (link:../client-profiles/02-placeholders-and-detection.adoc[Client Profiles Specification, Placeholders & Detection]); for `claude`:
++
+[source,text]
+----
+/mcp-plan-marshall <plan_id> --from-epic <epic_id>
+----
++
+The entry command runs `pm-mcp enter --client <client_id> plan <plan_id> --from-epic <epic_id>` (link:../cli-and-security/01-cli-and-installer.adoc#command-tree[CLI, Coordination & Security Specification, Command Tree]). The invariant *Emit is not running* is strictly enforced: the epic representation pre-renders the eligible `emit:<plan_id>` commands, and only the human operator starts the new plan session. There is no `auto_emit` setting (*deliberate change vs. `plan-marshall`*: its `orchestrator.auto_emit` does not exist), and `parallelization_scope` is answered per epic and stored in `epic.json` (compiled default `1`), never a configuration default.
+
+* *Source `epic_row` & the `running` Write*: When the operator runs the emitted entry command in a new host session, `pm-mcp enter` writes the pending entry record with the requested `plan_id` and `from_epic`, and the plan's bootstrap routes to its source unit `source-epic-row`. The unit reads the queue row under the epic lock: it must exist in that epic with status `launched`, else the source fails (`row_unknown`, `row_not_launched`, `spec_unreadable`). The plan's `request.md` is the row's staged spec section (its claim sections parsed as in <<server-derived-landing-facts>> item 2), its `plan_id` is the row's (no slug), and `origin.epic_id` and `origin.source: epic_row` are set. The bootstrap's `start.create-scope` transaction, which creates the plan, sets the row `running` (with `started_at`) under the lock order `workspace` -> `plan` -> `epic`; the session becomes the first row of `plans/<plan_id>/sessions.jsonl`. No observation and no file watcher is involved.
+
+* *Single Epic Pointer, Fail Loud*: Epic membership of a plan has one carrier, `origin.epic_id`, filled from the pending entry record's `from_epic` written by the emitted entry command (link:../store-schemas.adoc[Store Schemas Specification], Workflow State Store); no tool parameter carries it. Every consumer reads membership only from there. The pointer is checked both ways in the bootstrap's commit re-check, which returns to `start.ready` with the reason `epic_pointer_mismatch`: a new `plan_id` that equals a `launched` queue row of some epic while `from_epic` is absent or names another epic, and a `from_epic` whose row is not `launched`. A plan with `from_epic` set never skips `default:emit-landing`; an unresolvable epic yields `landing_delivery: pending`, never a dropped step and never a refusal after the merge.
+* *Re-Grounding Staleness at Emission*: The representation offering `emit:<plan_id>` shows, per candidate, `regrounded_at_sha` (the commit the row's specification was last re-grounded against, <<server-derived-landing-facts>> item 2) and `main_commits_since` (commits on the default branch since then, with the count of those touching the row's expected surface). It adds a warning fact when the specification was never re-grounded or when the default branch advanced on its expected surface since; the warning alone never withholds the `emit` link, a `stale` row verdict does.
+
+[#epic-surface-disjointness]
+=== Staging-Time Surface Disjointness (Epic Modelling Invariant)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-16[PM-WATCH-DISP-16], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-21[PM-WATCH-DISP-21]_
+
+Disjointness of plan surfaces is an invariant the epic establishes when it cuts its work into plans, not a property the server re-evaluates at runtime. The server enforces it once, when a plan is staged, and only within one epic:
+
+1. *Declared Surface*: Every staged plan declares its expected surface in its queue row (`declared_surface: {paths: [...], modules: [...]}`, <<_git_distributed_epic_ledger_per_file_store_layout_adr_024>>). Paths may be files, directories (prefix-matched) or globs (expanded); every entry must name a git-tracked path or glob inside the workspace, and modules are resolved to their directories through module discovery (the derived fact `module_discovery` of the project's `derived-facts.json`, link:../domain-extensions.adoc[Domain Extensions Specification]). A plan whose surface cannot be declared (an empty surface, an entry under a git-ignored tree such as `.marshall/local/**` or outside the workspace, or an entry that cannot be evaluated) is refused with `surface_undeclared` naming the offending entries. There is no `indeterminate` path: a surface is either declared and comparable, or the staging is refused.
+2. *Staging Check*: When the epic writes a queue row (staging a plan with its specification, or amending the declared surface or `prerequisites[]` of a `staged` row), the server compares the declared surface under the epic lock against the declared surface of every other non-terminal row of the same epic (every `live` state, `parked` included). An overlap is admitted only when the two rows are ordered through prerequisites: one depends, transitively over `prerequisites[]`, on the other, so it can only be emitted after the other reached `terminal.shipped`. An unordered overlap refuses the write with `surface_overlap`, naming the overlapping plans and paths; the epic re-cuts the plans or declares the ordering. The queue row is written only when the check passes.
+3. *Emission*: `emit:<plan_id>` checks only prerequisites (`terminal.shipped`); it performs no surface comparison, because the invariant already holds for every staged row.
+4. *Scope*: The check covers one epic. There is no cross-epic comparison and no comparison against plans started without an epic; conflicts with those surface at rebase or merge: a rebase conflict in `sync-baseline` or `finalize.merge-sync` calls the plan's `remediation.merge-conflict` policy, and a pull request the provider refuses to merge ends the plan `handed_back`.
+5. *Runtime Drift Is Recorded, Never Blocking*: A running plan of the epic may change files beyond its declared surface inside its worktree; the server records `realized − declared` as unplanned changes with their provenance (link:../phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows Specification, Task Envelope Execution]). When unplanned paths overlap the declared surface of another non-terminal row of the same epic that is not ordered with it, the overlap is only noted in the plan's landing record, naming the plans and paths; the epic's landing reconciliation handles it. The overlap never blocks the plan or any emission; the epic decides whether to re-order or re-cut the affected staged rows.
+
+=== Git-Distributed Epic Ledger & Per-File Store Layout (ADR-024)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-13[PM-WATCH-DISP-13], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-14[PM-WATCH-DISP-14], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-15[PM-WATCH-DISP-15], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-16[PM-WATCH-DISP-16], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-30[PM-WATCH-STORE-30], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-37[PM-WATCH-DISP-37]_
+
+To allow epic state to merge cleanly across worktrees and machines via Git without monolithic file conflicts, the daemon persists epic state under `.marshall/orchestrator/<epic_id>/` using a strict per-concern file split:
+
+[cols="2,2,3"]
+|===
+|Path |Writer Discipline |Contents & Invariants
+
+|`epic.json`
+|Daemon only (atomic write-and-rename under epic lock).
+|Epic header (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-header[Store Schemas Specification, Epic Header]): `epic_id` (the epic's identity, kept unchanged when the epic is archived to `.marshall/archived-orchestrators/<epic_id>-<YY-MM-DD>/`, link:../filesystem-layout.adoc#archives[Filesystem Layout Specification, Plan & Epic Archives]; the dated suffix and the title are never identities), title, workstream definitions, the per-epic `parallelization_scope`, the coarse `lifecycle`, and `format_version`. It carries no FSM state: the workflow state (`epic.*`) lives only in the epic's `status.json` in the per-project machine store, so the two files never share a name.
+
+|`queue/<plan_id>.json`
+|Daemon only (exclusive create `CREATE_NEW` on addition; row-local read-modify-write on update).
+|One file per staged plan (schema: link:../store-schemas/04-epic-and-change-ledger.adoc#epic-queue-row[Store Schemas Specification, Queue Row]), keyed by the child plan's `plan_id` in the canonical plan grammar (link:../identifiers/01-general-rules-and-registry.adoc#id-plan-id[Identifier Registry]; derivation in link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]), which is allocated and phantom-ID checked when the row is staged. The epic-local ordinal (`PLAN-03`, `PLAN-PR-025B`) is kept only as the display-only field `ordinal`; no link, envelope, resource, or lookup addresses a row by it, and the write side and the read side of every epic↔plan address (emission, `from_epic`, running observation, inbox, landings) use `plan_id`. Each row tracks the closed 15-state plan vocabulary partitioned into `live` (`staged`, `ready`, `launched`, `running`, `handed_back`, `parked`), `terminal.shipped` (`merged`, `completed`), and `terminal.closed_unshipped` (`abandoned`, `superseded`, `split`, `retired`, `transferred`, `resolved`, `returned`). A row's plan outcome maps onto it when the landing is reconciled: `merged` -> `merged`; `no_change` -> `completed`; `aborted` -> `abandoned`; `returned` -> `returned` (the work may be staged again as a new row); `handed_back` -> `handed_back`, a live status awaiting a human merge, which the landing reconciliation settles from the observed pull request (merged -> `merged`, closed -> `abandoned`), so a dependant of a handed-back row emits only after its pull request merged. `parked` is an operator hold: a parked row is never offered `emit`, but its declared surface still takes part in the staging-time disjointness check (<<epic-surface-disjointness>>). Each row carries `prerequisites[]` (the `plan_id` values of rows of the same epic it depends on; emission waits until all are in `terminal.shipped`) and `declared_surface{paths[], modules[]}` (its expected surface, written only when the staging check passes). The closed-unshipped members mirror `plan-marshall` (`orchestrator.py`, `CLOSED_UNSHIPPED_PLAN_STATUSES`): `superseded` (the work was absorbed by a named successor row), `transferred` (the row moved to another epic's ledger, <<cross-epic-transfer>>), `retired` (withdrawn, no successor carries it), `resolved` (the defect closed with no plan work at all); `abandoned`, `split`, `returned`, and the live `handed_back` are `PM-MCP` members. A row staged by intake carries `intake{source_epic, source_plan_id, source_location, message_id}`; a row whose work left carries `disposition` (`transferred`, `re-scoped`, or `left_alone`) with the confirming message. Executing child plans **never** write to `queue/` directly.
+
+|`inbox.jsonl`
+|Strictly append-only event log (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-inbox-record[Store Schemas Specification, Epic Inbox & Plan Mailbox Records]), appended under the epic lock by the plan-scope outbox link (<<plan-scope-outbox-link>>), by `default:emit-landing`, by other epics (<<cross-epic-transfer>>), and by the owning epic's own claim and processing transitions; no line is ever rewritten.
+|Structured cross-scope messages from executing child plans (blocker reports, process findings, landing notifications) and from other epics (`transfer_offer`, `intake_confirmed`); an overlap of a plan's unplanned changes with a sibling's surface arrives with the plan's landing notification (<<epic-surface-disjointness>>). Each `message` event carries a store-assigned, never-reused `message_id` (`msg-NNNN`); `claimed` and `processed` events reference it, and a message's current state (`pending`, `claimed`, `processed`) is the fold of its events. Distinguishes the three empty states (`no_file`, `empty_file`, `all_processed`) from `unreadable` (reported with the failing line), which is never read as empty. Plan-side writes resolve through the epic ledger resolution seam to the shared epic worktree copy, never the primary checkout.
+
+|`landings.jsonl`
+|Append-only under epic lock when a landing notification is reconciled.
+|Structured landing history records for completed or closed child plans (<<server-derived-landing-facts>>; record schema by reference to the landing envelope: link:../store-schemas/04-epic-and-change-ledger.adoc#landing-record[Store Schemas Specification, Landing Record]). Each landing carries the plan's whole findings ledger as `findings[]`, so the epic never depends on the archived plan directory to read them.
+
+|`spec.md`
+|Written only through epic-scope `submit` links.
+|The epic specification: workstream and staged-plan sections, including each staged plan's claim sections and expected surface (the authoritative, checked copy is the queue row's `declared_surface`). Served as `pm://epic/{epic_id}/spec/{section}` (link:../mcp-tools.adoc[MCP Tools Specification]).
+
+|`resume_anchor.md`
+|Daemon-rendered markdown artifact.
+|Human- and clone-readable queue overview and resumption summary. Regenerated automatically on merge conflict; regeneration refuses with an explicit diagnostic if any `queue/<plan_id>.json` source file is unreadable.
+|===
+
+The ledger directory is fully git-tracked. The epic's non-tracked scope state (the FSM `status.json`, the session log `sessions.jsonl`, `digests.json`, and the transaction journal) is not part of it; it lives in `epics/<epic_id>/` of the per-project machine store (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]).
+
+[#plan-scope-outbox-link]
+==== Plan-Scope Outbox Link (`outbox:send`)
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-32[PM-WATCH-STORE-32], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-1[PM-WATCH-TOOL-1]_
+
+Every plan state of a plan whose `mcp/status.json` carries `origin.epic_id` offers `outbox:send` (rel `submit`, form `submit`, free `kind:enum[blocker_report|process_finding|landing_notification],summary:text[1..200],body:text[1..16384]`). The target inbox is derived by the store from `origin.epic_id` and the sending `plan_id`; the caller supplies no path or epic identifier. `landing_notification` is emitted only by `emit-landing`; an overlap of the plan's unplanned changes with a sibling's declared surface is noted in its landing record, never sent as a message (link:../store-schemas/04-epic-and-change-ledger.adoc[Store Schemas Specification, Epic Inbox]). Following the link appends one `message` event, returns its store-assigned `message_id`, and never changes the plan's own state.
+
+*Read Access*: The inbox is served as `pm://epic/{epic_id}/inbox` and the per-message resource `pm://epic/{epic_id}/inbox/{message_id}`. The epic's representation points at every message of its inbox; a plan's representation points at the messages it sent itself, with their current delivery state (`pending`, `claimed`, `processed`). The resources carry no per-scope read restriction: every scope of the project may read them, and the project boundary (`PM-SEC-2`) is the access boundary (link:../mcp-tools/03-resource-uris.adoc#_normative_resource_uri_templates[MCP Tools Specification, Read Access Within the Project]).
+
+[#plan-mailbox]
+==== Plan Mailbox (Epic → Plan Channel)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-26[PM-WATCH-DISP-26]_
+
+The epic → plan direction is a per-plan mailbox `mcp/mailbox.jsonl` in the plan directory, mirroring `plan-marshall`'s addressee mailbox (`plan-orchestrator` `inbox write --target-plan`, `inbox mailbox`). It lives in the plan directory of the per-project machine store, which never moves except on archival, when the mailbox moves with it (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), and follows the same strictly append-only event model with store-assigned, never-reused `message_id` values as the epic inbox (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-inbox-record[Store Schemas Specification, Epic Inbox & Plan Mailbox Records]):
+
+* *Write*: The owning epic's session follows `mailbox_send:<plan_id>` (rel `submit`, free `kind:enum[advisory|spec_amendment|coordination],summary:text[1..200],body:text[1..16384]`), offered for every queue row whose child plan exists. Within the epic transaction, which holds the epic lock, the server takes the mailbox's own leaf lock (like the leaf lock of `audit.jsonl`, link:../store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification]), reads the last `message_id`, and appends one `message` event, addressed by the child `plan_id` (the queue key); the caller supplies no path, and the plan lock is not taken. Only the epic named in the plan's `origin.epic_id` may write the mailbox.
+* *Target Resolution*: A target plan that does not exist (a `staged` row not yet started) or is archived is refused at write time with `target_undeliverable`, and the message is never written elsewhere. For an existing plan the write succeeds and reports the target's liveness (`running`, `not_running`, or `indeterminate` when its `mcp/status.json` or session log is unreadable); `not_running` and `indeterminate` never withhold delivery, because the plan reads its mailbox when it resumes.
+* *Read*: A plan's representation points only at its own mailbox: every plan representation whose mailbox holds unconsumed messages carries `facts.mailbox` (`unconsumed_count`), and the resource `pm://plan/{plan_id}/mailbox` (and `…/mailbox/{message_id}`) serves the messages with their consumption and the mailbox's `delivery_state` (`never_delivered`, `delivered_unconsumed`, `consumed`, or `unmeasured`), which is not rendered in `facts` because only unconsumed messages call for an action (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]). Reading is fail-open: an unreadable mailbox renders `facts.mailbox` with `mailbox_state: unreadable` (its `delivery_state` is recorded `unmeasured`) and never blocks the plan. `mailbox_ack:<message_id>` appends a `consumed` event under the same mailbox leaf lock. A reader ignores a torn last line.
+* *Advisory Only*: A mailbox message never changes the plan's state, scope, or tasks; an epic changes a launched or running plan's scope only through the operator (<<server-derived-landing-facts>> item 2, *Running Rows Are Not Re-Scoped*). Because its content is advisory, the mailbox is not covered by the plan's digest sidecar (`mcp/digests.json`).
+
+[#cross-epic-transfer]
+==== Cross-Epic Intake & Transfer
+
+A row moves from one epic to another only as a recorded transfer over the two inboxes; only the owning epic's session ever changes its own queue rows:
+
+1. *Offer*: The source epic follows `transfer_offer:<plan_id>` (rel `submit`, free `target_epic:epic_id,rationale:text[1..2000]`), which appends a `message` event of kind `transfer_offer` (`source_epic`, `source_plan_id`, `source_location`) to the target epic's inbox under the target epic lock. An offer is not a transfer: the source row stays unchanged.
+2. *Intake*: The target epic's session stages its own row from the offer, subject to the staging-time surface check (<<epic-surface-disjointness>>); the new row carries `intake{source_epic, source_plan_id, source_location, message_id}`, and the server appends `intake_confirmed` to the source epic's inbox.
+3. *Source Disposition*: On `intake_confirmed` the source epic's session sets the source row's `disposition` (`transferred`, which moves the row to `terminal.closed_unshipped` status `transferred`; `re-scoped`; or `left_alone`). A source row stays live until its own session records the disposition, and the representation lists pending offers and unanswered confirmations as facts.
+
+[#epic-landing]
+=== Epic Landing (`land-ledger`)
+_See Requirement link:../../Requirements.adoc#PM-WF-15[PM-WF-15: Epic Creation, Plan Emission & Cross-Plan Merge Mutex]_
+
+Ledger changes are edited in the shared epic worktree (link:../filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification]) and reach the default branch only through the `land-ledger` link of `epic.active`, which runs the landing in the state `epic.landing` (<<epic-workflow>>):
+
+1. *One Landing for All Epics*: A landing covers every pending change in the shared epic worktree, whatever epic made it, in one pull request from the epic branch. There are never concurrent per-epic landing pull requests.
+2. *Repository-Wide Serialization*: The landing holds the repository-wide epics-worktree lock for its git steps; a concurrent `land-ledger` waits for the lock or is answered with the open pull request. The landing never joins the per-repository plan merge FIFO or takes the plan merge lease (link:../phase-workflows.adoc[Phase Workflows Specification], Cross-Plan Merge Mutex): its diff is confined to `.marshall/orchestrator/**` and `.marshall/archived-orchestrators/**`, disjoint from every plan surface by construction, so plan merges and epic landings never block each other.
+3. *Ledger Paths Only*: The landing stages and commits only `.marshall/orchestrator/**` and `.marshall/archived-orchestrators/**`, even though the worktree holds nothing else; a diff touching any other path refuses the landing.
+4. *Pull-Request Reuse & Composition*: A repeated landing reuses the open pull request of the epic branch and never opens a duplicate; title and body are composed from the landing snapshot (epics touched, queue rows changed, landings and inbox records added), never from plan artifacts.
+5. *Gate*: Required CI checks only. The plan pre-merge review barrier (link:../phase-workflows.adoc[Two Fail-Closed Barrier Predicates]) does not apply: a ledger-only diff draws no review-bot participation (`.marshall/**` is excluded from review bots), so Predicate 2 could never be satisfied.
+6. *Merge Confirmation*: The landing's git steps are the primitives of the plan merge: `git.stage-and-commit` and `git.push` in the epic worktree, `ci.pr-create` (or the reused pull request), and `ci.merge` or, when the derived fact `merge_queue_enforced` holds, `ci.enqueue`, both bound to the expected head SHA (the landing snapshot's commit; a moved head refuses the merge and the landing stops as in item 8). The landing waits for a terminal outcome (`merged`, `ejected`, `closed`, or `timed_out`) and is stamped `landed` only from the provider's observed pull-request state (`ci.pr-observe` or `ci.queue-membership`: `merged`, with the merge commit on the base branch), never from a merge command's return value or exit code. A queue wait is bounded by stall as `finalize.merge-queue-wait` is (link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows Specification, Cross-Plan Merge Mutex item 5]): observed progress restarts the clock, `timed_out` follows only after no progress for twice the queue's check-response timeout (compiled fallback `3600` s) and is a no-verdict outcome, never a landing verdict.
+7. *Post-Merge*: The server never moves the primary checkout: when its default branch is checked out and behind the merged landing, the epic's next representation carries the fact `primary_checkout_behind` naming `git pull` for the user to run. The epic branch is resynced by `git.fetch` and a merge commit of the new default branch into it (`git.stage-and-commit` of a non-fast-forward merge) inside the epic worktree, without removing the worktree; ledger writes committed after the landing snapshot stay on the branch. A reset of the epic branch to the default branch, a rebase, and a recreation of the branch are forbidden, because each could discard post-snapshot writes.
+8. *Failure*: CI failure, queue ejection, or wait timeout stops the landing and reports it; worktree and branch are left exactly as they were (no reset), so following `land-ledger` again resumes.
+
+[#server-derived-landing-facts]
+=== Server-Derived Landing Facts, Spec Re-Grounding & Cross-Plan Locks
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-17[PM-WATCH-DISP-17], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-18[PM-WATCH-DISP-18], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-19[PM-WATCH-DISP-19], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-20[PM-WATCH-DISP-20], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-22[PM-WATCH-DISP-22], link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-23[PM-WATCH-DISP-23], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-42[PM-WATCH-GEN-42], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-38[PM-WATCH-PHASE-38]_
+
+[[_server_derived_landing_facts_spec_re_grounding_cross_plan_locks]]
+1. *Server-Derived Landing Facts (`n/a` vs. `unknown`)*: When a child plan reaches `completed` and merges, the daemon derives objective landing facts directly from the git commit history, plan audit log, and realized footprint store (commits merged, files changed, tasks completed, loop-back count, test/coverage deltas). Values that do not apply to the plan's profile are recorded as `"n/a"`, while values that could not be read due to missing artifacts are recorded as `"unknown"`—degraded answers are never folded into `"n/a"`. The model in the epic session submits only the semantic landing analysis and downstream impact judgment via `submit_landing:<plan_id>`.
+** *Landing Shape*: A landing record is the landing envelope that `emit-landing` writes, defined once in link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_landing_envelope_emit_landing[Phase Workflows Specification, Landing Envelope] (identity and merge facts, figures, step record, review facts, `findings[]`, narrative and amendments, completeness, one landing per `plan_id`, and the non-landing record written when nothing merged); `landings.jsonl` stores it unchanged.
+** *Squash-Aware Landing Commit*: The landing commit is located as the base-branch commit whose subject ends with `(#<pr_number>)`; a two-parent merge-commit lookup is never the only tier.
+** *Fact States*: Every landing is plan-typed: `"n/a"` is never legal at the pull-request and merge keys and is legal at the deliverable and task keys only for landings of `local_changes` plans (`plan_source`, whose land lane has no deliverables or tasks) and of `pr` plans (no deliverables; tasks only from a loop-back), and every `"n/a"` names the rule, derived from plan data, that made the fact inapplicable. A fact whose source question no longer applies after the observed event (for example the provider's mergeable state after the pull request merged) is recorded as `"not_applicable_after_merge"`, distinct from both `"n/a"` and `"unknown"`; a genuinely failed read stays `"unknown"` and keeps the landing incomplete. A fact that is `"unknown"` on every landing of an epic is surfaced as a detector defect.
+** *No Partial Landing*: A landing without its fact block is refused at write time as an internal write refusal (`landing_facts_missing`, failure class `server_fault`; never a `rejected` reason of a link); it is never persisted partially.
+** *Shipped-Without-Landing Reconciliation*: Every epic representation compares the queue rows in `terminal.shipped` with `landings.jsonl`. Rows without a landing record are listed in `facts.unlanded_shipped` (count and `plan_id` values; the count is always stated, zero included) and offer `reconcile_landing:<plan_id>`, which derives the landing facts server-side from the child plan's archived stores and git history. A shipped row is never treated as landed without a landing record.
+2. *Specification Corpus Re-Grounding*: When the staged specifications are reviewed against repository `HEAD`, `epic.active` offers `reground`, which launches the `read_only` model job of `epic.reground` over every staged row whose specification was written or last re-grounded before the current `HEAD` (<<epic-workflow>>); its entity exposes only the `submit:reground` link, so the job never writes the ledger directly. Every persisted re-grounding claim verdict is explicitly labeled `observed` or `hypothesis`, where every `hypothesis` must name the specific repository file or artifact that confirms or refutes it. Per row the job submits a row verdict `current | stale`: `stale` means the section no longer holds against `HEAD` and must be re-written; a row with a `contradicted` claim cannot be `current`. The row verdict is kept in the queue row (`reground_verdict`, with `regrounded_at_sha`); a `stale` row is not offered `emit` until its section is re-submitted through `spec_section`, which clears the verdict.
+** *Claim-Section Parse States*: Every claim section of a staged specification (`spec.md`) parses to exactly one of `absent`, `empty`, `unreadable` (a table or prose where a bullet list is expected, or a heading that matches only case-insensitively), or `parsed`. `unreadable` blocks admission of that row (no `emit` link; the reason is stated in `facts`) and never passes vacuously; `absent` and `empty` are reported as distinct states.
+** *Verdict Record*: A persisted re-grounding verdict record carries `claim` (section and claim index), `label` (`observed` | `hypothesis`), `verdict` (`corroborated` | `contradicted` | `partially_exercised` | `unverifiable`), `checked_at` (the commit SHA the claim was checked against), `by` (the `job_id` or scope that produced it), `scope_change` (`none` | `rescoped`), `exercised_path` (the components actually tested, for example `reader -> classifier`), and `evidence` (text). `contradicted` is admissible only when `exercised_path` covers every component the claim names; otherwise the verdict is `partially_exercised`.
+** *Archived Snapshots Are Not Siblings*: Cross-checks against sibling epics read the active root and the archived root (link:../filesystem-layout.adoc#archives[Filesystem Layout Specification, Plan & Epic Archives]) and identify an epic only by the `epic_id` in its `epic.json`; an archived snapshot whose `epic_id` equals the checking epic's own is never a sibling candidate, and a distinct epic is still enumerated and compared.
+** *Running Rows Are Not Re-Scoped*: The epic offers no spec-editing or re-scoping link for a queue row in `launched` or `running`; a re-grounding verdict that would re-scope such a row is recorded as pending and applied only after the row reaches a terminal state. Overlapping work waits for the running plan to land.
+3. *Fixed Lock Hierarchy & Cross-Plan Coordination Primitives*: All representation and resource reads execute against atomic filesystem snapshots without holding scope locks during long-running script or build jobs, and whenever an operation mutates multiple scopes, short transaction locks are acquired in a strict global order (`workspace` lock -> `plan` lock -> `epic` lock -> `machine` lock), while long-lived claims are leases (link:../store-schemas.adoc[Store Schemas Specification], `PM-IMPL-7`). The server serializes PR merge execution across concurrent plans via a fair per-repo FIFO admission queue and merge lease in `<PM_MCP_BASE>/state/merge-queue.json`, while shared review-bot rate-window claims (e.g., CodeRabbit hourly windows) are leases in `<PM_MCP_BASE>/state/review-bot-windows.json`. Machine-wide build concurrency is bounded by the slot cap in `<PM_MCP_BASE>/machine-config.json` (model jobs by their own cap, xref:05-model-job-launch.adoc#model-slots[Model Slots & One Writer per Plan]), where stale slot reaping (`ProcessHandle.of(pid)`) executes inside the same atomic state transition as new job admission and the FIFO queue never drops a submitted build.

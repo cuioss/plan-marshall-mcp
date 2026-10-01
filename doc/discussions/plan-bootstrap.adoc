@@ -1,0 +1,577 @@
+= Plan Bootstrap (Z6)
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../Requirements.adoc[Requirements] » xref:README.adoc[Discussions] » Plan Bootstrap
+
+NOTE: *Status: decided 2026-09-29*: Z6-A, Z6-B and Z6-1 to Z6-25 are decided (see <<decisions>>); where a *Decision* or *Adjusted by* line differs from the recommendation or the proposal body, that line holds (notably Z6-A: bootstrap sub-workflows per scope kind, `pm_start` removed; Z6-B: two-level guard for external text). Operator direction (2026-09-29): "There are multiple ways to bootstrap a plan. Collect them all and model a process for that." The topic absorbs the review points D8, D9, D10, D24 and D51. Follow-up topic: server-launched sub-agents (Z7).
+
+A proposal to model every way a plan (and an epic) comes into existence as one server-side process. Today the corpus has a creation verb (`pm_start`) with six sources, but no process around it: nothing selects what to work on, nothing gathers a source's inputs before the plan exists, epic-emitted plans have no source at all, and an epic cannot be created. Legacy `plan-marshall` has about twenty ways in, spread over two commands, several menus and inline init prose. This document collects them (<<inventory-legacy>>), lists what PM-MCP specifies today and where it contradicts itself (<<inventory-pmmcp>>), describes the target process (<<target-model>>), and asks one question per open design point (<<decisions>>).
+
+Line numbers refer to the working tree at `37fe966` (`feature/prepare`, with the round-3 edits applied). Abbreviations, all under `doc/specification/` unless stated: CS01 = `cli-and-security/01-cli-and-installer.adoc`, MT01 = `mcp-tools/01-core-workflow-tools.adoc`, MT03 = `mcp-tools/03-resource-uris.adoc`, PW01 / PW02 = `phase-workflows/01-planning-phases-1-2.adoc` / `02-planning-lanes-phases-3-4.adoc`, SC02 / SC03 = `state-catalogue/02-plan-phases-1-3.adoc` / `03-plan-phases-4-5-land.adoc`, SC06 = `state-catalogue/06-setup-epic-other.adoc`, SS01 / SS02 = `store-schemas/01-format-and-session-log.adoc` / `02-workflow-state-store.adoc`, SS04 = `store-schemas/04-epic-and-change-ledger.adoc`, DAE03 = `dispatch-and-effort/03-escalation-roles-readers.adoc`, DAE04 = `dispatch-and-effort/04-epic-coordination.adoc`, DE05 = `domain-extensions/05-recipes-and-extension-points.adoc`, CP01 / CP02 = `client-profiles/01-profile-schema.adoc` / `02-placeholders-and-detection.adoc`, WD02 / WD04 = `workflow-dsl/02-units-jobs-decisions.adoc` / `04-ast-node-model.adoc`, REQ02 / REQ04 / REQ11 = `doc/requirements/02-workflow.adoc` / `04-tools.adoc` / `11-migration.adoc`, RM = `doc/roadmap.adoc`, WC = xref:workflow-consistency.adoc[Workflow Consistency]. LEG = the legacy skills tree `plan-marshall/marketplace/bundles/plan-marshall/skills/` with PM = `plan-marshall/`, P1 = `phase-1-init/`, PO = `plan-orchestrator/` (evidence of behaviour, never a compatibility target).
+
+[#direction]
+== Scope and operator direction
+
+*In scope*: every path from "the user wants something done" to a plan (or epic) in its first workflow state: the host entry commands and their arguments, the pending entry record, selecting what to work on, gathering and verifying a source before the plan exists, the atomic creation, resuming, epic-emitted plans, creating and filling an epic, and the lesson maintenance that feeds lesson-sourced plans. *Out of scope*: everything after `init.classify` (WC decided it), the epic's running coordination after `epic.active` (DAE04), and the setup workflow's own states (SC06), except where a bootstrap route enters them.
+
+The approved draft (operator 2026-09-29):
+
+. *Entry*: `/plan-marshall [args]`, `/plan-orchestrator [args]`, `/marshall-steward` run `pm-mcp enter`; the arguments (plan id, text, issue, lesson, recipe, pr, local, base branch, from-epic) go into the pending entry record.
+. *Bootstrap unit*: a unit of the workspace scope gathers everything before a plan exists, so an abandoned start leaves no plan directory: `start.resolve` (automatic: ambiguity guard; existing id -> resume; named source -> its source step; nothing named -> `start.choose`; missing setup -> the setup workflow), `start.choose` (server-listed candidates as facts, links `resume:<id>`, `new:request`, `new:issue`, `new:lesson:<id>`, `new:recipe:<key>`, `new:local_changes`, `new:pr`, `maintain:lessons`), source sub-steps (issue fetch through the ingestion validator, lesson premise, recipe parameters from `parameters_schema` replacing the built-in selection screens, local-changes preview, PR observation, epic row spec section), and `start.commit` = `pm_start` (atomic creation, then `init.classify`).
+. *Epic-emitted plans*: a new source `epic_row` (epic id + plan id): `request.md` is the staged spec section, the `plan_id` binds the queue row, and the emitted command is the host entry command.
+. *Epic bootstrap*: epic intake `epic.define` (title, vision into `spec.md`, `parallelization_scope`; source text or issue), `epic.decompose` (dispatch of the decompose role; workstreams and staged specs submitted; surface disjointness checked by the server), then `epic.active`.
+. *Lesson maintenance* (analyze, aggregate): a separate workspace workflow that ends pointing at `new:lesson:<id>`.
+
+Principles applied to every item: clean cut from legacy (legacy is reference behaviour, nothing is imported); server-side first; model-facing minimality; native provider modules; the process enforces itself (no operator questions during a plan, bounded self-remedy then a defined fallback, operator influence only through the operator channel, content questions are question records per Z5-E); minimal resolution first; no new dependency.
+
+*Bootstrap is not mid-plan*: before a plan exists there is no plan to protect. Choosing what to work on is the user's intent, relayed by the model from the host conversation; it is a legitimate interaction and not an operator question in the sense of Z5-A. Once `pm_start` has created the plan, every rule of WC applies unchanged.
+
+[#inventory-legacy]
+== Inventory A: legacy ways in
+
+[cols="1,3,4,3,4"]
+|===
+|# |Trigger |Gathers |Joins at |Evidence (LEG)
+
+|L1 |`/plan-marshall task="…"` |plain text |inline init |PM `SKILL.md:79`
+|L2 |`task="implement .plan/orchestrator/{slug}/plans/PLAN-NN-x.md"` (epic-emitted) |file pointer read as `request --body-file`; the pointer marks the plan orchestrated (mailbox checkpoints, lessons to the epic inbox, landing) |inline init |P1 `SKILL.md:302-315`; PO `scripts/_orchestrator_inbox.py:350-387`
+|L3 |`issue=<url>` |`ci issue view`, id `issue-{n}`, `--issue-url`; comment mirroring after refine, outline, finalize; `Closes #n` |inline init |P1 `SKILL.md:333-340`
+|L4 |`lesson=<id>` |lesson get; premise check 4b (Refine / Close / Residual; Close removes the lesson and deletes the plan); convert-to-plan 5b; doc-shaped lesson -> `lesson_cleanup` recipe; post-init self-check; refine 13.5 Q-Gate |inline init |P1 `SKILL.md` steps 4b, 5b
+|L5 |`action=lessons` |menu over lessons + "Analyze all" + "Aggregate" + "Back"; Analyze deduplicates, closes, merges; creates no plan |menu |PM `workflow/planning.md:840-868`, `:936-992`
+|L6 |`action=recipe` |recipe listing (extension `provides_recipes` + project `recipe-*` skills) and pick; built-in `refactor-to-profile-standards` multi-screen selection (domains automatic, profile single-select, per-domain skill multi-select); audit recipes take scope + base branch |menu, then init |`recipe-refactor-to-profile-standards/workflow/selection-flow.md:47-187`
+|L7 |`recipe=<key>` |resolve-recipe; not found lists the available recipes |init |PM `SKILL.md:75-84`
+|L8 |no arguments (`action=list`) |menu: plans with phase, "Create new plan", "Create plan from recipe", "List lessons" |menu |PM `workflow/planning.md:44-91`
+|L9 |`plan=<id>` |resume auto-detect: executor preflight, worktree re-anchor, routing context, metrics boundary reconcile, route by phase |phase of the plan |PM `SKILL.md:102-172`
+|L10 |`action=outline\|execute\|finalize plan=<id>` |explicit phase; `execute` without plan shows an "Executable Plans" menu |phase |PM `SKILL.md:75-84`; PM `workflow/execution.md:31`
+|L11 |re-init of an existing id |Resume / Replace / Rename |init |P1 `SKILL.md:207-249`
+|L12 |`lessons-aggregate` |multi-select groups, supersede and prune; prints `lesson=` commands; no plan |menu |PM `workflow/planning.md:27`, `:996-998`; `workflow/planning-lessons-aggregate.md`
+|L13 |automatic recipe route in init |recipe match `>= 0.6` routes automatically, else a propose prompt; aspect classification; doc-shaped predicate |init |P1 `SKILL.md` (tier 1)
+|L14 |`/plan-orchestrator init slug=` |scaffold, status (orchestrator store), `parallelization_scope` asked (default from project), `epic.md` vision text, resume anchor |epic |PO `workflow/init.md:18-128`
+|L15 |`/plan-orchestrator decompose` |source material pasted or on disk; optional dispatched leaf drafts; workstreams `WS-NN`; `PLAN-NN` specs with Expected Surface; split guard at 6 deliverables; queue rows staged |epic |PO `workflow/decompose.md:34-114`
+|L16 |`/plan-orchestrator next` (and proactive emit after analyze) |N = `parallelization_scope`; admission disjoint and prep-ready; emits `/plan-marshall task="implement …PLAN-NN.md"`; `auto_emit` |epic |PO `SKILL.md:23`, `:72`; `workflow/orchestrate.md`
+|L17 |`/plan-orchestrator resume` |ledger read, closed read-only, launched verified against ground truth |epic |PO `workflow/resume.md`
+|L18 |`/plan-orchestrator lessons` |fixed lessons-routing epic; clusters routed to sibling epic inboxes |epic |PO `SKILL.md:28`, `:77`; `workflow/lessons-handling.md`
+|L19 |follow-ups |analyze inbox "Stage" disposition; retrospective and lessons-capture seed lessons; finalize prints loop-back commands |display only |PO `SKILL.md:73`; `workflow/analyze.md`
+|L20 |`/plan-orchestrator preflight` |documented, not wired |none |PO `SKILL.md:30`, `:79`, `:85`; `workflow/preflight.md`
+|===
+
+No hook starts a plan; there is no PR adoption, no local-changes source and no automatic follow-up plan.
+
+*Action resolution* (PM `SKILL.md:75-84`): explicit `action` > `plan=` > `task` / `issue` > `lesson` > `recipe` > list menu; an ambiguity guard over `{task, issue, lesson, recipe, plan}`; `base_branch` is accepted at init only.
+
+*Common init path* (P1, inline): preflight; inputs exactly one of description / lesson / issue / recipe plus `plan_id`, domain, base branch; id derivation (description 3–5 words, `issue-{n}`, `recipe-{key}-{ts}`, lesson title slug + suffix); phantom guard; exists -> Resume / Replace / Rename; status create; metrics; per-source content; lesson premise; request create; convert-to-plan; tier-1 recipe / aspect / doc-shaped; references (branch, base precedence parameter > `default_base_branch` > current); domain detection; session warning; change-type and scope heuristics; lane routing; sibling collision (Proceed / Rename / Abort); posture; build-server preflight; transition. Afterwards: self-check, porcelain clean, metrics boundary, handshake, `init_without_asking` gate, lane dispatch, inline recipe shortcut.
+
+*Prompts, in order of appearance*: list menu; lessons menu; recipe pick; recipe selection screens; coverage gathering; init prompts (plan exists, lesson obsolescence, recipe proposal, domain, sibling collision, posture, build server); refine batch; outline review.
+
+*Configuration knobs*: `branch_strategy`, `use_worktree`, `init_without_asking`, `deep_lane`, `escalation`, `auto_route_recipe` (+ threshold), `lane_selection`, `plan_without_asking`, `execute_without_asking`, `default_base_branch`, `interaction_mode`, `orchestrator.auto_emit`, `orchestrator.parallelization_scope`, `orchestrator.use_worktree`. PM-MCP already dropped or replaced every one of them (WC; DAE04:90 for `auto_emit`); none is reintroduced here.
+
+*Legacy defects to guard* (renamed LB1–LB15; each item says which it guards):
+
+[cols="1,6"]
+|===
+|LB1 |The automatic recipe route never sets `plan_source` (recipe chosen, source still the request).
+|LB2 |The `lesson_cleanup` recipe that the doc-shaped predicate routes to is unresolvable.
+|LB3 |Coverage gathering exists in documentation only.
+|LB4 |The recipe selection flow writes plan metadata before the plan exists.
+|LB5 |`execute_without_asking` default conflicts between two documents.
+|LB6 |The recipe entry skips the init wrapper (preflight, phantom guard).
+|LB7 |Stale "dispatched leaf" wording in decompose.
+|LB8 |Input names differ between the command and init (`task` vs `description`).
+|LB9 |"Create new plan" from the list menu collects no request text.
+|LB10 |`lesson=` has no bypass of the menu when the lesson id is known.
+|LB11 |"Rename" has no input step; "Resume" ignores the plan's phase.
+|LB12 |The documented untrusted-content gate for issue bodies is never called.
+|LB13 |`base_branch` is overloaded (target vs current), and the scope of audit recipes is undeclared.
+|LB14 |The epic preflight is documented but unwired.
+|LB15 |Session capture is documented but never called.
+|===
+
+[#inventory-pmmcp]
+== Inventory B: current PM-MCP design
+
+* *Entry*: the host commands `/plan-marshall`, `/plan-orchestrator`, `/marshall-steward` run `pm-mcp enter --client <c> <plan|epic|workspace> [<plan_id>|<epic_id>] [--from-epic <epic_id>] [--model <id>]` (CS01:221-225). The runtime resolves project and enrolment, checks the lifecycle gate for `plan` / `epic`, detects the environment, probes the host build, and appends a session row to an existing scope, or for a plan that does not exist yet writes `pending/<entry_id>.json` (session row + `entry_id` + `from_epic`) and prints the `entry_id` (CS01:228-234; SS01:86, :182-203). The client profile requires `commands.entries.{plan, epic, workspace}` (CP01:156-171), but only `{{command:plan}}` has a placeholder (CP02:82-87). What an entry command does with its arguments (new vs existing, which source) is not specified.
+* *Creation*: `pm_start(entry_id, exactly one of request | issue_number | lesson_id | recipe_id | local_changes | pr_number, summary?, recipe_params?, plan_slug?, posture?, stop_after?, review_outline?, base_branch?)` (MT01:40-134, REQ04:8), with a closed scope-less refusal list that keeps the pending record (MT01:45). Source contracts: PW01:205-234 (the issue is fetched inside `pm_start`, Z5-32; the lesson is premise-checked in `init.lesson-premise`, Z5-30; recipe parameters validated against `parameters_schema`, DE05:129; local changes captured as a snapshot commit; a PR observed with `ci.pr-view`). Plan id derivation and `plan_id_taken`: PW01:236-242.
+* *Phase 1*: `init.classify` re-entrant with the init question records (PW01:247; SC02:24-76); `init.ready` routes by lane.
+* *Selection*: `pm_plans()` and `pm_epics(include_archived?)` list scopes with a `last_entered` marker (MT01:179). No lesson listing, no recipe listing (MT03 has no lesson or recipe resource), no issue or PR listing, no local-changes preview. A start without source is undefined; the workspace scope (`plan_id: NO_PLAN`) offers no start or list link.
+* *Epics*: `epic.entry -> epic.inspect-ledger (initialized | resumed) -> epic.active` (SC06:230-243; DAE04:20-70). `epic.json` requires title, workstreams, `parallelization_scope`, lifecycle (DAE04:120), but no link or question writes them; `spec.md` has no writing link (DAE04:134-136); the roles `decompose` and `reader` are never dispatched (DAE03:213-214). `emit:<plan_id>` sets the row `launched` and returns the raw shell command `pm-mcp enter --client <c> plan <plan_id> --from-epic <epic_id>` (DAE04:83-90).
+* *Workspace and setup*: enrolment creates the workspace scope at `setup.entry` (SC06:14-25); setup is only an implicit precondition of `pm_start` (`config_invalid`, `integration_variant_unset`, `config_dirty`).
+* *Resume*: `pm-mcp enter` on an existing scope plus `pm_state`; the session-start hook pointer (CS01, Session-Start Hook); `plan_id_taken` points to resume (PW01:242).
+
+Contradictions and gaps (resolved in the items named):
+
+[cols="1,6"]
+|===
+|C1 |No path creates an epic: SC06:233 says "from `pm_start` of an epic", but `pm_start` has no epic source (MT01:40), `pm-mcp enter` step 4 creates no epic (CS01:233), and `epic.inspect-ledger` `initialized` is unreachable (<<z6-14>>).
+|C2 |No epic intake: nothing writes the title, workstreams, `parallelization_scope` or `spec.md`; `decompose` and `reader` are never dispatched; no epic source (text, issue) (<<z6-15>>, <<z6-16>>).
+|C3 |Emitted plans have no source: none of the six sources is "the staged spec section of my epic row"; `request.md` is undefined for them (<<z6-13>>).
+|C4 |The entered `plan_id` is lost: the pending record has no `plan_id` field, so the child is not bound to its queue row and `launched` never becomes `running` (DAE04:92); `epic_pointer_mismatch` checks one direction only (MT01:40) (<<z6-2>>, <<z6-13>>).
+|C5 |The emitted command is a raw shell command, not the host entry command; client id and `entry_id` handover are unspecified (DAE04:83-88) (<<z6-13>>).
+|C6 |No selection mechanism for lessons, recipes, issues, PRs; no local-changes preview; a start without source is undefined; the entry commands' content is unspecified (<<z6-2>> to <<z6-5>>).
+|C7 |`stop_after: plan` exists only in the tool schema (MT01:115-119): no composition rule, and no source consumes a returned plan's planning result (D51) (<<z6-18>>).
+|C8 |Source parameter inconsistencies: PW01:212 names a `description` parameter absent from the schema; the schema admits `plan_slug` with `recipe_id` (derived id) and `base_branch` with `pr_number` (base from the PR) (<<z6-12>>).
+|C9 |Missing `pm_start` refusals: unknown, consumed or swept `entry_id`; lifecycle gate re-check at creation; `enter plan <archived_id>` (<<z6-3>>, <<z6-12>>).
+|C10 |Setup is implicit: no route from a start to the setup workflow; a stepped-out `setup.commit-changes` leaves `config_dirty` until the operator acts (<<z6-6>>).
+|C11 |"clean-tree guard" at `init.ready` (SC02:76; PW01:37) is not defined anywhere (<<z6-20>>).
+|C12 |Minor: the epic queue vocabulary ignores the plan outcomes of Z5-2 / F3 (SS04:127; DAE04:82, :124) (<<z6-17>>); the reader dispatch of Phase 2 is stale after Z5-32 (DAE03:194; REQ11:11) (<<z6-16>>).
+|===
+
+[#target-model]
+== Target model
+
+One process, three units: the *bootstrap unit* (per entry, hosted by the workspace scope), the plan workflow from `init.classify` on (unchanged), and the *epic intake* states at the front of `epic.pmwf`. Lesson maintenance is a separate workspace unit that feeds the bootstrap (<<z6-19>>).
+
+[source,text]
+----
+host entry command  /plan-marshall [args]   /plan-orchestrator [args]   /marshall-steward
+        |                    |                          |                        |
+        v                    v                          v                        v
+ pm-mcp enter --client <c> plan|epic [<id>] [args]                    pm-mcp enter workspace
+        |                                                                        |
+        +-- live scope named ------------> session row, print scope id --> pm_state (resume)
+        |
+        +-- otherwise --------------------> pending/<entry_id>.json (kind, args), print entry_id
+                                                   |
+                                                   v
+   bootstrap unit (entity <entry_id> of the workspace scope, pm_state/pm_do plan_id NO_PLAN)
+     start.resolve (auto)
+        setup missing/dirty  -> start.setup-required --recheck--> start.resolve
+        >1 source named      -> start.choose (only the named candidates)
+        epic_row             -> source.epic-row
+        one source named     -> source.<kind>
+        nothing named        -> start.choose
+     start.choose (links)    -> resume:<id> (terminal start.resumed)
+                                new:request | new:issue | new:lesson:<id> | new:recipe:<key>
+                                new:local_changes | new:pr | new:epic | maintain:lessons | abandon
+     source.issue | source.lesson | source.recipe | source.local-changes | source.pr | source.epic-row
+        failure              -> start.source-failed --retry|back--> ...
+     start.ready (links[0] = pm_start(entry_id, commit options))
+        pm_start transaction -> plan scope at init.classify   (terminal start.committed)
+                             -> epic scope at epic.entry      (kind epic)
+
+   epic.pmwf: epic.entry -> inspect-ledger -> epic.define -> epic.decompose -> epic.active
+----
+
+*Bootstrap unit* (`bootstrap.pmwf`, compiled only, one instance per pending entry record, state stored in the record; <<z6-1>>):
+
+[cols="2,1,5"]
+|===
+|State |Kind |Purpose, links and exits
+
+|`start.resolve` |`auto` |Reads the record's `kind` and `args`. Routes: setup precondition unmet -> `start.setup-required`; more than one source named -> `start.choose` restricted to the named candidates (ambiguity guard); `from_epic` -> `source.epic-row`; one source named -> `source.<kind>`; a named id that is archived or unknown, or nothing named -> `start.choose` (<<z6-3>>).
+|`start.setup-required` |link |Facts: the setup state and what is missing (first run not completed, `setup.needs-repair`, integration variant unset, `.marshall/config/` dirty) with the operator command where one is needed. Links `recheck` -> `start.resolve`, `abandon` (<<z6-6>>).
+|`start.choose` |link |Facts: server-computed candidate lists (<<z6-5>>). Links `resume:<plan_id>` / `resume:epic:<epic_id>` -> `start.resumed`; `new:request (text)`, `new:issue (issue_number)`, `new:lesson:<lesson_id>`, `new:recipe:<recipe_key>`, `new:local_changes`, `new:pr (pr_number)`, `new:epic (epic_slug)` -> the source step; `maintain:lessons` -> `start.handed-over`; `abandon` (<<z6-4>>).
+|`source.issue` |`job` |Bounded `ci.issue-view` through the ingestion validator; `succeeded` -> `start.ready`, otherwise `start.source-failed` (<<z6-7>>).
+|`source.lesson` |`auto` |Resolves the lesson, checks it is unclaimed and active, runs the premise check; a valid premise -> `start.ready`; resolved or invalid -> `source.lesson-premise` (<<z6-8>>).
+|`source.lesson-premise` |link |Facts: the premise evidence. Links `continue` -> `start.ready` (evidence recorded for the plan's `amendments[]`), `retire` (verdict `obsolete`, no plan) -> `start.abandoned`, `back` -> `start.choose` (<<z6-8>>).
+|`source.recipe` |link or `auto` |With a non-empty `parameters_schema`: facts carry the schema and the server-resolved option lists, link `submit recipe_params` validated by the server -> `start.ready`; without one: `auto` -> `start.ready` (<<z6-9>>).
+|`source.local-changes` |`auto` |Preview of the change set (paths, commits ahead, base branch); empty -> `start.source-failed` (`no_local_changes`); otherwise `start.ready` (<<z6-7>>).
+|`source.pr` |`job` |Bounded `ci.pr-view`: open, head writable; failure -> `start.source-failed` (<<z6-7>>).
+|`source.epic-row` |`auto` |Reads the queue row (`launched`, same epic) and its spec section; failure -> `start.source-failed` (<<z6-13>>).
+|`start.source-failed` |link |Facts: the reason. Links `retry` (bounded) -> the source step, `back` -> `start.choose`, `abandon`.
+|`start.ready` |link |Facts: the source summary and the derived `plan_id`. `links[0]` names the tool call `pm_start(entry_id, …)`; `set_slug (plan_slug)` re-derives the id; `back` -> `start.choose`. `pm_start` enters `start.committed` in its creation transaction and consumes the record (<<z6-10>>, <<z6-11>>).
+|`start.committed`, `start.resumed`, `start.handed-over`, `start.abandoned` |terminal |End of the bootstrap; the record is deleted in the transaction that enters the terminal. The pending-record sweep removes records that never reach one.
+|===
+
+*Epic intake* (front of `epic.pmwf`; <<z6-14>>, <<z6-15>>):
+
+[cols="2,1,5"]
+|===
+|State |Kind |Purpose, links and exits
+
+|`epic.entry` |`auto` |`epic.inspect-ledger`: `initialized` -> `epic.define`; `resumed` routes by the ledger's completeness: no header content -> `epic.define`; no staged row -> `epic.decompose`; otherwise `epic.active`.
+|`epic.define` |link |Facts: the epic source (text, or the issue fetched in `source.issue` of the bootstrap). Link `submit define (title, vision, parallelization_scope?)` writes `epic.json` and the vision section of `spec.md` -> `epic.commit-ledger` -> `epic.decompose`.
+|`epic.decompose` |link |Links `dispatch:decompose` (a worker drafts workstreams and staged plan sections, returns through `returned:<dispatch_id>`), `submit workstream (id, title, order)`, `submit stage (…)` (the existing link with its `surface_overlap` / `surface_undeclared` checks), `next decomposed` (guard: at least one staged row) -> `epic.active`.
+|===
+
+[#decisions]
+== Decision items
+
+Items are ordered so that each depends only on earlier ones. Every item names the principle that decides it and what the server checks.
+
+[#z6-a]
+=== Z6-A Principle: bootstrap sub-workflows instead of source parameters
+
+* *Question*: Operator 2026-09-29 while discussing Z6-10: "Why not bootstrapping using a subprocess? For all bootstraps like plan, epic and marshall-steward. So you do not need to pass a fixed number."
+* *Evidence*: Z6-2 and Z6-10 as proposed enumerate the sources twice (the `pm-mcp enter` flags and the `pm_start` arguments); every new way to start would change the CLI, the tool schema, PM-TOOL-1 and the host bundles.
+* *Decision*: Operator 2026-09-29: adopted, and `pm_start` is removed. Every scope is created by a bootstrap sub-workflow of its kind (`bootstrap-plan`, `bootstrap-epic`; the workspace keeps `project-setup`, driven by `/marshall-steward`). `pm-mcp enter` passes only the kind, an optional id, and an optional free-text hint (the user's words). The ways to start are links of the bootstrap; the model maps the user's words onto a link, and the server validates every argument. Each source is its own sub-workflow unit with the exit contract `done {source record}` or `stepped_out` (`source-issue`, `source-lesson`, `source-recipe`, `source-pr`, `source-local-changes`, `source-epic-row`); a new way to start is one more unit and one more link, never a CLI flag or tool parameter. When the bootstrap ends `done`, the engine creates the plan or epic atomically from the gathered record in that transaction; the checks formerly made by `pm_start` (identifier taken, lifecycle gate, configuration state) are re-checked in that transaction, and a failing check returns to `start.ready` with the reason in `facts`. No CLI flag and no tool parameter enumerates sources; the core tools are `pm_state`, `pm_do` and the service tools.
+* *Adjusted by naming review N5 (2026-10-01)*: the workspace entry command is `/mcp-marshall-steward`; the entry commands carry the `mcp-` prefix (`/mcp-plan-marshall`, `/mcp-plan-orchestrator`, `/mcp-marshall-steward`, `$mcp-…` on Codex) for harness autocompletion and coexistence with the legacy plugin; the plain names are a later improvement (link:../later-improvements.adoc#_l_9_plain_entry_command_names[Later Improvements L-9]).
+
+[#z6-b]
+=== Z6-B Principle: two-level guard for external text
+
+* *Question*: Operator 2026-09-29 while discussing Z6-16: "we have two levels here: a technical cleanup (like the current script), but we need still an LLM based check against command injection attacks."
+* *Evidence*: the deterministic ingestion validator catches structural defects (control characters, invisible Unicode, schema, lengths, link forms) but not semantic injection (text that reads as instructions to the model); the PM-MCP server has no model access of its own (models run in the host, `PM-WF-5`).
+* *Decision*: Operator 2026-09-29: adopted. External text passes two guards before it reaches a model as content: (1) the deterministic validator of the server, which stays the primary containment boundary; (2) a dispatched LLM screener with zero tools that receives the cleaned text in-band and returns a closed verdict record (`clean | suspicious` with flagged spans), validated by the server. The screener can only restrict, never grant (fail-closed: an unparseable or missing verdict counts as `suspicious`); it is defence in depth, never the boundary; screened text is still delivered marked untrusted. Z6-16 is adjusted: the reader family becomes the screener role instead of being withdrawn. Follow-ups: <<z6-22>> (surfaces), <<z6-23>> (effect of `suspicious`), <<z6-24>> (dispatch mechanics).
+
+[#z6-1]
+=== Z6-1 Where the bootstrap lives and how it is addressed
+
+* *Question*: The bootstrap must hold state before a plan exists (what was named, what was chosen, what a source step found) and must be driven by the model through the ordinary verbs. Where does that state live, which unit declares the states, and how does a tool call address one entry among several concurrent ones?
+* *Evidence*: The pending entry record already exists per entry, is written under the workspace lock (round-3 D33) and removed by the sweep (SS01:86, :182-203; `timeouts/02-runtime-leases-operator-web.adoc:62-63`). Scoped tools take `plan_id` or `NO_PLAN` (MT01, Architectural Constraints item 10); `pm_state` / `pm_do` accept `entity` (MT01:139-151). A `scope workspace` unit has no terminal and must return to its start state (WD04:256); entity units are compiled only, declare `phase inherit` and have terminals (WD02:18). Legacy holds this state in the conversation only (L5, L6, L8 menus), which is how LB4 and LB9 arise.
+* *Options*:
+** (a) *Entity of the workspace scope*: a compiled-only `scope entity` unit `bootstrap.pmwf` whose instance id is the `entry_id`; its state lives in the pending record; the model addresses it with `pm_state(plan_id: "NO_PLAN", entity: "<entry_id>")` and `pm_do(…, entity: "<entry_id>", link)`. `phase inherit` resolves to `workspace`. Grammar unchanged; the entity id grammar admits `ent-…`.
+** (b) New `scope entry` and a new `entry_id` parameter on `pm_state` / `pm_do`: explicit, but a grammar change and a schema change of two core tools.
+** (c) States inside `project-setup.pmwf`: one workspace unit, but concurrent entries would share one state position.
+** (d) No unit: the entry command's prose uses `pm_plans` and new listing resources, then calls `pm_start`: model-side logic, contradicts server-side first.
+* *Recommendation*: (a). It reuses the pending record, the workspace lock and the entity addressing; concurrent entries never share a position; nothing is created under `plans/` until the commit.
+* *Affected*: WD02:18 (entity units: the bootstrap unit hosted by the workspace scope), WD04:256; SS01:182-203 (pending record gains the bootstrap state, <<z6-2>>); MT01 `pm_state` / `pm_do` (`entity` may name an `entry_id` under `NO_PLAN`); identifiers (`entry_id` as entity id); new State Catalogue section "Bootstrap" in SC06; REQ02 PM-WF-1 (scope list); PM-ARCH-4.
+* *Decision*: Operator 2026-09-29: (a): compiled-only entity unit bootstrap.pmwf hosted by the workspace scope; instance id = entry_id; state in the pending entry record; addressed with pm_state/pm_do(plan_id: NO_PLAN, entity: <entry_id>).
+* *Adjusted by Z6-A*: the entity units are bootstrap-plan and bootstrap-epic; their source steps are called sub-workflow units (source-issue, source-lesson, source-recipe, source-pr, source-local-changes, source-epic-row).
+
+[#z6-2]
+=== Z6-2 Entry commands, their arguments, and the pending record fields
+
+* *Question*: What does each host entry command pass to `pm-mcp enter`, what does `enter` record, and what does it print?
+* *Evidence*: CS01:225 (`enter` syntax without source arguments); CS01:233 (pending record only "for a plan that does not exist yet"; its fields `session`, `entry_id`, `from_epic`); SS01:191 (required fields); CP01:156-171 (three entries required), CP02:82-87 (one placeholder); the entered `plan_id` is lost (C4). Legacy arguments: `task`, `plan`, `issue`, `lesson`, `recipe`, `action`, `base_branch`, `slug` (PM `SKILL.md:75-84`); LB8 (names differ between command and init).
+* *Options*:
+** (a) *All arguments into the record*: `pm-mcp enter --client <c> plan|epic [<id>] [--request-file <f> | --issue <n> | --lesson <id> | --recipe <key> | --pr <n> | --local] [--base-branch <b>] [--from-epic <e>] [--model <m>]`. A live scope named by `<id>` gets a session row and `enter` prints `scope: plan <id>` (resume). Everything else writes the pending record with `kind` (`plan` | `epic`), `requested_id` (the named id or null), `args` (the named sources, unvalidated), `from_epic`, `bootstrap` (state position and gathered facts, <<z6-1>>), and prints `entry: <entry_id>`. The entry command template calls `pm_state` on whichever it printed. Request text is passed as a file in `.marshall/local/temp/` or on stdin, never on the command line (length, quoting).
+** (b) Arguments stay in the host conversation; `enter` records only the entry, the model passes the source later to `pm_start`: no server record of what the user asked for; the ambiguity guard would be model prose.
+* *Recommendation*: (a). One argument vocabulary with the source names of `pm_start` (guards LB8); the server sees what the user named, so `start.resolve` decides (server-side first). `/marshall-steward` keeps `enter workspace` (setup and lesson maintenance). The three command templates are rendered from one placeholder per entry (`{{command:plan}}`, `{{command:epic}}`, `{{command:workspace}}`).
+* *Affected*: CS01:221-234 (syntax, step 4, printed output); SS01:86, :182-203 (pending entry record schema: `kind`, `requested_id`, `args`, `bootstrap`); CP01:156-171, CP02:82-87 (two placeholders); `requirements/13-client-profiles.adoc` PM-CLIENT-1; RM:166, :301.
+* *Decision*: Operator 2026-09-29: (a): all arguments into the pending record (kind, requested_id, args, from_epic, bootstrap); live scope named by id -> session row and 'scope:' output; otherwise 'entry: <entry_id>'; request text via file or stdin; one placeholder per entry command.
+* *Adjusted by Z6-A*: pm-mcp enter takes only the kind, an optional id and an optional free-text hint; no source flags; the pending record holds kind, requested_id, hint, from_epic and the bootstrap state.
+
+[#z6-3]
+=== Z6-3 `start.resolve`: routing and the ambiguity guard
+
+* *Question*: How does `start.resolve` route, what does it do when several sources are named, and what about an archived or unknown id, an expired lifecycle gate, or an `entry_id` that was consumed or swept?
+* *Evidence*: Legacy precedence `action > plan > task/issue > lesson > recipe > list` with an ambiguity guard (PM `SKILL.md:75-84`); PW01:242 (`plan_id_taken` names live or archived); C9 (missing refusals); the lifecycle gate is checked at `enter` only (CS01:228).
+* *Options*:
+** (a) *No precedence*: exactly one named source routes to its step; two or more route to `start.choose` showing only the named candidates with the fact `ambiguous: [..]`; an archived `requested_id` routes to `start.choose` with the fact `archived: <id>` (read-only, no resume link); an unknown id routes to `start.choose` with `requested_id` kept as the slug proposal for `new:request`. The lifecycle gate is re-checked by `pm_start` (refusal `lifecycle_closed`). A tool call naming a consumed or swept `entry_id` is refused `entry_unknown` (scope-less, facts: the re-entry command).
+** (b) Legacy precedence: deterministic, but silently drops what the user also named.
+** (c) Refuse at `enter` on ambiguity: the user retypes; no server state to show alternatives.
+* *Recommendation*: (a). The user resolves ambiguity, the server never guesses; every route ends in a state with links, so no dead end exists.
+* *Affected*: new SC section "Bootstrap" (`start.resolve` row); MT01:45 (refusals `lifecycle_closed`, `entry_unknown`); identifiers (reason enum); PW01:236-242.
+* *Decision*: Operator 2026-09-29: (a): no precedence; one source -> its step; several -> start.choose restricted to the named candidates; archived id -> start.choose (fact archived, read-only); unknown id -> start.choose with the id as slug proposal; refusals lifecycle_closed (re-checked by pm_start) and entry_unknown.
+* *Adjusted by Z6-A*: start.resolve routes a live id to resume and everything else to start.choose with the hint as a fact; the ambiguity guard is unnecessary because the model follows one link; lifecycle_closed is re-checked in the commit transaction; a pm_state/pm_do on a consumed or swept entry is scope_not_found.
+* *Adjusted by round-4 D16 (2026-10-01)*: the lifecycle gate is a compiled release constant; while it is closed, plans and epics are created only in projects enrolled with `--pilot` (`pm-mcp operator enrol --pilot`), everywhere else the re-check refuses `lifecycle_closed`.
+
+[#z6-4]
+=== Z6-4 `start.choose`: link state or question record
+
+* *Question*: When nothing is named, the user chooses what to work on. Is that a link state the model follows after relaying the user's pick, or a question record delivered per `questions.delivery`?
+* *Evidence*: Z5-E / Z5-60 (question records are content questions of a scope, bounded by a question wait with a fallback); legacy asks with `AskUserQuestion` menus (L5, L8); no plan exists yet, so there is no fallback end to take on expiry.
+* *Options*:
+** (a) *Link state*: `start.choose` renders candidate facts and one link per choice; the model shows them to the user in the host conversation and follows the chosen link; no wait, no expiry (an untouched record is removed by the sweep).
+** (b) Question record of a new class `start` delivered by elicitation or session: consistent delivery, but a question wait whose expiry has no meaningful fallback (starting some plan unasked would be wrong).
+* *Recommendation*: (a). The choice is the user's intent, not a content question of a running scope; a link state needs no new class, wait or fallback. The model relays; the server lists, validates and records.
+* *Affected*: SC "Bootstrap" (`start.choose`); `phase-workflows/07-questions-waivers-operator-influence.adoc` ( note that bootstrap choices are links, not question records).
+* *Decision*: Operator 2026-09-29: (a), decided by the reviewer under the operator's delegation (at least 95% confidence): start.choose is a link state; no question record, wait or fallback.
+
+[#z6-5]
+=== Z6-5 Candidate listings: which, and through which primitives and resources
+
+* *Question*: Which candidates does `start.choose` list, how much of each goes into `facts` (model-facing minimality), and where does the full list live?
+* *Evidence*: `pm_plans` / `pm_epics` exist (MT01:179); no lesson or recipe resource (MT03); recipes: compiled built-in and domain recipes plus project-local `.marshall/recipes/` (DE05:19-21); lessons: store with `status` and `claim` (`store-schemas/10-job-and-lesson-records.adoc:151-170`); legacy lists plans with phase, lessons, recipes (L5, L6, L8); issues and PRs are never listed in legacy.
+* *Options*:
+** (a) *Five server listings*: live plans with phase and `last_entered`; active unclaimed lessons (id, title, category); recipes (key, title, whether it takes parameters) compiled and project-local; local changes present (boolean, path count, commits ahead); epic rows `launched` and not yet started, for `kind: plan`; for `kind: epic` live epics instead of plans. Facts carry counts and at most ten entries per list (most recent first); full lists are the new resources `pm://workspace/lessons` and `pm://workspace/recipes`, plans and epics stay with `pm_plans` / `pm_epics`. Issues and PRs are not listed: the user names a number (`new:issue`, `new:pr`).
+** (b) As (a) plus open issues and PRs listed through the provider module: one provider list call per `start.choose`, latency and rate limits for a list the user rarely needs.
+** (c) Links only, no facts: the model cannot tell the user what exists.
+* *Recommendation*: (a). Everything listed is local and cheap; the provider listing is recorded as a later improvement (L-6 "Issue and PR candidates in the plan bootstrap").
+* *Affected*: MT03 (two resources); SC "Bootstrap" (`start.choose` facts); `doc/later-improvements.adoc` (L-6); REQ04 PM-TOOL-3 (resource list).
+* *Decision*: Operator 2026-09-29: (a): five local listings (plans or epics, active unclaimed lessons, recipes compiled and project-local, local changes present, launched epic rows); facts carry counts and at most ten entries per list; full lists as pm://workspace/lessons and pm://workspace/recipes; issues and PRs not listed (L-6).
+
+[#z6-6]
+=== Z6-6 Setup as a precondition route (and the stepped-out setup commit)
+
+* *Question*: What happens when a user starts a plan in a project whose setup never completed, needs repair, has an unset integration variant, or has uncommitted configuration (`config_dirty`) because `setup.commit-changes` stepped out?
+* *Evidence*: `pm_start` refusals `config_invalid`, `integration_variant_unset`, `config_dirty` (MT01:45); setup rests in `setup.completed` and records `setup_run` (SC06:14-25); `setup.commit-changes` routes `stepped_out` to itself (WD04 Rule 6, its link state), leaving the configuration dirty; nothing points a start at the setup (C10). Legacy runs the steward separately and init fails late.
+* *Options*:
+** (a) *Precondition state in the bootstrap*: `start.resolve` evaluates the same predicates `pm_start` refuses on; when one holds, `start.setup-required` names it (facts: setup state, missing item, and for operator-owned items the operator command) and offers `recheck`. The model drives the workspace setup through `pm_state(NO_PLAN)` (the same session, same scope) and then follows `recheck`. `pm_start` keeps the refusals as the transactional re-check. For `config_dirty` after a stepped-out setup commit, `setup.commit-changes` stays the resting state whose `retry` commits again; the facts of `start.setup-required` point to it.
+** (b) Start the setup automatically from the bootstrap (a `call`): a workspace unit cannot be called from an entity unit, and setup choices go through the operator channel anyway.
+** (c) Keep the refusals only: the user learns about setup only at the commit, after gathering a source.
+* *Recommendation*: (a). The check moves forward, no state machine is duplicated; the refusals stay for races between check and commit.
+* *Affected*: SC "Bootstrap"; SC06 (`setup.commit-changes`: stepped-out rest named as the `config_dirty` resolution); MT01:45 (refusal facts point to the setup state); RM:307.
+* *Decision*: Operator 2026-09-29: (a): start.resolve evaluates the pm_start setup predicates; start.setup-required names what is missing (operator command where operator-owned) and offers recheck; pm_start keeps its refusals for races; config_dirty after a stepped-out setup commit resolved by setup.commit-changes retry, pointed to by the facts.
+* *Adjusted by Z6-A*: pm_start refusals become the re-check of the bootstrap's commit transaction.
+
+[#z6-7]
+=== Z6-7 Source steps for issue, pull request and local changes
+
+* *Question*: Which reads of a source happen in the bootstrap (before the plan exists) and which stay in `pm_start`, and how does each fail?
+* *Evidence*: Z5-32 (issue fetched inside `pm_start`, refusal `issue_unavailable`); PW01:217 (issue), :229 (local changes capture), :233 (PR observation, `capability_missing`); legacy fetches inline and never calls its untrusted gate (L3, LB12).
+* *Options*:
+** (a) *Reads in the bootstrap, capture in the commit*: `source.issue` (job: bounded `ci.issue-view`, title and body through the ingestion validator, stored in the pending record), `source.pr` (job: `ci.pr-view`, open and head writable), `source.local-changes` (auto: preview of paths and commits ahead). Failures enter `start.source-failed` with the reason (`not_found`, `not_readable`, `provider_unavailable`, `pr_not_open`, `head_not_writable`, `no_local_changes`), `retry` bounded by the compiled condition budget, `back`, `abandon`. `pm_start` uses the validated issue text from the record, re-observes the PR head (it may have changed), and takes the local-changes snapshot at commit time (the preview is informational; an empty capture at commit is still refused `no_local_changes`).
+** (b) Keep every read in `pm_start` (Z5-32 as decided): no bootstrap step for these sources; a failure is a refusal the model must turn into a new call.
+* *Recommendation*: (a). The user sees the issue title, the PR state or the change set before committing; the refusals `issue_unavailable` and `capability_missing` become bootstrap states, which adjusts Z5-32 (no state inside the plan waits for the fetch still holds). `no_local_changes` stays as a commit refusal for the race.
+* *Affected*: PW01:215-233 (source table: where each read happens); MT01:40, :45 (issue text taken from the record, `issue_unavailable` removed); WC Z5-32 (Adjusted-by line); SC "Bootstrap".
+* *Decision*: Operator 2026-09-29: (a): source.issue (job, fetch + ingestion validator, text stored in the pending record), source.pr (job, open + writable head), source.local-changes (auto preview); failures -> start.source-failed (bounded retry, back, abandon); pm_start uses the stored issue text, re-observes the PR head, captures local changes at commit (empty still refused). Adjusts Z5-32.
+* *Adjusted by Z6-A*: source-issue, source-pr and source-local-changes are sub-workflow units called by the bootstrap; their failures return stepped_out or their own retry states.
+
+[#z6-8]
+=== Z6-8 Lesson premise before the plan
+
+* *Question*: Should the lesson premise check run in the bootstrap, so an obsolete lesson ends without creating a plan, instead of in `init.lesson-premise` inside the plan (Z5-30)?
+* *Evidence*: PW01:221 (premise check transitions to `init.lesson-premise`; obsolete retires the lesson and ends the plan `returned`); SC02:40-46; Z5-30 (fixed classifier order lesson premise first); legacy creates the plan and deletes it on "Close" (L4). A `returned` plan runs the post-run band and is archived for a result that is "nothing to do".
+* *Options*:
+** (a) *Premise in the bootstrap*: `source.lesson` resolves the lesson (active, unclaimed, else `start.source-failed` `lesson_unavailable`) and runs the premise check; a resolved or invalid premise enters `source.lesson-premise` with `continue` (the evidence is carried into the new plan as an `amendments[]` entry, `source: refutation`), `retire` (verdict `obsolete`, lesson store write, `start.abandoned`), `back`. `init.lesson-premise` is removed; the init question order becomes recipe, sibling collision, domain. The claim stays in the `pm_start` transaction.
+** (b) Keep Z5-30: no change; an obsolete lesson costs a plan that ends `returned`.
+* *Recommendation*: (a). No residue plan for a lesson that needs no work; the user decides while choosing (a legitimate bootstrap interaction), so the question wait and its `returned` fallback disappear for this case. Adjusts Z5-30 (order and one state).
+* *Affected*: PW01:221, :247; SC02:24-46 (`init.lesson-premise` removed, `init.classify` order); WC Z5-30 (Adjusted-by line); Z5-60 fallback table (init row); SC "Bootstrap".
+* *Decision*: Operator 2026-09-29: (a): source.lesson resolves (active, unclaimed, else start.source-failed) and runs the premise check; source.lesson-premise continue (evidence carried as amendment, source refutation) / retire (verdict obsolete, no plan) / back; init.lesson-premise removed; init question order recipe, sibling collision, domain; claim stays in the pm_start transaction. Adjusts Z5-30.
+* *Adjusted by Z6-A*: source-lesson is a sub-workflow unit including the premise check.
+
+[#z6-9]
+=== Z6-9 Recipe parameters and the built-in selection screens
+
+* *Question*: How are `recipe_params` gathered, and what replaces legacy's multi-screen selection flow (domains, profile, per-domain skills) of `refactor-to-profile-standards` without writing plan metadata before the plan exists (LB4)?
+* *Evidence*: DE05:61, :129 (per-recipe `parameters_schema`, validated at `pm_start`, `recipe_params_invalid`); legacy selection flow (`recipe-refactor-to-profile-standards/workflow/selection-flow.md:47-187`); LB3 (coverage gathering doc-only), LB6 (recipe entry skips init wrapper), LB13 (audit scope undeclared).
+* *Options*:
+** (a) *Schema plus server option sources*: a recipe's `parameters_schema` may mark an enum as server-resolved with a closed set of option sources (`x-pm-options: domains | profiles | skills:<domain> | modules | base_branches`); `source.recipe` renders the schema with the resolved options as facts and one `submit recipe_params` link, validated by the server; dependent choices (skills per chosen domain) are resolved in one step because the option sources are computed for every domain up front. Audit recipes declare `scope` and `base_branch` in their schema (guards LB13).
+** (b) Plain JSON schema: the model fills values from its own knowledge of the project; invalid values are refused, but the user sees no choices.
+** (c) A multi-step sub-workflow per recipe: mirrors legacy screens, but each recipe becomes a unit.
+* *Recommendation*: (a). One state, one link; the server owns the option lists (server-side first); nothing is written to a plan before `pm_start` (LB4); the recipe entry passes the same `start.resolve` and commit as every source (LB6).
+* *Affected*: DE05 (Declarative Recipe Descriptor Schema: `x-pm-options`, closed list; item 8); MT01 (`recipe_params` taken from the record); SC "Bootstrap" (`source.recipe`).
+* *Decision*: Operator 2026-09-29: (a): parameters_schema enums may declare x-pm-options (closed set domains | profiles | skills:<domain> | modules | base_branches); source.recipe renders schema + resolved options as facts, one submit recipe_params link validated by the server; dependent options pre-computed; audit recipes declare scope and base_branch.
+* *Adjusted by Z6-A*: source-recipe is a sub-workflow unit; recipe_params are part of its result record.
+
+[#z6-10]
+=== Z6-10 `start.commit` and `pm_start`
+
+* *Question*: Is `pm_start` the commit of the bootstrap, and what does it still take as arguments?
+* *Evidence*: MT01:40-134 (sources as tool arguments; creation transaction; closed refusals); REQ04:8 (PM-TOOL-1); the core tool set is verified on four hosts in M1 (RM:69).
+* *Options*:
+** (a) Keep the schema: `pm_start` still takes the source arguments; the bootstrap only shows them as `facts.start_args`: two carriers of the same selection that can disagree.
+** (b) *`pm_start` commits the prepared entry*: `pm_start(entry_id, plan_slug?, posture?, stop_after?, review_outline?, base_branch?)`; the source, its gathered content and `recipe_params` come from the pending record; a record not at `start.ready` is refused `entry_not_ready` (facts: its state). For `kind: epic` the same call creates the epic scope (<<z6-14>>); the posture, stop and review options are refused for epics.
+** (c) Commit as a bootstrap link (`pm_do(…, link: start)`); `pm_start` removed from the tool set: fully hypermedia, but changes the verified tool set and PM-TOOL-1 on every host.
+* *Recommendation*: (b). One carrier of the selection (the record), one creation verb for plans and epics, the tool set unchanged; the atomic transaction and the refusal list stay in one place.
+* *Affected*: MT01:37-134 (description, schema, refusals `entry_not_ready`, `entry_unknown`, `lifecycle_closed`); REQ04:8; PW01:205 (sources come from the record); RM:293; identifiers.
+* *Decision*: Operator 2026-09-29: Superseded by Z6-A: pm_start is removed from the tool set; the bootstrap's done transaction creates the scope; its former refusals are re-checked in that transaction and return to start.ready with the reason.
+
+[#z6-11]
+=== Z6-11 `plan_id` collision: resume, rename, replace
+
+* *Question*: How are legacy Resume / Replace / Rename (L11, LB11) expressed now that the bootstrap exists?
+* *Evidence*: PW01:242 (`plan_id_taken` keeps the record, names a free slug; resume is `pm_state`, rename a new `plan_slug`, replace is operator `delete-plan`); Z5-30 (`rename` removed inside the plan).
+* *Options*:
+** (a) *In `start.ready`*: the facts show the derived `plan_id` and whether it is free; `set_slug (plan_slug)` re-derives it; a live plan with that id offers `resume:<plan_id>`; an archived one only the rename. `pm_start` keeps `plan_id_taken` for the race and leaves the record at `start.ready`. Replace stays operator `delete-plan` followed by `recheck`.
+** (b) Only the `pm_start` refusal (today): works, but the collision is found after the user confirmed.
+* *Recommendation*: (a). Rename gets its input step (guards LB11); no model or server replace path.
+* *Affected*: PW01:242; SC "Bootstrap" (`start.ready`); MT01:45.
+* *Decision*: Operator 2026-09-29: (a), decided by the reviewer under the operator's delegation: collision handled in start.ready (set_slug, resume:<plan_id> for a live plan, rename only for an archived one); plan_id_taken stays for the race; replace stays operator delete-plan.
+* *Adjusted by Z6-A*: a taken identifier found by the commit re-check returns to start.ready (no plan_id_taken refusal).
+
+[#z6-12]
+=== Z6-12 Source parameter inconsistencies and missing refusals (confirm set)
+
+* *Question*: Confirm the following corrections, which follow from Z6-2, Z6-3 and Z6-10.
+* *Evidence and corrections*:
+** PW01:212 names `description` (or `request`): the bootstrap argument is `request` only (C8, LB8).
+** `recipe` + `plan_slug`: the recipe plan id is derived (`recipe-{key}-{ts}`, DE05:125); `plan_slug` with a recipe source is refused `invalid_arguments` (C8).
+** `pr` + `base_branch`: the base is the PR's base; `base_branch` with a PR source is refused `invalid_arguments` (C8).
+** PR footprint overlap: PW01:233 routes it to `init.sibling-collision` like every source; the older refusal wording elsewhere is removed (C8).
+** New scope-less refusals: `entry_unknown` (consumed or swept `entry_id`), `entry_not_ready`, `lifecycle_closed` (C9).
+** `enter plan <archived_id>` routes to `start.choose` with the fact `archived` (<<z6-3>>) (C9).
+* *Recommendation*: confirm all.
+* *Affected*: PW01:205-234; MT01:45 and schema; identifiers (reason enum); SC02.
+* *Decision*: Operator 2026-09-29: confirm all, decided by the reviewer under the operator's delegation (follows from Z6-2, Z6-3, Z6-10 as decided).
+* *Adjusted by Z6-A*: the parameter inconsistencies are moot (no source parameters remain); the new refusals become bootstrap states; entry_not_ready is unnecessary.
+* *Adjusted by naming review N5 (2026-10-01)*: the entry commands carry the `mcp-` prefix (`/mcp-plan-marshall`, `/mcp-plan-orchestrator`, `/mcp-marshall-steward`, `$mcp-…` on Codex) for harness autocompletion and coexistence with the legacy plugin; the plain names are a later improvement (link:../later-improvements.adoc#_l_9_plain_entry_command_names[Later Improvements L-9]). The arguments and the one placeholder per entry command are unchanged.
+
+[#z6-13]
+=== Z6-13 Epic-emitted plans: source `epic_row`, queue-row binding, emitted command
+
+* *Question*: What is the source of a plan the epic emitted, how is the plan bound to its queue row, and what command does the epic hand the operator?
+* *Evidence*: C3, C4, C5; DAE04:83-94 (emit sets `launched`, returns `pm-mcp enter --client <c> plan <plan_id> --from-epic <epic_id>`; `running` observed from `origin.epic_id`); MT01:40 (`epic_pointer_mismatch` one direction); legacy L2 (spec file pointer read as body; `spec_pointer_unreadable` leaves residue; the epic learns the plan id only at landing analysis). `implementation-watch/cli-and-security.adoc` PM-WATCH-CLI-1 presupposes a spec-file source.
+* *Options*:
+** (a) *Source `epic_row`*: `enter plan <plan_id> --from-epic <epic_id>` records `requested_id` and `from_epic`; `start.resolve` routes to `source.epic-row`, which reads the queue row under the epic lock: it must exist in that epic with status `launched`, else `start.source-failed` (`row_not_launched`, `row_unknown`, `spec_unreadable`). `request.md` is the row's staged spec section (claim sections parsed as in DAE04:200); the `plan_id` is the row's (no slug); `origin.epic_id` and `origin.source = epic_row` are set; `pm_start` sets the row `running` in its creation transaction (lock order workspace -> plan -> epic holds), so the observation of DAE04:92 becomes a write. `epic_pointer_mismatch` is checked both ways: a `launched` row id without `from_epic`, and a `from_epic` whose row is not `launched`. The emitted command in `facts.emitted_command` is the host entry command of the emitting session's client, rendered from the profile (`/plan-marshall plan=<plan_id> from-epic=<epic_id>` for `claude`; the neutral form for `neutral`).
+** (b) Keep `origin.epic_id` only and let the child start from a `request` holding the spec text the model copies: no binding, model-side copy of untrusted-to-the-plan text.
+* *Recommendation*: (a). The server reads the spec section itself, binds the row atomically, and hands the operator a command they type in the host.
+* *Affected*: DAE04:83-94 (emitted command, `running` written by `pm_start`); SS02 `origin.source` enum (+ `epic_row`); SS04 queue row (`started_at`); PW01:205 (source table row); MT01:40 (`epic_pointer_mismatch` both ways); CP02 (entry command rendering with arguments); PM-WATCH-CLI-1; REQ02 PM-WF-15.
+* *Decision*: Operator 2026-09-29: (a), decided by the reviewer under the operator's delegation: source epic_row, row bound and set running in the pm_start transaction, epic_pointer_mismatch both ways, emitted command = host entry command.
+* *Adjusted by Z6-A*: source-epic-row is a sub-workflow unit; the row is set running in the bootstrap's commit transaction.
+* *Adjusted by naming review N5 (2026-10-01)*: the host entry command the epic emits is `/mcp-plan-marshall <plan_id> --from-epic <epic_id>`; the entry commands carry the `mcp-` prefix (`/mcp-plan-marshall`, `/mcp-plan-orchestrator`, `/mcp-marshall-steward`, `$mcp-…` on Codex) for harness autocompletion and coexistence with the legacy plugin; the plain names are a later improvement (link:../later-improvements.adoc#_l_9_plain_entry_command_names[Later Improvements L-9]).
+
+[#z6-14]
+=== Z6-14 Creating an epic (D8)
+
+* *Question*: How does an epic come into existence? (Operator on D8: "in general option 1 = `pm-mcp enter … epic <new id>` creates the scope, but we need a (sub-)workflow that gathers all information, structural and content".)
+* *Evidence*: C1; SC06:233 ("from `pm_start` of an epic"); CS01:233 (no new epic); `identifiers/01-general-rules-and-registry.adoc` (epic id from `pm-mcp enter … epic <id>`, same grammar as plan ids, PW01:240); legacy L14 (`/plan-orchestrator init slug=`).
+* *Options*:
+** (a) *Through the bootstrap*: `enter epic [<id>]` writes a pending record `kind: epic`; `start.resolve` resumes a live epic, otherwise offers `new:epic (epic_slug)` (pre-filled with `<id>`, phantom-ID and taken checks as for plans) with an optional source (text or `new:issue`), then `start.ready`; `pm_start(entry_id)` creates the epic scope (machine store `epics/<epic_id>/`, session row, `status.json` at `epic.entry`, the ledger directory in the epic worktree) and the intake states gather the content (<<z6-15>>).
+** (b) `enter epic <new id>` creates the scope directly (D8 option 1 as first stated); the content is gathered in `epic.define`: no bootstrap for epics, but an entry without id has no server path, and a mistyped id creates an epic.
+** (c) A separate `pm_start_epic` tool: extends the tool set.
+* *Recommendation*: (a). It follows the operator's direction (enter starts it, a workflow gathers structure and content) while creating the scope only at the commit, so an abandoned entry leaves no epic.
+* *Affected*: SC06:230-235 (entered from `pm_start`, `initialized` reachable); CS01:233; MT01:40 (epic creation); identifiers (`epic_id` origin); RM:419.
+* *Decision*: Operator 2026-09-29: (a) as reworded by Z6-A, decided by the reviewer under the operator's delegation (it follows from Z6-A and the operator's D8 direction): pm-mcp enter epic [<id>] opens a bootstrap-epic entry; the epic scope (machine store, session row, status.json at epic.entry, ledger directory) is created in the bootstrap's done transaction; an abandoned entry leaves no epic.
+
+[#z6-15]
+=== Z6-15 Epic intake: `epic.define` and `epic.decompose` (D9)
+
+* *Question*: Which states and links write the epic header, `spec.md` and the workstreams, and what does the server check?
+* *Evidence*: C2; DAE04:20-70 (`stage` needs an existing `spec_section`), :120 (header fields), :134-136 (`spec.md` "written only through submit links", none defined), :101-107 (surface disjointness at staging); legacy L14 (vision text, `parallelization_scope` asked), L15 (workstreams `WS-NN`, specs with Expected Surface, split guard at 6 deliverables).
+* *Options*:
+** (a) *Two link states before `epic.active`*: `epic.define` with `submit define (title, vision, parallelization_scope?)`: the server writes `epic.json` (title, `parallelization_scope`, compiled default `1`, lifecycle `defining`) and the `vision` section of `spec.md`, then `epic.commit-ledger`. `epic.decompose` with `submit workstream (workstream_id, title, order)`, `submit spec_section (anchor, text)` (writes a staged plan section of `spec.md`; claim sections parsed per DAE04:200, `unreadable` refused), the existing `stage`, `dispatch:decompose` (<<z6-16>>), and `next decomposed` (guard: at least one staged row, every staged row's section parses) -> `epic.active`. `epic.active` keeps `stage`, `workstream` and `spec_section` for later additions (except for `launched` / `running` rows, DAE04:203). `epic.inspect-ledger` gains the outcomes `undefined` and `undecomposed` for resumed epics.
+** (b) One `submit_spec` link taking the whole `spec.md` plus workstreams, then `stage` per row: fewer links, but the server validates one large document and the model rewrites it for every change.
+* *Recommendation*: (a). Each write is small and checked where it is made; the split guard is a server rule on `spec_section` (more than six deliverables refused with `section_too_large`, legacy's threshold).
+* *Affected*: DAE04:20-70 (DSL excerpt), :120-136; SC06:224-275 (new rows); SS04 epic header (`lifecycle` values); MT03 (`pm://epic/{epic_id}/spec/{section}` already exists); REQ02 PM-WF-15.
+* *Decision*: Operator 2026-09-29: (1) under Z6-A: bootstrap-epic gathers title, vision, parallelization_scope (default 1), source text or source-issue; done creates epic.json and the vision section of spec.md; epic.pmwf starts at epic.decompose (dispatch:decompose, submit workstream, submit spec_section with section_too_large above six deliverables, stage, next decomposed guarded by >=1 staged row -> epic.active); epic.active keeps these links for additions.
+
+[#z6-16]
+=== Z6-16 Decompose and reader roles (D9, D10)
+
+* *Question*: Which dispatches use the roles `decompose` and `reader`, now that Z5-32 fetches issue text through the deterministic validator without a reader?
+* *Evidence*: DAE03:194 (Phase 2 dispatches list "issue-body reader ingestion", stale), :213-214 (roles `analyze`, `decompose`, `reader`), :271-319 (reader family, `ingest_candidates`); REQ11:11 (Stage 3 justifies the reader dispatch by the `issue_number` source); RM:301 (reader variants shipped in M7). The server-fetched issue and PR bodies pass the validator directly (MT01:40); an epic source from an issue is fetched the same way (<<z6-14>>).
+* *Options*:
+** (a) *`decompose` used, `reader` withdrawn from v1*: `dispatch:decompose` in `epic.decompose` dispatches a worker (ordinary worker family, role `decompose`) that returns drafts through `returned:<dispatch_id>` and submits through the links of <<z6-15>>. The reader family, the role key `reader`, the reader variants and `ingest_candidates` are removed from v1 and recorded as L-7 "Reader family for web research"; DAE03:194 drops the reader mention; REQ11:11 and RM:301 drop the reader dispatch and variants.
+** (b) Keep the reader family unused: dead surface in bundles, tests and specs.
+** (c) Route issue bodies through a reader again: reverses Z5-32 for no containment gain, since the validator is the boundary (DAE03:276).
+* *Recommendation*: (a). Nothing in v1 needs untrusted extraction by a model; removing it shrinks the bundle and the M7 scope.
+* *Affected*: DAE03:190-319; REQ11:11; RM:289, :301; CS01 bundle layout (reader variants); `doc/later-improvements.adoc` (L-7); REQ02 PM-WF-14.
+* *Decision*: Operator 2026-09-29: (a): decompose used by epic.decompose; reader family, reader role key, reader variants and ingest_candidates withdrawn from v1 (L-7 Reader family for web research). Operator confirmed the principle: fetching, extraction and guardrails of external content are server work (native provider modules fetch, deterministic extraction, ingestion validator as containment boundary); the model only judges content the server has already fetched, validated and marked untrusted.
+* *Adjusted by Z6-B*: the reader family is not withdrawn: it becomes the zero-tool injection screener (no web tools), role key screen; L-7 is not created; the web-research use stays out of v1.
+* *Adjusted by Z7-10*: the reader family is removed entirely; the screener is the only model role over external text, and decompose and spec re-grounding run as read_only model jobs of the Z7-10 role table (orchestrator.effort.decompose, orchestrator.effort.analyze).
+
+[#z6-17]
+=== Z6-17 Epic queue-row vocabulary vs plan outcomes (D24)
+
+* *Question*: How do the plan outcomes `merged | handed_back | returned | no_change | aborted` (Z5-2, F3) map onto the queue-row statuses, and when is a prerequisite satisfied?
+* *Evidence*: SS04:127 (14 statuses: live `staged, ready, launched, running, blocked, parked`; `terminal.shipped` `merged, completed`; `terminal.closed_unshipped` `abandoned, superseded, split, retired, transferred, resolved`); DAE04:82 (emission waits for `terminal.shipped`), :124; `blocked` is live although Z5-24 retired the condition; DAE04 inbox "scope deviations" (Z5-36 removed them); a `handed_back` prerequisite never ships.
+* *Options*:
+** (a) *Mapping with two new statuses*: `merged` -> `merged`; `no_change` -> `completed`; `handed_back` -> new live status `handed_back` (awaiting a human merge; the epic's landing reconciliation observes the pull request: merged -> `merged`, closed -> `abandoned`); `returned` -> new `terminal.closed_unshipped` status `returned` (the row may be re-staged as a new row); `aborted` -> `abandoned`. `blocked` is removed; "scope deviations" becomes "unplanned-change overlaps".
+** (b) Map onto existing statuses only: `handed_back` -> `blocked` until the merge is observed, `returned` and `aborted` -> `abandoned`: no new values, but `blocked` gets a meaning unrelated to its name and `returned` loses its planning result.
+* *Recommendation*: (a). Dependants of a handed-back row emit only after its pull request merges, which is the truth the prerequisite rule wants.
+* *Affected*: SS04:106-130 (enum); DAE04:82, :124, :128; RM:419, :422; REQ02 PM-WF-15.
+* *Decision*: Operator 2026-09-29: (a): merged -> merged; no_change -> completed; aborted -> abandoned; handed_back -> new live status handed_back (landing reconciliation observes the PR: merged -> merged, closed -> abandoned); returned -> new closed_unshipped status returned (re-stageable as a new row); blocked removed; 'scope deviations' -> 'unplanned-change overlaps'.
+
+[#z6-18]
+=== Z6-18 `stop_after: plan` and its follow-up (D51)
+
+* *Question*: `pm_start(stop_after: plan)` (kept by Z5-29) ends a plan `returned` after Phase 4, "and a follow-up plan executes it"; no composition rule prunes the phases and no source consumes the planning result. Specify it, or remove it?
+* *Evidence*: MT01:115-119; REQ04:8; WC Z5-29 (kept `stop_after: plan`, review question added); C7. The optional outline review question (`review_outline`, PW02:164) already gives the user a look at the outline before execution. Legacy has no planning-only mode.
+* *Options*:
+** (a) *Remove*: drop `stop_after` from the schema and REQ04; the review question covers "see before execution"; a returned plan's outline stays readable in the archive for a human-written follow-up request.
+** (b) Specify with a follow-up source: composition rule (event `stop_after`, steps from Phase 5 on pruned with reason `stop_after`), the plan ends `returned`, and a new bootstrap candidate `new:from_plan:<plan_id>` whose plan imports the returned plan's outline and re-validates it (Q-Gate against current `HEAD`) before Phase 4.
+** (c) Specify without a follow-up source: composition rule and `returned` only.
+* *Recommendation*: (a). The feature has no consumer besides a human, the review question serves the stated purpose, and (b) needs a new source with outline import and re-validation. *Flag*: this reverses a sub-choice of Z5-29 and needs the operator's decision.
+* *Affected*: MT01:115-119; REQ04:8; PW02:164; RM:331; WC Z5-29 (Adjusted-by line).
+* *Decision*: Operator 2026-09-29: (a): stop_after: plan removed; the outline review question covers seeing the plan before execution; a future 'plan now, execute later' would be one new source unit under Z6-A. Reverses the 'kept' sub-choice of Z5-29.
+
+[#z6-19]
+=== Z6-19 Lesson maintenance: in or out, and where
+
+* *Question*: Legacy offers lesson analysis (dedup, close, merge) and aggregation (supersede, prune) without creating a plan (L5, L12). Does PM-MCP have such a workflow, and how does it connect to the bootstrap?
+* *Evidence*: lesson store with retirement and `superseded` (`store-schemas/10-job-and-lesson-records.adoc:151-170`); retention sweep of superseded lessons (RM:400); lessons-capture in the post-run band (REQ02:204); `maintain:lessons` in the approved draft.
+* *Options*:
+** (a) *Separate workspace unit* `lessons.pmwf` (compiled only, workspace scope, entered from `maintain:lessons` or `/marshall-steward`): `lessons.analyze` (auto: server-computed duplicate and stale candidates by title, component and cited-file evidence), `lessons.review` (link: `dispatch:analyze-lessons` for a model judgment of groups, `submit merge (ids, into)`, `submit retire (id, verdict)`, `submit supersede (id, by)`; each validated and written under the lesson lock), `lessons.done` with facts listing `new:lesson:<id>` candidates, back to its start. Delivered after the dispatch mechanics and lessons-capture.
+** (b) Out of v1: lessons are only listed and started; duplicates accumulate until the retention sweep; recorded as a later improvement.
+* *Recommendation*: (a) as the direction, delivered late (<<z6-21>>). It keeps the lesson store usable without plans; the server computes candidates, the model judges groups, the server writes.
+* *Affected*: new SC section "Lesson maintenance" in SC06; store-schemas lesson record (merge provenance); `/marshall-steward` entry; RM (placement).
+* *Decision*: Operator 2026-09-29: (a): separate compiled workspace unit lessons.pmwf (lessons.analyze server candidates; lessons.review model judgment via dispatch or Z7 job, submit merge / retire / supersede validated under the lesson lock; lessons.done lists new:lesson:<id> candidates), entered from maintain:lessons or /marshall-steward; delivered late (M10, next to lessons-capture).
+* *Adjusted by round-4 D6 (2026-10-01)*: `lessons.pmwf` is a called sub-workflow (`scope subworkflow`, exit contract `done` / `stepped_out`) entered through the call state `setup.maintain-lessons` of project setup, not a workspace unit entered directly.
+* *Adjusted by round-4 D8 (2026-10-01)*: lesson review runs on the multi-submit entity unit: the repeatable submits `merge`, `retire` and `supersede`, ended by the closing `submit:review`.
+* *Adjusted by naming review N5 (2026-10-01)*: the workspace entry command named here is `/mcp-marshall-steward`; the entry commands carry the `mcp-` prefix (`/mcp-plan-marshall`, `/mcp-plan-orchestrator`, `/mcp-marshall-steward`, `$mcp-…` on Codex) for harness autocompletion and coexistence with the legacy plugin; the plain names are a later improvement (link:../later-improvements.adoc#_l_9_plain_entry_command_names[Later Improvements L-9]).
+
+[#z6-20]
+=== Z6-20 Clean-tree guard at `init.ready` (and minor corrections)
+
+* *Question*: SC02:76 and PW01:37 say "the `deep` exit applies the clean-tree guard", which is defined nowhere. What is meant?
+* *Evidence*: C11; the Clean Main Checkout Guard (`phase-workflows/02-planning-lanes-phases-3-4.adoc:230`) compares the main checkout with `entry_baseline`, recorded at plan creation (REQ02 PM-WF-10); the Phase 5 clean-tree gate is a different check (SC03:144).
+* *Options*:
+** (a) Replace the phrase by a reference to the Clean Main Checkout Guard (already evaluated at every server boundary), no new check.
+** (b) Define a new guard at `init.ready`: duplicates the existing one.
+* *Recommendation*: (a). Also correct the minor items of C12's neighbourhood: Z5-31 cites `pm://plans/{plan_id}` (correct: `pm://plan/{plan_id}`); an IT example names phase `init` instead of `phase-1-init`.
+* *Affected*: SC02:76; PW01:37; WC Z5-31 (citation); the IT example in `mcp-tools/04-errors-and-testing.adoc`.
+* *Decision*: Operator 2026-09-29: (a), decided by the reviewer under the operator's delegation: reference the Clean Main Checkout Guard; minor citation and IT-example corrections.
+
+[#z6-21]
+=== Z6-21 Roadmap placement
+
+* *Question*: Which milestone delivers which part, respecting the Z4 pull-forward decisions (enrolment M3, setup first run M7, dispatch M8, ingestion validator M7, `local_changes` / `pr` M10, `claude` installer M7)?
+* *Evidence*: RM:293 (`pm_start` with four sources in M7), :297 (Phase 1 in M7), :301 (`claude` bundle and entry commands in M7), :307 (setup first run M7), :394, :397 (local changes and PR in M10), :419-422 (epics in M11).
+* *Options*:
+** (a) *Follow the sources*: M3 extends `pm-mcp enter` and the pending record (Z6-2); M7 delivers the bootstrap unit with `start.resolve`, `start.setup-required`, `start.choose` (plans, lessons, recipes), the sources request, issue, lesson (with premise), recipe (with option sources) and `pm_start` as commit, plus the two resources; M10 adds `source.local-changes` and `source.pr` with their lanes and the `handed_back` / `returned` queue mapping prerequisite (outcomes); M11 adds `kind: epic`, `new:epic`, epic intake, `dispatch:decompose`, `source.epic-row`, the emitted host command and the queue-row mapping; lesson maintenance goes to M10 next to lessons-capture (needs M8 dispatch).
+** (b) Deliver the whole bootstrap in M11: M7 would need a temporary `pm_start` with source arguments, rewritten later.
+* *Recommendation*: (a). Each milestone ships the bootstrap for the sources it already delivers; no interim tool schema.
+* *Affected*: RM:166, :293, :297, :301, :307, :394, :397, :419, :422; REQ11 PM-MIG-1 stage descriptions.
+* *Decision*: Operator 2026-09-29: (a) as revised under Z6-A/Z6-B/Z6-24: M1 headless-CLI verification per harness and tool set without pm_start; M3 enter (kind, id, hint), pending record with bootstrap state, entity addressing; M4 job kind llm; M7 bootstrap-plan with sources request, issue, lesson, recipe, the two resources, level-1 validator and screener on the claude harness; M10 source-local-changes, source-pr, review-comment screen, lessons.pmwf; M11 bootstrap-epic, epic.decompose, source-epic-row, queue-row mapping; M13 remaining hosts' headless templates. Z7 may still move dispatch items.
+
+[#z6-22]
+=== Z6-22 Surfaces of the LLM screener (follow-up of Z6-B)
+
+* *Question*: Which external texts pass the level-2 screener?
+* *Evidence*: issue title and body (PW01:217), PR title and body (PW01:233), review comments and bot findings (`remediation.review-findings` gather, WD08; SS03), analysis-provider messages (`remediation.analysis`), upstream MCP results (MT02:173), CI log and build excerpts (evidence resources, SS14).
+* *Options*: (1) all externally authored free text, own job output level 1 only; (2) everything including CI log and build excerpts; (3) human-authored text only.
+* *Recommendation*: (1): screen wherever a third party controls the words.
+* *Decision*: Operator 2026-09-29: (1): screen all externally authored free text (issue and PR title/body, every review comment and bot finding text, analysis-provider messages, upstream MCP results entering a store); CI log and build excerpts level 1 only (own job output). Operator: research a library for the server-side level 1 (library evaluation pending).
+
+[#z6-23]
+=== Z6-23 Effect of a `suspicious` verdict (follow-up of Z6-B)
+
+* *Question*: What happens to a text the screener flags, in the bootstrap and inside a plan?
+* *Options*: (1) bootstrap: a link state shows the flagged spans (`accept`, audited, text still marked untrusted; `back`); inside a plan: the text is withheld, only structured fields (author, file, line, kind) are delivered, the finding stays pending and the unit ends through its budget and fallback, the hand-back report lists the withheld items, a `met` waiver lets the plan proceed; (2) deliver redacted text (flagged spans removed); (3) pause the plan until an operator reviews (contradicts Z5-A).
+* *Recommendation*: (1).
+* *Decision*: Operator 2026-09-29: (1): bootstrap: the source step enters a link state showing the flagged spans, accept (text used, still marked untrusted, acceptance audited) or back; inside a plan: text withheld, only structured fields (author, file, line, kind) plus 'withheld: flagged by screener' delivered; a withheld finding stays pending and the unit ends through its budget and fallback (hand-back report lists withheld items); a met waiver of that finding lets the plan proceed.
+
+[#z6-24]
+=== Z6-24 Screener dispatch mechanics (follow-up of Z6-B)
+
+* *Question*: Role key, batching, effort level, verdict schema, and where the screen state sits in each source and gather unit.
+* *Options*: (1) a dedicated state `<unit>.screen` directly after the fetch or gather job of every unit that ingests external text; all new texts of that step in one batch in-band (split above a size bound); result schema `screen-verdict` `{items: [{text_id, verdict: clean|suspicious, spans: [{start, end, reason}]}]}` validated by the server, missing, extra or unparseable items count as `suspicious`; verdicts cached per scope by the SHA-256 of the cleaned text so a re-gather screens only new texts; role `screen` (shipped default low); (2) the working agent screens its own input (no separation); (3) one screen per text. The operator's revision (the *Decision* line) replaces the host dispatch of option (1) by an exec job through the detected harness's headless CLI and keeps its batching, schema and cache.
+* *Recommendation*: (1).
+* *Decision*: Operator 2026-09-29: revised by the operator: the screener runs as an exec job of kind llm through the headless CLI of the detected harness (client/client_detected of the entering session; the last entering session when a scope saw several), zero tools, server-fixed prompt, closed screen-verdict JSON, fail-closed; batching and SHA-256 verdict cache as in option 1; precondition: the harness declares a headless command template in its client profile and the CLI is present (verified per harness in the M1 host spikes), otherwise the step blocks naming the missing item; the job reads the harness's own auth and uses network (explicit confinement exception, never PM-MCP credentials); a headless run can never start further model jobs (PM-WF-5). Operator addition: operator configuration (local-config.json) may name a specialized model per model-job role (for example screen), passed through the CLI when that harness offers it. Opens topic Z7 (server-launched sub-agents: all dispatches as harness-CLI jobs).
+* *Adjusted by Z7-1 and Z7-5*: the screener is a model job launched per the Z7 launch contract: job llm screen role screen.effort, zero_tool class through the headless block of the selected harness, no MCP connection, an empty job-private working directory; the role ships the compiled default level-1.
+
+[#z6-25]
+=== Z6-25 Level-1 validator stack and dependencies (follow-up of Z6-B, Z6-22)
+
+* *Question*: Which stages and libraries make up the deterministic level-1 guard (PM-SEC-1), and which new dependencies are approved?
+* *Evidence*: library evaluation 2026-09-29 (JDK 25; `org.commonmark:commonmark` 0.30.0 BSD-2-Clause; `org.jsoup:jsoup` 1.23.2 MIT; `com.ibm.icu:icu4j` 78.3 Unicode-3.0; not recommended: `langchain4j-guardrails` (beta, heavy for about 20 regexes), OWASP Java HTML Sanitizer (browser HTML), ONNX Runtime + DJL classifiers (no GraalVM support, 100–700 MB models); `de.cuioss:cui-http` 3.1 has no free-text pipeline but URL pipelines and test attack databases). Sources: Maven Central metadata, AWS and Microsoft ASCII-smuggling write-ups, OWASP LLM Prompt Injection Prevention Cheat Sheet, Spotlighting (arXiv 2403.14720).
+* *Options*: (1) JDK + commonmark: Unicode stage to a fixpoint (tag block, variation selectors, Cf/Cc/Co/Cn, lone surrogates, ANSI escapes; NFC content, NFKC detection copy), markdown AST stage (images removed, links outside the allowlist neutralized, raw HTML and HTML comments removed and reported, exfiltration-shaped URLs flagged, extracted URLs validated with the cui-http URL pipelines), bounds, own rule table (risk signal and finding, never a gate alone), spotlighting delimiters at delivery; every change reported, never silently dropped; cui-http generators and garak/promptfoo corpora as JUnit fixtures; local classifier deferred as a later improvement. (2) As (1) plus jsoup and/or icu4j. (3) JDK only (markdown handled by hand-written parsing).
+* *Recommendation*: (1).
+* *Decision*: Operator 2026-09-29: (1): JDK + org.commonmark:commonmark 0.30.0 (BSD-2-Clause; new dependency approved by the operator for the level-1 markdown stage); stages Unicode fixpoint, markdown AST, bounds, own rule table (risk signal + finding, never a gate alone), spotlighting at delivery; every change reported; cui-http URL pipelines for extracted URLs; cui-http generators and garak/promptfoo corpora as JUnit fixtures; local classifier deferred as a later improvement.
+
+[#post-apply]
+== Post-apply follow-ups
+
+[#f2]
+=== F2 Session-start hook pointer to a pending bootstrap entry
+
+* *Question*: After `/clear` or compaction during a bootstrap, before the scope exists, what does the session-start hook point at?
+* *Decision*: Operator 2026-09-30: `pm-mcp hook session-start` also points at the newest pending bootstrap entry, naming `pm_state(plan_id: NO_PLAN, entity: <entry_id>)`, within the 512-byte ceiling. The scope matched by `client_session_id` is preferred (live scope or pending entry; the newest `last_seen_at` or `created_at` wins); without a session id the project's newest candidate. The hook reads files only and never starts the daemon.
+
+[#f3]
+=== F3 Adoption of an existing epic ledger
+
+* *Question*: How does an epic whose git-tracked ledger exists without machine scope (for example after a clone) enter the bootstrap?
+* *Decision*: Operator 2026-09-30: `start-epic.resolve` recognises an `epic` entry whose id names an existing ledger (`.marshall/orchestrator/<epic_id>/` with `epic.json`) without `epics/<epic_id>/` and routes it to the adopt path (`start-epic.adopt`); without a requested id `start-epic.define` offers `adopt_epic:<epic_id>`. The `done` transaction creates only the machine scope (session row, `status.json`) from the ledger, the durable truth, and enters `epic.decompose` when the ledger has no staged row, otherwise `epic.active`; an unreadable ledger ends in a failure state with the reason (`start-epic.adopt-failed`). Watch item `PM-WATCH-DISP-38`.
+* *Adjusted by round-4 D17 (2026-10-01)*: the adoption enters `epic.decompose` only for a ledger without any queue row (the specified form), otherwise `epic.active`; "no staged row" would leave an epic with only launched or running rows in a state that cannot ingest landings.
+
+[#f4]
+=== F4 No revocation of cross-project grants (follow-up of round-3 decision D12)
+
+* *Question*: Can the operator revoke a cross-project access grant before the plan ends?
+* *Decision*: Operator 2026-09-30: no revocation. A grant holds until the plan ends; `abort` of the plan is the only way to stop it. Stated at the grant record, the `grant-access` verb, and `PM-SEC-2`.
+
+[#affected]
+== Affected documents (summary)
+
+[cols="3,5"]
+|===
+|Document |Changes (items)
+
+|`requirements/02-workflow.adoc` |PM-WF-1 scope list (Z6-1); PM-WF-10 (Z6-20); PM-WF-14 (Z6-16); PM-WF-15 (Z6-13, Z6-15, Z6-17)
+|`requirements/04-tools.adoc` |PM-TOOL-1 `pm_start` signature (Z6-10, Z6-18); PM-TOOL-3 resources (Z6-5)
+|`requirements/11-migration.adoc` |PM-MIG-1 stage 3 (Z6-16, Z6-21)
+|`requirements/13-client-profiles.adoc` |PM-CLIENT-1 entry arguments (Z6-2)
+|`specification/cli-and-security/01-cli-and-installer.adoc` |`pm-mcp enter` syntax, step 4, output (Z6-2, Z6-14); bundle layout without reader variants (Z6-16)
+|`specification/client-profiles/01-profile-schema.adoc`, `02-placeholders-and-detection.adoc` |entry placeholders, entry command rendering with arguments (Z6-2, Z6-13)
+|`specification/mcp-tools/01-core-workflow-tools.adoc` |`pm_start` description, schema, refusals; `entity` under `NO_PLAN` (Z6-1, Z6-3, Z6-7, Z6-10, Z6-12, Z6-13, Z6-14, Z6-18)
+|`specification/mcp-tools/03-resource-uris.adoc` |`pm://workspace/lessons`, `pm://workspace/recipes` (Z6-5)
+|`specification/phase-workflows/01-planning-phases-1-2.adoc` |source table, plan id, classifier order, clean-tree wording (Z6-7, Z6-8, Z6-11, Z6-12, Z6-13, Z6-20)
+|`specification/phase-workflows/02-planning-lanes-phases-3-4.adoc`, `07-questions-waivers-operator-influence.adoc` |`stop_after` (Z6-18); bootstrap choices are links (Z6-4)
+|`specification/state-catalogue/02-plan-phases-1-3.adoc` |`init.lesson-premise` removed, `init.classify` order, `init.ready` wording (Z6-8, Z6-20)
+|`specification/state-catalogue/06-setup-epic-other.adoc` |new sections Bootstrap and Lesson maintenance; epic intake rows; `setup.commit-changes` note (Z6-1, Z6-3 to Z6-9, Z6-11, Z6-14, Z6-15, Z6-19)
+|`specification/workflow-dsl/02-units-jobs-decisions.adoc`, `04-ast-node-model.adoc` |bootstrap entity unit hosted by the workspace scope (Z6-1)
+|`specification/store-schemas/01-format-and-session-log.adoc` |pending entry record fields (Z6-2)
+|`specification/store-schemas/02-workflow-state-store.adoc`, `04-epic-and-change-ledger.adoc`, `10-job-and-lesson-records.adoc` |`origin.source` + `epic_row`; queue-row enum and `started_at`; epic header lifecycle; lesson merge provenance (Z6-13, Z6-15, Z6-17, Z6-19)
+|`specification/dispatch-and-effort/03-escalation-roles-readers.adoc`, `04-epic-coordination.adoc` |roles and reader family (Z6-16); epic DSL excerpt, emission, queue vocabulary (Z6-13, Z6-15, Z6-17)
+|`specification/domain-extensions/05-recipes-and-extension-points.adoc` |`parameters_schema` option sources (Z6-9)
+|`specification/identifiers/*` |`entry_id` as entity id; refusal reasons (Z6-1, Z6-3, Z6-12)
+|`roadmap.adoc` |placement (Z6-21)
+|`implementation-watch/cli-and-security.adoc` |PM-WATCH-CLI-1 source assumption (Z6-13)
+|`later-improvements.adoc` |L-6 issue and PR candidates (Z6-5); L-7 reader family (Z6-16)
+|`discussions/workflow-consistency.adoc` |Adjusted-by lines on Z5-29, Z5-30, Z5-31 (citation), Z5-32 (Z6-7, Z6-8, Z6-18, Z6-20)
+|===

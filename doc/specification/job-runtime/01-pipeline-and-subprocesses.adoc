@@ -1,0 +1,245 @@
+= Job Runtime Specification: Execution Pipeline, Subprocesses & Outcomes
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../job-runtime.adoc[Job Runtime Specification] » Execution Pipeline, Subprocesses & Outcomes
+
+== Verify-Not-Resolve Execution Pipeline
+
+Before spawning any subprocess, the runtime reads the enrolment file of the job's project, `<PM_MCP_BASE>/enrolments/<project_id>.json` (link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]), verifies its integrity (<<enrolment-integrity>>), and then validates the job request through a deterministic three-stage verification pipeline (`PM-EXEC-1`..`PM-EXEC-3`, `PM-SEC-2`):
+
+[source,text]
+----
+  Job Request (Scope, Executable, Argv, WorkingDir)
+                       │
+                       ▼
+       ┌───────────────────────────────┐
+       │ 0. Enrolment HMAC Check       │ ──► Mismatch: REFUSED (enrolment_tampered)
+       └───────────────┬───────────────┘
+                       │ Valid (HMAC matches file content)
+                       ▼
+       ┌───────────────────────────────┐
+       │ 1. Working Directory Check    │ ──► Mismatch: REFUSED (outside enrolled tree)
+       └───────────────┬───────────────┘
+                       │ Valid (Root or linked worktree)
+                       ▼
+       ┌───────────────────────────────┐
+       │ 2. Executable & Digest Check  │ ──► Mismatch: REFUSED (unpinned tool / digest drift)
+       └───────────────┬───────────────┘
+                       │ Valid (Exact path & SHA-256 match)
+                       ▼
+       ┌───────────────────────────────┐
+       │ 3. Argument Schema Validation │ ──► Mismatch: REFUSED (illegal flag / unquoted space)
+       └───────────────┬───────────────┘
+                       │ Valid
+                       ▼
+             Spawn Subprocess (Direct)
+----
+
+* *Working Directory Confinement (`PM-SEC-2`)*: The working directory must resolve canonically via `Path.toRealPath()` to the project's enrolled root or a live linked git worktree verified via `git worktree list --porcelain`. Arbitrary paths or symlink escapes are rejected with outcome `refused` and reason `path_traversal_rejected`.
+* *Working Directory Selection (`PM-ARCH-5`)*: The working directory is derived from the plan's persisted worktree presence at job start, never from the phase: jobs for plans whose `worktree_path` is set run in the plan's worktree root; jobs for plans whose `worktree_path` is `null` and plan-less jobs run in the main checkout (link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]). A job that removes a worktree never runs with a working directory inside that worktree. The one exception is the screener, a model job that runs in the empty subdirectory `cwd/` of its job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/`, which it can read and never write (link:../dispatch-and-effort/05-model-job-launch.adoc#job-working-directory[Model Jobs & Effort Specification, Working Directory & Screener Isolation]); no other job's working directory lies outside the enrolled tree.
+* *Verify-Not-Resolve Executable Resolution (`PM-EXEC-1`, `PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`)*: The runtime *never* searches the system `PATH`:
+** *Wrapper Jobs (`mvnw`, `gradlew`, `pw`)*: The wrapper must be committed at the root of the tree, must match an enrolled wrapper name in the project's enrolment file, and its SHA-256 content hash must match the enrolled digest. The digest check also covers every file that decides which tool runs and with which flags, recorded at enrolment as the wrapper's `pinned_files`: the wrapper jar and wrapper properties (`gradle/wrapper/gradle-wrapper.jar`, `gradle/wrapper/gradle-wrapper.properties`, `.mvn/wrapper/maven-wrapper.properties`) and the repository build configuration (`.mvn/maven.config`, `.mvn/jvm.config`, `gradle.properties`) where present; a pinned file that appears after enrolment counts as changed. Enrolment of `mvnw` or `gradlew` requires `distributionSha256Sum` in the wrapper properties, so the downloaded distribution is pinned as well. A mismatch refuses the job with `refused`, reason `build_config_changed`, the changed paths, and the `pm-operator enrol` command that re-baselines them (`PM-EXEC-2`). The interpreter-based wrapper `pw` is never started through its `#!/usr/bin/env` shebang: the runtime invokes the enrolled interpreter host tool (the wrapper's `interpreter`) with the wrapper as its first argument. What a wrapper runs is decided by the enrolled canonical template of the build verb (`build.canonical_templates`) or its compiled default; there is no per-wrapper goal allowlist.
+** *Host Tools (`git`, `gh`, `glab`, `python3`, `npm`, `npx`)*: The runtime invokes the exact absolute `executable_path` recorded in the project's enrolment file after verifying that the file's current SHA-256 matches the enrolment record.
+** *Harness Jobs (`llm`)*: The harness executable of a model job (`claude`, `codex`, `opencode`) is enrolled per machine by `pm-operator enrol-harness <client>`, which records its absolute path, the version its version probe reports, and its SHA-256, and nothing else: no environment value and no credential (link:../store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]). The runtime invokes exactly that path, never a `PATH` lookup. Before every model-job spawn it verifies the HMAC sidecar of `harnesses.json`; a mismatch refuses the job (`refused`, a `security` audit record `enrolment_tampered`), and the model-job state raises `precondition_unmet` with reason `harness_tampered` naming `pm-operator enrol-harness <client>`, which re-baselines the file. There is no pause and no `accept-edit` form for it. Harnesses update themselves, so a digest that differs from the record is accepted only when the version probe of the file reports a version within the supported version range of the harness's client profile: the new digest and version are recorded and audited. A version outside the range, or a probe that fails, refuses the job with `harness_version_unsupported`. The argument vector is the one the server composed from the profile's `headless` template (link:../dispatch-and-effort/05-model-job-launch.adoc#launch-contract[Model Jobs & Effort Specification, Launch Contract]), validated like every other.
+** *Project Script Jobs (`project_script`, `PM-EXT-5`)*: Both the script file (`script_path`) and its interpreter (`interpreter`, an enrolled host tool) must match their enrolled SHA-256 digests (`project_scripts.<project_script_id>` of the project's enrolment file), the job's use must match the script's `binding` (`worker_kind` and `target`), and the job arguments must validate against the script's enrolled `argument_schema`; the budget is the script's `max_timeout_seconds`. There is no job kind for legacy `plan-marshall` scripts.
+* *Argument Schema Validation (`PM-EXEC-1`, `PM-EXEC-5`)*: The argument vector (`argv`) is checked against a closed allowlist schema per tool type. Shell meta-characters (`|`, `;`, `&`, `$`, `` ` ``, `>`, `<`) are never evaluated: the runtime spawns every job without a shell, and the `#!/bin/sh` wrappers `mvnw` and `gradlew` receive the validated vector as positional arguments. This validation guards only against injection through link parameters; flags that come from repository content (the build configuration files above) are governed by their enrolled digests, not by the argument schema.
+
+[#enrolment-integrity]
+=== Enrolment Integrity Check (`PM-EXEC-2`)
+
+Step 0 of the pipeline verifies the HMAC-SHA-256 sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac` against the current enrolment file of the job's project (link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas Specification, Project Enrolment Store]) before every verify-not-resolve check, in addition to the check in the project's recovery after a runtime start. A failed check blocks only this project's jobs. The runtime (`pm-mcpd`) computes and writes every HMAC with a key that only it reads. Key handling, operator re-baselining, and the accepted residual risks (hosts without a keyring; a same-user process that re-baselines through the operator endpoint with the runtime token) are specified in link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-integrity[CLI, Coordination & Security Specification, Enrolment Integrity].
+
+* *Mismatch*: The job is refused with reason `enrolment_tampered` (outcome `refused`) and a `security` record is appended to `audit.jsonl`; the runtime never repairs or re-signs the file and trusts no enrolment until the operator re-baselines it through the operator CLI.
+* *Write Protection*: Jobs can neither read nor write `<PM_MCP_BASE>` on Linux (xref:02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Linux Filesystem Confinement (Landlock)]); the HMAC is the control against writers that are not jobs, such as a model-driven host shell.
+
+== Subprocess Lifecycle & Process-Group Isolation
+
+Every job runs as a direct child of the always-on runtime (`pm-mcpd`), started through the launcher `pm-exec`, independent of any host connection (link:../runtime-model.adoc[Runtime & Interaction Model Specification]), inside its own isolated operating system process group (`PM-EXEC-4`, `PM-EXEC-5`, `PM-IMPL-1`).
+
+*Job identity and files*: A job's `job_id` (link:../identifiers/01-general-rules-and-registry.adoc#id-job-id[Identifier Registry]) is its kind prefix (`b` build, `c` ci, `g` git, `p` project script, `l` model job of kind `llm`) and 16 random hex digits (64 bits); a review-bot poll is a `ci` job with the budget key `ci:<operation>`, never a kind of its own; at creation it is checked against the project's existing job records and drawn again on a collision. The job record (link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas Specification, Job Record]) and the job log lie side by side at `<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.json` and `<job_id>.log`. Language servers are no jobs (<<_warm_language_server_pool_orthogonal_service_access_pm_svc_2_pm_svc_4_pm_tool_2,Warm Language Server Pool>>).
+
+[#job-status]
+*Job status*: A job record's status is `queued`, `running`, `refused`, or `ended` (with its fate, <<outcome-derivation>>). `queued` is a real wait before spawn: the job waits for a slot of its machine lease store, a build slot for a `build` job or a model slot for an `llm` job (link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas Specification, Machine Lease Stores]); it has no process, no `pid`, and no running budget, and a queued job is cancelled or refused without any signal. Admission moves it to `running` in the transaction that takes the slot; a job that needs no slot is `running` from its creation.
+
+=== Process-Group Creation via the `pm-exec` Launcher
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-2[PM-WATCH-JOB-2]_
+
+Java's `ProcessBuilder` cannot place a child into a new process group or session (`setpgid`/`setsid`); a child started directly would inherit the runtime's own process group, and signalling that group would hit the runtime and every other job. The runtime therefore starts every job through the launcher `pm-exec`, a separate tiny native binary of the release (plain GraalVM native image with FFM, no Quarkus, module `pm-modules/pm-exec`), started by its path in the runtime's own installation directory `<PM_MCP_HOME>/bin/`, never through `PATH`:
+
+. The runtime verifies the job (verify-not-resolve, `PM-EXEC-2`) and starts `<PM_MCP_HOME>/bin/pm-exec -- <verified absolute executable> <args…>` with `ProcessBuilder`, keeping all of its I/O handling (pipes, in-memory `stdin` payloads, log redirection, exit codes).
+. The launcher calls `setpgid(0, 0)` via FFM, so its PID becomes the process-group ID, and then replaces itself with the target via `execve` (never `execvp`: no `PATH` search, `PM-EXEC-1`). The job's PID recorded by the runtime is therefore both the job PID and its process-group ID.
+. Cancellation and timeouts signal exactly that group (`kill(-pid, …)`). Warm build daemons that detach themselves into their own session (Gradle daemon, `mvnd`) are intentionally not affected (`PM-EXEC-4`).
+. `pm-exec` is not a user command and not a verb of `pm-mcp` or `pm-operator`; only the runtime starts it: it accepts only an absolute executable path, an argument vector, and (on Linux) the confinement sets, performs no verification of its own, reads no file of `<PM_MCP_BASE>`, and holds no secret.
+
+*Alternative for later implementations (macOS only)*: Start jobs directly via FFM `posix_spawn` with `POSIX_SPAWN_SETPGROUP` (the mechanism already used for the detached runtime start, link:../runtime-model.adoc[Runtime & Interaction Model Specification]). This removes the extra `execve` hop but replaces `ProcessBuilder` completely: pipes, `stdin` streaming, output capture, and exit-status reaping (`waitpid`) must then be implemented on FFM as well. The job contract (process group = job PID, outcome classification) is identical, so the runtime can switch implementations without changing any other specification. On Linux the `pm-exec` launcher (or an equivalent restricted spawner thread) stays mandatory: `PR_SET_NO_NEW_PRIVS` and the Landlock ruleset must be applied between `fork` and `execve`, and `posix_spawn` offers no hook for that.
+
+[source,java]
+----
+List<String> argv = new ArrayList<>(List.of(pmExecBinary, "--")); // <PM_MCP_HOME>/bin/pm-exec
+argv.addAll(verifiedArgv); // verifiedArgv.get(0) is the verified absolute executable path
+ProcessBuilder pb = new ProcessBuilder(argv);
+pb.directory(verifiedWorkingDir.toFile());
+// Environment sanitization
+pb.environment().clear();
+pb.environment().putAll(sanitizedEnvAllowlist);
+// Standard input handling: /dev/null by default, or in-memory pipe for multi-line payloads
+if (stdinPayload.isPresent()) {
+    pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+} else {
+    pb.redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")));
+}
+// Direct output redirection to job log file (never inherits the runtime's stdin/stdout)
+pb.redirectOutput(jobLogPath.toFile());
+pb.redirectErrorStream(true);
+Process process = pb.start();
+if (stdinPayload.isPresent()) {
+    byte[] bytes = stdinPayload.get();
+    Thread.startVirtualThread(() -> {
+        try (OutputStream out = process.getOutputStream()) {
+            out.write(bytes);
+            out.flush();
+        } catch (IOException ignored) {
+            // Child process exited early; handled by exit-code & outcome classifier
+        }
+    });
+}
+----
+
+=== In-Memory `stdin` Streaming vs Retired Temp-File Patterns (`PM-EXEC-5`)
+
+When a workflow primitive served by the CLI variant (link:../cli-and-security/02-credentials-and-operator.adoc#cli-variant-credentials[CLI, Coordination & Security Specification, Credentials of the CLI Variant]) passes multi-line text to an enrolled `git` or `ci` tool, `JobRuntime` supplies the validated UTF-8 bytes in `stdinPayload`. The native variant runs in process and passes the same text as an in-memory request payload; it has no job and no `stdin`.
+
+The `stdin` forms of the CLI variant are closed:
+
+* `git`: `git -C <tree> commit -F -`.
+* `gh`: `gh pr create|edit|comment --body-file -`, `gh issue create|comment --body-file -`, and `gh api graphql --input -` for the fixed GraphQL documents.
+* `glab`: the operations whose `glab` subcommand has no confirmed `stdin` form (`mr create`, `mr note`, `issue note`) are sent as `glab api <endpoint> --input -` with a server-composed JSON body. Until the Milestone-1 verification of these forms passes, these operations return `unsupported_by_variant{reason: no_stdin_form}` in the CLI variant, and the `gitlab` integration needs the native variant for them; free text is never moved to the argument vector or a file to work around it.
+
+For every form:
+
+* *Zero Temp or Scratch Files*: The server never writes commit messages or PR/issue bodies to scratch files, neither in the manner of `plan-marshall`'s `.plan/temp/{plan_id}-commit-msg.txt` and `<plan>/work/ci-bodies/` nor to `/tmp/`.
+* *Zero Shell / Argv Exposure*: Multi-line text is never placed in `verifiedArgv`, avoiding OS `ARG_MAX` limits and `ps` command-line inspection.
+* *Deterministic EOF*: The virtual writer thread closes `process.getOutputStream()` immediately after flushing `bytes`, guaranteeing that `git` and `gh` see EOF and never hang waiting for interactive input.
+
+=== Process Termination & Cancellation Protocol
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-22[PM-WATCH-JOB-22]_
+
+When a job exceeds its allocated budget (`PM-EXEC-4`, link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]), when the user/client calls `cancel`, or when the runtime drains:
+
+1. *SIGTERM Escalation*: The runtime sends `SIGTERM` to the job's process group (`kill(-pgid, SIGTERM)` via Java FFM, `PM-TECH-4`), whose ID equals the job PID (see <<Process-Group Creation via the `pm-exec` Launcher>>).
+2. *Grace Period*: The runtime (`pm-mcpd`) waits the termination grace period (link:../timeouts/01-job-budgets-and-waits.adoc#grace-period[Timeouts & Budgets Specification]) for all processes in the group to exit cleanly.
+3. *SIGKILL Cleanup*: If any process of the group remains alive after the grace period, the runtime issues `kill(-pgid, SIGKILL)`. Steps 1–3 address the group, never only its leader: they run to completion even when the leader has already exited and only descendants remain.
+4. *Cancel Before the Group Exists*: The launcher calls `setpgid` after it starts, so a cancel (or budget expiry, or drain) that reaches a job in that window gets `ESRCH` from `kill(-pgid, …)`. The runtime then signals the PID directly (`kill(pid, SIGTERM)`) and retries against the group after the short bounded delay of link:../timeouts/01-job-budgets-and-waits.adoc#cancel-group-retry[Timeouts & Budgets Specification, Cancel-Before-Group Retry], and records `cancel_before_group: true` in the job record.
+5. *Outcome*: The outcome of a terminated job is derived by <<outcome-derivation>>; relay termination never affects a job. A `timed_out` job is `no_verdict` in every roll-up (link:../timeouts/01-job-budgets-and-waits.adoc#no-verdict-rule[Timeouts & Budgets Specification, Timed-Out Outcomes Are No-Verdict]).
+6. *Live Orphans after a Runtime Crash*: The job record is written before spawn and, mandatorily, replaced right after spawn with the job PID (which is its process-group ID) and the process start instant (`pid`, `process_started_at`); the launcher reports its PID after `setpgid` and before `execve`, and the job counts as running only once that replace is persisted. In the project's recovery after the next runtime start, every record left `queued` is settled `status: ended`, `fate: killed` without signalling anything (it never started), and every record left `running` is settled `killed` by the first matching rule, and it is never adopted or re-executed (link:../runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]): (a) its `spawned_at` lies before the system boot time: the process cannot have survived the reboot, and nothing is signalled; (b) its `pid` is `null` (the runtime ended between spawn and the post-spawn replace): nothing is signalled, and the audit record notes `orphan unidentifiable`; (c) otherwise the runtime probes the process group with `kill(-pgid, 0)`: a group exists while any of its members lives, and a PGID cannot be reused while its group is alive within one boot, so a live group whose ID equals the recorded PGID is that job's group, even when the leader (whose start instant was recorded) has exited. Such a group is terminated with steps 1–3; a group that no longer exists needs no termination.
+
+[#in-process-operations]
+=== In-Process Operations (Native Variant)
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-3[PM-WATCH-JOB-3]_
+
+A `git` or `ci` operation of the native variant (JGit, provider HTTP clients) runs inside the runtime: no argument vector, no environment, no process group, no Landlock ruleset, and no `pm-exec` launcher exist for it. It is still a job of the runtime, so waits, cancellation, metrics, and recovery treat it like any other job:
+
+* *Job Record*: Every in-process operation gets a job record of its kind (`git` or `ci`, job id prefix `g` or `c`) with `execution: in_process`, its budget key `<kind>:<operation>`, `budget_seconds`, and `budget_derivation`; the process fields (`argv_digest`, `pid`, `process_started_at`, `spawned_at`, `exit_code`, `signal`) are `null` and `confinement` is `not_applicable` (link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas Specification, Job Record]). It writes no job log file.
+* *Budget & Cancellation*: The operation runs under the budget of its operation class; at budget expiry, on `cancel:<job_id>`, and at drain it is cancelled cooperatively (JGit `ProgressMonitor`, interruption of the HTTP exchange), every HTTP request carries the compiled per-request connect and read timeout, and an operation that does not return within the grace period is abandoned with its late result discarded (link:../timeouts/01-job-budgets-and-waits.adoc#in-process-operations[Timeouts & Budgets Specification, In-Process Operations]). A partial result is never used.
+* *Outcome*: Rows 1 to 4 of <<outcome-derivation>> apply unchanged (`refused` before the operation starts, `cancelled`, `timed_out` as `no_verdict`, `killed` at drain or for a record left `running` by a previous runtime instance; nothing is probed or adopted). Otherwise the fate is `succeeded` when the operation returned a domain outcome of its closed contract enumeration, `failed` when it returned a transport outcome (`auth_failed`, `permission_denied`, `provider_unavailable`, `malformed_response`, `unsupported_by_variant`, `capability_missing`), and `indeterminate` when it ended outside its contract (an unexpected exception, recorded by its class). A provider rate limit (`rate_limited{reset_at}`, or a `Retry-After`) is neither a failure nor a timeout: the operation is re-issued after the stated instant, the time until then does not count against its budget, and the wait records `provider_rate_limit` (<<_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4>>).
+
+=== Bounded Long-Poll & Progress-Reset Waiting Primitives (`PM-WF-8`, `PM-IMPL-4`)
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-5[PM-WATCH-JOB-5], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-6[PM-WATCH-JOB-6], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-19[PM-WATCH-JOB-19]_
+
+When a workflow transition spawns a long-running `build`, `ci`, `project_script`, or `llm` job, or when the model invokes `pm_build` (`PM-SVC-1`, `PM-SVC-4`):
+
+* *Bounded Wait Slice*: The server holds the request open for at most the bounded wait window (`bounded_wait_seconds` of the client profile; value, bounds, and the rule relating it to the host idle timeout in link:../timeouts/01-job-budgets-and-waits.adoc#bounded-wait[Timeouts & Budgets Specification, Bounded Wait Window]). If the job completes within the window, the server immediately evaluates the completion guard and returns the next workflow state.
+* *Progress Notifications*: When the client profile supports `progress_resets_timeout == true` and supplies a `_meta.progressToken`, the call waits up to the progress wait upper bound (link:../timeouts/01-job-budgets-and-waits.adoc#progress-wait[Timeouts & Budgets Specification]) and the job runner emits periodic `notifications/progress` frames (current build stage and elapsed time, at the interval of link:../timeouts/01-job-budgets-and-waits.adoc#progress-interval[Timeouts & Budgets Specification]) over the calling host connection (relayed to the host by `pm-mcp serve`).
+* *Non-Blocking Wait Links*: If the job is still running when the window elapses, the call returns a valid hypermedia state with the implicit `wait:<job_id>` (`rel: wait`, `form: wait`) and `cancel:<job_id>` (`rel: abort`, `form: noop`) links (`PM-WF-8`, link:../workflow-dsl/02-units-jobs-decisions.adoc#implicit-job-links[Workflow DSL Specification, Implicit Links of Job States]), never failing with an MCP transport timeout.
+* *Wait Attribution*: Every wait slice records `wait_reason` (closed enum `build`, `ci`, `model_job`, `review_bot_window`, `operator_waiver`, `question`, `merge_queue`, `precondition_poll`, `provider_rate_limit`) and `deliberate` (`true` for a waiver wait, a question wait, or a rate window). `provider_rate_limit` is the time a provider's API rate limit (`Retry-After` or a rate-limit reset instant) deferred the next observation (link:../timeouts/01-job-budgets-and-waits.adoc#ci-repoll-cadence[Timeouts & Budgets Specification, Provider Re-Poll Cadence]); it is never a timeout and never a failure. `record-metrics` sums wait time per reason and reports deliberate waits separately from poll misses, never as one "waste" figure.
+
+[#engine-deadlines]
+=== Engine Deadlines: Waiver Wait & Question Deadline
+
+Two waits of a plan end by time without any model call: the waiver wait of a remediation unit and the deadline of an open question record (values in link:../timeouts/01-job-budgets-and-waits.adoc#remediation-budgets[Timeouts & Budgets Specification, Remediation Budgets, Question & Waiver Waits]). Both deadlines are persisted instants (`expires_at` of the waiver request and of the question record, link:../store-schemas/14-plan-instance-waivers-questions.adoc[Store Schemas Specification]), never in-memory timers alone:
+
+* *Waiver Wait*: A server-side `composite_job` of the unit (`remediation.await-waiver`), bound as `active_job` like every job state; its constituents are the deadline and a watch of the plan's `waivers.jsonl`. A `waive` naming the requested gate or budget settles it `waived` or `raised`; the deadline settles it `expired`. It needs no model turn and no host session.
+* *Question Deadline*: A question state is a `link` state (it offers the answer link for `session` delivery); its deadline is engine-owned and processed by the runtime's deadline timer, which takes the class fallback transition in its own journaled transaction under the scope lock. Mode `operator` sets no deadline; modes `none` and `model` usually resolve at creation.
+* *Timer*: The runtime keeps one deadline timer over the persisted instants of every enrolled project; it fires at the earliest instant and after every runtime start, where the per-project recovery (link:../runtime-model.adoc#per-project-recovery[Runtime & Interaction Model Specification, Per-Project Recovery]) processes every deadline that passed while the runtime was down, before the project is served. A deadline fires at most once; its transaction re-checks that the record is still open (an answer or a waiver that won the race wins).
+* *Holds*: While the scope is under an integrity pause, a passed deadline is held and processed after the pause ends. `abort` and `delete-plan` close the pending records (questions `cancelled`, waiver requests `expired`) in their own transaction, so no timer fires on them. The question wait and the waiver wait never overlap in one plan.
+
+=== Warm Language Server Pool & Orthogonal Service Access (`PM-SVC-2`, `PM-SVC-4`, `PM-TOOL-2`)
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-5[PM-WATCH-TOOL-5]_
+
+The Job Runtime manages the runtime's bounded pool of warm Language Server Protocol (LSP) processes (`max_lsp_instances` in `machine-config.json`, link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas Specification, Machine Configuration]) spoken via Eclipse `LSP4J` over `stdio` (`PM-TECH-2`, `PM-TECH-3`):
+
+* *Verify-Not-Resolve Launch*: Each language server binary (for example `jdtls`, `pyright-langserver`, `typescript-language-server`, `rust-analyzer`, or any other language server a domain declares) is verified against `language_servers` of the project's enrolment file `enrolments/<project_id>.json` before launch.
+* *Pool Processes, Not Jobs*: A language server is started through `pm-exec` like a job, in its own process group and, on Linux, with the same confinement as a job of its project (xref:02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Linux Filesystem Confinement (Landlock)]), but it gets no job record, no `job_id`, and no outcome (there is no job kind for it). After a runtime crash it ends when its `stdin` closes.
+* *Lifecycle & Eviction*: Instances are keyed by `(canonical_worktree_path, language_id)` (the plan worktree, or the main checkout at the enrolled `project_root`), initialized lazily on the first `pm_lsp` call (`PM-TOOL-2`, `PM-SVC-4`), evicted cleanly (`shutdown` -> `exit` -> `SIGTERM`) after the language server idle timeout (`lsp_idle_timeout_seconds`; start, request, and idle timeouts in link:../timeouts/02-runtime-leases-operator-web.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle]) or when the runtime drains or stops, and restarted automatically on unexpected exit, at most 2 times per instance (a compiled constant). After the retries are exhausted, `pm_lsp` returns `lsp_unavailable` for that instance until its idle eviction or a runtime restart (link:../mcp-tools.adoc[MCP Tools Specification], closed error codes).
+
+[#outcome-derivation]
+== Outcome Derivation
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-1[PM-WATCH-JOB-1], link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-23[PM-WATCH-JOB-23]_
+
+The runtime derives every job outcome itself, at the boundary, from evidence it observed: whether it refused the job before spawn, which signal it sent and why, the wait status of the process (exit code or terminating signal), and the parse of the job log (`PM-EXEC-4`, `PM-SVC-1`). A status that a job reports about itself (the `status` field of a `project_script` output payload, the `job-result` of a model job) is evidence to check, never the outcome. The table is closed and evaluated top to bottom; the first matching row decides. The derived outcome (`fate`), the matching row (`outcome_row`), the exit code or signal, and `cancel_before_group` (<<Process Termination & Cancellation Protocol>>) are recorded in the job record (link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas Specification, Job Record]).
+
+[cols="1,3,2,3"]
+|===
+|# |Evidence |Outcome |Notes
+
+|1
+|The job was refused before spawn: verify-not-resolve pipeline (<<Verify-Not-Resolve Execution Pipeline>>, including `enrolment_tampered`, `build_config_changed`, `path_traversal_rejected`), argument schema, or admission.
+|`refused`
+|Carries the refusal reason (`refusal_reason` of the job record); no process ever existed.
+
+|2
+|The runtime sent the termination signal because of a `cancel:<job_id>` (or the cancel of a composite constituent).
+|`cancelled`
+|Whatever the process's exit status after the signal.
+
+|3
+|The runtime sent the termination signal because the job's budget expired (link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets Specification, Job Budgets]).
+|`timed_out`
+|Whatever the process's exit status after the signal; `no_verdict` in every roll-up (link:../timeouts/01-job-budgets-and-waits.adoc#no-verdict-rule[Timeouts & Budgets Specification]).
+
+|4
+|The process ended by any other signal: the runtime's drain or orphan termination, a crash signal (`SIGSEGV`, `SIGBUS`, `SIGABRT`, `SIGILL`, `SIGFPE`), an external `SIGKILL` (for example the OOM killer) or any other external signal; or the job was still `queued` at drain; or the record was left `running` or `queued` by a previous runtime instance (a queued job has no process, so nothing is signalled).
+|`killed`
+|The signal is recorded (`signal` name and number, or `runtime_restart`); never retried without an explicit workflow transition.
+
+|5
+|The job log is missing, truncated, or unreadable.
+|`indeterminate`
+|Also for exit code `0`; no findings are emitted.
+
+|6
+|A `project_script` reports a `status` that contradicts the exit code or the parsed evidence.
+|`indeterminate`
+|The contradiction (reported status, exit code, parse result) is recorded (`self_report_contradiction` of the job record).
+
+|7
+|Exit code `0` and the tool parser found its positive success marker, with no contradicting evidence.
+|`succeeded`
+|Success markers: build — the engine's terminal success marker (`BUILD SUCCESS`, `BUILD SUCCESSFUL`) or the tool's passing summary (xref:03-parsers-and-gates.adoc#_native_build_output_parsers[Native Build Output Parsers]); `git` — exit `0` plus the post-condition read where the primitive declares one; `ci` — a parseable `--json` payload of the expected shape; `project_script` — a schema-valid output payload whose `status` agrees; `llm` — the harness's final result event and a structured result that validates against the job's named result schema (`job-result`, or `screen-verdict` for the screener). For a harness whose profile declares `exit_reliable: false`, the final result event parsed from its JSONL output replaces the exit code in rows 7 to 10.
+
+|8
+|Exit code `0` without the positive success marker, or with contradicting evidence (parsed errors, failing test counts).
+|`indeterminate`
+|Never folded into `succeeded` or `failed`.
+
+|9
+|Non-zero exit code and the parser extracted at least one diagnostic.
+|`failed`
+|Located diagnostics become findings.
+
+|10
+|Non-zero exit code and no parsed diagnostic.
+|`failed_unparsed` for `build` jobs; `failed` for every other job type
+|xref:03-parsers-and-gates.adoc#_unparseable_output_fallback_failed_unparsed[Unparseable Output Fallback (`failed_unparsed`)].
+|===
+
+For an in-process operation of the native variant, rows 5 to 10 are replaced by the contract-based rule of <<in-process-operations>>; the success markers of row 7 for `git` and `ci` apply to the jobs of the CLI variant.
+
+*Write order at job end*: When a job settles, the runtime writes in this fixed order: the job record's fate (which revokes a model job's token; the job record carries no usage), then for a model job its metrics row with the parsed usage (`metrics.json` of the job's scope, link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]), then the change-ledger row (`change-ledger.jsonl`, for jobs that stamp one), then the timing observation (link:../store-schemas/09-derived-facts-and-build-timings.adoc#build-timings-store[Store Schemas Specification, Build Timings Store]), then the build-slot or model-slot release; a model job's job-private directory is removed last. A crash in between loses at most a model job's metrics row (reported by `record-metrics` as the divergence `row_absent_from_metrics`, never read as `0`), a freshness mark (the build re-runs), or a timing sample, and the recovery removes a job-private directory whose job has settled.
+
+Language server instances of the warm LSP pool are not classified by this table; their failures are reported as the non-run reasons of link:../domain-extensions.adoc[Domain Extensions Specification] (Explicit Non-Run Reporting) and the timeouts of link:../timeouts/02-runtime-leases-operator-web.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle].

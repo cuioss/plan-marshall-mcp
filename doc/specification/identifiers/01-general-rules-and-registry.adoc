@@ -1,0 +1,262 @@
+= Identifier Registry: General Rules & Registry (Scopes, Workflow, Jobs)
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../identifiers.adoc[Identifier Registry] » General Rules & Registry (Scopes, Workflow, Jobs)
+
+== Traceability
+
+_See Requirements:_
+
+* _See Requirement link:../../Requirements.adoc#PM-ARCH-4[PM-ARCH-4: Stateless Requests & Explicit Scope Addressing]_
+* _See Requirement link:../../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+* _See Requirement link:../../Requirements.adoc#PM-WF-4[PM-WF-4: Entity-Scoped Links & Fine-Grained Concurrency]_
+* _See Requirement link:../../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_state, pm_do)]_
+* _See Requirement link:../../Requirements.adoc#PM-TOOL-3[PM-TOOL-3: Read-Only MCP Resource URI Surface]_
+* _See Requirement link:../../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+* _See Requirement link:../../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream MCP Proxy & Provenance Tagging]_
+* _See Requirement link:../../Requirements.adoc#PM-IMPL-2[PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output]_
+
+
+[#general-rules]
+== General Rules
+
+The following rules apply to every identifier in the registry; a table row states only what it adds.
+
+1. *ASCII only*: Every identifier consists of printable ASCII characters (`0x21..0x7E`); none contains whitespace, a path separator other than the ones its grammar names, or a character that needs escaping in a file name, a URI path segment, a TOON scalar, or a host tool name. Unicode normalization never applies because no identifier admits non-ASCII input.
+2. *Case*: Identifiers are lower case unless the grammar admits upper case explicitly (entity-addressed identifiers such as `TASK-001` and `F-12`, `module_id`, repository paths). An identifier is compared byte-exactly; the server never folds case to make two identifiers match.
+3. *Separators*: `-` separates words inside one identifier, `_` separates words inside names that must also be valid tool or parameter names, `.` separates the segments of a dotted identifier (`state_id`, `primitive_id`), `:` separates the parts of a link identifier and a finalize step identifier, and `/` separates URI and path segments. No other separator is used, and an identifier never starts or ends with a separator unless its grammar says so.
+4. *Maximum length*: Every identifier has a maximum length, stated in the table; a grammar whose regex is unbounded is bounded by the stated length (enforced as `maxLength` in a schema, or by the server's validator where the schema subset cannot express it). An identifier that exceeds its bound is refused, never truncated.
+5. *Server-generated identifiers are opaque to the model*: The model copies a server-generated identifier verbatim from a representation, a model job's prompt file, or a tool result; it never composes, increments, or parses one. The server never derives meaning from the model's spelling of such an identifier beyond looking it up in the addressed scope.
+6. *Model-supplied identifiers are validated server-side*: Every identifier that arrives from the model (tool arguments, link identifiers, `args` values that name an entity) is checked against its grammar by the server's argument validator before it is looked up, and a violation is answered as defined in link:../mcp-tools/04-errors-and-testing.adoc#protocol-errors-vs-domain-workflow-failure-states[MCP Tools Specification, Protocol Errors] (`invalid_arguments` for tool arguments, `rejected` for link arguments). A grammatically valid identifier that names nothing in the addressed scope is `scope_not_found` or `link_not_available`, never an empty result.
+7. *No identifier encodes another scope's identifier*: An identifier is resolved only within the scope that the same call addresses; it never embeds the `plan_id`, `epic_id`, or `project_id` of another scope (`message_id`, `job_id`, `waiver_id`, `question_id`, and `batch_id` carry no scope). Composite storage addresses such as `plans/<plan_id>/`, `locks/plan-<plan_id>.lock`, the credential account `<project_id>/<credential_key>`, the archived epic directory `<epic_id>-<YY-MM-DD>`, the capture ref `refs/pm-mcp/captures/<plan_id>` of a `local_changes` plan (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows, Plan Source Contracts]), or the baseline scratch worktree `.marshall/local/worktrees/baseline-<plan_id>-<sha12>` (`<sha12>` the first 12 hex digits of the merge-base commit, link:../job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime, Gate Honesty Verification]) are paths built from identifiers, not identifiers, and are never parsed back into one.
+8. *Stability*: An identifier is immutable once allocated. An identifier marked _never reused_ is not allocated again after its entity is deleted, archived, or retired; one marked _re-derivable_ is computed from content and is equal whenever the content is equal.
+9. *Schema subset*: A tool `inputSchema` expresses a grammar with a lookaround-free `pattern` plus `minLength`/`maxLength` (link:../mcp-tools.adoc[MCP Tools Specification], Architectural Constraint 3). Stored schemas may use lookaround.
+
+[#registry]
+== Registry
+
+`Generated by` names the party that allocates the value: *server* (the runtime `pm-mcpd` computes it, also where a command of `pm-mcp` or `pm-operator` requests it; neither client binary allocates an identifier), *model* (supplied in a tool call or link argument, validated by the server), *operator* (set through an operator CLI verb or operator-owned file), *user* (typed into the host entry command), or *build* (fixed in the compiled binary, a workflow definition, or a compiled-in catalogue).
+
+[#registry-scopes]
+=== Scopes & Plans
+
+[cols="2,3,1,2,2,3"]
+|===
+|Identifier |Grammar (regex) and max length |Generated by |Uniqueness scope |Stability & reuse |Defined for / used in
+
+|[[id-plan-id]]`plan_id`
+|`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`, 3–64. Refused when it also matches a phantom shape: a `lesson_id`, a UUID, a bare hex string of 12 or more characters, or a token beginning case-insensitively with `execution-context` or `agent-`. The prefix `baseline-` is reserved: a supplied or derived `plan_id` beginning with it is refused the same way, because plan worktrees and baseline scratch worktrees share `.marshall/local/worktrees/` (Rule 7). [[id-no-plan]]The literal `NO_PLAN` is a reserved value of every tool's `plan_id` parameter, not a `plan_id`: it addresses the project's workspace scope (its main checkout, `PM-ARCH-4`; link:../mcp-tools.adoc[MCP Tools]), cannot match this grammar (upper case and `_`), and the phantom-id guard refuses it as a derived or supplied `plan_id` of a plan to create. It mirrors the `NO_PLAN` sentinel of `plan-marshall`.
+|server (from `plan_slug`, from the plan source, or in the recipe form, in the plan bootstrap; allocated for staged epic rows at staging)
+|Project: live `plans/` and `archive/` of the per-project machine store together
+|Immutable; not reused while the plan is live or archived (`plan_id_taken`, re-checked in the bootstrap's `start.create-scope` transaction). After `delete-plan` or an archive purge the id may be allocated again, while the deleted plan's branch, pull request, and capture ref may remain (link:../store-schemas/13-leases-integrity-testing.adoc#plan-deletion-lessons[Store Schemas, Plan Deletion], accepted risk)
+|Derivation: link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows, Plan ID Derivation]; tool properties link:../mcp-tools.adoc[MCP Tools]; `scope_id`, `from_epic`, queue rows link:../store-schemas.adoc[Store Schemas]; paths link:../filesystem-layout.adoc#machine-store[Filesystem Layout]
+
+|[[id-recipe-plan-id]]Recipe plan ID
+|`recipe-{recipe_key}-{yyyy-mm-dd-hh-mm-ss}` (UTC): `^recipe-[a-z][a-z0-9]*(-[a-z0-9]+)*-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$`, at most 64 (27 fixed characters plus a `recipe_key` of at most 37). A form of `plan_id`.
+|server
+|As `plan_id`
+|As `plan_id`
+|link:../domain-extensions/05-recipes-and-extension-points.adoc#recipe-plan-id[Domain Extensions, Recipe Plan ID]
+
+|[[id-plan-slug]]`plan_slug`
+|`^[a-z0-9]+(-[a-z0-9]+){0,7}$`, 3–64. A valid slug is a valid `plan_id`; the same phantom shapes are refused.
+|model (the `set_slug` commit option of the plan bootstrap) or user (the id named at `pm-mcp enter`)
+|None of its own; becomes the `plan_id` verbatim
+|Not stored as an identifier (kept as `bootstrap.options.plan_slug` of the pending entry record until creation)
+|Pending entry record link:../store-schemas/01-format-and-session-log.adoc#pending-entry-record[Store Schemas]; link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Plan ID Derivation]
+
+|[[id-epic-id]]`epic_id`
+|The `plan_id` grammar, 3–64, with the same phantom refusal.
+|user (`pm-mcp enter … epic <epic_id>`) or model (the epic slug of the epic bootstrap), validated by the server in the epic bootstrap and created by its `start.create-scope` transaction
+|Project: active and archived epics together
+|Immutable; kept unchanged on archival (the dated archive suffix is not part of it); never reused
+|link:../mcp-tools.adoc[MCP Tools] (Constraint 7); link:../dispatch-and-effort.adoc[Model Jobs & Effort] (epic ledger); `origin.epic_id`, `from_epic`, `requested_id` link:../store-schemas.adoc[Store Schemas]
+
+|[[id-scope-id]]`scope_id`
+|A `plan_id` or `epic_id`; `null` for the workspace scope (which a tool call addresses with `plan_id: NO_PLAN`, <<id-no-plan>>), never the `project_id`.
+|server
+|As the identifier it holds
+|As the identifier it holds
+|`status.json`, transaction journal, job records, audit records, lease owners (`LeaseOwner`, beside the required `project_id`) link:../store-schemas.adoc[Store Schemas]; session logs are addressed by their scope directory and carry no `scope_id`
+
+|[[id-project-id]]`project_id`
+|`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`, 3–64.
+|operator (enrolment)
+|Machine (the enrolment file names `enrolments/<project_id>.json`)
+|Immutable while enrolled; identical for the main checkout and every worktree; never supplied by the model (resolved by the link:../filesystem-layout.adoc#project-resolution[project resolution rule] from the `PM-MCP-Workspace` header or the working directory of `pm-mcp enter`, and recorded in every session row)
+|link:../filesystem-layout.adoc#machine-store[Filesystem Layout, Per-Project Machine Store]; link:../store-schemas/11-enrolment-store.adoc#enrolment-store[Store Schemas, Enrolment Store]; credential accounts link:../cli-and-security.adoc[CLI & Security]
+
+|[[id-entry-id]]`entry_id`
+|`^ent-[0-9a-f]{8,32}$`, 12–36.
+|server (runtime, on the request of `pm-mcp enter`)
+|Project (`pending/` of the machine store)
+|Single use: the entity id of one bootstrap (`bootstrap-plan` or `bootstrap-epic`, hosted by the workspace scope); deleted in the transaction that enters a terminal of the bootstrap, kept across a refused re-check of its `start.create-scope` transaction, removed by the pending-record sweep; a call naming a deleted id is `scope_not_found`. Never reused
+|`pm_state` / `pm_do` with `plan_id: NO_PLAN` and `entity: <entry_id>` link:../mcp-tools.adoc[MCP Tools]; pending entry record link:../store-schemas/01-format-and-session-log.adoc#pending-entry-record[Store Schemas]
+
+|[[id-client-session-id]]`client_session_id`
+|`^[\x21-\x7E]{1,128}$`, 1–128; a host value outside the grammar is recorded as `null`.
+|host (forwarded by the relay)
+|None guaranteed (opaque host value)
+|Opaque; compared byte-exactly for `last_entered` and for the server's decision to append a session row; `null` in a row means the host provided none
+|link:../runtime-model.adoc[Runtime Model], Connection Metadata; session rows (`sessions.jsonl`) and `metrics.json` model-job rows link:../store-schemas/01-format-and-session-log.adoc#scope-session-log[Store Schemas]
+
+|[[id-epic-ordinal]]Epic queue `ordinal`
+|Not an identifier: the display-only epic-local ordinal (`PLAN-03`, `PLAN-PR-025B`) of an epic queue row. No link, envelope, resource, or lookup addresses a row by it.
+|server (staging)
+|—
+|Display only
+|link:../dispatch-and-effort.adoc[Model Jobs & Effort], Git-Distributed Epic Ledger
+
+|[[id-workstream-id]]`workstream_id`
+|`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`, 2–64.
+|model (`submit workstream` of `epic.decompose` and `epic.active`), validated by the server
+|Epic
+|Immutable
+|Epic header `workstreams[]` and queue row link:../store-schemas/04-epic-and-change-ledger.adoc#epic-header[Store Schemas]; `stage` link:../dispatch-and-effort/04-epic-coordination.adoc[Model Jobs & Effort]
+|===
+
+[#registry-workflow]
+=== Workflow & Links
+
+[cols="2,3,1,2,2,3"]
+|===
+|Identifier |Grammar (regex) and max length |Generated by |Uniqueness scope |Stability & reuse |Defined for / used in
+
+|[[id-link-id]]Link identifier (`link`)
+|`^[a-z][a-z0-9_-]{0,31}(:(question:)?[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?$`, at most 106. Three forms: scope-wide `<action>` (`^[a-z][a-z0-9_-]{0,31}$`), entity-addressed `<action>:<entity_id>`, question-addressed `<action>:question:<question_id>` (only `wait:question:<question_id>`, the bounded long-poll on an open question record). Implicit links: `wait:<job_id>` (a model job included), `cancel:<job_id>`, `wait:<composite_id>` (the state identifier of a `composite_job` state), `wait:<state_id>` and `cancel:<state_id>` (the state identifier of a fan-out `job llm` state), `wait:question:<question_id>`, `step_out` (on every resting link state of a sub-process), and the scope-wide self-report link `report_bypass`. No link addresses an operator decision: none exists. The `resume:<entity>` link of the `job_incomplete` condition addresses the entity, never the `job_id`; on a fan-out state the condition offers the scope-wide `resume` instead (link:../dispatch-and-effort.adoc[Model Jobs & Effort], job lifecycle).
+|server (offered in a representation; the model copies it)
+|One representation (link patterns are unique within their state)
+|Stateless token; a stale or unknown link is rejected (`link_not_available`, `stale_entity`)
+|Semantics link:../hypermedia-format/02-link-grammar.adoc#link-identifier-grammar[Hypermedia Format, Link Identifier Grammar]; `pm_do.link` link:../mcp-tools.adoc[MCP Tools]; implicit links link:../workflow-dsl/02-units-jobs-decisions.adoc#implicit-job-links[Workflow DSL]; self-report link:../hypermedia-format/01-representation-and-link-forms.adoc#self-report-link[Hypermedia Format]
+
+|[[id-action-name]]Action name
+|`^[a-z][a-z0-9_-]{0,31}$`, 1–32 (the DSL `action_id`).
+|build (workflow definition)
+|One state
+|Changed only with a workflow version
+|link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL, EBNF]
+
+|[[id-entity-id]]`entity` / entity identifier
+|`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`, 1–64. Every addressable entity kind's identifier is a member of this grammar: `task_id`, `finding_id`, `envelope_id`, `job_id`, `question_id`, `deliverable_id` (`remove_deliverable:`), `state_id` (composite waits), `entry_id` (a bootstrap entity under `plan_id: NO_PLAN`), `plan_id` (`emit:`, `mailbox_send:`, the resume choice of a bootstrap), `lesson_id` and `recipe_key` (the source choices of a bootstrap), `bot_kind` (`retry:`), a team configuration file name (`rewrite_config:`, for example `project.json`), and `enrich-<module_id>`.
+|server (the identifier of the addressed entity)
+|Scope and entity kind
+|As the identifier it holds
+|`pm_state.entity`, `pm_do.entity` link:../mcp-tools.adoc[MCP Tools]; link:../hypermedia-format/01-representation-and-link-forms.adoc#canonical-top-level-fields[Hypermedia Format, `entity`]
+
+|[[id-state-id]]`state_id` (and `composite_id`)
+|`^[a-z][a-z0-9_-]{0,31}(\.[a-z][a-z0-9_-]{0,31})*$`, at most 64 (`<phase>.<step>[.<substate>]`, or `<subworkflow>.<state>`).
+|build (workflow definition)
+|Workflow definition unit
+|Renamed only through a `migrate` declaration and the released-states gate
+|link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL, EBNF]; `status.json` `state` link:../store-schemas.adoc[Store Schemas]; link:../hypermedia-format/01-representation-and-link-forms.adoc#canonical-top-level-fields[Hypermedia Format, `state`]
+
+|[[id-dsl-identifier]]DSL identifiers (workflow, sub-workflow, primitive, outcome)
+|`identifier` = `^[a-z][a-z0-9_-]{0,31}$`, 1–32; `primitive_id` = two identifiers joined by `.`; workflow and sub-workflow names follow `state_id` (for example `git.commit_and_push`). The merged plan workflow unit has the id `plan` (a part header such as `workflow finalize` names a file only). The DSL's reserved keywords (link:../workflow-dsl/01-grammar.adoc#dsl-reserved-keywords[Workflow DSL, Reserved Keywords]) (among them `question`, `result`, and `has`) are refused as an outcome name or as a segment of a state, primitive, role, or configuration key identifier. The outcome id `stepped_out` is reserved for the control outcome of a sub-workflow and is never declared by a primitive. The question class of a `question` clause is the closed enum `init`, `clarification`, `review`, `task`, `setup`, `ask` (the `class` of a question record).
+|build
+|Definition unit (outcomes: per primitive result enum)
+|Changed only with a workflow version
+|link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL, EBNF]; `call_stack` frames link:../store-schemas.adoc[Store Schemas]
+
+|[[id-param-name]]Free parameter name (and every DSL parameter name)
+|`^[a-z][a-z0-9_]{0,31}$`, 1–32; never contains `-`. The DSL `param_name` production: link parameters (`param_decl`), sub-workflow `param` declarations, and `call` arguments. A reserved DSL keyword is refused.
+|build (link or sub-workflow declaration)
+|One link, or one sub-workflow
+|Changed only with a workflow version
+|`free` column link:../hypermedia-format.adoc[Hypermedia Format]; `param_name` link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL, EBNF]; `call_stack` `bound_args` link:../store-schemas.adoc[Store Schemas]
+
+|[[id-schema-name]]Named parameter schema (`schema_name`)
+|`^[a-z][a-z0-9-]{0,47}$`, 1–48 (for example `question-envelope`). The name inside the free parameter type `schema[<schema_name>]`.
+|build (compiled into the binary with the workflow definitions)
+|Global (one registry of named parameter schemas)
+|Changed only with a workflow version; an unregistered name fails DSL validation (Rule 1)
+|link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format, Named Parameter Schemas]; `schema_ref` link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL, EBNF]
+
+|[[id-phase]]`phase`
+|Closed enum. Persisted (canonical) value: `phase-1-init`, `phase-2-refine`, `phase-3-outline`, `phase-4-plan`, `phase-5-execute`, `phase-6-finalize`, `completed`, `aborted`, `orchestrator`, `workspace`. Representation projection (1:1): `init`, `refine`, `outline`, `plan`, `execute`, `finalize`, `completed`, `aborted`, `orchestrate`, `workspace`. Every persisted `phase` field (status, findings, metrics, amendments) uses the canonical value.
+|build
+|—
+|Closed; extended only with a schema version
+|`status.json`, findings link:../store-schemas.adoc[Store Schemas]; link:../hypermedia-format/01-representation-and-link-forms.adoc#canonical-top-level-fields[Hypermedia Format, `phase`]
+
+|[[id-question-id]]`question_id` and `branch_key`
+|`question_id`: `^Q-[0-9]{3,6}$`, 5–8: the value of a scope-wide counter, zero-padded to at least three digits (`Q-001`). `branch_key`: `^[a-z][a-z0-9_]{1,31}$`, 2–32.
+|`question_id`: server (when it appends the `asked` line of a question record); `branch_key`: model (options of a model-authored question) or build (options of a server-raised question), validated by the server
+|`question_id`: plan, epic, or workspace scope (one `questions.jsonl` each); `branch_key`: one question
+|`question_id`: never reused within the scope; `branch_key`: valid for the question's lifetime
+|Question record link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas, Question Record]; `wait:question:`, `answer_questions` link:../hypermedia-format.adoc[Hypermedia Format]; link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-record-creation[Model Jobs & Effort, Question Record Creation]
+
+|[[id-step-id]]Finalize step identifier (`step_id`)
+|`^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9-]{0,63}$`, at most 97: `<source>:<name>` with source `default` (shared bundle), `project` (project-local), or a bundle name (for example `plan-marshall:automatic-review`).
+|build (catalogue) or operator (project-local steps)
+|Project finalize pipeline
+|Stable; a shipped step id is renamed only by a release whose notes name the rename (the project's units and `workflow.json` are then refused until the setup workflow's offered change is adopted)
+|Catalogue link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows]; step records link:../store-schemas.adoc[Store Schemas]
+|===
+
+[#registry-jobs]
+=== Jobs
+
+[cols="2,3,1,2,2,3"]
+|===
+|Identifier |Grammar (regex) and max length |Generated by |Uniqueness scope |Stability & reuse |Defined for / used in
+
+|[[id-job-id]]`job_id`
+|`^[bcglp]-[0-9a-f]{16}$`, 18: the kind prefix and 16 random hex digits (64 bits). There is no legacy `script` job kind (`PM-MIG-2`), and no job kind for language servers: they are pool processes without job records (link:../job-runtime.adoc[Job Runtime]). The prefix names the job kind: `b` build, `c` CI, `g` git, `l` model job (`llm`), `p` project script. A review-bot poll is a `ci` job with the budget key `ci:<operation>`; it has no kind and no prefix of its own. `pm_build.job_id` accepts only the `b-` form; a model job's metrics row, served reads, finding, and verdict fields accept only the `l-` form.
+|server (random; checked at creation against the existing job records, a collision draws again)
+|Project (`<PM_MCP_BASE>/projects/<project_id>/jobs/<job_id>.json` and `<job_id>.log`)
+|Never reused
+|`pm_build` link:../mcp-tools.adoc[MCP Tools]; link:../job-runtime.adoc[Job Runtime]; `active_jobs`, change ledger, metrics, served reads link:../store-schemas.adoc[Store Schemas]; `wait:`/`cancel:` link:../workflow-dsl/02-units-jobs-decisions.adoc#implicit-job-links[Workflow DSL]; `PM_MCP_JOB_ID` of a model job's environment
+
+|[[id-envelope-id]]`envelope_id`
+|`^envelope-[0-9]+$`, at most 64.
+|server (envelope packing)
+|Plan
+|Never reused within the plan
+|link:../dispatch-and-effort/01-task-envelopes.adoc#_deterministic_envelope_packing_algorithm_envelopepacker[Model Jobs & Effort, Envelope Packing]; task record link:../store-schemas.adoc[Store Schemas]
+
+|[[id-task-id]]`task_id`
+|`^TASK-[0-9]{3,}$`, at most 64.
+|server (Phase 4 task creation)
+|Plan
+|Never renumbered or reused; a removed task keeps its identifier with its disposition
+|Task record link:../store-schemas.adoc[Store Schemas]; `pm://plan/{plan_id}/task/{task_id}` link:../mcp-tools.adoc[MCP Tools]
+
+|[[id-deliverable-id]]`deliverable_id`
+|`^D[0-9]+$`, at most 64 (the deliverable number of the outline).
+|model (outline), validated by `OutlineValidator`
+|Plan outline
+|Stable across outline revisions of the plan
+|Task record link:../store-schemas.adoc[Store Schemas]; link:../phase-workflows.adoc[Phase Workflows], Phase 3
+
+|[[id-level-id]]Effort level
+|`^level-[1-7]$` or the literal `inherit`.
+|build
+|—
+|Closed
+|link:../dispatch-and-effort/03-escalation-roles-readers.adoc#effort-ladders[Model Jobs & Effort, Effort Ladders]; link:../client-profiles.adoc[Client Profiles]
+|[[id-role-key]]`role_key`
+|`^[a-z][a-z0-9.-]{0,63}$`, 1–64: the dotted configuration path a job state names (`job llm <entity_kind> role <role_key>`), for example `plan.phase-5-execute.effort.default` or `screen.effort`. A closed set: exactly the keys of the Role Registry.
+|build (Role Registry; named by the job states of the workflow definitions)
+|Binary (one role registry)
+|Closed; changed only with a workflow version. A key the registry does not know is a validation error on read
+|link:../dispatch-and-effort/03-escalation-roles-readers.adoc#_role_registry_lookup_hierarchy[Model Jobs & Effort, Role Registry]; `model_job.role` of the job record, `role` of the metrics rows, `model_jobs.roles` of `local-config.json` link:../store-schemas.adoc[Store Schemas]; the `llm:<role_key>` form of the <<id-budget-key,budget key>>
+
+|[[id-budget-key]]Budget key (`budget_key`)
+|`^[a-z][a-z0-9_]{0,31}:[a-z][a-z0-9.-]{0,63}(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?$`, at most 155. Four forms: `<build_system>:<verb>[@<module_id>]` (xref:02-registry-stores-to-web.adoc#id-build-verb[canonical build verb], xref:02-registry-stores-to-web.adoc#id-module-id[`module_id`]), `<kind>:<operation>` for `git` and `ci` operations, `project_script:<project_script_id>` (xref:02-registry-stores-to-web.adoc#id-project-script-id[`project_script_id`]), and `llm:<role_key>` (<<id-role-key,`role_key`>>).
+|server (composed from the job's kind and its canonical command, contract operation, script, or role); an operator-set key of `command_budgets` is validated against the grammar
+|Project
+|Re-derivable: the same command, operation, script, or role always yields the same key; a key that module discovery no longer yields is pruned from the build timings store
+|link:../timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets, Job Budgets]; `budget_key` of the job record, the keys of `build-timings.json`, and `command_budgets` of the enrolment file link:../store-schemas.adoc[Store Schemas]
+
+|[[id-item-id]]Screening item identifier (`item_id`)
+|`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`, 1–64 (the <<id-entity-id,entity identifier>> grammar): for a finding its `finding_id`, for every other external text item an identifier the server assigns when it builds the batch.
+|server (batch building)
+|One screening batch (`batch_id`)
+|Stable within its batch; the verdict cache is keyed by the item's SHA-256, never by `item_id`
+|link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batch-v1[Model Jobs & Effort, Batch Format]; `screen[]` of the pending entry record link:../store-schemas/01-format-and-session-log.adoc#pending-entry-record[Store Schemas]; the `screen_accepted` audit record
+|===

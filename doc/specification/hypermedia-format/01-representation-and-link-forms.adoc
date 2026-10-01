@@ -1,0 +1,253 @@
+= Hypermedia Format & TOON Encoding Specification: Representation Structure & Link Forms
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../hypermedia-format.adoc[Hypermedia Format & TOON Encoding Specification] » Representation Structure & Link Forms
+
+== Normative TOON Representation Structure
+_See Requirement link:../../Requirements.adoc#PM-WF-1[PM-WF-1: Hypermedia State Representation (HATEOAS)]_
+
+_See Requirement link:../../Requirements.adoc#PM-SKILL-4[PM-SKILL-4: Dynamic State Context Injection via Representations]_
+
+_See Requirement link:../../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_state, pm_do)]_
+
+_See Requirement link:../../Requirements.adoc#PM-TOOL-4[PM-TOOL-4: Domain Failures as Valid Workflow States]_
+
+_See Requirement link:../../Requirements.adoc#PM-IMPL-2[PM-IMPL-2: Versioned JSON/JSONL Storage & TOON Wire Output]_
+
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-1[PM-WATCH-HYP-1]_
+
+Every workflow state representation is serialized as a top-level TOON object with a fixed canonical field ordering.
+
+[#canonical-top-level-fields]
+=== Canonical Top-Level Fields
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-2[PM-WATCH-HYP-2], link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-3[PM-WATCH-HYP-3]_
+
+[cols="1,1,1,3"]
+|===
+|Field |Presence |Type |Normative Definition
+
+|`scope`
+|Required
+|Closed enum
+|`"plan"`, `"epic"`, `"workspace"` (the project's workspace scope, which hosts `project-setup`; a call addresses it with `plan_id: "NO_PLAN"`, link:../identifiers/01-general-rules-and-registry.adoc#id-no-plan[Identifier Registry, `NO_PLAN`], never with a `scope` input), or `"entity"` (when queried with `entity`: by a model job for the one entity its job-bound connection is bound to, <<model-job-states>>, or by the main session for a pending bootstrap entry of the workspace scope, `plan_id: "NO_PLAN"` with `entity: <entry_id>`).
+
+|`plan_id` / `epic_id`
+|Required (one of), except for `scope: workspace` and a bootstrap entry
+|String
+|The addressed plan identifier (`plan_id`) or orchestrator epic identifier (`epic_id`). A `workspace` representation and the representation of a bootstrap entry carry neither (not even the `NO_PLAN` sentinel that addressed them); their project is the one named by the request's `PM-MCP-Workspace` header.
+
+|`entity`
+|Conditional
+|String
+|Present iff `scope == "entity"` (e.g., `envelope-2`, or the `entry_id` `ent-3f9a2c41` of a bootstrap entry).
+
+|`state`
+|Required
+|Dotted enum
+|Closed-enum state name (`<phase>.<step>[.<substate>]`, e.g., `finalize.concurrent-wait`, `execute.verify-sweep` (a job state, also while its job runs); every state is catalogued in the link:../state-catalogue.adoc[State Catalogue]; while a sub-workflow is active, the active sub-workflow state, e.g., `git.compose-message`). Never a boolean.
+
+|`condition`
+|Conditional
+|Closed enum
+|Present iff the scope's `pending_condition` is set (link:../store-schemas.adoc[Store Schemas Specification]): the condition kind (`footprint_violation`, `job_incomplete`, `config_drift`, `guard_indeterminate`, `precondition_unmet`, `integrity_breach`; link:../state-catalogue/01-conventions-generic-conditions.adoc#state-catalogue-conditions[State Catalogue, Conditions]). `state` stays the current state id; `facts` carry the condition and `links` list only the condition's links (link:../workflow-dsl/04-ast-node-model.adoc#condition-overlays[Workflow DSL Specification, Condition Overlays]). Every condition except `integrity_breach` offers its bounded self-remedy links; when their budget per condition instance is spent, the engine takes the phase's fallback route with the condition recorded as the gap. `integrity_breach` is the only pause: it renders `links[0]` and `facts.operator_command` (`accept-edit`, `abort`), and every `pm_do` on the paused scope is rejected with `integrity_paused` until the operator resolves it.
+
+|`phase`
+|Required
+|Closed enum
+|Lifecycle phase (`init`, `refine`, `outline`, `plan`, `execute`, `finalize`, `completed`, `aborted`, `orchestrate`, or `workspace`, mapped 1:1 to `phase-1-init`..`phase-6-finalize`, `completed`, `aborted`, `orchestrator`, `workspace` in `status.json`; link:../identifiers/01-general-rules-and-registry.adoc#id-phase[Identifier Registry, `phase`]).
+
+|`summary`
+|Required
+|String
+|Single-line human-readable status summary (`1..160` ASCII characters).
+
+|`skill`
+|Optional
+|URI String
+|URI of the vocabulary skill guiding model judgment in this state (`skill://pm/<path>/SKILL.md`; the DSL clause `skill pm/<path>` maps to `skill://pm/<path>/SKILL.md`). Omitted in purely deterministic states.
+
+|`rejected`
+|Optional
+|Object
+|Present only when the immediately preceding `pm_do` transition was rejected (`link`, closed-enum `reason`, and diagnostic `detail`; link:../mcp-tools.adoc[MCP Tools Specification], § Rejected Transition Representation). A condition the plan bootstrap re-checks when it creates the scope is no rejection: the entry returns to `start.ready` with the reason in `facts` (link:../state-catalogue.adoc[State Catalogue], Bootstrap).
+
+|`profile_warning`
+|Optional
+|Closed enum
+|`client_identity_mismatch`, present when the calling host is not the client the scope was entered with, so the rendered skill forms may not fit it (link:../client-profiles.adoc[Client Profiles Specification], Mismatch Resolution & Audit Behavior). Serving through the `neutral` profile raises no warning; the choice is recorded in the session row (<<model-facing-minimality>>). A job-bound connection takes its profile from its job record and never raises it.
+
+|`facts`
+|Required
+|Object
+|Minimal key-value map of domain facts required to exercise judgment in `state`, restricted to fields with a declared operational purpose (<<model-facing-minimality>>). Large payloads are referenced via `pm://` resource URIs.
+
+|`links`
+|Required
+|Tabular TOON array
+|`links[N]{rel,link,form,free}:` listing all transitions valid from `state`. Empty (`links[0]{rel,link,form,free}:`) only in terminal states (`PM-WF-1`) and under the `integrity_breach` condition, whose only resolutions are operator verbs.
+|===
+
+[#facts-content-rules]
+=== Facts Content Rules
+_See Requirement link:../../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-5[PM-WATCH-HYP-5]_
+
+The server renders `facts` under seven general rules. Rules 1 to 5 apply to every representation and every resource derived from the same stores; rules 6 and 7 apply to every representation, tool result, and error payload:
+
+1. *Server-Derived Counts Name Their Population*: Every count in `facts` (deliverables, files, tasks, findings) is derived by the server from the structured store at render time, never copied from authored text, and names its population in the key (for example `files_realized`, `files_declared`, `files_declared_unrealized`), so realized and declared-but-unrealized members are never mixed in one number.
+2. *Population-Checked Aggregates*: A server-aggregated count or coverage figure (findings, reviewed comments, tokens, examined modules) is computed together with its population size. A zero over a non-empty population that structurally cannot be zero, or a figure whose population cannot be read, is rendered `indeterminate`, never `0` or "clean".
+3. *Closed-Vocabulary Rule*: Every closed enumeration that classifies observed or judged input (statuses, dispositions, buckets, verdicts, linkage) contains an explicit out-of-set member (`unknown`, `indeterminate`, `not_applicable`, or `out_of_scope`, as fits). No member doubles as a stand-in for an unclassifiable case, and a malformed input is classified differently from an absent one.
+4. *Truncation Is Reported*: Any server-side clamp of text (pull-request body sections, comment bodies against a provider's size cap such as 65,536 characters) reports `truncated: true` with the original and the kept length and cuts at a sentence or line boundary; text is never cut mid-sentence silently.
+5. *Continuation Policy Is Always Rendered*: Every plan and epic representation carries `facts.continuation_policy` (`stop_at_phase_boundary` or `stop_on_issue_only`, persisted in `mcp/status.json`, link:../store-schemas.adoc[Store Schemas Specification], Workflow State Store), so the operator's standing instruction survives compaction without being re-issued. It concerns only the main session: a model job never decides about continuing (its end is observed by the server), so its prompt carries no policy. [[continuation-stop-points]]Under both policies the model stops at the same stop points: a question state whose open question record is delivered in the session (`questions.delivery` resolved to `session`, or `questions.mode: operator` with `session` delivery), the `integrity_breach` pause, and a terminal state; `stop_at_phase_boundary` adds every phase boundary. A question delivered by elicitation or on a paired web device is no stop point: the model may long-poll it with `wait:question:<question_id>` (<<question-waiver-and-exit-links>>). A waiver wait is a server-side job state and no stop point. The policy is set only through the operator channel, `pm-operator continuation-policy (--plan <plan_id> | --epic <epic_id>) <policy>`, at any time; no representation offers a link that changes it, and a value relayed by the model is never accepted (`PM-WF-12`).
+6. [[model-facing-minimality]]*Model-Facing Minimality*: A representation (its top-level fields and `facts`), a tool result (`pm_build`, `pm_lsp`, `pm_plans`, `pm_epics`, `pm_skills`, `pm_skill`, `pm_skill_file`), and an error payload (`rejected`, the `isError: true` envelope, JSON-RPC `error.data`) carry only information that changes what the model does next: the offered links and their parameters, the facts its judgement in the current state needs, the error it must correct, the identifiers it must pass back (`job_id`, `question_id`, `finding_id`, `entity`), and the text it must relay to the user or operator (`summary`, `facts.operator_command`). Everything else is recorded, never returned: the implementation variant that served an operation; derivation and provenance sources (`budget_derivation`, the `source` of a configuration value or a resolved limit, a build template's source); internal versions (`format_version`, `worktree_sha_version`, binary and relay versions) unless the model must act on them; confinement and sandbox details; lease and holder internals (`holder_instance`); digests and hashes the model makes no decision on (`worktree_sha`, `config_hash`, `input_digest`); calibration bases (`predicted_cost_basis`); timing internals (elapsed seconds, `derived_at`, `recorded_at`, job durations, learned-budget hygiene); retry bookkeeping; the internal job identifiers of a composite wait; the launch contract of a model job (harness, model, effort, argument vector, prompt file, job token digest, model-slot lease) and its parsed usage and cost; screener verdicts beyond the `withheld` marker of a withheld item; tallies and populations that serve only metrics; and `audit_id`, except on the errors an operator must look up (`internal_fault`, `file_unreadable`). Such data goes to `audit.jsonl`, the metrics store, the job record, or the server log, and where a human or the operator needs it, it is served on demand by the operator surfaces (the operator CLI `pm-operator`, for example `pm-operator status`, the web app the runtime serves over the Local API, and `pm://` resources such as `pm://project/config`), never pushed in a representation or tool result. Web listener, pairing, and paired-device details (listener, certificate fingerprint, `device_id`, device labels, the channel of an operator action) and the `stalled` state of a plan are operator data only and never model-facing. When the model's judgement needs a count (for example the open blocking findings), the count is rendered and its population list is not; rules 1 and 2 name and check a population, they do not require rendering it. A build-time test (`ModelFacingFieldAuditTest`) walks every representation, tool-result, and error-payload record type and fails on any field that is not in the registry of model-facing fields, in which every entry declares its operational purpose (`link_parameter`, `pass_back`, `judgement`, `error_correction`, or `relay`); a new model-facing field is a registry change with a stated purpose.
+7. [[operator-command-relay]]*Operator Commands Are Relay Text for Three Cases Only*: `facts.operator_command` is rendered only where the next step belongs to the operator and the model's part is to relay it: the `integrity_breach` pause (`pm-operator accept-edit …` and `pm-operator abort …`), a waiver hint (a pending waiver request, or a waivable gate whose remediation budget is exhausted: the `pm-operator waive <plan_id> <gate> …` command with the closed gate identifier), and a bounded self-remedy that needs an operator setting, grant, enrolment, or credential first (`pm-operator credentials …`, `pm-operator config --project <project_id>` for example to set `model_jobs.harness`, `pm-operator grant-access …` for a cross-project access, or `pm-operator enrol-harness …`, beside the bounded `retry` of the state or of its `precondition_unmet` condition). No representation asks the model to relay an operator decision: none exists. The model relays a waiver hint as information and never answers it; a waiver is written only through the operator channel, and a model-relayed "waive" is not accepted (`PM-WF-12`).
+
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-6[PM-WATCH-HYP-6]_
+
+[#call-path-breadcrumb]
+==== Call-Path Breadcrumb (`facts.call_path`)
+
+While a sub-process is active (a `call` has made the sub-process's first resting state current, guided step-in, link:../workflow-dsl.adoc[Workflow DSL Specification]), `facts.call_path` lists the call-site state ids of the scope's call stack from the root frame outward (for example `call_path[1]: finalize.push-barrier`); it is absent at the root frame. It is model-facing because it states where the implicit `step_out` link returns to (one frame up, <<question-waiver-and-exit-links>>) and which caller's skill section frames the current judgment. Each interactive state of a sub-process asks for exactly one piece of model judgment through one link naming its skill section; `facts` carry only inputs the server cannot derive.
+
+[#remediation-evidence-facts]
+==== Remediation Evidence (`facts.failures`)
+
+The `decide` state of a remediation policy unit renders the server-gathered failure envelopes as `failures[N]{failure_id,class,kind,file,line,message,excerpt_uri}` (link:../workflow-dsl/08-remediation-units.adoc#remediation-units[Workflow DSL Specification, Remediation Policy Units]), with the budgets left per offered action. `excerpt_uri` points at an untrusted evidence resource (`pm://plan/{plan_id}/evidence/{evidence_id}`, link:../mcp-tools/03-resource-uris.adoc[MCP Tools Specification, Resource URI Surface]); log text is never inlined beyond `message`. The envelope's `source` and `fingerprint` (class, kind, file, normalized message), the provider run and job ids, log URLs, and the provider variant are recorded in the evidence record and the job record, never rendered: the server, not the model, compares fingerprints (<<model-facing-minimality>>). A failure the operator cannot waive carries `waivable: false`.
+
+=== Canonical Representation Example
+
+`finalize.push-barrier` is a `call` state (`call git.commit_and_push`), so it is never a resting state: while the push barrier runs, the representation shows the active `git.*` sub-workflow state with `phase` inherited from the caller and the call-path breadcrumb. The example shows `git.compose-message`, entered when the barrier (`message_mode=none_assert_clean`) finds unexpected uncommitted files; its one judgment is the commit message, and its implicit `step_out` link unwinds the frame to `finalize.push-barrier`:
+
+[source,toon]
+----
+scope: plan
+plan_id: plan-2026-042
+state: git.compose-message
+phase: finalize
+summary: "push barrier found 2 uncommitted files, commit message required"
+skill: "skill://pm/git/commit-message/SKILL.md"
+facts:
+  call_path[1]: finalize.push-barrier
+  changed_files: 2
+  continuation_policy: stop_at_phase_boundary
+  module_scope: http
+  suggested_type: fix
+links[2]{rel,link,form,free}:
+  next,commit,submit,"message:text[1..2000]"
+  abort,step_out,submit,"reason:text[1..2000]"
+----
+
+[#link-forms]
+== The Three Normative Link Forms
+_See Requirement link:../../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job Links & Wait Transitions]_
+
+_See Requirement link:../../Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
+
+Every row in `links[N]{rel,link,form,free}:` belongs to one of three closed link forms (`submit`, `wait`, `noop`). The `form` column defines the interaction mechanics expected from the caller. No form requests an operator decision: the model never waits on the operator inside a link, and operator influence reaches a plan only through operator verbs (waivers, `abort`, the integrity resolutions) on the operator channel. No form starts a sub-agent in the host: model work beyond the main session's own judgment runs as a server-launched job, which the caller follows with `wait` (<<model-job-states>>).
+
+[cols="1,2,2,3"]
+|===
+|Link Form |Target Tool |`free` Column |Execution Semantics
+
+|`submit`
+|`pm_do(scope, link, args)`
+|Non-empty typed parameter list (e.g., `"outline:text[1..65536]"`, `"disposition:enum[FIX\|SUPPRESS\|ACCEPT],reply_text:text[1..4000]"`)
+|Submits model judgment artifacts to the server (from the main session, or from a model job for its bound entity), including the question, waiver-request, and exit links of <<question-waiver-and-exit-links>>. The server validates `args` against the link's closed schema before executing the backing primitive.
+
+|`wait`
+|`pm_do(scope, link, {})`
+|`""` (empty)
+|Monitors an asynchronous background job (`wait:<job_id>`, a build, CI, git, project-script, or model job), a composite wait state (`wait:<composite_id>`) or a fan-out model job state (`wait:<state_id>`, which waits on the set of the state's jobs), or an open question record delivered by elicitation or on a paired web device (`wait:question:<question_id>`). Blocks up to the bounded wait window or, on a connection that qualifies, the progress wait bound with periodic MCP progress notifications (values in link:../timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Budgets Specification]) and returns either the terminal state representation, the representation after the question was answered or its wait expired, or the updated running representation of a job state.
+
+|`noop`
+|`pm_do(scope, link, {})`
+|`""` (empty)
+|Triggers a deterministic server-side transition that requires zero free judgment parameters from the model (for example `push`, `cancel:<job_id>`, `sync`, or advancing a green gate).
+|===
+
+[#question-waiver-and-exit-links]
+=== Question, Waiver-Request & Exit Links
+_Implementation watch: link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-7[PM-WATCH-HYP-7]_
+
+These links are ordinary `submit` or `wait` links; their relation and form satisfy the closed relation table (xref:02-link-grammar.adoc#_closed_link_relations_rel[Closed Link Relations (`rel`)]):
+
+[cols="2,1,1,5"]
+|===
+|Link |`rel` |`form` |Semantics
+
+|`ask` (`question:schema[question-envelope]`)
+|`submit`
+|`submit`
+|Offered only by states that declare it. Creates a server-owned question record (`origin: model`) from the model-supplied envelope (xref:02-link-grammar.adoc#named-parameter-schemas[Named Parameter Schemas]) and enters the state's question wait. How the question is answered follows the operator's question configuration (`questions.mode`, `questions.delivery`, link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-records[Model Jobs & Effort Specification, Question Records]). Server-raised questions (init classifiers, the optional outline review) are created by their primitive, never through `ask`.
+
+|`ask:<task_id>` (`question:schema[question-envelope]`)
+|`submit`
+|`submit`
+|The task-question link of a task envelope entity (`envelope.task.active`), followed by the envelope job. Records the question for the task and ends the entity (`yield_reason: question`, server-recorded); the envelope's remaining tasks, the asking task included, go to the next envelope's job, which receives the answer in `facts`. No entity state and no job waits on a question.
+
+|`answer_questions` (`answers:list<schema[question-answer]>`)
+|`submit`
+|`submit`
+|Offered by a question state whose open records are delivered in the session (`questions.delivery` resolved to `session`), and by `execute.task-question` once its `task` record expired and moved to "parent answer expected". The model relays each question to the user and submits the answers (`channel: user_relayed`), or, for an expired `task` record, answers it itself (`channel: model`); each `branch_key` is validated against its record's options (`invalid_link_args`), a second answer is refused `already_answered`, and an answer on a user channel after the question wait expired is refused `question_expired`. A relayed answer is a content answer only: an override is never taken as a content answer, and a content answer is never an override (`PM-WF-12`).
+
+|`wait:question:<question_id>`
+|`wait`
+|`wait`
+|Offered by a question state whose open record is delivered by elicitation or on a paired web device. A bounded long-poll on that record; it returns the next representation once the record is answered or its question wait expired, otherwise the unchanged question state.
+
+|`request_waiver` (`rationale:text[1..2000]`)
+|`escalate`
+|`submit`
+|Offered only by the `decide` state of a remediation policy unit whose `waiver_wait_seconds` is positive and whose failing gate is on the closed waivable list. Files a waiver request (link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-request-record[Store Schemas Specification, Waiver Request Record]) that the operator answers only through the operator channel (`pm-operator waive`); the unit then waits server-side, bounded by `waiver_wait_seconds`. It is a request, never a decision the model waits on inside the call.
+
+|`hand_back` (`reason:text[1..2000]`)
+|`abort`
+|`submit`
+|The model's own exit from a plan it cannot continue. Offered on plan-scope link states only, never inside a sub-process. Takes the phase's fallback route at once: `returned` in Phases 1–4 (`plan.return` forwards a plan branch that already carries commits, after a loop-back from Phase 5, to the hand-back), `handed_back` from Phase 5 until the merge; the reason goes into the landing record and the pull request's gap comment.
+
+|`step_out` (`reason:text[1..2000]`)
+|`abort`
+|`submit`
+|Implicit link of every resting link state of a sub-process (never of an `auto`, `job`, or `composite_job` state, never at plan scope). Unwinds exactly one frame: the sub-process returns the control outcome `stepped_out` with the reason, and the caller routes it once (typically to a state offering `hand_back`, or to its own `step_out`). A step-out consumes no budget and writes no waiver. It is rendered in `links`, unlike `report_bypass`.
+|===
+
+Ending a plan or epic as `aborted` is never a link: the operator verb `pm-operator abort <plan|epic> <id> --reason` moves the scope to `plan.aborted` or `epic.aborted` in its next transaction.
+
+[#model-job-states]
+=== Model Job States (`job llm`)
+
+A state that needs model work beyond the main session's own judgment (refine analysis, the Q-Gate worker, outline authoring, task envelopes, triage, the screener, and the other job sites of link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification]) is a job state of kind `llm` (DSL `job llm <entity_kind> role <role_key> [each <primitive_id>]`, link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States]). Entering it composes the job's launch contract (link:../dispatch-and-effort/05-model-job-launch.adoc#launch-contract[Model Jobs & Effort Specification, Launch Contract]) and starts the harness's headless CLI as a server-launched job; the host never starts a sub-agent and no representation carries a launch instruction. For the main session the job state is an ordinary job state: the representation carries `state`, `summary`, and the implicit links `wait:<job_id>` and `cancel:<job_id>`, and nothing of the launch contract (<<model-facing-minimality>>). A fan-out state (`each`) runs one job per element of a server-computed list and addresses its links by the state identifier, like a composite: `wait:<state_id>` waits on the set and `cancel:<state_id>` cancels every job of the state; no constituent `job_id` is rendered. A job waiting for a model slot renders like a running one; its `queued` status stays in the job record.
+
+[source,toon]
+----
+scope: plan
+plan_id: plan-2026-042
+state: refine.analyze
+phase: refine
+summary: "refine analysis job running"
+facts:
+  continuation_policy: stop_on_issue_only
+links[2]{rel,link,form,free}:
+  wait,"wait:l-7c01de9a3f2b4e58",wait,""
+  abort,"cancel:l-7c01de9a3f2b4e58",noop,""
+----
+
+* *Completion Is the Awaited Event*: The job's end, observed by the server, runs the return-evaluation primitive of its entity kind (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#return-evaluation[Model Jobs & Effort Specification, Return Evaluation]) over the persisted records the job submitted and yields the closed outcome that moves the job state; `wait:<job_id>` returns that next representation. The job's own final structured output is only `{status, display_detail}` and never carries a deliverable: deliverables reach the server only through `submit` links.
+* *The Job's Own Connection*: The job connects back through `pm-mcp serve --job` with its job-bound capability (link:../dispatch-and-effort/05-model-job-launch.adoc#job-token[Model Jobs & Effort Specification, Job-Bound Capability]) and addresses only the scope and entity it is bound to (`scope: entity`); its first call is `pm_state` on that entity, its representations follow this format with the entity's links, and a link that would start a model job is never offered to it (single-level leaf rule, `PM-WF-5`). The contract envelope of its prompt (`job_id`, scope, entity, the first call, the offered links with their named schemas, the result schema) is rendered from the same link and schema definitions as its representations, so one definition drives both (link:../dispatch-and-effort/05-model-job-launch.adoc#job-prompt[Model Jobs & Effort Specification, Prompt File & Contract Envelope]).
+* *Missing Submission*: A job that ended without its entity's required `submit` raises the condition `job_incomplete` on the job state (link:../state-catalogue/01-conventions-generic-conditions.adoc#condition-job_incomplete[State Catalogue, Conditions]; link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#job-completion[Model Jobs & Effort Specification, Completion]). Its only link is `resume:<entity>` (rel `next`, form `noop`, no free parameters), which launches a new job for the entity's remaining work, bounded by the condition budget; a spent budget takes the phase's fallback. On a fan-out state the condition is raised once on the state and its only link is the scope-wide `resume`, which relaunches jobs only for the unfinished entities. A call of an ended job is refused `job_ended`; no link addresses a job by anything but its `job_id` or its entity.
+
+[#self-report-link]
+=== Self-Report Link (`report_bypass`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+
+`report_bypass` (rel `submit`, form `submit`, free `action:text[1..500],reason:text[1..1000]`) is an implicit engine link (link:../workflow-dsl/02-units-jobs-decisions.adoc#implicit-job-links[Workflow DSL Specification, Implicit Links]): `pm_do` accepts it in every state of a live plan, epic, or entity scope, terminal states included (never for an archived plan, and not while the `integrity_breach` pause holds, when it is rejected `integrity_paused` like every `pm_do`), but it is never rendered in `links`, so rendered link sets (`links[0]` of a terminal state or of the `integrity_breach` pause) stay exact. Its only announcement is rule (7) of the always-loaded core skill `skill://pm/core/SKILL.md` (link:../mcp-tools.adoc[MCP Tools Specification], Core Conduct Vocabulary). It is the link with which the model reports an action it took outside the offered links: a bypass of a sanctioned path, a direct read or write of `.marshall/`, or a host tool call that replaced a missing link. Following it writes an audit record (`category: transition`, `event: self_report`) and files a `self_report` finding (link:../store-schemas.adoc[Store Schemas Specification], Findings Ledger Record), then returns the unchanged current representation; it never changes the scope's state and is never refused for its content beyond the parameter bounds. It is accepted in every state because a bypass cannot be anticipated by state, and not rendered because it would add the same link to every representation.
+
+The server can observe writes to digest-protected stores and changes to the worktree footprint, but not host-side reads of `.marshall/` or host actions that leave no store or footprint change. Those remain an accepted residual risk (`PM-SEC-1`): they are visible only when self-reported.

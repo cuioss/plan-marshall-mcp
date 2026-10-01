@@ -1,0 +1,407 @@
+= Job Runtime Implementation Watch
+:toc: left
+:toclevels: 2
+:toc-title: Table of Contents
+:sectnums:
+:nofooter:
+
+link:../ImplementationWatch.adoc[Implementation Watch] » Job Runtime
+
+== Overview
+
+Watch items for the link:../specification/job-runtime.adoc[Job Runtime Specification]: job outcome derivation, git
+and CI subprocesses, the Landlock read set, bounded waits, build output parsers and timeout verdicts. The sections mirror the
+specification. Item format and lifecycle: link:../ImplementationWatch.adoc[Implementation Watch].
+
+== Outcome Derivation
+
+[#PM-WATCH-JOB-1]
+=== PM-WATCH-JOB-1: Job outcomes are derived at the boundary
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#outcome-derivation[Job Runtime § Outcome Derivation],
+link:../specification/domain-extensions/05-recipes-and-extension-points.adoc#_standard_output_payload_stdout[Domain Extensions § Standard Output Payload],
+link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4]
+Hazard:: Two vocabularies (`indeterminate` in the wrapper, `unknown` at the boundary) named one state, and a wrapper
+could claim a status the boundary never derived.
+Guard:: The runtime derives job outcomes itself; a `project_script` output `status` is validated against the
+observed exit and parse evidence and never adopted blindly.
+Source:: truthful-signals PLAN-TRUTH-155 D5.
+
+[#PM-WATCH-JOB-23]
+=== PM-WATCH-JOB-23: A crash at job end loses at most a usage row, a freshness mark, or a timing sample
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#outcome-derivation[Job Runtime § Outcome Derivation] (Write order at job end),
+link:../specification/store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas § Job Record] (Write order at job end)
+Hazard:: Settling a job in an arbitrary order lets a crash leave a released build slot with an unsettled record, or a
+ledger row that stamps a build whose job record never recorded its fate.
+Guard:: Crash injection after each step of the fixed order (job record fate, for a model job its metrics row,
+change-ledger row, timing observation, slot release): after restart every store is consistent, and the only losses
+are a model job's missing metrics row (`record-metrics` reports it as the divergence `row_absent_from_metrics`,
+never as `0`; the job record carries no usage), a missing ledger row (the next freshness check re-runs the build), or a missing timing sample; no step is
+re-derived and no marker file exists.
+Source:: operator decision of 2026-09-29 (doc review); metrics row per round-4 decision D10 (2026-10-01); no
+plan-marshall defect record.
+
+== Subprocess Lifecycle & Process-Group Isolation
+
+[#PM-WATCH-JOB-2]
+=== PM-WATCH-JOB-2: Test and production git seams share one environment policy
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_process_group_creation_via_the_pm_exec_launcher[Job Runtime § Process-Group Creation via the `pm-exec` Launcher],
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5], link:../Requirements.adoc#PM-EXEC-5[PM-EXEC-5]
+Hazard:: The test fixture scrubbed environment-injected git configuration, but about 20 production scripts did not.
+Guard:: The runtime clears the child environment and applies the allowlist while keeping file-based developer git
+configuration; a test launches the runtime with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0` set and asserts that no git job sees them, exercising the production
+seam, not a test-only scrub.
+Fixture:: CodeRabbit finding `5ed953` (PR #1585).
+Source:: orchestrator-refactor epic Open Defect (PLAN-08).
+
+[#PM-WATCH-JOB-3]
+=== PM-WATCH-JOB-3: A git timeout is not a refusal
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_process_termination_cancellation_protocol[Job Runtime § Process Termination & Cancellation Protocol],
+link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#in-process-operations[Job Runtime § In-Process Operations],
+link:../specification/timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets § Job Budgets & Escalation],
+link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4]
+Hazard:: A git timeout was treated like a refusal and answered with `--force`; a timed-out worktree removal could
+leave a partially deleted tree.
+Guard:: `timed_out` git jobs never trigger `--force`; a timed-out `worktree remove` is re-checked for partial
+deletion before a retry; git timeouts adapt for large checkouts. The same holds for in-process operations of the
+native variant: a test lets a JGit operation and a provider request exceed their class budget and asserts
+cooperative cancellation, a discarded partial result, `timed_out` as `no_verdict`, and a job record without process
+fields.
+Fixture:: the 60 s budget fired twice on one plan.
+Source:: code-intelligence-substrate PLAN-CIS-052 fold-N6.
+
+[#PM-WATCH-JOB-4]
+=== PM-WATCH-JOB-4: A worktree is never removed from inside itself
+
+Anchor:: link:../specification/filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout § Worktree Lifecycle],
+link:../Requirements.adoc#PM-ARCH-5[PM-ARCH-5]
+Hazard:: A forked finalize agent inherited the worktree as its working directory and could not finish
+branch-cleanup.
+Guard:: The branch-cleanup job spec runs `git worktree remove` with the main checkout as working directory; a test
+asserts it, and a relay or host started inside the worktree does not affect it (jobs never inherit the host's
+working directory).
+Fixture:: forked finalize agent with its working directory inside `.plan/local/worktrees/<plan_id>/` (lesson
+`2026-09-20-08-010`).
+Source:: process-compliance PLAN-13 D3.
+
+[#PM-WATCH-JOB-5]
+=== PM-WATCH-JOB-5: Bounded waits are wall-clock and say what happened
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../specification/timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Budgets § Waits & Long-Polls],
+link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4]
+Hazard:: A wait budget passed as an iteration count expired in seconds and reported a bot "absent" while it was
+running; a wait at its ceiling could not tell waiting from re-polling finished work; wait cost was invisible.
+Guard:: Wait jobs use monotonic wall-clock deadlines (test with fast pollers); an exhausted poll is `unproven`, not
+absent; a bounded wait returning `running` reports whether the job state changed during the window; a wait on an
+already-settled job returns immediately; time deferred by a provider rate limit is attributed `provider_rate_limit`,
+never counted as a timeout. The wait population below is the baseline for bounded-wait metrics.
+Fixture:: 600 s budget burned in seconds ("CodeRabbit absent" while running); a script cost rollup of 2,051 calls, 14,423,580 ms, dominated by the three wait notations
+build_server 27.4%, ci 27.3%, ci_complete_precondition 23.1% (77.8% together). Wait attribution by reason:
+deliberate (an operator ruling to wait out a CodeRabbit quota window) vs poll miss (8 `ci_complete_precondition`
+polls averaging 417 s), never one "waste" figure.
+Source:: review-apparatus PLAN-PR-048 D2; lessons-routing lesson 2026-09-23-05-003 (`.plan/orchestrator/orchestrator-refactor/inbox/archive/verdict-staleness-scoping/verdict-staleness-scoping-003.md`); post-run-quality PLAN-PRQ-11 D0
+and D2.
+
+[#PM-WATCH-JOB-6]
+=== PM-WATCH-JOB-6: A verdict is bound to its job identity
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2]
+Hazard:: Re-attaching to a build wait returned a previous job's verdict.
+Guard:: Every wait and `pm_build` result carries the job id, and the job record binds it to the `worktree_sha` it was
+computed for (recorded, never returned: hypermedia-format Model-Facing Minimality); a test re-attaches after a
+runtime restart and after a second job for the same command started.
+Source:: truthful-signals PLAN-TRUTH-150 D1.
+
+[#PM-WATCH-JOB-7]
+=== PM-WATCH-JOB-7: A silent non-zero exit is its own outcome
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_unparseable_output_fallback_failed_unparsed[Job Runtime § Unparseable Output Fallback],
+link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6]
+Hazard:: Jobs exited non-zero without a diagnostic, and the failure carried nothing to act on. The bounded output tail
+is specified for builds only.
+Guard:: Non-build jobs (`git`, `ci`, scripts) exiting non-zero without a parsed diagnostic also attach the exception
+class, subject, bounded output tail and log URI.
+Source:: lessons-routing lesson 2026-09-23-05-006 (`.plan/orchestrator/orchestrator-refactor/inbox/archive/verdict-staleness-scoping/verdict-staleness-scoping-006.md`).
+
+[#PM-WATCH-JOB-9]
+=== PM-WATCH-JOB-9: CI runs are looked up by head SHA
+
+Anchor:: link:../specification/phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows § Normative Step Catalogue] (`ci-verify`, order 22)
+Hazard:: Filtering CI runs by `pull_requests[].number` missed fork PRs, where the field is routinely empty.
+Guard:: `ci-verify` resolves runs by head SHA (and branch), never by `pull_requests[]`; fixture with an empty
+`pull_requests`.
+Source:: review-apparatus PLAN-PR-026 § FOLDED IN 2026-08-27 (lesson 2026-08-08-21-005).
+
+[#PM-WATCH-JOB-19]
+=== PM-WATCH-JOB-19: One shared provider poll honours `304` and `Retry-After`
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../specification/timeouts/01-job-budgets-and-waits.adoc#ci-repoll-cadence[Timeouts & Budgets § Provider Re-Poll Cadence]
+Hazard:: Every wait polls the provider on its own and ignores rate-limit signals; the credential's rate budget is
+exhausted, and the throttling is reported as a timeout or as a failure of the checks being waited for.
+Guard:: Recorded provider with `ETag` support and a rate limit: two concurrent waits on the same `(credential,
+resource)` cause one request per 30 s cadence; a `304` is an observation that changes nothing; a rate-limit answer
+with `Retry-After` or a reset instant defers the next request to that instant, the wait slices carry the reason
+`provider_rate_limit`, the deferral is not counted against the wait's budget, and the wait never ends `timed_out`
+because of it.
+Source:: PM-MCP git and provider integration design review, operator decisions of 2026-09-28 (Z2-27); no plan-marshall defect record.
+
+[#PM-WATCH-JOB-22]
+=== PM-WATCH-JOB-22: Recovery signals only a process it can identify
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_process_termination_cancellation_protocol[Job Runtime § Process Termination & Cancellation Protocol] (Live Orphans after a Runtime Crash),
+link:../specification/store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas § Job Record] (Post-spawn, Recovery)
+Hazard:: A job counted as running before its record names the PID leaves an orphan the recovery cannot identify; a
+recovery that trusts a PID from before the last boot, or guesses one, signals an unrelated process that reuses it.
+Guard:: Crash injection between spawn and the post-spawn replace: after restart the record (`pid: null`) is marked
+`killed` with the audit note "orphan unidentifiable" and no signal is sent; a `running` record whose `spawned_at` lies
+before the system boot time is marked `killed` and no signal is sent; control: a same-boot record with `pid` and
+`process_started_at` is probed and its process group terminated as specified.
+Source:: operator decision of 2026-09-29 (doc review); no plan-marshall defect record.
+
+== Linux Filesystem Confinement (Landlock)
+
+[#PM-WATCH-JOB-20]
+=== PM-WATCH-JOB-20: A job cannot read the PM-MCP base directory
+
+Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime § Linux Filesystem Confinement] (Read set),
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5]
+Hazard:: Landlock rules only grant access, so a read rule on `/` also grants `<PM_MCP_BASE>`; a job that reads
+`run/runtime.token` can call every endpoint of the local API, the operator endpoints included, and a job that reads a
+fallback credential file, an enrolment, or another project's machine store learns what the operator never gave it.
+Guard:: On Linux with Landlock, a job fixture tries to read `<PM_MCP_BASE>/run/runtime.token`, a fallback credential
+file under `<PM_MCP_BASE>/credentials/`, and an entry of the per-project machine store, and each read fails with a
+permission error; positive control: the same job reads a binary under `<PM_MCP_HOME>`, a sibling of `<PM_MCP_BASE>`
+in its parent directory, and a sibling of each directory on the path from `/` (read set built by sibling
+enumeration); control: an entry created on that path after job start is not readable by the job, which is the
+accepted limitation, and an entry created elsewhere stays readable; the one exception: a model job (kind `llm`)
+reads its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` and fails to read that of another job and
+every other entry of `<PM_MCP_BASE>`.
+Source:: PM-MCP client architecture design review, operator decisions of 2026-09-28 (Z1-6), read set widened to the
+whole of `<PM_MCP_BASE>` by the operator decision of 2026-09-29; job-private directory per round-4 decision D3
+(2026-10-01); no plan-marshall defect record.
+
+[#PM-WATCH-JOB-21]
+=== PM-WATCH-JOB-21: A job writes only its own project root
+
+Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime § Linux Filesystem Confinement] (Write set),
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5]
+Hazard:: A write set built from every enrolled project root, or one that still covers `<PM_MCP_BASE>`, lets a job of
+one project rewrite another project's sources or the runtime's own stores and enrolments.
+Guard:: On Linux with Landlock, a job fixture of project A writes into the enrolled root of project B and into
+`<PM_MCP_BASE>` (an enrolment file and a machine-store file), and each write fails with a permission error; positive
+control: the same job writes into its own project root, one of its worktrees, `.marshall/local/temp/`, a declared
+toolchain cache, and `/tmp`, and each write succeeds; for a model job (kind `llm`) additionally the harness sub-paths
+its client profile declares (`headless.writable_paths`: login or credential file, caches, session directory)
+succeed, while its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (which it can only read), a settings
+or hook file of its harness, the home of another harness, and the rest of `<PM_MCP_BASE>` fail.
+Source:: operator decision of 2026-09-29 (doc review); extended per Server-Launched Sub-Agents Z7-3 (2026-09-29);
+rewritten per round-4 decisions D2 and D3 (2026-10-01); no plan-marshall defect record.
+
+[#PM-WATCH-JOB-28]
+=== PM-WATCH-JOB-28: Nothing the daemon reads or trusts lies in a job's write set
+
+Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime § Linux Filesystem Confinement] (Write set, Read set),
+link:../specification/runtime-model.adoc#_singleton_discovery[Runtime Model § Singleton & Discovery] (Socket, Path length)
+Hazard:: A prompt file, result schema, socket, or token kept in the system temporary directory lies in every job's
+write set: a job of any project replaces the next model job's prompt or schema, or plants a socket the clients
+connect to, and a socket fallback under the temporary directory puts the listener itself there.
+Guard:: On Linux with Landlock: the set of paths the runtime reads back or trusts for a launch (prompt file, rendered
+result schema, MCP configuration, the screener's `cwd/`, socket, token, runtime record) is disjoint from the write set
+of every job kind; a model job reads its own `<PM_MCP_BASE>/run/jobs/<job_id>/`, fails to write it, and fails to read
+or write that of another job; a `PM_MCP_BASE` long enough to push `run/runtime.sock` over the platform `sun_path`
+limit refuses the start and creates no file or directory in the system temporary directory; positive control: a
+default-length base binds the socket and a model job starts from its job-private directory.
+Source:: doc review round 4 (2026-10-01), decision D3.
+
+== Native Build Output Parsers
+
+[#PM-WATCH-JOB-10]
+=== PM-WATCH-JOB-10: Green-build test counts aggregate every summary block
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_native_build_output_parsers[Job Runtime § Native Build Output Parsers]
+Hazard:: A successful multi-module build reported `tests_run: 0` (sixth recurrence).
+Guard:: Parser test over the fixture below: counts aggregate every summary block; an aggregation failure reports the
+test population as unmeasured, never 0.
+Fixture:: 15-module `verify -Ppre-commit`, BUILD SUCCESS, 3,083 tests, reported `tests_run: 0`.
+Source:: truthful-signals PLAN-TRUTH-150 D5.
+
+[#PM-WATCH-JOB-11]
+=== PM-WATCH-JOB-11: A test filter matching nothing reports zero tests
+
+Anchor:: link:../specification/mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools § `pm_build`],
+link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2]
+Hazard:: A scoped Maven test filter (`-Dtest=<package>.*`) matching zero classes failed the surefire build instead of
+reporting zero tests.
+Guard:: The Maven adapter passes `-Dsurefire.failIfNoSpecifiedTests=false` (or equivalent) and reports `tests_run: 0`
+distinctly; test with a non-matching filter.
+Fixture:: cui-jsf lesson `2026-06-16-09-001`.
+Source:: repository cui-jsf-test-basic, `.plan/local/lessons-learned/2026-06-16-09-001.md` (git-ignored consumer lesson store); lessons-routing PLAN-LR-01 D3.
+
+[#PM-WATCH-JOB-12]
+=== PM-WATCH-JOB-12: pytest-xdist group suffixes are normalised
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_native_build_output_parsers[Job Runtime § Native Build Output Parsers]
+Hazard:: pytest-xdist appends `@<group>` to the node ids of `xdist_group` tests, so a passing test was reported
+missing.
+Guard:: The pytest parser strips `@<group>` before test identity matching.
+Fixture:: `…::test_concurrent_appends_both_survive@orchestrator_add_row_contention` passed but was reported missing.
+Source:: lessons-routing lesson 2026-09-24-09-007 (`.plan/orchestrator/orchestrator-refactor/inbox/archive/ledger-decomposition-and-row-vocabulary/ledger-decomposition-and-row-vocabulary-009.md`).
+
+[#PM-WATCH-JOB-13]
+=== PM-WATCH-JOB-13: Every build is a change-ledger row
+
+Anchor:: link:../specification/store-schemas/04-epic-and-change-ledger.adoc#_change_ledger_record_change_ledger_jsonl[Store Schemas § Change Ledger Record],
+link:../Requirements.adoc#PM-SVC-4[PM-SVC-4]
+Hazard:: The build-row writer missed builds: 796 ledger rows scanned, 0 summed, while 27 real builds ran.
+Guard:: Test that N builds (plan-scoped and orthogonal `pm_build`) produce N `kind = "build"` rows.
+Fixture:: `ledger_rows_scanned: 796`, `summed_rows: 0`, `build_count: 0`, `total_build_seconds: unavailable` vs 27
+builds (PR #1550); acceptance `summed_rows == 27`.
+Source:: post-run-quality PLAN-PRQ-08 § Claim Labels (evidence folded 2026-09-21 from retrospective-aspects-publish-verdict-005).
+
+[#PM-WATCH-JOB-14]
+=== PM-WATCH-JOB-14: Truncated payloads report forwarded and total size
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_unparseable_output_fallback_failed_unparsed[Job Runtime § Unparseable Output Fallback],
+link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6]
+Hazard:: A payload was truncated in forwarding (2,475 bytes / 4 turns emitted, ~575 bytes / 2 turns forwarded) while
+its counts still described the original.
+Guard:: Any truncated payload, such as the `failed_unparsed` tail, reports forwarded and total sizes.
+Source:: truthful-signals (quality-aspect) PLAN-217 D4.
+
+[#PM-WATCH-JOB-18]
+=== PM-WATCH-JOB-18: Build-tool trailer advice is not a diagnostic
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_native_build_output_parsers[Job Runtime § Native Build Output Parsers]
+Hazard:: Failure-trailer advice of the build tool was filed as located findings, and unrecognised `[ERROR]` lines
+defaulted to a real category.
+Guard:: Parser test over a failing Maven log: trailer lines produce no findings; unknown `[ERROR]` lines are
+`unrecognized`, never a located finding.
+Fixture:: 6 trailer lines (`Re-run Maven using the -X switch…`, `[Help 1] http://…`, `mvn <args> -rf :<module>`) filed
+as `deprecation_warning`/`error` findings after a failing `verify -Pcoverage`.
+Source:: truthful-signals PLAN-TRUTH-150 § FOLDED 2026-09-15 (c) item 2.
+
+== Adaptive Build Timeouts, Coverage Parsers & Gate Honesty
+
+[#PM-WATCH-JOB-15]
+=== PM-WATCH-JOB-15: A timeout over a passing build is no verdict
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime § Adaptive Timeout Learning],
+link:../specification/timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets § Job Budgets & Escalation],
+link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
+Hazard:: Timeouts were read as failures.
+Guard:: Matched tests: a failing build stays `failed`; a timeout over a build that would pass yields no verdict; an
+unlearned budget is recorded as `budget_derivation: floor_default` in the job record (never rendered) and its timeout
+offers `retry` with the escalated budget instead of failing the gate.
+Fixture:: job `dbbc60f9` (an integration test that normally takes 1250–1800 s timed out at 300 s before any test ran and was resubmitted as `abe890bd`);
+plugin-doctor real-tree test over 300 s under `module-tests`, green under `verify` (one test red in one runner and
+green in another, invisibly); a 30 s budget against a verb measured at 24–57 s.
+Source:: truthful-signals PLAN-TRUTH-169 D3, D4.
+
+[#PM-WATCH-JOB-16]
+=== PM-WATCH-JOB-16: A timed-out or residue-poisoned run never inflates the learned budget
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime § Adaptive Timeout Learning],
+link:../specification/timeouts/01-job-budgets-and-waits.adoc#job-budgets[Timeouts & Budgets § Job Budgets & Escalation],
+link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
+Hazard:: A module test timed out on a worktree full of build residue; blending the timeout into the learned value
+re-tiered every later run of the command.
+Guard:: Scenario test: a timed-out run leaves `L` unchanged and sets a one-shot escalation budget that the next
+finished run clears; a run started over residue above the threshold is stored `poisoned` and not blended while clean
+observations exist; the job facts show `observations`, `poisoned`, `escalated`.
+Fixture:: module-tests timed out at 873 s on 52,704 residue files (450 MB), green in 529 s after cleanup;
+quality-gate 968 s and module-tests 1473 s re-tiered against 360 s and 501 s earlier; 9 orchestrator yields.
+Source:: truthful-signals PLAN-TRUTH-150 § FOLDED 2026-09-13.
+
+[#PM-WATCH-JOB-8]
+=== PM-WATCH-JOB-8: A formatter never dirties a clean base
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime § Gate Honesty Verification] (Baseline Separation, baseline scratch worktree),
+link:../Requirements.adoc#PM-WF-10[PM-WF-10]
+Hazard:: A local auto-fixing formatter rewrote committed files that CI accepted, dirtying every worktree before the
+clean-tree guard ran (no longer reproduced with ruff 0.16.8).
+Guard:: Quality-gate and format jobs run on a fresh worktree of the base leave `git status --porcelain` empty; test
+in a nested-worktree location. The baseline scratch worktree `baseline-<plan_id>-<sha12>` is reused only when clean
+and at its merge base; a test dirties it and asserts that the next base run replaces it.
+Fixture:: import-order churn on `test/test_shared_harness_parse_ns_{defaults,no_seam}.py`, files never edited by hand,
+recurring across plans (test-quality PLAN-183 quality-gate run, orchestrator-refactor PLAN-02 chore commit, PR body of
+review-apparatus PLAN-PR-067).
+Source:: lessons-routing lesson 2026-09-23-23-001 (filed per `.plan/orchestrator/review-apparatus/inbox/archive/charter-assembled-at-run-time/charter-assembled-at-run-time-008.md`; re-verified stale in `.plan/orchestrator/lessons-routing/epic.md` Decisions).
+
+[#PM-WATCH-JOB-17]
+=== PM-WATCH-JOB-17: A red baseline never fails the plan
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime § Gate Honesty Verification] (Baseline Separation),
+link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
+Hazard:: A whole-tree gate red on the unmodified base branch blocked every finalize, and standing coverage debt in a
+module the plan never touched fanned out into several findings; nothing told base failures from plan failures.
+Guard:: Fixture repository whose base already fails the whole-tree gate while the plan's diff is clean: the outcome
+is `baseline_red`, no plan finding is filed, and no remediation loop is offered; a coverage shortfall in an
+untouched module yields exactly one `baseline_debt` finding of severity `info`; matched negative control: a
+diagnostic the plan introduced still routes to `triage_required`.
+Fixture:: whole-tree gate red on the plan worktree (3×) and on a pristine `origin/main` scratch worktree, per-bundle gates green, CI green;
+Token-Sheriff #744 (JaCoCo 0.70 / 0.57 against 0.80) fanning out into 5 findings.
+Source:: process-compliance inbox `truth-179-opencode-target-detection-landed-005`; truthful-signals
+PLAN-TRUTH-145 § FOLDED 2026-09-15 (c) item -062.
+
+[#PM-WATCH-JOB-25]
+=== PM-WATCH-JOB-25: A red that the base shows is proven, never assumed
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime § Gate Honesty Verification] (Baseline Separation),
+link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
+Hazard:: A red gate is excused as baseline-red on a guess, or a `baseline_red` verdict recorded for one tree is
+reused after a new commit changed it.
+Guard:: Fixtures: the base's CI result shows the same failing check with the same fingerprints -> `baseline_red`,
+bound to the `worktree_sha` of the evaluated tree and recorded as a build row; a new commit makes the row stale and
+the gate re-runs; a failure whose fingerprint the base does not show calls `remediation.build-failure`; without a CI
+result on the base the local build of the merge base is the proof, and without either the red is not baseline.
+Source:: operator decision of 2026-09-29 (workflow consistency, doc review); no plan-marshall defect record.
+
+[#PM-WATCH-JOB-26]
+=== PM-WATCH-JOB-26: Evidence gathering degrades to the tail parser, never to nothing
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#evidence-gathering[Job Runtime § Evidence Gathering per Failure Class]
+Hazard:: A domain `log_parser` that throws or emits records outside its schema leaves the remediation unit without
+failure envelopes, so `decide` is entered with nothing to judge, or the malformed records reach the model.
+Guard:: Fixture parsers per failure mode (exception, schema-violating record, empty output on a failed check): the
+gather job falls back to the generic tail parser, records failures of kind `unknown` with excerpt URIs, and logs the
+parser fault; no record outside the failure envelope schema is stored; matched control: a valid parser's records
+pass unchanged.
+Source:: operator decision of 2026-09-29 (workflow consistency, doc review); no plan-marshall defect record.
+
+== Working-Tree Hash (`worktree_sha`)
+
+[#PM-WATCH-JOB-24]
+=== PM-WATCH-JOB-24: Both git variants compute the same `worktree_sha`
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#worktree-sha[Job Runtime § Working-Tree Hash],
+link:../Requirements.adoc#PM-SVC-1[PM-SVC-1]
+Hazard:: A digest computed from variant-specific status output, or from bytes that git configuration reshapes, marks
+a fresh build stale (or a stale build fresh) when a project switches between the native and the CLI variant.
+Guard:: Fixture repositories with changed, deleted, untracked, and ignored paths: the native (`StatusCommand`) and the
+CLI (`git status --porcelain -z`) variant of `git.worktree-sha` return identical digests and version `1`, and an
+ignored path does not change the digest; control: setting `core.autocrlf`, `core.quotePath`, and `diff.noprefix`
+leaves both digests unchanged.
+Source:: operator decision of 2026-09-29 (doc review); no plan-marshall defect record.
+
+== Ingestion Validator (Level 1)
+
+[#PM-WATCH-JOB-27]
+=== PM-WATCH-JOB-27: The ingestion validator reaches a fixpoint and reports every change
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#ingestion-validator[Job Runtime § Ingestion Validator],
+link:../Requirements.adoc#PM-SEC-1[PM-SEC-1]
+Hazard:: A single Unicode pass leaves smuggled characters that a removal exposes (nested tag sequences, an ANSI escape
+split by a removed code point); a silently dropped span hides what the validator did from the screener and the audit.
+Guard:: Fuzz and corpus tests (cui-http generators, garak and promptfoo corpora as JUnit fixtures): running the
+validator on its own output changes nothing; no tag-block code point, variation selector, `Cf`, `Co`, or `Cn` code
+point, lone surrogate, or ANSI escape survives; images, raw HTML, and links outside the allowlist are removed or
+neutralized with one reported change each; a rule-table hit is recorded as a finding and never blocks on its own; the
+number of passes is bounded.
+Source:: Plan Bootstrap Z6-25 (2026-09-29).

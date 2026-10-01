@@ -1,0 +1,204 @@
+= Workflow DSL & Engine Specification: Grammar
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Grammar
+
+== Formal EBNF Grammar for the Workflow DSL
+_See Requirement link:../../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-3[PM-WF-3: Capability Enforcement by Link Omission]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-4[PM-WF-4: Entity-Scoped Links & Fine-Grained Concurrency]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+_See Requirement link:../../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
+
+Workflow definitions (the default `*.pmwf` units compiled into the binary under `classpath:/workflows/`, the project-owned copies of the phase, sub-workflow, and remediation units in `.marshall/config/*.pmwf`, xref:04-ast-node-model.adoc#project-owned-units[Project-Owned Workflow Units & Compiled Invariants], and the composed plan instance of every plan, xref:09-plan-instance.adoc#plan-instance[Plan Instance]) conform to the following ISO/IEC 14977 Extended Backus-Naur Form (EBNF) grammar. The DSL is line-oriented; comments start with `#` and run to the end of the line.
+
+[source,ebnf]
+----
+workflow_file        = workflow_header ,
+                       [ instance_decl ] ,
+                       ( subworkflow_decl | [ scope_decl ] ) ,
+                       start_decl ,
+                       { migrate_decl } ,
+                       state_decl , { state_decl } ;
+                       (* instance_decl: only in a composed plan instance, which only the server
+                          writes (09-plan-instance.adoc, Instance Header Grammar) *)
+
+workflow_header      = "workflow" , state_id , "version" , positive_int ,
+                       "format" , positive_int ,
+                       [ "derived_from" , positive_int ] , EOL ;
+                       (* version: the unit's revision; format: the DSL format version, accepted only
+                          at the binary's current value (store-schemas.adoc, Format Versioning);
+                          derived_from: only in a project-owned copy, the default revision it derives from *)
+scope_decl           = "scope" , ( "plan" | "epic" | "workspace" | "entity" ) , EOL ;
+subworkflow_decl     = "scope" , "subworkflow" , EOL ,
+                       { subworkflow_param } ,
+                       [ result_decl ] ;
+subworkflow_param    = "param" , param_name , ":" , subworkflow_type , EOL ;
+subworkflow_type     = enum_type
+                     | "int" , [ int_range ]
+                     | "list" , "<" , enum_type , ">" ;
+result_decl          = "result" , schema_ref , EOL ;
+                       (* the typed result record the unit returns with its outcome `done` *)
+start_decl           = "start" , state_id , EOL ;
+migrate_decl         = "migrate" , state_id , "->" , state_id , EOL ;
+
+state_decl           = "state" , state_id , [ terminal_decl ] , EOL ,
+                       [ phase_clause ] ,
+                       [ skill_clause ] ,
+                       [ facts_clause ] ,
+                       state_body ;
+terminal_decl        = "terminal" , outcome_id , outcome_class ;
+outcome_class        = "success" | "skip" | "failure" | "indeterminate" | "unsettled" | "stepped_out" ;
+                       (* the closed OutcomeClass set, lower case; `stepped_out` only with the
+                          reserved outcome id `stepped_out` *)
+
+phase_clause         = "phase" , ( identifier | "inherit" ) , EOL ;
+skill_clause         = "skill" , skill_path , EOL ;
+facts_clause         = "facts" , primitive_id , EOL ;
+
+state_body           = (* empty for terminal states *)
+                     | auto_clause
+                     | job_clause
+                     | call_clause
+                     | question_clause , { link_clause }
+                     | link_clause , { link_clause } ;
+
+auto_clause          = "auto" , primitive_id , EOL ,
+                       outcome_transition , { outcome_transition } ;
+
+job_clause           = ( "job" | "composite_job" ) , primitive_id , EOL ,
+                       outcome_transition , { outcome_transition }
+                     | "job" , "llm" , entity_kind , "role" , role_key ,
+                       [ "each" , primitive_id ] , EOL ,
+                       outcome_transition , { outcome_transition } ;
+                       (* job llm: a model job the server launches for one entity of the kind;
+                          each: fan-out, one model job per element of the server-computed list
+                          the primitive returns; 02-units-jobs-decisions.adoc, Model Job States *)
+entity_kind          = identifier ;
+role_key             = identifier , { "." , identifier } ;
+                       (* effort role key, e.g. plan.phase-5-execute.effort.default; the effort level is
+                          always resolved from the role (dispatch-and-effort.adoc, Role Resolution) *)
+
+call_clause          = "call" , state_id , [ "(" , [ call_arg_list ] , ")" ] , EOL ,
+                       outcome_transition , { outcome_transition } ;
+call_arg_list        = call_arg , { "," , call_arg } ;
+call_arg             = param_name , "=" , call_value ;
+call_value           = enum_value | positive_int_or_zero
+                     | "[" , enum_value , { "," , enum_value } , "]" ;
+
+question_clause      = "question" , question_class , EOL ,
+                       outcome_transition , { outcome_transition } ;
+question_class       = "init" | "clarification" | "review" | "task" | "setup" | "ask" ;
+                       (* the state waits on the scope's open question records of that class
+                          (02-units-jobs-decisions.adoc, Question States & the Question Deadline) *)
+
+link_clause          = "link" , relation , link_id_pattern ,
+                       [ "[" , link_form , "]" ] ,
+                       "(" , [ param_list ] , ")" , EOL ,
+                       [ guard_clause ] ,
+                       link_action ,
+                       outcome_transition , { outcome_transition } ;
+
+relation             = "next" | "alt" | "retry" | "fix" | "loop_back"
+                     | "submit" | "wait" | "escalate"
+                     | "abort" | "emit" ;
+
+link_form            = "submit" | "wait" | "noop" ;
+
+link_id_pattern      = action_id , [ ":" , ( entity_placeholder | identifier ) ] ;
+entity_placeholder   = "<" , identifier , ">" ;
+
+param_list           = param_decl , { "," , param_decl } ;
+param_decl           = param_name , ":" , type_spec , [ "?" ] ;
+
+type_spec            = scalar_type
+                     | "list" , "<" , scalar_type , ">" ;
+scalar_type          = "text" , [ int_range ]
+                     | "int" , [ int_range ]
+                     | enum_type
+                     | schema_ref ;
+enum_type            = "enum" , "[" , enum_value , { "|" , enum_value } , "]" ;
+schema_ref           = "schema" , "[" , schema_name , "]" ;
+                       (* named parameter schema, hypermedia-format.adoc, Named Parameter Schemas *)
+schema_name          = lowercase_alpha , { lowercase_alpha | digit | "-" } ;   (* identifiers.adoc, named parameter schema *)
+
+int_range            = "[" , positive_int_or_zero , ".." , positive_int , "]" ;
+                       (* the same bracket form as the hypermedia `free` column, e.g. text[1..500] *)
+
+guard_clause         = "guard" , guard_expr , EOL ,
+                       [ "depends_on_config" , "[" , config_key , { "," , config_key } , "]" , EOL ] ;
+guard_expr           = guard_term , { "or" , guard_term } ;
+guard_term           = guard_factor , { "and" , guard_factor } ;
+guard_factor         = [ "not" ] , ( guard_atom | "(" , guard_expr , ")" ) ;
+guard_atom           = "in_worktree"
+                     | "has_open_findings"
+                     | "all_tasks_completed"
+                     | "predicate:" , primitive_id
+                     | "param:" , param_name , "has" , enum_value ;
+                       (* param: only in a subworkflow unit; true iff the bound value of the
+                          current call frame's parameter equals or contains the value *)
+
+link_action          = "do" , primitive_id , EOL ;
+
+outcome_transition   = outcome_id , "->" , state_id , EOL ,
+                       [ result_guard ] ,
+                       { completes_clause } ;
+result_guard         = "guard" , [ "not" ] , "result." , param_name , EOL ;
+                       (* only on a call site: a field of the callee's result record, which holds
+                          when the field is true (boolean) or present (optional) *)
+completes_clause     = "completes" , step_id , "as" , step_completion , EOL ;
+step_completion      = "done" | "skipped" | "failed" | "waived" ;
+                       (* waived: only on the outcome `waived` of a remediation call (Rule 9) *)
+step_id              = step_segment , ":" , step_segment ;   (* identifiers.adoc, step_id *)
+step_segment         = lowercase_alpha , { lowercase_alpha | digit | "-" } ;
+config_key           = identifier , { "." , identifier } ;   (* an enum or boolean configuration key *)
+
+state_id             = identifier , { "." , identifier } ;
+primitive_id         = identifier , "." , identifier ;
+skill_path           = "pm/" , identifier , { "/" , identifier } ;  (* maps to the URI "skill://" , skill_path , "/SKILL.md" *)
+outcome_id           = identifier ;
+action_id            = identifier ;
+identifier           = lowercase_alpha , { lowercase_alpha | digit | "_" | "-" } ;
+param_name           = lowercase_alpha , { lowercase_alpha | digit | "_" } ;   (* identifiers.adoc, free parameter name *)
+enum_value           = letter , { letter | digit | "_" | "-" } ;
+positive_int         = nonzero_digit , { digit } ;
+positive_int_or_zero = "0" | positive_int ;
+letter               = lowercase_alpha | uppercase_alpha ;
+lowercase_alpha      = ? ASCII "a".."z" ? ;
+uppercase_alpha      = ? ASCII "A".."Z" ? ;
+digit                = "0" | nonzero_digit ;
+nonzero_digit        = ? ASCII "1".."9" ? ;
+any_char_except_nl   = ? any Unicode scalar value except "\n" ? ;
+EOL                  = [ "#" , { any_char_except_nl } ] , "\n" ;
+----
+
+Identifiers (state, primitive, action, parameter, and outcome names) are lowercase; their regex forms and length bounds (32 characters per identifier, 64 per dotted `state_id`) are registered in the link:../identifiers/01-general-rules-and-registry.adoc#id-state-id[Identifier Registry], which the static verification rules enforce. Parameter names (`param_name`: link parameters, sub-workflow `param` declarations, `call` arguments, and result record fields) follow the registry's link:../identifiers/01-general-rules-and-registry.adoc#id-param-name[free parameter name] grammar and never contain `-`, because they appear verbatim as keys of `pm_do` `args` and in the hypermedia `free` column. Ranges use the bracket form of the wire (`text[1..500]`, `int[0..100]`), so a declared parameter reads the same in DSL source and in the rendered `free` column. Enum values are a separate token (`enum_value`) that also admits upper case, so closed domain vocabularies such as `enum[FIX|SUPPRESS|ACCEPT]` are expressible verbatim. Lists use the single syntax `list<…>` in both the DSL and the hypermedia `free` column (link:../hypermedia-format.adoc[Hypermedia Format Specification]); there is no free-form object type and no boolean type. The only object-valued type is the named schema reference `schema[<schema_name>]` (also as `list<schema[<schema_name>]>`), whose value the server validates against the closed JSON Schema registered under that name (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]); a name that is not registered fails validation (Rule 1 in xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]). Sub-workflow `param` declarations never use it; a sub-workflow's `result` declaration always does.
+
+`param` and `result` declarations are permitted only in the header of a `scope subworkflow` file. The `param` declarations are the complete closed parameter schema that every `call` site must bind (Rule 6 in xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]); sub-workflow parameters are restricted to `enum[…]`, `int`, and `list<enum[…]>` because they are bound from literal values at the call site or by the plan instance's composition (xref:09-plan-instance.adoc#plan-instance[Plan Instance]), never from model input.
+
+[#dsl-reserved-keywords]
+* *Reserved keywords*: `workflow`, `version`, `format`, `derived_from`, `scope`, `param`, `result`, `start`, `migrate`, `state`, `terminal`, `phase`, `inherit`, `skill`, `facts`, `auto`, `job`, `composite_job`, `call`, `question`, `link`, `guard`, `depends_on_config`, `do`, `llm`, `role`, `each`, `completes`, `as`, `and`, `or`, `not`, `has`, `in_worktree`, `has_open_findings`, `all_tasks_completed`, `predicate`, `text`, `int`, `enum`, `schema`, and `list` are reserved. None of them may be used as an outcome name, a parameter name, a job entity kind, or a segment of a state, primitive, role, or configuration key identifier; the parser rejects such a use with the source file and line. The outcome id `stepped_out` is reserved for the control outcome of a sub-workflow (<<sub-workflow-exits>>). Positional vocabularies are not reserved, because they occur only where the grammar expects them: the relation and form values (`next` .. `emit`, `noop`), which deliberately double as action names (`link retry retry [noop]`, `link escalate request_waiver [submit]`), the question classes (`init` .. `ask`), the keyword `instance` of a plan instance's header line (xref:09-plan-instance.adoc#instance-header-grammar[Instance Header Grammar]), and the scope, outcome class, and step completion values (`plan`, `epic`, `workspace`, `entity`, `subworkflow`, `success` .. `stepped_out`, `done`, `skipped`, `failed`, `waived`), which are also ordinary identifier segments (`plan.allocate-remediation-tasks`).
+* *Link relations and forms*: `relation` and `link_form` are the closed enumerations `LinkRelation` and `LinkForm` (xref:04-ast-node-model.adoc#_ast_node_model[AST Node Model]), taken from the link:../hypermedia-format/02-link-grammar.adoc#_closed_link_relations_rel[Hypermedia Format Specification, Closed Link Relations] table. Every relation admits a fixed set of forms and has a default form, which applies when a `link` clause omits `[form]`. Their compatibility, and the fit of the form to the parameter list and the link action, is Rule 12 (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]). There is no escalation form and no escalation action: the rel `escalate` names only a `submit` link that files a waiver request (`request_waiver`, xref:02-units-jobs-decisions.adoc#waivers-and-integrity[Waivers, Waiver Requests & the Integrity Pause]), which never waits for or applies an operator answer.
+* *Model jobs*: A state that needs model work is a job state written only as `job llm <entity_kind> role <role_key> [each <primitive_id>]`; there is no dispatch link and no host sub-agent. Entering the state starts one model job that the server launches for one entity of the kind and that works on that entity through its own job-bound connection (xref:02-units-jobs-decisions.adoc#model-job-states[Model Job States]). With the fan-out clause `each <primitive_id>` the state starts one such job per element of the list the named server primitive computes, each with its own entity, and completes when every entity has its required submission. The DSL never names an effort level or a model: the level is always resolved from the role at launch time (link:../dispatch-and-effort/03-escalation-roles-readers.adoc#_role_registry_lookup_hierarchy[Model Jobs & Effort Specification, Role Registry & Lookup Hierarchy]), so a configuration change of the role reaches the next job without a workflow version. The state offers the implicit `wait:<job_id>` like every job state; its outcome transitions belong to the job's completion, which runs the return-evaluation primitive the entity kind registers, and their outcome set is that primitive's closed outcome set.
+* *`phase inherit`*: A state that declares `phase inherit` takes the phase value of the calling state: in a `scope subworkflow` unit the `callerPhase` of the top `CallFrame` (xref:06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Call-Stack Execution & Persistence Semantics]), which is itself the resolved phase value of the caller state, so a nested call inherits transitively down to the first state with a concrete phase; in a `scope entity` unit the phase value of the state whose model job drives the entity, and `workspace` for the bootstrap units hosted by the workspace scope (xref:02-units-jobs-decisions.adoc#workflow-definition-units[Workflow Definition Units]). `inherit` is admitted only in `scope subworkflow` and `scope entity` units (Rule 6); a sub-workflow or entity state never changes `status.phase`.
+* *Terminal declarations*: Every terminal state declares `terminal <outcome_id> <outcome_class>`: the outcome it reports (for a sub-workflow, the outcome returned to the caller) and its `OutcomeClass` (xref:05-primitives.adoc#primitive-outcome-classes[Outcome Classes & Step Records]), for example `state git.done terminal done success`, `state git.stepped-out terminal stepped_out stepped_out`, or `state plan.aborted terminal aborted failure`. The plan unit's terminals are `completed` (declared `terminal merged success`), `handed_back`, `returned`, and `plan.aborted`. The declared outcome id of a root plan terminal is nominal: the plan's `outcome` field is authoritative, and `completed` ends a plan whose `outcome` is `merged` or `no_change`.
+* *Ends of a scope*: A plan ends in one of its three delivery terminals `completed` (plan `outcome` `merged` or `no_change`), `handed_back`, or `returned`, each reached only through `finalize.archive-plan` after the post-run band, or in `plan.aborted`; an epic in `epic.archived` or `epic.aborted`. `plan.aborted` and `epic.aborted` (phase value `aborted`, class `failure`) are entered only by an engine-owned, scope-wide transition: the operator verbs `pm-operator abort` and `delete-plan`, or the `abort` resolution of an integrity pause (xref:02-units-jobs-decisions.adoc#waivers-and-integrity[Waivers, Waiver Requests & the Integrity Pause]); no DSL transition targets them and no model link reaches them. The model's own exit at plan scope is the declared link `hand_back (reason: text[1..2000])` (rel `abort`, form `submit`), which takes the phase's fallback route at once: `plan.return` (outcome `returned`; it forwards to `finalize.hand-back` when the plan branch holds commits beyond the base, as after a loop-back from Phase 5) in Phases 1–4, `finalize.hand-back` (outcome `handed_back`, or `returned` when the branch holds no commit beyond the base) in Phase 5, the `land` lane, and Phase 6 before the merge. Inside a sub-workflow the model's exit is the implicit `step_out` (<<sub-workflow-exits>>), never `hand_back`. The rel `abort` with form `noop` remains only for `cancel:<job_id>`.
+* *Step completion (`completes`)*: A transition that settles a finalize step names it with one `completes <step_id> as done|skipped|failed|waived` clause per settled step, on the lines following the transition. The engine writes the step record (`mcp/status.json` `steps`, link:../store-schemas.adoc[Store Schemas Specification]) and closes the step's open firing in the transaction of that transition; Rule 9 (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]) checks that every firing of a step is completed exactly once on every path and never as `done` on a failing or stepped-out path. `waived` is admitted only on the outcome `waived` of a `call` to a remediation unit (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]): the step is settled by a consumed operator waiver, whose `waiver_id` the step record references, and it satisfies Phase-Exit Completeness (link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_re_entry_head_at_completion_verdict_currency_rules[Phase Workflows Specification, Verdict Currency Rules]). Entering `plan.aborted`, `plan.return`, or `finalize.hand-back` records every begun, unsettled step `failed` in the entering transaction (the on-entry rule), so no transition into them carries a `completes … as failed` clause.
+* *Configuration-dependent guards*: A `guard` clause may declare `depends_on_config [key, …]`, the enum or boolean keys of the effective configuration (in the effective-key form `<file_stem>.<dotted path>`, for example `project.review.currency` or `derived.push_remote`, link:../store-schemas/07-project-configuration.adoc#project-configuration-store[Store Schemas Specification, Project Configuration]) whose values the guard reads. Rule 3 checks reachability for every combination of the declared keys' values (xref:04-ast-node-model.adoc#static-verification-rules[Static AST Verification Rules (Build Time & Every Unit Load)]).
+* *Bound-parameter guards*: The atom `param:<name> has <value>` reads the bound value of the current call frame's parameter `<name>` (an `enum` equal to the value, or a `list<enum>` containing it). A remediation unit guards its `decide` links with it against the bound `actions` list, so the plan instance's composition can withhold an action per call site (for example `actions=[retry]` for a `land` plan, xref:09-plan-instance.adoc#composition-rules[Composition Rules]) without a copy of the unit.
+
+[#sub-workflow-exits]
+* *Result guards and the sub-workflow exit contract*: A sub-workflow's exit contract is small and control-only: `done` with the typed result record of its `result` declaration, the domain outcomes of its other terminals only where callers genuinely continue differently (a remediation unit's `resolved`, `waived`, `exhausted`, `fix_requested`), and the control outcome `stepped_out`. A caller that continues differently on a result detail branches on it with a result guard: the outcome is routed twice, once with `guard result.<field>` and once with `guard not result.<field>` over the same field (a boolean field holds when true, an optional field when present), for example `done -> finalize.create-pr` with `guard result.pushed`, or `done -> remediation-ci.await-ci` with `guard result.commit`. Every resting link state of a sub-workflow offers the implicit link `step_out (reason: text[1..2000])`, which unwinds exactly one frame and returns `stepped_out {by: model, cause: step_out, reason}` to the caller; a terminal that declares the reserved outcome `stepped_out` (class `stepped_out`) is a server-produced step-out (`by: server`, `cause`: the outcome that entered it), for example `git.commit_and_push` after exhausted commit attempts. A call site routes `stepped_out` once (Rule 6), typically to the phase's fallback state or, inside a sub-workflow, to one of its own link states, whose `step_out` continues the unwinding like an exception. The one exception is the server step-out with `cause: condition` after a condition's self-remedy budget is spent (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays]): it unwinds every frame in one transaction and enters the phase's fallback state directly, without taking a caller's `stepped_out` transition, so no unit's own recovery state (a remediation unit's `decide`) catches it.
+_Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-14[PM-WATCH-DSL-14], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-15[PM-WATCH-DSL-15]_
+* *Question states*: A state whose body starts with `question <class>` rests until the scope's open question record of that class is resolved: answered on any delivery channel, or resolved by the engine-owned question deadline through the class's compiled fallback (xref:02-units-jobs-decisions.adoc#question-states[Question States & the Question Deadline]). Its outcome transitions route the class's closed resolution outcomes, each to a re-entrant `auto` state that reads the answer from the record and decides (per-option routing lives there, never in the question clause); the state may declare further links (for example `hand_back`). The catalogue kind `awaiting_user` is derived from this clause.

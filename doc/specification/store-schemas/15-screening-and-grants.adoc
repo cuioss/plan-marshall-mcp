@@ -1,0 +1,81 @@
+= Store Schemas Specification: Screening & Access Grants
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Screening & Access Grants
+
+[#screen-verdict-cache]
+== Screen Verdict Cache (`screen-verdicts.jsonl`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-1[PM-SEC-1: Two-Boundary Security Model & Untrusted Content Containment]_
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-35[PM-WATCH-DISP-35]_
+
+External text (issue and pull request titles and bodies, review comments and bot findings, analysis-provider messages, upstream MCP results entering a store) passes two guards before it reaches a model as content: the server's deterministic level-1 validator, which cleans it and reports every change, and the level-2 screener, a zero-tool model job of role `screen.effort` that returns a closed verdict per item (link:../dispatch-and-effort/06-untrusted-text-screening.adoc#screener[Model Jobs & Effort Specification, Screener Job]). The screener can only restrict: an item whose verdict is missing, extra, or unparseable counts as `suspicious`. Screened text is still delivered marked untrusted.
+
+* *One Batch per Firing*: Every source unit and every gather firing that ingests external text builds one screening batch (named schema `batch-v1`, link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batch-v1[Model Jobs & Effort Specification, Batch Format]) over its new items. The batch is persisted with the records it came from (the finding records with their `batch_id`, the bootstrap's source record in the pending entry record) and is not stored separately; `batch_id` is a per-scope counter (`BT-<n>`) recorded on each item and in this cache.
+* *Cache*: One append-only file per scope, `screen-verdicts.jsonl` in the plan directory, in `epics/<epic_id>/`, and in `workspace/` (which also serves the bootstrap entities it hosts), written in the transaction that settles the screener job. Before a batch is sent, every item whose SHA-256 has a verdict in the scope's cache takes it and is left out; only uncached items are screened, split into several screener jobs above the screening split bound (link:../timeouts/03-retention-host-config.adoc#screening-split-bound[Timeouts & Budgets Specification, Screening split bound]). Only verdicts the screener returned are cached; an item counted `suspicious` fail-closed (job failed, timed out, or answered without the item) is not cached and is screened again by the next firing. The `start.create-scope` transaction of a plan bootstrap copies the verdicts of its source items into the new plan's cache.
+* *Effect*: In a bootstrap, a `suspicious` item enters a link state that shows the flagged spans: `accept` (the text is used, still marked untrusted; audited) or `back`. Inside a scope, a `suspicious` item is withheld: only its structured fields and `withheld: flagged by screener` are delivered, a withheld finding stays `pending`, and the unit ends through its budget and fallback unless a `met` waiver of its gate lets the plan proceed (xref:03-findings-and-review-records.adoc#_findings_ledger_record_findings_jsonl[Findings Ledger Record]).
+* *Integrity*: The cache is covered by its scope's digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]); flagged spans are operator and audit data, never rendered to a model beyond the bootstrap's accept state.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/screen-verdict.json",
+  "title": "ScreenVerdictRecord",
+  "type": "object",
+  "required": ["format_version", "sha256", "verdict", "spans", "batch_id", "job_id", "screened_at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the level-1-cleaned text; the cache key within the scope." },
+    "verdict": { "type": "string", "enum": ["clean", "suspicious"] },
+    "spans": {
+      "type": "array",
+      "description": "suspicious only: the flagged spans of the cleaned text; empty for clean.",
+      "items": { "type": "object", "required": ["start", "end", "reason"], "additionalProperties": false, "properties": { "start": { "type": "integer", "minimum": 0 }, "end": { "type": "integer", "minimum": 0 }, "reason": { "type": "string", "maxLength": 200 } } }
+    },
+    "batch_id": { "type": "string", "pattern": "^BT-[0-9]+$" },
+    "job_id": { "type": "string", "pattern": "^l-[0-9a-f]{16}$", "description": "The screener job (role screen.effort) that returned the verdict." },
+    "screened_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+[#grant-record]
+== Access Grant Record (`grants.jsonl`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-2[PM-SEC-2: Workspace Confinement & Path Traversal Prevention]_
+
+A plan reads or writes only its own project. Access to another enrolled project (its checkout, or its archived plans) exists only through an operator grant: `pm-operator grant-access <plan_id> <project_id> read|read-write --reason <text>` (link:../cli-and-security/02-credentials-and-operator.adoc#operator-channel-isolation[CLI, Coordination & Security Specification, Operator Channel Isolation]) appends one line to the plan's append-only `plans/<plan_id>/grants.jsonl`; the runtime executing that verb is its only writer, no link or primitive writes it, and every line is mirrored into the audit log (`access_granted`, xref:12-machine-stores.adoc#audit-log[Audit Log]). The model never requests a grant: an access to another project without a grant for the needed access raises the `precondition_unmet` condition (reason `grant_missing`, `facts.operator_command` naming the verb), whose bounded `retry` re-checks the grants before the phase's fallback. A grant holds until the plan ends: there is no revocation verb and no revoking record, and `abort` of the plan is the only way to stop an issued grant. It is refused for the plan's own project, an unenrolled project, and an ended plan (`plan_ended`). The store is covered by the plan's digest sidecar.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/grant-record.json",
+  "title": "AccessGrantRecord",
+  "type": "object",
+  "required": ["format_version", "project_id", "access", "reason", "operator", "at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "The other enrolled project the plan may access." },
+    "access": { "type": "string", "enum": ["read", "read-write"] },
+    "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "operator": {
+      "type": "object",
+      "required": ["channel", "os_principal"],
+      "additionalProperties": false,
+      "properties": {
+        "channel": { "type": "string", "enum": ["cli", "web"] },
+        "device_id": { "type": ["string", "null"], "pattern": "^dev-[0-9a-f]{12}$" },
+        "os_principal": { "type": "string" }
+      }
+    },
+    "at": { "type": "string", "format": "date-time" }
+  }
+}
+----

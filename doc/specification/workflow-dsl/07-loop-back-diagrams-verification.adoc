@@ -1,0 +1,248 @@
+= Workflow DSL & Engine Specification: Loop-Back, Diagram Generation & Verification
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Loop-Back, Diagram Generation & Verification
+
+[#loop-back-bounds]
+== Worktree-Constrained Loop-Back & Iteration Bounds
+_See Requirement link:../../Requirements.adoc#PM-WF-7[PM-WF-7: Remediation Policies, Loop-Back & Iteration Bounds]_
+
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-63[PM-WATCH-PHASE-63]_
+
+When a remediation needs cross-task work (a CI failure, a failing quality gate, or review findings that one in-branch fix cannot settle), the workflow returns from `finalize` to `execute` through the `loop_back` form of `fix` of a remediation unit (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]): the unit returns `fix_requested`, and the caller's `auto` state `finalize.allocate-remediation` allocates the remediation tasks. Two server-side invariants govern it.
+
+=== 1. Worktree Confinement Guard (`in_worktree`)
+
+* Every `loop_back` link whose target lies in Phase 5, which is the `loop_back` action of the remediation units (`fix_requested` -> `finalize.allocate-remediation` -> `execute.envelope-ready`), declares `guard in_worktree`, beside the unit's action and budget guards (`param:actions has loop_back`, `predicate:remediation.fix-budget-left`). The rule does not cover `loop_back_outline` (<<_3_loop_back_to_the_outline>>): that link, of rel `loop_back`, targets the outline from `plan.revise-tasks` (Phase 4, where a plan has a worktree only after an earlier loop-back from Phase 5) and from `execute.infeasible-review`, and carries no `in_worktree` guard, only its budget guard.
+* `GuardExpr.InWorktree` evaluates to `true` if and only if the plan's `mcp/status.json` records a non-null `worktree_path` and that path is `.marshall/local/worktrees/<plan_id>/`, exists, and is a valid git worktree for the plan's branch. The plan directory itself never moves (link:../filesystem-layout.adoc#worktree-lifecycle[Filesystem Layout Specification, Worktree Lifecycle]).
+* Once the plan passes `finalize.merge-gate`, merges its branch, and its worktree is removed (`worktree_path: null`), `InWorktree` evaluates to `false`. Every `loop_back` link the guard covers is then omitted from representations and rejected by `pm_do`.
+* A `land` plan never loops back: its composition binds `actions=[retry]` and prunes the `loop_back` links with reason `land_lane` (xref:09-plan-instance.adoc#composition-rules[Composition Rules]).
+
+=== 2. Budget-Bounded Iterations
+
+* A loop-back is a `fix` of its remediation unit: it is charged to the unit's `fix_budget` for the plan and the unit's class (`policy_counters`, persisted and never reset; link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]). The template default is `3` per class, the compiled hard cap `5`; the only way past the effective ceiling is the operator's waiver `--raise fix_budget:<policy>=N`, set on the operator's own initiative and composed into the plan instance (event `waiver`). There is no loop-limit state and no extension decision.
+* `budget-check` precedes every entry into the unit's `decide`: while budget remains, the `loop_back` link is offered (subject to `in_worktree`); when every budget is spent, the unit ends `exhausted` (or waits a bounded `waiver_wait_seconds` for a raise first), and the caller takes the fallback `finalize.hand-back`. The effective ceiling and the consumed count are rendered in `facts`, so the model always sees the bound actually applied.
+* `plan.allocate-remediation-tasks` allocates fresh task files (`TASK-NNN.json`) and a fresh envelope (`envelope-M`, run by a new envelope job) in the worktree in the same locked transaction; completed tasks are never mutated or reopened. Unplanned changes of a loop-back inside the worktree are recorded with the loop-back as provenance, never reviewed.
+* *Productive vs Unproductive Loop-Backs*: When a loop-back iteration returns to `finalize`, the server records it in `mcp/status.json -> loop_backs[]` with `iteration`, `productive` (the iteration made at least one fix commit or filed at least one new finding, derived from `change-ledger.jsonl` and the findings store, never from a model claim), `fix_commits`, `findings_raised`, and `findings_self_seeded` (findings located in lines changed by an earlier iteration's fix). The unit's `decide` renders the productive and unproductive counts, the self-seeded share of the last iteration (and of the self-review step's rounds, link:../domain-extensions.adoc[Domain Extensions Specification], Self-Review Surfacer Contract), and the findings raised in the last iteration, so converging and oscillating loops are distinguishable. Every loop-back counts against the budget; `productive` never lifts it, and the self-seeded share never stops the loop by itself.
+* Waiting for a review bot's rate window (`finalize.review-window-wait`) and re-triggering a bot are `retry` actions, never loop-backs; they consume the `retry_budget` of `remediation.review-findings` only where the unit's `retry` triggers them.
+* A refusal whose reason cannot change between rounds at an unchanged `HEAD` (for example a verifier that cannot apply to the plan's content) is recorded once and closes the step or reaches its unit once; it never offers `loop_back`.
+
+=== 3. Loop-Back to the Outline
+
+* `loop_back_outline` (from `execute.infeasible-review`, and the `fix` of the Phase 4 Q-Gate policy) targets the lane's authoring state: `outline.deep` for a deep plan, `outline.light-regate` for a light plan (never `outline.light`, `INV-INIT-2`).
+* It is bounded by the compiled loop-back budget `1`, raisable only through `fix_budget:qgate-findings`, because the re-authored outline passes the outline Q-Gate again. Exhaustion takes the fallback `plan.return`, which forwards to `finalize.hand-back` (`handed_back`) when Phase 5 committed work beyond the base, otherwise ends `returned`.
+* A loop-back from Phase 5 keeps the worktree: `worktree_path` is null in Phases 1–4 unless the plan returned from Phase 5 through `loop_back_outline`; the outline jobs then run in the worktree (their working directory), and `execute.worktree-init` adopts the existing worktree. The re-authored outline and the re-derived tasks compose new instance versions at the events `outline` and `plan`; completed tasks and firings stay in the history, and the loop-back counter is never reset.
+
+== Automated Mermaid, AsciiDoc Table, and ASCII Diagram Generation
+_See Requirement link:../../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation]_
+
+Because workflow definitions are parsed into a typed `WorkflowDefinition` AST in `pm-workflow`, all visual documentation and runtime state inspection diagrams are generated deterministically from the AST by `WorkflowDiagramGenerator`.
+
+=== Supported Render Targets
+
+1. *Mermaid State Diagram (`renderMermaid(WorkflowDefinition, Optional<String> activeState)`)*: Emits `stateDiagram-v2` blocks grouping `StateNode` entries by `phase` into composite states, labeling transitions as the example below renders them: `rel link_id [form] [guard] / outcome` for a link transition (for example `loop_back loop_back [submit] [in_worktree] / requested`) and `<kind> / outcome` for an `auto`, `call`, `question`, or `composite_job` transition (for example `call / stepped_out`, with `[result.pushed]` for a result-guarded one), and marking `activeState` with a `classDef active` style when rendering for a live plan. The blocks of the default units are embedded into AsciiDoc documentation under `doc/`. For a plan, `pm://plan/{plan_id}/diagram` renders the plan instance version in force (xref:09-plan-instance.adoc#plan-instance[Plan Instance]), not the template: the active state and the call-path breadcrumb, the pruned elements as a note with their prune reason, and every waived gate with its waiver id; `pm://plan/{plan_id}/instance[/{version}]` serves the DSL text with its header.
+2. *AsciiDoc State/Link/Outcome Tables (`renderAsciiDocTables(WorkflowDefinition)`)*: Emits one AsciiDoc table per phase group listing every state with its links (`rel`, identifier, `form`, free parameters, guard), its implicit links, and outcome transitions, committed under `doc/` next to the Mermaid diagrams. Its per-state summary table has exactly the columns of the link:../state-catalogue.adoc[State Catalogue]: State id | Phase value | Kind | Entered from | Offered links / outcomes | Exits to | Defined in (the *Defined in* column is emitted empty and maintained by hand in the catalogue). The *Kind* column is derived from `StateBehavior`: `auto`, `job` (also for a `ModelJob` state), `composite_job`, `call`, `link`, `terminal`, and `awaiting_user` for a `QuestionWait` state.
+3. *Deterministic ASCII Box-and-Transition Table (`renderAscii(WorkflowDefinition, Optional<String> activeState)`)*: Emits a right-border-aligned ASCII state box diagram and transition matrix for terminal output (`pm-operator status`, which also names the instance version and its last composition event).
+
+=== Example Generated Mermaid & ASCII Output
+
+The Mermaid example renders an excerpt of the plan workflow's `finalize` phase group from the reference excerpt (xref:03-reference-excerpt.adoc#_reference_workflow_dsl_excerpt_finalize_pmwf[Reference Workflow Excerpt]) with `finalize.remediate-ci` as the active state; the ASCII example renders the `decide` state of `remediation.ci-failure` (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]) as the active state inside that call:
+
+[source,mermaid]
+----
+stateDiagram-v2
+    state "finalize.settle-commit" as finalize_settle_commit
+    state "finalize.review-cap-check" as finalize_review_cap_check
+    state "finalize.concurrent-wait" as finalize_concurrent_wait
+    state "finalize.remediate-ci" as finalize_remediate_ci
+    state "finalize.restart-watch" as finalize_restart_watch
+    state "finalize.allocate-remediation" as finalize_allocate_remediation
+    state "finalize.hand-back" as finalize_hand_back
+    state "finalize.next-step" as finalize_next_step
+    state "execute.envelope-ready" as execute_envelope_ready
+    finalize_settle_commit : call git.commit_and_push
+    finalize_review_cap_check : auto review.check-structural-caps
+    finalize_concurrent_wait : composite_job finalize.watch-ci-and-bots
+    finalize_remediate_ci : call remediation.ci-failure
+    finalize_restart_watch : auto finalize.restart-watch
+    finalize_allocate_remediation : auto plan.allocate-remediation-tasks
+    finalize_hand_back : auto finalize.hand-back
+    finalize_settle_commit --> finalize_review_cap_check : call [result.pushed] / done
+    finalize_settle_commit --> finalize_next_step : call [not result.pushed] / done
+    finalize_settle_commit --> finalize_hand_back : call / stepped_out
+    finalize_review_cap_check --> finalize_concurrent_wait : auto / within_caps
+    finalize_concurrent_wait --> finalize_remediate_ci : composite_job / ci_failed
+    finalize_concurrent_wait --> finalize_restart_watch : composite_job / watch_interrupted
+    finalize_restart_watch --> finalize_concurrent_wait : auto / concurrent_restarted
+    finalize_restart_watch --> finalize_hand_back : auto / exhausted
+    finalize_remediate_ci --> finalize_next_step : call / resolved
+    finalize_remediate_ci --> finalize_next_step : call / waived
+    finalize_remediate_ci --> finalize_allocate_remediation : call / fix_requested
+    finalize_remediate_ci --> finalize_hand_back : call / exhausted
+    finalize_remediate_ci --> finalize_hand_back : call / stepped_out
+    finalize_allocate_remediation --> execute_envelope_ready : auto / allocated
+    finalize_hand_back --> finalize_next_step : auto / handed_back
+    classDef active fill:#90ee90
+    class finalize_remediate_ci active
+----
+
+[source,text]
+----
+┌────────────────────────┬───────────────────────────┬────────────────────┬───────────────────────────────────────────┐
+│ State                  │ Link (rel)                │ Guard              │ Outcome -> Next State                     │
+├────────────────────────┼───────────────────────────┼────────────────────┼───────────────────────────────────────────┤
+│ *remediation-ci.decide │ retry (retry)             │ retry-budget-left  │ rerun_started -> remediation-ci.await-ci  │
+│  (ACTIVE)              │ fix (fix)                 │ fix-budget-left    │ recorded -> remediation-ci.commit-fix     │
+│                        │ loop_back (loop_back)     │ in_worktree, ...   │ requested -> remediation-ci.fix-requested │
+│                        │ request_waiver (escalate) │ waiver-requestable │ requested -> remediation-ci.waiver-wait   │
+│                        │ step_out (abort)          │ -                  │ stepped_out -> caller                     │
+└────────────────────────┴───────────────────────────┴────────────────────┴───────────────────────────────────────────┘
+----
+
+=== Build-Time Drift Gate
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-15[PM-WATCH-GEN-15], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-19[PM-WATCH-DSL-19]_
+
+A mandatory JUnit test (`WorkflowDiagramDriftTest`) in `pm-workflow` parses all `classpath:/workflows/*.pmwf` files, invokes `WorkflowDiagramGenerator`, and compares the output byte-for-byte against the committed diagram files in `doc/`. Any divergence fails the build, guaranteeing that workflow documentation can never drift from the executable state machine.
+
+A second mandatory JUnit test (`StateCatalogueDriftTest`) in `pm-workflow` compares the state table rendered by `renderAsciiDocTables` for all `*.pmwf` units with the link:../state-catalogue.adoc[State Catalogue]. It fails the build when a state defined in any `.pmwf` unit is missing from the catalogue or a catalogued state is defined in no unit, or when a row's phase value, kind, or exits differ; it also verifies that every link in the catalogue's *Defined in* column resolves (`PM-IMPL-5`). The catalogue's Conditions table is not compared with the `.pmwf` units (conditions are engine-owned, xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays (Engine-Owned)]); the test fails when its condition kinds differ from the constants of `ConditionKind`.
+
+== State-Machine Property Verification, Scenario Replay & State Migration
+_See Requirement link:../../Requirements.adoc#PM-TEST-3[PM-TEST-3: State-Machine Invariant, Property & McpAssured Protocol Verification]_
+
+_See Requirement link:../../Requirements.adoc#PM-TEST-4[PM-TEST-4: End-to-End Scenario & Compaction Resume Testing]_
+
+_See Requirement link:../../Requirements.adoc#PM-TEST-6[PM-TEST-6: Behavioural Conformance of Model-Facing Content]_
+
+_See Requirement link:../../Requirements.adoc#PM-MIG-4[PM-MIG-4: Stage Exit Criteria & Lifecycle Gate]_
+
+=== Property-Based State-Machine Verification (`PM-TEST-3`)
+
+The `pm-workflow` test suite executes property-based tests (using `jqwik` / `cui-test-generator`) over every compiled `WorkflowDefinition` AST:
+
+* *No Dead-End Non-Terminal States*: See <<no-dead-end-states>>.
+* *Strict Guard Enforcement & Link Omission*: Random sequences of `pm_do` calls with invalid link names, unsatisfied guards (such as `loop_back` when `in_worktree == false`), or out-of-range parameters never mutate `mcp/status.json` and always return `rejected.reason` with `isError: false`.
+* *Exhaustion Reaches the Fallback*: Random failure injection into every remediation unit verifies that once every budget of a class is spent, `decide` is never entered again for that class, the unit returns `exhausted` (after the bounded waiver wait when `waiver_wait_seconds > 0`), and the caller enters the phase's fallback state (`plan.return` or `finalize.hand-back`), whose post-run band ends in `finalize.archive-plan`; no path reaches `execute.envelope-ready` from a unit without an allocation by `finalize.allocate-remediation`.
+* *Raises Continue the Counter*: A `raise` waiver lifts only the effective ceiling of its policy in a new instance version; the consumed count continues, and no re-entry, new `HEAD`, loop-back, or re-composition resets it.
+* *Step-Out Unwinds One Frame*: Following `step_out` in any resting link state of a sub-workflow pops exactly one call frame, charges no budget, writes no waiver, and takes the caller's `stepped_out` transition; a `stepped_out` of a phase caller's unit reaches the fallback with the gap `cause: stepped_out`.
+* *Single-Level Leaf Model Job Invariant*: Property generators traverse all reachable states of every unit a model job drives and verify that no `job llm` state is reachable from it, and that a job-bound connection is refused every link into one.
+* *Monotonic Bounded Loops*: Random failure injection in Q-Gate remediation and finalize-to-execute loop-backs verifies that no class is charged more `fix` or `retry` actions than its effective ceiling (never above the compiled hard cap), that the loop-back to the outline runs at most once without a `fix_budget:qgate-findings` raise, and that every bounded wait (waiver wait, question deadline outside `questions.mode: operator`, watch restarts) ends.
+* *Integrity Pause Holds Everything*: While an `integrity_breach` is set, every `pm_do` of the scope is rejected with `integrity_paused` and no deadline fallback of a question or waiver request is taken; `accept-edit` clears it only after the digests re-verify.
+
+[#no-dead-end-states]
+==== No Dead-End Non-Terminal States
+_Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-1[PM-WATCH-DSL-1]_
+
+Every persisted sub-state of every non-terminal `StateNode` has at least one exit whose guard can hold: an offered link (including the implicit `step_out` of a sub-workflow link state), the implicit wait of a bound job (`active_job`), the resolution of an open question record (an answer or its deadline), or an `auto`/`job` transition, whose guard evaluates to `HELD` in a store and configuration state the generators reach (xref:04-ast-node-model.adoc#guard-results[Three-Valued Guard Results]). Persisted sub-states include entity sub-states, every condition overlay (`pending_condition`; the integrity pause's exit is the operator's `accept-edit` or `abort`, every other condition's is its bounded self-remedy or the fallback), and a bound running or settled job. That some abstract guard assignment would offer a link is not sufficient. Every reachable state has a finite path to a `terminal` state (`completed`, `handed_back`, `returned`, or, through the operator's transition, `plan.aborted`), or, in a `scope workspace` unit, back to its start state (Rule 3).
+
+=== Deterministic Scenario Replay Harness (`pm-scenario`, `PM-TEST-4`)
+
+The harness is a test-scope part of `pm-workflow` (JUnit, in-process), not a module of its own (link:../module-structure.adoc#test-placement[Module Structure § Test Placement]). End-to-end lifecycle scenarios are authored as deterministic `.pmscenario` scripts executed in-process by `ScenarioReplayRunner` against a hermetic temporary git repository without invoking any live LLM:
+
+[source,text]
+----
+scenario happy-path-single-module
+start request "Add null-safe header parser" slug "header-parser" review_outline true   # drives bootstrap-plan to the plan's creation
+assert_state refine.analyze            # job llm state: the refine job is bound
+assert_links wait
+job_do submit:refine {"clarified_request":"Add a null-safe header parser ...","correctness":98,"completeness":96,"consistency":100,"non_duplication":100,"ambiguity":95,"module_mapping":100,"evidence_class":"self_assessment","pr_title":"feat(http): add null-safe header parser"}
+complete_job {"outcome":"succeeded"}
+assert_state outline.deep
+...
+assert_state outline.review            # outline.gate passed; optional review question Q-003
+answer_question Q-003 elicitation {"branch_key":"approve"}
+assert_state plan.derive-tasks
+...
+complete_job b-00000000000000a1 {"outcome":"succeeded","worktree_sha":"e3b0c442..."}
+assert_state completed
+assert_outcome merged
+----
+
+`job_do` issues a call on the job-bound connection of the model job bound to the current state (the simulated job), `complete_job` without an id ends that job; the harness never launches a harness CLI.
+
+* Simulated `do` arguments use only the DSL parameter types (`text`, `int`, `enum[…]`, `list<…>`, and the named schemas `schema[…]`); there is no free-form object type, so the six refine confidence dimensions (`correctness`, `completeness`, `consistency`, `non_duplication`, `ambiguity`, `module_mapping`) are submitted as separate `int[0..100]` parameters.
+* Each scenario step supports deterministic assertions (`assert_state`, `assert_links`, `assert_skill`, `assert_rejected`, `assert_outcome`, `assert_instance_version`) and simulated actor actions (`do`, `job_do`, `complete_job`, `answer_question` on a named delivery channel, `expire_question`, which fires a question deadline, and `operator_cli` for the operator verbs `waive`, `unwaive`, `abort`, `accept-edit`, `delete-plan`).
+* The mandatory CI regression suite replays scenarios covering: (1) happy-path single-module plan, (2) multi-task envelope jobs and a context yield, (3) a CI failure through `remediation.ci-failure`, once with an in-branch `fix` and once with a worktree-constrained `loop_back` to `execute`, (4) review-bot finding triage in `remediation.review-findings` (`FIX`, `SUPPRESS`, `ACCEPT`), (5) policy exhaustion ending `handed_back` (draft pull request, gap comment and label, post-run band, archive), and the same run passing through a pre-set `operator_cli waive`, (6) mid-job daemon restart recovery (a killed watch constituent through `finalize.restart-watch`), (7) a light-lane plan through `init.light-gate` and the collapsed light envelope to `outline.gate`, (8) light-to-deep escalation by the server budget trigger and by the judgment trigger, (9) question records answered by elicitation, relayed in the session, and expired to their class fallback (including `returned` from Phase 1), (10) a `step_out` from `git.commit_and_push` and from a remediation unit up to the fallback, and (11) an integrity pause resolved by `accept-edit` and one ended by `operator_cli abort`.
+
+[#behavioural-conformance-harness]
+=== Behavioural Conformance Harness (`PM-TEST-6`)
+
+The deterministic harnesses above verify the engine without a live model. The behavioural conformance harness (`pm-conformance`) verifies the model-facing content instead: whether a live model, served the rendered vocabulary skills and representations of one client profile, follows the rules they state. It is PM-MCP tooling, not prose: scenario execution, trajectory capture, observation, scoring, and verdict computation are performed by the harness against the runtime's own records, and no step relies on the model's account of what it did.
+
+==== Execution Boundary: Out-of-Band Pre-Release Gate
+
+* The harness lives in its own module `pm-conformance` outside the regular build (link:../module-structure.adoc#module-pm-conformance[Module Structure, `pm-conformance`]): it is built and run only through its own Maven profile and is never bound to `verify`. `verify`, `-Pintegration-tests`, `-Pcoverage`, and the required CI checks (`build / conclusion`, `integration-tests / conclusion`) never invoke a live model.
+* It is run explicitly against a release candidate (its four native binaries `pm-mcp`, `pm-operator`, `pm-mcpd`, and `pm-exec` in the release layout, the client bundles embedded in `pm-mcpd`) before a release whose model-facing content changed: vocabulary skill templates, guidance strings, representation wording, client profiles, or tool descriptions. The resulting report is published with the release candidate; a `violated` or `indeterminate` verdict is resolved by a recorded operator decision (see *Evidence, Not Authorization* below), never by the harness.
+* Each run starts an isolated runtime under a temporary `PM_MCP_BASE`, connects the host under test through a real `pm-mcp serve` relay with the client's installed bundle (`pm-operator client install <client>`), and uses a hermetic fixture repository per scenario.
+
+==== Scenario Records
+
+Behavioural scenarios are declarative records executed against a live model through a real client connection (`pm-mcp serve`) on a fixture repository. Each scenario declares:
+
+* `rule_ref`: the skill URI and section that states the rule, with the canonical (pre-render) SHA-256 of that section.
+* `situation`: the fixture state and the entry command.
+* `pressure`: the prompt or state condition that tempts a violation.
+* `observation`: a predicate over the recorded tool-call trajectory, the returned `rejected.reason` values, and the resulting artifact tree.
+* `binding_context`: where the rule binds, including its scoped exceptions. A scenario never places a rule in a context where its `binding_context` excludes it.
+* `enforcement_class`: the class of the rule under link:../mcp-tools/02-service-and-skill-tools.adoc#vocabulary-skill-rule-classification[Vocabulary Skill Rule Classification] (`engine`, `check`, or `guidance`). For an `engine` rule the scenario measures attempts that the engine rejected; the engine's acceptance of a violation is a `PM-TEST-3`/`PM-TEST-4` defect, not a behavioural verdict.
+* `tolerance_band` and `population`: the held-rate band the verdict is mapped against and the number of samples per run.
+* `negative_control`: `true` for a control scenario whose pressure is built to be violated; the harness expects `violated` from it.
+
+Only rules whose violation is mechanically observable in the recorded tool calls or the resulting artifact tree are scored.
+
+==== Trajectory Capture & Observation
+
+* The trajectory is read from the isolated runtime's `audit.jsonl` (every MCP tool call, transition, rejection, and `channel` value, link:../cli-and-security.adoc[CLI, Coordination & Security Specification]), from the plan and orchestrator stores, and from the fixture repository's final tree and commits. Host transcripts and model self-reports are never inputs of an observation.
+* *Order-Tolerant Trajectory Predicates*: An observation predicate asserts the reached state, the set of required calls, and the absence of forbidden calls; it asserts call order only when order is itself the rule under test.
+* *Reference Artifact Trees*: A benchmark scenario is a real workflow task on a fixture repository whose expected result is a concrete reference artifact tree (files, commits, recorded lessons), never a prose rubric; recipe-sourced plans skip Phase 2 and therefore run in batch without an operator stand-in.
+* *Representation Parsing*: The baseline of every client includes a representation-parsing scenario in which the model extracts `links` and `facts` from a `pm_state` result in the TOON wire form (`PM-TOOL-5`, `PM-IMPL-2`).
+
+==== Batch Roles
+
+A question-driven scenario runs with three separate roles: the executor (model under test), an operator stand-in that answers the question records of `refine.awaiting_answers` through the `session` delivery (`answer_questions`) (at most one batched round, matching the relaunch ceiling of link:../phase-workflows/01-planning-phases-1-2.adoc#_single_batch_clarification_relaunch_ceiling[Phase Workflows § Single-Batch Clarification & Relaunch Ceiling]), and the scorer. Operator overrides (`PM-WF-12`: waivers, `abort`, integrity resolutions) are applied by the harness through the operator channel, never by the stand-in.
+
+==== Scoring & Verdicts
+
+* *Axis Statement*: The harness design lists the five eval axes (task success, tool-use quality, trajectory compliance, hallucination, response quality) and states for each whether it is scored and, if not, why; each scored axis has a rubric that the observation predicate implements.
+* *Deterministic Scorer First*: The scorer is the harness's predicate evaluator, which needs no model call. A judging model is admitted only for a scored axis whose rubric no predicate can decide; it is then fixed across all models under test, and before each run the harness compares its model identifier and family against the model under test and refuses the run with `scorer_not_independent` when the judge is the scored model or its sibling at default configuration.
+* *Verdict Over a Margin*: Each scenario is run over a stated population of samples; the harness computes the held rate and its margin and maps it to `held`, `violated`, or `indeterminate` against the scenario's tolerance band. The per-sample observation is boolean; the three-valued verdict exists only at the aggregated level. A sample that cannot be scored (host error, timeout, unreadable trajectory) is counted as unscorable, and a run whose scored samples fall below the population resolves to `indeterminate`, never to `held`. A single run is reported with `sample: true`, never as a verdict.
+* *Attribution Mode*: Every verdict records `attribution: isolated | realistic_context`; a rule that is also stated in resident content (the `pm/core` skill, entry commands, catalogue descriptions, link:../client-profiles/02-placeholders-and-detection.adoc#host-resident-surface-inventory[Host-Resident Surface Inventory]) can only be measured as `realistic_context`.
+
+==== Rule Population & Selection
+
+* *Derived Rule Population*: The baseline's rule population is derived from every resident and served source in the Host-Resident Surface Inventory (entry commands, catalogue descriptions, `pm/core`, tool descriptions, the server-composed job prompts); the harness reports the derived population size and never asserts completeness.
+* *Selection by Defect Cost*: Rules are selected for scenarios by recorded defect cost (audit rejections such as `invalid_link_args`, integrity breaches, and historical defect records), never by intuition; the selection records its source.
+* *Negative Controls*: Every baseline contains at least one negative-control scenario; a baseline whose negative control does not score `violated` is itself reported `indeterminate`, because the harness has shown it cannot detect a violation.
+
+==== Digest Binding & Baseline Lifecycle
+
+* *Digest Binding*: Every scenario records the canonical (pre-render) SHA-256 of the skill section that states its rule and every verdict records the rendered per-client `_meta.sha256` (`PM-SKILL-2`); a scenario whose recorded canonical digest differs from the current skill is refused as `stale_scenario` until re-authored.
+* *Baseline Lifecycle*: A baseline is re-recorded when a bound skill digest, the client profile digest, the model identifier, or the binary's major/minor version changes; verdicts whose bound digest no longer matches are marked `invalidated`, never silently kept.
+
+==== Report Fields
+
+Every run report carries `client_id`, model identifier, binary version, client profile digest, bound skill digests, population, per-verdict counts, margin, tolerance band, `attribution`, `sample: true` for single runs, and token consumption per client and model (`unmeasured` when the host reports none, never `0`). Results are grouped by `enforcement_class`. Every report states an absolute reference as well as the delta to the previous baseline, never the delta alone. A client profile without a report of its own is reported as behaviourally untested; structural results (rendering, digests, registration, resolution) never stand in for it.
+
+*Verdict and Baseline Store*: Verdict records and baselines are versioned test artifacts in the PM-MCP repository, one file per client and model (`src/test/behaviour/baselines/<client_id>/<model>.json` in the module that hosts the harness), never a runtime store: the runtime neither writes nor reads them. Each file carries `format_version`, the scenario population, per-verdict counts, margin, tolerance band, the bound skill and client profile digests, and its pin (binary version and model identifier). The harness writes a new baseline only into the working tree; it enters the repository through a reviewed pull request and is thereby bound to a release. The delta of a report is computed against the baseline committed for the same client and model; a missing baseline makes the report absolute-only and names the client and model as behaviourally untested. A conformance verdict is never written to `findings.jsonl`, which is plan-scoped and has no verdict or population fields.
+
+==== Cost Ceilings & Sizing
+
+Every scoring layer, including a judging model, declares its cost ceiling (runtime, tokens, and money per run) in the harness configuration at design time; the harness stops a run that reaches a ceiling and reports it `indeterminate` with the ceiling that was hit. The sizing of a full baseline (runtime, tokens, and money per client and model) is published before the harness is used as a routine pre-release gate.
+
+==== Evidence, Not Authorization
+
+A verdict is evidence for a separately authorized decision. It never directly authorizes an edit of model-facing content, and a `violated` verdict is scoped to the rule, pressure, model, and client it was measured on. Any per-client or per-model change of wording, emphasis, or scaffolding beyond the vocabulary dimensions of `PM-CLIENT-2` requires a behavioural signal for that client and a recorded decision.
+
+=== State-Name Migration Registry & `released-states.txt` Gate (`PM-MIG-4`)
+_Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-19[PM-WATCH-GEN-19]_
+
+To guarantee that active plans survive upgrades of the runtime binary `pm-mcpd` across state renames or workflow splits:
+
+* Every state identifier shipped in a public release is appended to the committed `classpath:/workflows/released-states.txt` baseline. No `PM-MCP` release exists yet, so the baseline is empty until the first release and the default units declare no `migrate`; under the clean cut from `plan-marshall` no legacy or pre-release draft identifier is migrated.
+* When a state is renamed or split in a `.pmwf` file, the workflow header declares `migrate <old_state_id> -> <new_state_id>`.
+* When `WorkflowEngine` loads `mcp/status.json` whose `state` matches `<old_state_id>`, it transparently rewrites `state` to `<new_state_id>` and appends a `state_migrated` event to `audit.jsonl`.
+* A build-time JUnit gate (`ReleasedStatesMigrationTest`) verifies that every entry in `released-states.txt` either exists in the current `WorkflowDefinition.states()` map or is covered by a transitive `migrate` chain terminating in a live state.

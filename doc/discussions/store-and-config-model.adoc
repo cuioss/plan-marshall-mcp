@@ -1,0 +1,1640 @@
+= Store and Configuration Model
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../Requirements.adoc[Requirements] » xref:README.adoc[Discussions] » Store and Configuration Model
+
+NOTE: *Status: decided 2026-09-28*: see decision list (<<decisions>>); decisions applied to the specifications. Where a *Decision* line differs from the recommendation or the proposal body, the Decision line holds. All import parts (the one-way import, `adopt-project`, `import-legacy`, import receipts, the import mapping, and Z3-17) are withdrawn by the operator decision of 2026-09-27 that `PM-MCP` imports nothing from `plan-marshall` (clean cut) and are kept only as a record of the discussion.
+
+A clean-slate proposal for the persisted files of `PM-MCP`: which configuration exists at all, where it lives, who writes it, how every file is versioned and validated, and how `plan-marshall` data enters through the one-way import (withdrawn). It collects the open items D63 (configuration versioning), D64 (enrolment schema), D79 (stores without schema), D80 (lesson record) and D84 (entry record), together with the configuration shapes the specifications defer to "the later clean-slate configuration redesign". Nothing here is part of the target design until the decisions in <<decisions>> are taken and carried into the specifications.
+
+== Overview and principles
+
+Operator direction: `PM-MCP` stores and configuration are designed from a clean slate. `plan-marshall` shapes matter only as input of `pm-mcp operator adopt-project` and `pm-mcp operator import-legacy` (withdrawn: `PM-MCP` imports nothing, clean cut 2026-09-27). Logic, validation and derivation belong in the server. Before 1.0 there are no deprecation cycles and no compatibility shims (project `CLAUDE.md`).
+
+[cols="1,4"]
+|===
+|Principle |Meaning for stores and configuration
+
+|C1 Server-side first
+|A value the server can observe, derive or bound is never configured. Files hold decisions only a human can make.
+
+|C2 Fewer knobs
+|Every key must name a legitimate reason why one project chooses differently from another (<<removal>>). An option whose only sensible value is fixed becomes a constant. An option that only weakens a guarantee is removed.
+
+|C3 Sparse configuration
+|Configuration files hold only deviations from the compiled and derived defaults. The server computes the effective configuration and reports the source of every value.
+
+|C4 One owner per file
+|Every file has exactly one owner class: *team* (git-tracked, shared through the repository), *operator* (machine-local, written through the operator channel), or *server* (machine-local state). No file mixes owner classes, and no key exists in two owner classes.
+
+|C5 Nothing the model can write decides execution
+|Kept from `PM-EXT-6`: binaries, argument vectors, scripts and the origins tokens are sent to come only from operator-owned files.
+
+|C6 One file, one schema, one version
+|Every persisted JSON file and JSONL record carries `format_version`; a reader accepts exactly the versions the binary declares and refuses any other with a named reason.
+
+|C7 Identities, not paths
+|Machine-level records are keyed by `project_id` (link:../specification/identifiers.adoc[Identifier Registry]), never by a project root path.
+
+|C8 No bookkeeping in team files
+|Binary versions, fingerprints, migration ledgers and "offered" lists never land in git-tracked files, where they produce commit churn and merge conflicts between developers on different binaries.
+|===
+
+== Current state
+
+The current specifications (link:../specification/store-schemas.adoc[Store Schemas], link:../specification/filesystem-layout.adoc[Filesystem Layout], link:../specification/domain-extensions.adoc[Domain Extensions] § Three-Way Configuration Split and § Systematized `marshal.json` Upgrades) define a three-way split: git-tracked `.marshall/marshal.json` (top-level shape of `plan-marshall`'s `marshal.json`), operator-owned `enrolments.json` and `machine-config.json`, and server state under `<PM_MCP_BASE>`. Problems found:
+
+. *One file, four concerns*: `marshal.json` mixes team policy (base branch, providers), operator posture (`interaction_mode`, `*_without_asking`), derived data (`build.map` seed, domain activation) and server bookkeeping (`provisioned_version`, `config_seed_fingerprint`, `schema_version`, `applied_migrations`, `offered_steps`). `provisioned_version` changes whenever a developer with a different binary reconciles, so the tracked file churns between machines.
+. *Open schema*: `plan`, `skill_domains`, `providers`, `build` and `orchestrator` are declared only by description, while § Five-Phase Reconciliation promises "undeclared keys are refused". The schema cannot enforce what it does not declare.
+. *Materialised defaults*: because defaults are copied into the file, the design needs write-once seeding, `syncDefaults`, `offered_steps`, a seed fingerprint, `stepsSort` and `normalizeKeys`. All of this exists only to keep a copy of compiled defaults consistent.
+. *Three versioning schemes*: server stores use `format_version` with forward migration on startup (`PM-IMPL-2`); `marshal.json` uses `system.schema_version` with the `ConfigMigrationCommand` chain whose first command `M001` exists only to read legacy files (`PM-EXT-7`); credential files are unversioned. The migration chain carries `plan-marshall` history (`M002_rename_retired_step_keys`, `M004_split_enabled_bots…`) into a system that never had those shapes.
+. *Legacy knobs carried over unexamined*: most `plan.*` keys are copied from `plan-marshall`, including options whose only purpose was plan-marshall behaviour (`use_worktree`, `branch_strategy: direct`, `commit_and_push: false`, `q_gate_validation: off`, `admin_merge_on_stuck_state`) or that duplicate server logic (wait timeouts, iteration caps, prune thresholds).
+. *Deferred shapes*: `always_on`/`file_globs` overrides, `project_skills`, `active_profiles`, `outline_skill`, `workflow_skill_extensions`, the lane selection mode, forced escalation, the recipe threshold, per-deliverable verification verbs and the cost table are all deferred to this redesign.
+. *Enrolment gaps (D64)*: `enrolments.json` lacks fields other specifications rely on: canonical and discovery argument templates, CLI provider `verify_command` overrides, `project_script` worker binding and argument schema (`PM-EXT-5` requires the schema). `allowed_goals` duplicates the templates. One file for all projects means one tampered or unparsable entry blocks every project.
+. *Stores without schema (D79)*: the epic ledger `status.json`, queue rows, `landings.jsonl`, `metrics.json`, `build-timings.json`, `install-records.json`, `effort-ladder.json`, `state/runtime.json` and `state/operator-auth.json` have prose only. The job journal and `discovery-cache.json` have no location. `.marshall/recipes/` is used by Domain Extensions but missing from the layout and the `.gitignore` partition.
+. *Path keys*: `build-timings.json` and `machine-config.json` → `derivation_resolvers` are keyed by project root; a moved checkout loses its learned budgets and resolver settings.
+. *Name clash*: the git-tracked epic header `.marshall/orchestrator/<epic_id>/status.json` and the epic FSM store `epics/<epic_id>/status.json` share a name but not a schema.
+. *Retention in the wrong owner*: `system.retention` is git-tracked, but it governs machine-local stores (archived plans, job logs, lessons) that no other clone sees.
+. *Lesson format (D80)*: the `key=value` header with single-line JSON values is a private grammar; there is no body revision history and no source list, and applying a lesson moves its file into a plan directory, which in turn needs the carry-back veto on plan deletion.
+. *Entry record (D84)*: `entry` duplicates `scope_type`; `client_version`, `client_session_id`, `from_epic` and `environment_match_tier` are optional, so "not recorded" and "host provides none" are indistinguishable; `workspace_root` duplicates the enrolled project root.
+
+== Target model
+
+[#config-model]
+=== Configuration model
+
+==== Files and ownership
+
+[cols="2,1,2,3"]
+|===
+|File |Owner |Writer |Content
+
+|`.marshall/config/project.json`
+|team
+|project-setup workflow (validated links), committed edits
+|Repository and collaboration policy: base branch, branch prefix, merge method, CI provider override, integrations (Sonar coordinates), review bots and review currency.
+
+|`.marshall/config/workflow.json`
+|team
+|project-setup workflow, committed edits
+|Plan workflow policy: minimum planning lane, refine policy, verification verbs, optional finalize steps and their parameters, effort levels (target-neutral).
+
+|`.marshall/config/domains.json`
+|team
+|project-setup workflow, committed edits
+|Overrides of derived domain detection: forced enable/disable, `always_on`, `file_globs`, disabled profiles.
+
+|`.marshall/config/build-map.json`
+|team
+|`setup.seed-build-map` (write-once), `customize_routes`, `setup.reseed-build-map`, committed edits
+|The file-to-build route table (today `build.map`). Separate because it is seeded, reseeded and drift-checked on its own cycle and is by far the largest block.
+
+|`<PM_MCP_BASE>/projects/<project_id>/local-config.json`
+|operator
+|`pm-mcp operator config --project`, operator-channel links (elicitation) of the setup workflow
+|Operator posture and machine-local bindings of one project: continuation default, merge consent, recipe auto-route, interaction mode, language, commit trailer, effort ladder, envelope budget override, resolver enablement, retention. Replaces `effort-ladder.json` and `run-configuration.json`.
+
+|`<PM_MCP_BASE>/machine-config.json`
+|operator
+|`pm-mcp operator config`
+|Machine resources and bounds (build slots, LSP pool, drain, escalation cap, progress wait, audit rotation) and `project_defaults`, the machine-wide defaults for `local-config.json` keys.
+
+|`<PM_MCP_BASE>/enrolments/<project_id>.json` (+ `.hmac`)
+|operator
+|`pm-mcp operator enrol`
+|Execution bindings of one project (<<enrolment>>).
+|===
+
+Resolution of an effective value: team keys resolve *team file → derived value → compiled default*; operator keys resolve *`local-config.json` → `machine-config.json` `project_defaults` → compiled default*. No key is resolvable from both chains. The server publishes the effective configuration as `pm://project/config` with the source of every value (`team`, `derived`, `operator`, `machine_default`, `compiled`) and every validation finding, so neither the model nor the operator reads raw files.
+
+A project-local finalize step or recipe is split along C5: the team file names the step (id, order, lane), the enrolment binds the script (path, digest, interpreter, worker binding, argument schema), and the step is offered only when both agree.
+
+[#key-catalogue]
+==== Key catalogue (kept keys)
+
+Only keys that survive <<removal>> are listed. Types follow JSON Schema; every file additionally carries `format_version: 1`.
+
+[cols="3,2,3,1,3,3"]
+|===
+|Key |File |Type / default |Owner |Validated by |Source in `plan-marshall` import
+
+|`base_branch`
+|`project.json`
+|string; derived from `origin/HEAD` at setup, fallback `main`
+|team
+|server: branch exists on the remote (setup job); refusal `base_branch_unknown`
+|`project.default_base_branch`
+
+|`branch_prefix`
+|`project.json`
+|string `^[a-z0-9][a-z0-9/_-]*/$`; `feature/`
+|team
+|schema; server composes `<prefix><plan_id>`
+|`project.working_prefixes[0]`; further entries reported `dropped_by_design`
+
+|`merge_method`
+|`project.json`
+|enum `squash\|merge\|rebase`; derived from the provider's allowed methods (one allowed → that one; several → `squash`)
+|team
+|server: must be allowed by the repository settings (provider probe), else `merge_method_not_allowed`
+|`plan.phase-6-finalize.steps["default:branch-cleanup"].pr_merge_strategy`
+
+|`ci_provider`
+|`project.json`
+|enum `github\|gitlab`, or absent; derived from the remote host
+|team
+|server: enrolled host tool (`gh`/`glab`) present; operator credential entry for the origin
+|`providers[category=ci].skill_name` (only when derivation would differ)
+
+|`integrations.sonar`
+|`project.json`
+|object `{organization, project_key, credential_key}`; absent = no Sonar
+|team
+|schema; `credential_key` grammar; origin from the operator credential entry (`PM-CRED-5`)
+|`credentials_config["workflow-integration-sonar"]` + provider entry
+
+|`review.required_bots`, `review.optional_bots`
+|`project.json`
+|arrays of `bot_kind`; `[]`
+|team
+|server: every token resolves in the review-bot registry (`unregistered_kind`); lists disjoint
+|`…automatic-review.required_bots` / `optional_bots` (comma strings split)
+
+|`review.bot_registry`
+|`project.json`
+|array of registry records; `[]`
+|team
+|Review-Bot Registry schema; no collision with compiled `bot_kind`
+|none (new)
+
+|`review.currency`
+|`project.json`
+|enum `exact_sha\|after_last_push`; `after_last_push`
+|team
+|schema
+|none (`PM-MCP` key)
+
+|`planning.minimum_lane`
+|`workflow.json`
+|enum `light\|deep`; `light` (router decides, escalation ratchet always on)
+|team
+|schema
+|`plan.phase-1-init.deep_lane`: `always` → `deep`; `auto` → absent; `never` → dropped (weakens, reported)
+
+|`refine.compatibility`
+|`workflow.json`
+|enum `breaking\|deprecation\|smart_and_ask`; `breaking`
+|team
+|schema
+|`plan.phase-2-refine.compatibility`
+
+|`refine.simplicity`
+|`workflow.json`
+|enum `lean\|pragmatic\|defensive`; `lean`
+|team
+|schema
+|`plan.phase-2-refine.simplicity`
+
+|`execute.per_deliverable_verbs`
+|`workflow.json`
+|array of canonical build verbs; `["compile","module-tests"]`
+|team
+|server: subset of the Canonical Build Verb Set, each renderable by the project's effective template; non-empty
+|`plan.phase-5-execute.per_deliverable_build` (`default:verify:` prefix stripped)
+
+|`execute.final_verification`
+|`workflow.json`
+|array of verification step ids; derived from the build systems' verbs
+|team
+|server: each id a shipped verification step or an enrolled project step
+|`plan.phase-5-execute.verification_steps` keys
+
+|`finalize.step_catalogue`
+|`workflow.json`
+|integer; the binary's catalogue level at project creation
+|team
+|server: ≤ the binary's level; steps introduced above it are offered, not run
+|none (replaces `system.offered_steps`)
+
+|`finalize.steps.<step_id>`
+|`workflow.json`
+|object `{lane: off\|minimal\|standard\|full, params: {…}}`; only for optional steps
+|team
+|server: step is optional; `params` against the step descriptor's parameter schema
+|`plan.phase-6-finalize.steps` (only optional steps, only values differing from the `PM-MCP` default)
+
+|`finalize.project_steps.<step_id>`
+|`workflow.json`
+|object `{order, lane, project_script_id}`
+|team
+|server: `project_script_id` enrolled with binding `finalize_step`; `order` free in the descriptor table
+|`project:finalize-step-*` entries of `plan.phase-6-finalize.steps` (order from legacy position; binding left to the operator's enrolment, reported)
+
+|`effort.default`, `effort.plan.<phase>.<role>`, `effort.orchestrator.<surface>`, `effort.orchestrator.max`
+|`workflow.json`
+|effort level `level-1`..`level-7` or `inherit`; compiled role table
+|team
+|server: known group and role (`PM_MCP-100` on unknown)
+|`plan.effort`, `plan.<phase>.effort`, `orchestrator.effort`
+
+|`domains.<domain_id>.enabled`
+|`domains.json`
+|boolean; absent = derived by `setup.detect-domains`
+|team
+|server: known compiled or project-local domain
+|`skill_domains` keys (only where detection disagrees)
+
+|`domains.<domain_id>.always_on`
+|`domains.json`
+|boolean; descriptor default
+|team
+|schema
+|`skill_domains.<domain>.always_on` (only when it differs from the descriptor)
+
+|`domains.<domain_id>.file_globs`
+|`domains.json`
+|array of detection globs, replaces the descriptor's list; descriptor default
+|team
+|server: parses in the detection dialect; matches at least one tracked file (warning otherwise)
+|`skill_domains.<domain>.file_globs`
+
+|`domains.<domain_id>.disabled_profiles`
+|`domains.json`
+|array of activatable profiles; `[]`
+|team
+|schema
+|none (`active_profiles` is derived, see <<removal>>)
+
+|`routes.<domain_id>[]`
+|`build-map.json`
+|array of `{glob, role, build_class}`; seeded
+|team
+|server: fail-closed read (`build_map_invalid`, `build_map_unseeded`)
+|`build.map`
+
+|`continuation.default_policy`
+|`local-config.json`
+|enum `stop_at_phase_boundary\|stop_on_issue_only`; `stop_at_phase_boundary`
+|operator
+|schema; copied into each new plan's `continuation_policy`
+|derived from the five `*_without_asking` flags (all `true` → `stop_on_issue_only`)
+
+|`merge.auto_merge`
+|`local-config.json`
+|boolean; `false`
+|operator
+|schema; `true` never bypasses a barrier predicate
+|`…branch-cleanup.final_merge_without_asking`
+
+|`recipes.auto_route`
+|`local-config.json`
+|boolean; `true`
+|operator
+|schema
+|`plan.phase-1-init.auto_route_recipe`
+
+|`interaction_mode`
+|`local-config.json`
+|enum `basic\|advanced\|expert`; `advanced`
+|operator
+|schema
+|`interaction_mode`
+
+|`user_language`
+|`local-config.json`
+|string (`auto` or a language tag); `auto`
+|operator
+|schema
+|`project.user_language`
+
+|`commit_trailer`
+|`local-config.json`
+|object `{name, email}`; `plan-marshall`, `noreply@cuioss.de`
+|operator
+|server: no angle bracket or line break
+|none (legacy `manage-run-config` store is not read)
+
+|`effort_ladder.<client_id>.<level>`
+|`local-config.json`
+|object `{model, effort}`; compiled per client profile
+|operator
+|server: level known; capability gating per model alias
+|none (`plan-marshall`'s ladder file is not read, as today)
+
+|`envelope_budget_tokens`
+|`local-config.json`
+|integer ≥ 10000; derived from the client profile's context budget (compiled fallback `400000`)
+|operator
+|schema
+|`plan.phase-5-execute.per_envelope_budget_tokens` (`"400K"` parsed; only when it differs)
+
+|`derivation_resolvers.<resolver_id>.enabled`
+|`local-config.json`
+|boolean; `true`
+|operator
+|schema
+|none
+
+|`retention.{job_logs_days, archived_plans_days, superseded_lessons_days, arch_constraint_quiet_days}`
+|`local-config.json`
+|integers; `5`, `5`, `0`, `90`
+|operator
+|schema; minimum `0`
+|`system.retention.{build_results_days, archived_plans_days, lessons_superseded_days}`
+|===
+
+The machine knobs of `machine-config.json` keep their current names and bounds (link:../specification/timeouts/03-retention-host-config.adoc#configuration-keys[Timeouts § Configuration Keys]) except those removed in <<removal>>.
+
+[#enrolment]
+==== Enrolment (D64)
+
+One file per project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, with its own HMAC sidecar `<project_id>.json.hmac` and lock `locks/enrolment-<project_id>.lock`. A tampered or unreadable enrolment blocks only its project. The project index is the directory listing; `project_root` uniqueness across files is checked at every enrolment write and at runtime start (`enrolment_root_conflict`).
+
+[cols="2,3,3"]
+|===
+|Field |Content |Needed by
+
+|`project_id`, `project_root`, `enrolled_at`
+|Identity; canonical root; instant
+|every resolver
+
+|`host_tools[]`
+|`{name, executable_path, sha256, version}`, closed name set
+|Job Runtime (verify-not-resolve), providers
+
+|`wrappers[]`
+|`{name, relative_path, sha256, pinned_files[{relative_path, sha256\|null}], interpreter}`; `allowed_goals` removed (the templates decide what runs)
+|Job Runtime, Domain Extensions Tier 2
+
+|`build.canonical_templates.<build_system>.<verb>`
+|Argument vector with typed placeholders `{module}`, `{profile}`; absent = compiled default
+|Domain Extensions Tier 2; budget-key rendering and legacy timeout import
+
+|`build.discovery_templates.<build_system>.<name>`
+|Argument vector of a lazy discovery job; absent = compiled default
+|Domain Extensions § Module Discovery
+
+|`providers.<provider_id>.verify_argv`
+|Argument vector overriding the compiled provider verification (for example a `gh` host flag); absent = compiled
+|Domain Extensions Tier 2 (`verify_command` overrides)
+
+|`project_scripts.<project_script_id>`
+|`{script_path, sha256, interpreter_ref, max_timeout_seconds, binding: {worker_kind, target}, argument_schema}`; `worker_kind` ∈ `finalize_step\|recipe_harvester\|log_parser\|module_discovery\|edge_resolver`; `target` names the step id, recipe key or build system it serves; `argument_schema` is an inline JSON Schema (draft 2020-12 subset) validated at enrolment
+|Domain Extensions § `project_script`, `PM-EXT-5`, Timeouts § Job Budgets
+
+|`language_servers.<language_id>`
+|`{executable_path, sha256, args}`
+|Job Runtime LSP pool
+
+|`command_budgets.<budget_key>`
+|Seconds; clamped up to the engine floor
+|Timeouts § Job Budgets
+
+|`write_paths[]`
+|Toolchain cache directories for the Landlock write set; never under `<PM_MCP_BASE>`
+|Job Runtime § Linux Filesystem Confinement
+
+|`build_environment`
+|Captured environment values; credential-pattern names refused
+|Job Runtime § Job Environment
+|===
+
+[#store-inventory]
+=== Store inventory
+
+Owner classes: *T* team (git-tracked), *O* operator, *S* server state, *C* cache (deletable, re-derived), *L* log or audit. `PMB` abbreviates `<PM_MCP_BASE>`, `PS` the per-project store `PMB/projects/<project_id>`. Every JSON file and JSONL record carries `format_version` unless the row says otherwise (<<versioning>>). Rows marked _new_, _moved_, _renamed_ or _schema needed_ are changes this proposal makes.
+
+[cols="3,1,1,2,2,2,2,2,2"]
+|===
+|File |Owner |Format |Writer |Readers |Lock |Integrity |Retention |Import source
+
+|`.marshall/config/{project,workflow,domains,build-map}.json` _new_ (replace `marshal.json`)
+|T
+|JSON
+|setup workflow; committed edits
+|server (effective config)
+|workspace lock for server writes; git merges edits
+|git history; validated on every read
+|git
+|`.plan/marshal.json` (<<import-mapping>>)
+
+|`.marshall/project-architecture/_project.json`, `<module>/derived.json`, `<module>/enriched.json`
+|T
+|JSON
+|setup workflow (`discover-modules`, `enrich-architecture`)
+|server, `pm://architecture/**`
+|workspace lock
+|git; validated on read
+|git
+|`.plan/project-architecture/` (copied, re-validated)
+
+|`.marshall/recipes/<recipe_key>.{json,md}` _add to layout and `.gitignore` partition_
+|T
+|JSON + Markdown
+|committed edits
+|recipe registry
+|none
+|descriptor validation (fail-closed)
+|git
+|none
+
+|`.marshall/orchestrator/<epic_id>/epic.json` _renamed from `status.json`, schema needed_
+|T
+|JSON
+|server, epic lock, shared epic worktree
+|epic workflow, `pm_epics`
+|epic lock
+|git
+|git; archived with the epic
+|none (mapping only)
+
+|`…/queue/<plan_id>.json` _schema needed_
+|T
+|JSON
+|server (create `CREATE_NEW`, row-local update)
+|epic workflow, child plan resolver
+|epic lock
+|git
+|git
+|none (mapping only)
+
+|`…/inbox.jsonl`
+|T
+|JSONL events
+|server (append)
+|epic scope; sending plan (own messages)
+|epic lock
+|git
+|git
+|none (mapping only)
+
+|`…/landings.jsonl` _schema needed (by reference to the landing envelope)_
+|T
+|JSONL
+|server (append on reconcile)
+|epic scope
+|epic lock
+|git
+|git
+|none (mapping only)
+
+|`…/spec.md`, `…/resume_anchor.md`
+|T
+|Markdown (unversioned; `resume_anchor.md` derived)
+|server (`submit` links; rendering)
+|epic scope, child plan
+|epic lock
+|git; claim-section parse states
+|git
+|none (mapping only)
+
+|`.marshall/archived-orchestrators/<epic_id>-<YY-MM-DD>/`
+|T
+|as above
+|server (move)
+|history readers
+|epic lock
+|git
+|git (no purge)
+|none
+
+|`PMB/machine-config.json`
+|O
+|JSON
+|operator CLI
+|runtime, CLI
+|`locks/machine-config.lock`
+|validated on read (`invalid`/`unreadable` reported, never folded into defaults)
+|—
+|none
+
+|`PMB/enrolments/<project_id>.json` + `.hmac` _moved (one file per project)_
+|O
+|JSON
+|operator CLI
+|runtime, CLI
+|`locks/enrolment-<project_id>.lock`
+|HMAC sidecar per file
+|until `pm-mcp operator drop`
+|none
+
+|`PMB/credentials/<credential_key>.json`, `…/<project_id>/<credential_key>.json`
+|O
+|JSON (`format_version` added, Z3-18)
+|operator CLI
+|credential resolver
+|none (single writer, atomic)
+|`0600`/`0700` checks
+|—
+|`import-legacy` from `~/.plan-marshall/credentials/`, keyring
+
+|`PMB/conf/upstream-mcp.json`, `PMB/conf/profiles/<client_id>.json`
+|O
+|JSON
+|operator
+|runtime
+|none
+|validated on read
+|—
+|none
+
+|`PMB/state/install-records.json` _schema needed_
+|S
+|JSON
+|`pm-mcp client`
+|`pm-mcp client`, `pm-mcp enter` (drift notice)
+|`locks/install-records.lock`
+|—
+|—
+|none
+
+|`PMB/state/{build-slots,merge-queue,review-bot-windows}.json`
+|S
+|JSON
+|runtime
+|runtime, `pm-mcp status`
+|own machine locks
+|lease rules
+|entries released on evidence
+|none
+
+|`PMB/state/operator-auth.json` _schema needed_
+|S
+|JSON
+|operator CLI
+|operator CLI
+|`locks/operator-auth.lock`
+|—
+|—
+|none
+
+|`PMB/state/enrolment-hmac.key`
+|S
+|raw key (unversioned)
+|operator CLI
+|runtime, CLI
+|none (created once by the operator CLI)
+|`0600`
+|—
+|none
+
+|`PMB/state/runtime.json` _schema needed_
+|S
+|JSON
+|runtime at socket bind
+|relays, `pm-mcp drain`/`status`
+|runtime singleton lock
+|—
+|overwritten per start
+|none
+
+|`PMB/logs/audit.jsonl`, `audit-<id>.jsonl`, `audit-index.jsonl`, `audit.head`
+|L
+|JSONL / JSON
+|runtime, CLI
+|verifier, operator
+|audit lock (leaf)
+|hash chain, HMAC head
+|rotation by `audit_rotation`; index never purged
+|none
+
+|`PMB/logs/imports/<import_id>.json`
+|L
+|JSON
+|import verbs
+|operator
+|none (create-only)
+|immutable
+|never
+|—
+
+|`PMB/logs/daemon.log`, `PMB/logs/jobs/<job_id>.log`
+|L
+|text (unversioned)
+|runtime
+|operator, `pm://…/builds/{job_id}/log`
+|none
+|—
+|`job_logs_days`
+|none
+
+|`PS/local-config.json` _new (replaces `effort-ladder.json`, `run-configuration.json`)_
+|O
+|JSON
+|operator CLI; operator-channel links
+|runtime, `pm-mcp client install` (ladder)
+|`PS/locks/local-config.lock`
+|validated on read
+|—
+|`adopt-project` (posture keys, <<import-mapping>>)
+
+|`PS/build-timings.json` _moved from `PMB/state/`, keyed by budget key, schema needed_
+|S
+|JSON
+|runtime
+|job budget allocation, `pm-mcp status`
+|`PS/locks/build-timings.lock`
+|—
+|kept; stale keys pruned by discovery drift
+|`import-legacy` from `.plan/local/run-configuration.json`
+
+|`PS/cost-calibration.json` _new_
+|S
+|JSON
+|`record-metrics`
+|Phase 4 cost sizing
+|workspace lock
+|workspace digests
+|replaced on recalibration
+|none
+
+|`PS/discovery-cache.json` _located_
+|C
+|JSON
+|module discovery
+|module discovery
+|workspace lock
+|keyed by descriptor tree hash
+|deletable
+|none
+
+|`PS/jobs/<job_id>.json` _located (write-ahead job journal)_
+|S
+|JSON
+|runtime, before spawn and at fate
+|recovery, job resources
+|owning scope lock
+|—
+|`job_logs_days`
+|none
+
+|`PS/plans/<plan_id>/`: `request.md`, `outline.md`, `execution-manifest.json`, `tasks/TASK-NNN.json`, `references.json`, `findings.jsonl`, `assessments.jsonl`, `review-participation.jsonl`, `change-ledger.jsonl`, `metrics.json` (_schema needed_), `quality-report.json`, `mcp/{status,entry,digests,transaction-journal}.json`, `mcp/mailbox.jsonl`
+|S
+|JSON, JSONL, Markdown (unversioned)
+|runtime (journaled transactions)
+|runtime, `pm://plan/**`
+|plan lock
+|`mcp/digests.json`
+|until archived
+|none (open legacy plans are never imported)
+
+|`PS/archive/<plan_id>/`
+|S
+|as plan
+|`archive-plan`; `discharge-owed` only
+|readers by id
+|plan lock
+|`mcp/digests.json`
+|`archived_plans_days`
+|none
+
+|`PS/lessons/<lesson_id>.json` _changed format (<<lesson-record>>)_, `.digests.json`, `.transaction-journal.json`
+|S
+|JSON
+|runtime (lesson transitions), operator CLI (release, label)
+|lesson resolver, `pm://project/lessons/**`
+|`PS/locks/lessons.lock`
+|`.digests.json`
+|retired bodies purged after `superseded_lessons_days`; record kept
+|`adopt-project` from `.plan/local/lessons-learned/`
+
+|`PS/workspace/`: `change-ledger.jsonl`, `findings.jsonl`, `mcp/{status,entry,digests,transaction-journal}.json`
+|S
+|JSON, JSONL
+|runtime
+|runtime, `pm://workspace/**`
+|workspace lock
+|`workspace/mcp/digests.json`
+|life of adoption
+|none
+
+|`PS/epics/<epic_id>/{status,entry,digests,transaction-journal}.json`
+|S
+|JSON
+|runtime
+|runtime
+|epic lock
+|`digests.json`
+|read-only after archival
+|none
+
+|`PS/pending/<entry_id>.json`
+|S
+|JSON
+|`pm-mcp enter`
+|`pm_start`
+|workspace lock
+|—
+|startup sweep (compiled maximum age)
+|none
+
+|`PMB/locks/*.lock`, `PS/locks/*.lock`, `PMB/run/runtime.sock`
+|—
+|OS primitives
+|runtime, CLI
+|—
+|—
+|`0600`
+|—
+|—
+|===
+
+Schemas the proposal adds (to be written in link:../specification/store-schemas.adoc[Store Schemas]), in outline:
+
+[cols="2,5"]
+|===
+|Store |Fields
+
+|`epic.json`
+|`format_version`, `epic_id`, `title`, `created_at`, `workstreams[{workstream_id, title, order}]`, `parallelization_scope` (per-epic answer), `lifecycle` (`active\|landing\|terminal`), `terminal_reason`, `archived_at`. No FSM state: that lives only in `PS/epics/<epic_id>/status.json`.
+
+|Queue row
+|`format_version`, `plan_id`, `ordinal`, `workstream_id`, `status` (14-state vocabulary), `prerequisites[]`, `declared_surface{paths[], modules[]}`, `intake{…}`, `disposition{…}`, `staged_at`, `updated_at`, `spec_section`.
+
+|Landing record
+|`format_version` plus the landing envelope of link:../specification/phase-workflows/05-finalize-review-metrics-descriptor.adoc#_landing_envelope_emit_landing[Phase Workflows § Landing Envelope], referenced, not restated.
+
+|`metrics.json`
+|`format_version`, `rows[]` with a `kind` discriminator (`dispatch`, `wait`, `phase_close`, `served_read`) and the fields § Metrics Store lists per kind; aggregates are never persisted (derived in views).
+
+|`build-timings.json`
+|`format_version`, `keys{<budget_key>: {learned_seconds, observations, basis: learned\|imported, poisoned, cold, escalation_seconds\|null, last_observed_at}}`.
+
+|`cost-calibration.json`
+|`format_version`, `table{XS..XXL: tokens}`, `population_count`, `calibrated_at`; absent → compiled table, `basis: uncalibrated`.
+
+|`install-records.json`
+|`format_version`, `installs[{client_id, scope, target_root, bundle_version, installed_at, files[{path, sha256, rendered}], shared_configs[{path, owned_keys[], sha256}]}]`.
+
+|`runtime.json`
+|`format_version`, `pid`, `start_instant`, `version`, `socket_path`, `started_at`.
+
+|`operator-auth.json`
+|`format_version`, `failures`, `next_allowed_at\|null`, `last_failure_at\|null`.
+
+|Job record `jobs/<job_id>.json`
+|`format_version`, `job_id`, `kind`, `scope{type, id}`, `budget_key`, `budget_seconds`, `budget_derivation`, `argv_digest`, `status`, `spawned_at`, `ended_at`, `exit_code`, `fate`.
+|===
+
+[#versioning]
+=== Versioning and validation rules
+
+Proposal (D63): *no migration chain before 1.0.* Every persisted file carries `format_version`; a mismatch is refused with a named reason; legacy configuration enters only through `adopt-project`.
+
+. *Envelope*: every JSON root object and every JSONL record carries `format_version` (positive integer, one sequence per file kind). This now includes the four team configuration files, `local-config.json`, enrolments and credential files. Exempt: Markdown documents (their structure is checked by their parsers), plain-text logs, OS primitives, the raw HMAC key.
+. *Accept exactly one*: before 1.0 a binary accepts exactly the current `format_version` of each kind. A reader returns `absent`, `unreadable` (including a missing `format_version`), `format_outdated{file, found, current}` or `format_newer{file, found, current}`. No reader tolerates an older shape (`PM-WATCH-GEN-56`).
+. *Refuse, never rewrite*: an outdated or newer file is never modified. For a scope store the scope raises the `blocked` condition with the operator command; for team configuration every plan start and phase handshake refuses with `config_format_outdated` naming the file; for operator files the CLI names the file and the changed keys.
+. *Release discipline*: a `format_version` bump is listed in the release notes with the changed keys. Scope stores of in-flight plans follow the drain rule: `pm-mcp drain` reports live scopes, and the operator finishes them before upgrading or accepts that they stay readable only through the old binary. Sparse configuration keeps a manual update to a few lines.
+. *Validation on every read*: team files are validated against closed schemas (`additionalProperties: false` at every level) and the server-side rules of the key catalogue on every effective-configuration computation; findings are published in `pm://project/config`. An undeclared key is a finding (`unknown_config_key`), never silently kept.
+. *Snapshot of in-flight plans*: kept from `PM-EXT-7`: the execution manifest records `config_hash`, computed over the effective configuration (values plus sources plus the digest of the compiled defaults), not over file bytes; a difference raises `config_drift` (`adopt`/`keep`).
+. *Removed*: `system.schema_version`, `baseline_version`, `applied_migrations`, `provisioned_version`, `config_seed_fingerprint`, `offered_steps`, `ConfigMigrationCommand` (`M001`–`M004`), `syncDefaults`, `stepsSort`, `normalizeKeys`, `MINIMUM_SUPPORTED_SCHEMA_VERSION`, `unsupported_legacy_config_epoch`, the `ConfigMigrationChainTest`, and the startup forward migration of `PM-IMPL-2`.
+. *At 1.0*: one forward-migration mechanism for every file kind (ordered steps per kind, floor = oldest supported version, removal trigger recorded, `PM-WATCH-GEN-57`), decided then with the knowledge of the actual format churn.
+
+Evaluation of the proposal:
+
+[cols="1,3"]
+|===
+|Aspect |Assessment
+
+|For
+|No code whose only input is `plan-marshall` history. One rule for every file instead of three. No git-tracked bookkeeping. The reconcile pipeline shrinks to validation plus explicit reseed, which removes the source of `PM-WATCH-EXT-21`/`-22` hazards (restored steps, expanded curated maps). Import becomes a plain mapper with a removal trigger.
+
+|Against
+|A format bump strands in-flight plans of the previous binary. Mitigated by the drain rule and by keeping scope-store bumps rare before 1.0; the alternative (a migration step per bump) is exactly the shim the pre-1.0 policy forbids.
+
+|Against
+|Developers on different binaries share team files. A newer binary's `format_version` is refused by an older one (`format_newer`), which is the correct signal; sparse files make simultaneous format changes rare.
+
+|Risk
+|Operator-edited files (credentials) now need `format_version`; the operator CLI writes it, and a hand-written file without it is refused with a message naming the field.
+|===
+
+[#import-mapping]
+=== Import mapping `plan-marshall` → `PM-MCP`
+
+NOTE: *Withdrawn.* The operator decided on 2026-09-27 that `PM-MCP` imports nothing from legacy `plan-marshall` (clean slate): there are no import verbs, no import receipts, and no import mapping. This import mapping is withdrawn and kept only as a record of the discussion.
+
+The import is one mapper per verb, not a migration chain. It writes the current format directly, writes a key only when its value differs from the `PM-MCP` effective default (sparse), and lists every legacy key it did not write in the receipt with one reason: `dropped_by_design`, `derived_in_pm_mcp`, `fixed_constant`, `weakens_guarantee`, `unmappable_key`, or `equals_default`. The receipt's `store` enum gains `team_config`, `local_config`. Owner and removal trigger of each mapper are recorded (`PM-WATCH-GEN-57`): removed when the last project on the machine is adopted or released and one release has passed.
+
+[cols="2,2,3"]
+|===
+|Legacy key or store |Target |Reason / rule
+
+|`project.default_base_branch`, `working_prefixes`
+|`project.json` `base_branch`, `branch_prefix`
+|First prefix only; the others `dropped_by_design` (the server names branches)
+
+|`providers[]`
+|`ci_provider` (only if derivation differs), `integrations.sonar`
+|`verify_command` → `dropped_by_design` (enrolment `providers.<id>.verify_argv` if the operator wants it); `url`, `description`, `skill_name` → `derived_in_pm_mcp`
+
+|`credentials_config.*`
+|`integrations.<provider>`
+|non-secret coordinates only
+
+|`skill_domains.<d>`
+|`domains.json` (`enabled`, `always_on`, `file_globs` when differing)
+|`bundle`, `outline_skill`, `workflow_skill_extensions`, `active_profiles`, `system` → `derived_in_pm_mcp`; `project_skills` → `dropped_by_design` (names listed)
+
+|`build.map`
+|`build-map.json` `routes`
+|validated; invalid entries `unmappable_key`
+
+|`build.queue.max_retries`
+|—
+|`dropped_by_design`
+
+|`plan.effort`, `plan.<phase>.effort`, `orchestrator.effort`
+|`workflow.json` `effort.*`
+|unchanged levels
+
+|`plan.phase-1-init.deep_lane`
+|`planning.minimum_lane`
+|`never` → `weakens_guarantee`
+
+|`plan.phase-1-init.escalation`, `revalidation`, `q_gate_validation`, `use_worktree`, `branch_strategy`, `phase-5-execute.commit_and_push`
+|—
+|`weakens_guarantee` or `fixed_constant` (<<removal>>)
+
+|`*_without_asking` (five flags)
+|`local-config.json` `continuation.default_policy`
+|all `true` → `stop_on_issue_only`; otherwise `stop_at_phase_boundary`
+
+|`auto_route_recipe`, `interaction_mode`, `user_language`, `final_merge_without_asking`
+|`local-config.json`
+|posture keys
+
+|`auto_route_recipe_threshold`, `lane_prune_thresholds`, `confidence_threshold`, `max_iterations`, `checks_wait_timeout_seconds`, step timeouts
+|—
+|`fixed_constant`
+
+|`per_deliverable_build`, `verification_steps`
+|`execute.per_deliverable_verbs`, `execute.final_verification`
+|`default:verify:` prefix stripped
+
+|`cost_size_token_table`, `per_envelope_budget_tokens`
+|— / `local-config.json` `envelope_budget_tokens`
+|table `derived_in_pm_mcp` (calibration); budget only when differing
+
+|`plan.phase-6-finalize.steps`
+|`finalize.steps`, `finalize.project_steps`
+|mandatory steps `fixed_constant`; optional steps only when lane or params differ; `project:*` steps need an enrolled script (reported)
+
+|`…automatic-review.required_bots`, `optional_bots`
+|`review.*`
+|`bot_lists_provenance` → `dropped_by_design`
+
+|`system.retention.*`
+|`local-config.json` `retention.*`
+|`temp_on_maintenance`, `plugin_cache_*`, `no_plan_body_days` → `dropped_by_design`; `logs_days` → `equals_default` or folded into `job_logs_days`
+
+|`system.provisioned_version`, `config_seed_fingerprint`
+|—
+|`dropped_by_design`
+
+|`orchestrator.parallelization_scope`, `auto_emit`, `plan.open_in_ide`, `plan.coverage`, `project.pr_strategy`, `pr_compact_max_changed_files`, `merge_queue_managed_externally`, `finding_raw_input_max_bytes`
+|—
+|<<removal>>
+
+|`.plan/local/lessons-learned/*.md` (+ `.tombstones/`)
+|`PS/lessons/<lesson_id>.json`
+|header → fields; body → revision 1 with `sources: [{kind: legacy_import, ref: <source path>}]`; tombstone → `status: retired` with `retirement`; unreadable → imported verbatim as body with `status: unreadable_import`
+
+|`.plan/project-architecture/`
+|`.marshall/project-architecture/`
+|copied, validated
+
+|`.plan/local/run-configuration.json` `commands`
+|`PS/build-timings.json`
+|per link:../specification/timeouts.adoc#legacy-timeout-import[Timeouts § Legacy Timeout Import]; `architecture_refresh`, `build.queue`, `ci_durations`, `version` → `dropped_by_design`
+
+|`~/.plan-marshall/credentials/**`, legacy keyring
+|`PMB/credentials/**` (`PM-MCP` format)
+|`url` kept as origin; incomplete entries imported and reported
+|===
+
+[#lesson-record]
+=== Lesson record (D80)
+
+One JSON file per lesson, `PS/lessons/<lesson_id>.json`. The body stays Markdown, as a string field; the server serves it rendered as Markdown on `pm://project/lessons/{lesson_id}`. There is no private header grammar, one parser, one digest per lesson, and the file is never moved or deleted.
+
+[cols="2,2,4"]
+|===
+|Field |Type |Rule
+
+|`format_version`, `lesson_id`, `title`, `component`, `category`
+|as today
+|`bundle` removed (derived from `component` notation)
+
+|`status`
+|enum `active\|upstream_pending\|claimed\|superseded\|retired\|unreadable_import`
+|`claimed` replaces "moved into a plan directory"
+
+|`claim`
+|`{plan_id, claimed_at}\|null`
+|Set when a plan starts from the lesson; released on plan abort or deletion; on plan completion the lesson is retired or returned to `active` by the plan's outcome. Replaces the move and the carry-back veto.
+
+|`revisions[]`
+|array, `minItems: 1`, append-only
+|`{revision, body, sources[], revised_at, revised_by, reason}`; the current body is the last revision; a changed body is a new revision with its own source list (`PM-WATCH-STORE-17`)
+
+|`revisions[].sources[]`
+|array, `minItems: 1`
+|`{kind: plan\|finding\|job\|landing\|log\|operator_decision\|lesson\|legacy_import, ref, digest?}`; `ref` is an identifier or path the server resolved
+
+|`provenance`, `audience`, `audience_override`, `tool_version{value, basis: stamped\|absent\|undetermined\|override, audit_id?}`, `promotions[]`, `last_filing_failure`
+|as today
+|`tool_version` and its override folded into one object
+
+|`recurrence`
+|`{rule, count, last_seen}\|null`
+|`arch-constraint` only
+
+|`golden_label`, `labelled_at`
+|optional enum `correct\|incorrect\|partially_correct\|not_applicable`; date-time
+|Written only by the operator labelling action; absent means unlabelled (`PM-WATCH-STORE-19`)
+
+|`retirement`
+|`{retired_at, reason, by, coverage_verdict, covering_clause, covering_input}\|null`
+|Replaces the tombstone file; retention purges only `revisions[].body` of a retired lesson and keeps the record
+|===
+
+[#entry-record]
+=== Entry record (D84)
+
+[cols="2,2,4"]
+|===
+|Field |Required |Rule
+
+|`format_version`
+|yes
+|—
+
+|`scope_type`
+|yes
+|`plan\|epic\|workspace`; the CLI positional argument. `entry` is removed as a duplicate.
+
+|`scope_id`
+|yes (nullable)
+|`null` for `workspace` and in a pending record
+
+|`entry_id`
+|pending records only
+|The allocated id; removed by `pm_start` when the record is moved
+
+|`client_id`
+|yes
+|closed enum
+
+|`client_version`, `client_session_id`
+|yes (nullable)
+|`null` records "the host provides none", distinct from a record that never asked
+
+|`environment_match_tier`
+|yes
+|`pm-mcp enter` always evaluates it
+
+|`from_epic`
+|yes (nullable) for `plan`, forbidden otherwise
+|conditional schema (`if scope_type == plan`)
+
+|`entered_at`
+|yes
+|—
+|===
+
+`workspace_root` is removed: the record lives in the project's store, so the main checkout is the enrolled `project_root`; the session-start hook resolves the project from the working directory through the enrolment, as `pm-mcp enter` does.
+
+[#removal]
+== Removal & Simplification Analysis
+
+Every configuration key of `plan-marshall`'s `marshal.json` and of the current `PM-MCP` specifications. Verdicts: *remove*, *constant* (fix to a compiled value), *derive* (server-side), *keep* (with the reason a project legitimately chooses differently). "Weakens" marks options whose only effect is to disable a guarantee.
+
+[cols="3,3,1,4,2"]
+|===
+|Key |Current purpose |Verdict |Rationale |Affected specs
+
+5+|*Repository and collaboration*
+
+|`project.default_base_branch`
+|Base branch of plans
+|keep
+|Integration branch may differ from `origin/HEAD` (for example `develop`). Default derived.
+|FS, PW
+
+|`project.working_prefixes`
+|Allowed branch prefixes (model chose)
+|keep, simplified to `branch_prefix`
+|CI trigger patterns and branch protection differ per repository; the server names the branch, so one prefix suffices.
+|PW, WD
+
+|`project.pr_strategy`, `pr_compact_max_changed_files`
+|Ride an open PR with follow-up changes
+|remove
+|Legacy behaviour; in `PM-MCP` one plan is one pull request.
+|—
+
+|`project.merge_queue_managed_externally`, `…branch-cleanup.use_merge_queue`
+|Whether a queue exists and who owns it
+|derive
+|The provider reports whether a merge queue is enforced; bypassing an enforced queue is not an option. Creating one is a setup action, not a key.
+|DE (setup), PW
+
+|`…branch-cleanup.pr_merge_strategy`
+|Merge method
+|keep (derived default)
+|Repository conventions differ; derived when the provider allows exactly one method.
+|PW
+
+|`providers[]`
+|Provider declarations
+|derive (CI, VCS); keep `integrations.sonar`
+|VCS is always git; CI follows from the remote host and enrolled tools. Sonar coordinates are project facts the server cannot observe.
+|DE Tier 1, SS
+
+|`providers[].verify_command`
+|Shell verification command
+|remove (team); enrolment override
+|Executable strings never come from team files (C5).
+|DE Tier 2, SS enrolment
+
+|`credentials_config`
+|Non-secret provider parameters
+|keep, folded into `integrations`
+|Needed coordinates; one place per provider.
+|SS
+
+|`required_bots`, `optional_bots`
+|Review bots of the repository
+|keep
+|Which review apps are installed and which are mandatory is repository policy.
+|SS registry, PW
+
+|`bot_lists_provenance`
+|Records that the operator answered
+|remove
+|Bookkeeping; the presence of the lists is the answer.
+|—
+
+|`review_currency` (`PM-MCP`)
+|Strictness of review currency
+|keep
+|High-assurance repositories require review of the exact merged SHA; others accept the last push.
+|PW barrier
+
+|`review_rate_window_floor_seconds` (`PM-MCP`)
+|Floor of a rate-window wait without ETA
+|constant
+|A property of the bot provider, not of the project; belongs in the registry record or timeouts.
+|TO, SS
+
+|`interaction_mode`
+|How much the operator is told
+|keep (operator)
+|Personal preference; not team policy.
+|CP, PW
+
+|`project.user_language`
+|Answer language
+|keep (operator)
+|Personal preference.
+|CP
+
+5+|*Planning*
+
+|`phase-1-init.branch_strategy`
+|`direct` commits on the base branch
+|remove (weakens)
+|Plans always use a feature branch and pull request; `direct` bypasses review and CI.
+|PW, DE setup
+
+|`phase-1-init.use_worktree`
+|Run without a worktree
+|remove (weakens)
+|Operator direction: plans always execute in a worktree. Removes the `disabled` footprint cause and the non-worktree job path.
+|FS, SS references, JR
+
+|`init_`/`plan_`/`execute_`/`finalize_`/`loop_back_without_asking`
+|Auto-continue gates per transition
+|remove
+|Duplicates the per-plan `continuation_policy` (operator channel); replaced by `continuation.default_policy`.
+|PW, SC, DE setup
+
+|`phase-1-init.deep_lane`
+|Force deep or light
+|keep as `minimum_lane` (`light\|deep`)
+|Critical repositories may require deep discovery for every plan. Forcing light is removed: it can only skip a check the router would run.
+|PW Lane Ratchet
+
+|`phase-1-init.escalation`
+|Disable the light → deep ratchet
+|remove (weakens)
+|The ratchet fires on evidence of a false premise or ripple effect; disabling it only hides that evidence.
+|PW
+
+|`phase-1-init.lane_selection`
+|Prompt for the execution posture
+|remove
+|The server computes the posture and shows it in the preview with a change link; no prompt switch needed.
+|PW, SC
+
+|`phase-1-init.lane_prune_thresholds`
+|Numeric predicates of the standard posture
+|constant
+|Server-internal predicate calibration.
+|PW
+
+|`phase-1-init.auto_route_recipe`
+|Auto-route vs ask on a recipe match
+|keep (operator)
+|Some operators want to confirm every recipe; it changes only who confirms.
+|DE Tier-1 routing, PW
+
+|`phase-1-init.auto_route_recipe_threshold`
+|Match confidence for auto-route (`0.6`)
+|constant
+|Calibration of the server's scorer; changes with the scorer, not with the project.
+|DE, PW
+
+|`phase-2-refine.confidence_threshold`
+|Refine completion threshold (`95`)
+|constant (weakens if lowered)
+|Lowering only admits less-clarified requests.
+|PW
+
+|`phase-2-refine.compatibility`
+|Breaking vs deprecation policy
+|keep
+|Libraries with public API need deprecation; applications do not.
+|PW
+
+|`phase-2-refine.simplicity`
+|Implementation minimalism posture
+|keep
+|Safety-critical code legitimately prefers defensive structure.
+|PW
+
+|`phase-2-refine.revalidation`
+|Premise safety check on/off
+|remove (weakens)
+|`never` disables a safety check; `always` vs `auto` is a server decision.
+|PW
+
+|`phase-3-outline`/`phase-4-plan.q_gate_validation`
+|`off\|once\|until_clean`
+|constant (`until_clean`, bounded)
+|`off` weakens; `once` leaves known findings open. The compiled iteration cap (3) and the surgical bypass already bound cost.
+|PW Q-Gate, SC
+
+5+|*Execution*
+
+|`phase-5-execute.commit_and_push`
+|Local-only runs
+|remove (weakens)
+|Local-only outcome is derived from the absence of a remote/CI provider (`merge_outcome: local_only`), never chosen.
+|PW, WD `git.commit_and_push`, SS
+
+|`phase-5-execute.max_iterations`, `phase-6-finalize.max_iterations`
+|Loop caps
+|constant
+|Guarantees; the operator grants further iterations per plan (`granted_extensions`).
+|PW, WD, SS status
+
+|`per_deliverable_build`
+|Verbs after each deliverable
+|keep
+|Build cost differs widely (a slow module test suite versus compile-only feedback); validated against the verb set.
+|PW, 02-workflow
+
+|`verification_steps`
+|End-of-phase-5 sweep
+|keep (derived default)
+|Available verbs and project steps differ per build system.
+|PW
+
+|`cost_size_token_table`
+|Size → token table
+|derive
+|Calibrated by the server from `metrics.json`; a hand-set table can only be less accurate.
+|DE dispatch, SS metrics
+
+|`per_envelope_budget_tokens`
+|Envelope packing bound (`400K`)
+|derive (client profile), keep operator override
+|Depends on the model's context window, which is a property of the operator's host and ladder, not of the team.
+|DE dispatch, CP
+
+|`plan.finding_raw_input_max_bytes`
+|Byte cap of untrusted text
+|constant
+|Security bound; schemas already fix `maxLength`.
+|SS findings
+
+|`plan.open_in_ide`
+|Open the IDE on plan creation
+|remove
+|Not a server action; host bundles decide.
+|—
+
+|`plan.coverage.{thoroughness,scope}`
+|Coverage cell
+|remove
+|No consumer in `PM-MCP`.
+|—
+
+|`effort` roles
+|Target-neutral levels per role
+|keep
+|Cost versus quality trade-off is team policy (ADR-021).
+|DE dispatch
+
+5+|*Finalize*
+
+|`finalize.steps` lanes of mandatory steps (`push`, `create-pr`, `ci-verify`, `pre-push-quality-gate`, `branch-cleanup`, `record-metrics`, `emit-landing`, `archive-plan`, `sync-baseline`)
+|Enable/disable per step
+|constant (weakens)
+|These steps are the plan's guarantees; `off` would skip them.
+|PW roster, DE
+
+|`finalize.steps` lanes of optional steps (`simplify`, `security-audit`, `sonar-roundtrip`, `adr-propose`, `lessons-capture`, `preference-emitter`, `plan-retrospective`, `print-phase-breakdown`, `architecture-refresh`, `pre-submission-self-review`)
+|Enable, lane per step
+|keep
+|Cost and value differ per project (a docs repository has no use for `security-audit` at `full`).
+|PW, DE
+
+|`system.offered_steps`
+|Offer each new step once
+|remove; `finalize.step_catalogue`
+|One scalar catalogue level replaces a growing bookkeeping list.
+|DE reconcile, SS
+
+|`checks_wait_timeout_seconds`, `review_bot_buffer_seconds`, `re_review_await_timeout_seconds`, `review_rate_window_timeout_seconds`, `review_completion_poll_timeout_seconds`, `ce_wait_timeout_seconds`, `merge_queue_wait_budget_seconds`, `merge_hold_budget_seconds`, `merge_hold_window`
+|Per-step waits
+|constant
+|Waits are server-owned and re-polled (Timeouts § Waits); expiry never decides a verdict.
+|TO, PW
+
+|`re_review_on_loopback`, `re_review_on_branch_cleanup`
+|Re-review triggers
+|derive
+|Follows from `review.currency` and whether HEAD advanced.
+|PW barrier
+
+|`re_review_on_timeout`
+|`ask\|proceed\|defer`
+|constant (`ask`) (weakens)
+|`proceed` merges unreviewed code without an operator; the grant path exists as an operator decision.
+|PW, SS merge authorizations
+
+|`review_rate_window_await`
+|Wait for rate windows
+|constant (`true`)
+|Not waiting only produces a failed review round.
+|PW
+
+|`auto_rebase_threshold`
+|Auto-rebase policy
+|constant (`no_overlap_only`)
+|Any wider value rebases over overlapping changes without review.
+|PW
+
+|`admin_merge_on_stuck_state`
+|Admin merge bypass
+|remove (weakens)
+|Bypasses branch protection.
+|PW
+
+|`pre_merge_comment_barrier`
+|Barrier behaviour
+|constant
+|The barrier predicates are server-defined.
+|PW
+
+|`drop_review_on_scope_gate`
+|Skip self-review
+|remove (weakens)
+|Server decides applicability from the footprint.
+|PW
+
+|`final_merge_without_asking`
+|Merge without asking
+|keep (operator) as `merge.auto_merge`
+|Autonomy preference of the operator; never bypasses barrier predicates.
+|PW, SS merge authorizations
+
+|`sonar-roundtrip.touched_file_cleanup`
+|Sonar success scope
+|keep
+|"Leave touched files clean" is a legitimate team policy beyond new code.
+|PW
+
+|`sonar-roundtrip.do_transition`
+|Server-side Sonar dismissal
+|keep
+|Organisations differ on whether dismissals may bypass code.
+|PW
+
+|`preference-emitter.preference_min_recurrence`
+|Recurrence threshold
+|constant
+|Server calibration.
+|PW
+
+5+|*Domains and build*
+
+|`skill_domains` (enabled set)
+|Active domains
+|derive, keep override
+|Detection is deterministic; overrides for repositories where detection is wrong.
+|DE
+
+|`skill_domains.<d>.bundle`, `.outline_skill`, `.workflow_skill_extensions`
+|Frozen hook outputs
+|derive
+|Compiled descriptors are authoritative (Domain Extensions Tier 1).
+|DE
+
+|`skill_domains.active_profiles`
+|Profiles in use
+|derive, keep `disabled_profiles`
+|Activated per module by applicability rules; a project may switch a profile off (no integration tests).
+|DE
+
+|`skill_domains.<d>.project_skills`
+|Project-local skills appended to a domain
+|remove
+|`PM-MCP` serves only compiled skills; project automation enters as project-local recipes or enrolled `project_script` steps. Project-local vocabulary skills would be a separate feature.
+|DE, 03-skills
+
+|`skill_domains.<d>.always_on`, `.file_globs`
+|Detection overrides
+|keep
+|Repository layouts that the descriptor globs do not match.
+|DE descriptor
+
+|`build.map`
+|File-to-build routes
+|keep (own file)
+|Routes encode project structure; seeded, then curated.
+|DE
+
+|`build.queue.max_retries`
+|Client-side admission retries
+|remove
+|The server FIFO never drops a build.
+|—
+
+5+|*Orchestrator*
+
+|`orchestrator.parallelization_scope`
+|Default of a per-epic question
+|remove
+|Answered per epic and stored in `epic.json`; the compiled default is `1`.
+|DE dispatch
+
+|`orchestrator.auto_emit`
+|Emit without staging
+|remove
+|Emission is operator-mediated by design (the operator runs the emitted command).
+|DE dispatch
+
+5+|*System and machine*
+
+|`system.retention.*`
+|Purge ages
+|keep (operator), reduced to four keys
+|Disk and audit needs differ per machine; the stores are machine-local.
+|TO retention, SS sweeps
+
+|`system.retention.temp_on_maintenance`, `plugin_cache_*`, `no_plan_body_days`
+|Legacy maintenance
+|remove
+|No plugin cache, no `NO_PLAN` sentinel; `temp/` is never read across calls.
+|TO
+
+|`system.provisioned_version`, `config_seed_fingerprint`, `schema_version`, `baseline_version`, `applied_migrations`
+|Migration bookkeeping
+|remove
+|Replaced by `format_version` (<<versioning>>).
+|DE, SS, 15-ext, 14-impl
+
+|`machine-config.lock_wait_report_seconds`
+|Report threshold for lock waits
+|constant
+|Diagnostic threshold; also a `PM-MIG-5` trigger input, which must not vary per machine.
+|TO, SS
+
+|`machine-config.pending_entry_max_age_seconds`
+|Pending record sweep age
+|constant
+|No legitimate machine difference.
+|TO, RM
+
+|`machine-config.max_build_slots`, `max_lsp_instances`, `lsp_*_timeout_seconds`
+|Machine resources
+|keep
+|Cores and memory differ per machine.
+|TO, SS
+
+|`machine-config.drain_timeout_seconds`, `escalation_cap_seconds`, `progress_wait_max_seconds`, `audit_rotation`
+|Operational bounds
+|keep
+|Build durations and disk budgets differ per machine.
+|TO
+
+|`machine-config.derivation_resolvers`
+|Resolver enablement by project root
+|keep, moved to `local-config.json`
+|Tooling cost per machine; keyed by `project_id` there.
+|DE, SS
+
+|Enrolment `wrappers[].allowed_goals`
+|Goal allowlist
+|remove
+|The canonical templates decide what runs.
+|SS enrolment, DE Tier 2
+
+|Enrolment `command_budgets`, `write_paths`, `build_environment`, `language_servers`, `project_scripts`, templates
+|Execution bindings
+|keep
+|Known-slow commands, toolchain cache locations, captured environments and project scripts differ per project and machine.
+|SS, JR, TO
+
+|Client profile overrides (`conf/profiles/`)
+|Host timeouts
+|keep
+|Host releases change timeouts before a `PM-MCP` release does.
+|CP
+
+|`conf/upstream-mcp.json`
+|Upstream MCP servers
+|keep
+|Operator's own servers.
+|MT
+|===
+
+Abbreviations: FS Filesystem Layout, PW Phase Workflows, WD Workflow DSL, DE Domain Extensions (incl. setup), SS Store Schemas, SC State Catalogue, TO Timeouts, JR Job Runtime, RM Runtime Model, CP Client Profiles, MT MCP Tools.
+
+Net result: the key catalogue keeps 22 team keys (in four files) and 10 operator keys per project, plus the machine and enrolment keys marked *keep*; every other key of `plan-marshall`'s `marshal.json` becomes a compiled constant, is derived by the server, or is removed.
+
+[#decisions]
+== Decisions
+
+Each decision lists the question, the options, the recommendation and the documents that change if it is taken.
+
+=== Z3-1 Split of `.marshall/marshal.json`
+
+* *Question*: One configuration file or several?
+* *Options*: (a) keep one file with closed sections; (b) four purpose files `.marshall/config/{project,workflow,domains,build-map}.json`; (c) two files (`marshal.json` + `build-map.json`).
+* *Recommendation*: (b). Each file has a different edit cadence and writer path (build map on its seed/reseed cycle, domains on detection, workflow on team decisions), a smaller merge-conflict surface, and its own `format_version` and validation outcome.
+* *Affected*: Filesystem Layout (tree, `.gitignore` partition), Store Schemas § Project Configuration Store, Domain Extensions § Three-Way Split, `PM-EXT-6`, every `marshal.json` reference (94 occurrences), setup staging set.
+* *Decision*: Operator 2026-09-28: (b) four purpose files `.marshall/config/{project,workflow,domains,build-map}.json`.
+
+=== Z3-2 Sparse configuration and server-computed effective configuration
+
+* *Question*: Do files hold materialised defaults or only deviations?
+* *Options*: (a) materialised defaults with write-once seeding and `syncDefaults` (current); (b) sparse overrides, effective configuration computed by the server and published with per-key source.
+* *Recommendation*: (b). Removes `syncDefaults`, seed fingerprint, `stepsSort`, `normalizeKeys` and the restored-step hazards (`PM-WATCH-EXT-22`); default changes of a new binary reach every project, while in-flight plans stay protected by the manifest snapshot (Z3-11). `pm://project/config` makes the effective values visible.
+* *Affected*: Domain Extensions § Systematized Upgrades (largely removed), `PM-EXT-7`, MCP Tools (new resource), `PM-WATCH-EXT-21`/`-22`, `PM-WATCH-STORE-13` (the pinned defaults move to the compiled table).
+* *Decision*: Operator 2026-09-28: (b), as applied: sparse files and a server-computed effective configuration published with per-key source; two exceptions keep materialised content: the build map seed (write-once, explicit reseed) and the copies of the default `.pmwf` units, for which setup offers a three-way diff against the new default.
+
+=== Z3-3 Team policy versus operator posture
+
+* *Question*: Where do posture keys live (autonomy, interaction, language, trailer, ladder, retention)?
+* *Options*: (a) all in the git-tracked file (current, as `plan-marshall`); (b) a per-project operator file `PS/local-config.json` with machine-wide defaults in `machine-config.json`; (c) machine-wide only.
+* *Recommendation*: (b). Posture is a property of the person and machine, not of the repository; per-project override is needed because one operator treats repositories differently. Merges `effort-ladder.json` and `run-configuration.json` into one file.
+* *Affected*: Filesystem Layout § Per-Project Machine Store, Store Schemas (new schema), Dispatch & Effort § Effort Ladders, Workflow DSL (commit trailer), Domain Extensions (setup states `effort-ladder`, `project-settings`), Timeouts § Configuration Keys.
+* *Decision*: Operator 2026-09-28: (b) per-project `local-config.json` with machine-wide defaults in `machine-config.json` `project_defaults`; adjusted by Z2: the integration variants and the commit identity are per project only and have no machine-wide default.
+
+=== Z3-4 Remove options that weaken guarantees
+
+* *Question*: Are options kept whose only effect is to disable a guarantee?
+* *Options*: (a) keep with safe defaults; (b) remove them.
+* *Recommendation*: (b): `use_worktree`, `branch_strategy: direct`, `commit_and_push`, `escalation`, `revalidation`, `q_gate_validation: off`, forcing the light lane, lowering `confidence_threshold`, `admin_merge_on_stuck_state`, `re_review_on_timeout: proceed`, `drop_review_on_scope_gate`, `auto_rebase_threshold`, and disabling mandatory finalize steps. Each has a server-derived or operator-decision path for the rare legitimate case (local-only outcome from provider absence, extensions, merge authorizations).
+* *Affected*: Phase Workflows (lanes, Q-Gate, finalize roster, merge barrier), State Catalogue (`realized_state` cause `disabled`, `outline.review` bypass rows), Store Schemas § References (`disabled` cause), Job Runtime (non-worktree path), Workflow DSL (`git.commit_and_push` push modes), `02-workflow`.
+* *Decision*: Operator 2026-09-28: (b) remove them.
+
+=== Z3-5 One continuation policy instead of five auto-continue gates
+
+* *Question*: How is session autonomy configured?
+* *Options*: (a) the five `*_without_asking` flags plus `lane_selection`; (b) the existing per-plan `continuation_policy`, defaulted from `local-config.json`.
+* *Recommendation*: (b). One mechanism already exists in the status store and the operator channel; two would conflict.
+* *Affected*: Phase Workflows § Workflow Settings Resolution, State Catalogue (auto-continue branches), Domain Extensions (`setup.project-settings`), Store Schemas § status `continuation_policy`.
+* *Decision*: Operator 2026-09-28: (b) the per-plan `continuation_policy`, defaulted from `local-config.json`.
+
+=== Z3-6 Tuning knobs become compiled constants
+
+* *Question*: Stay configurable: recipe threshold, prune thresholds, refine confidence, iteration caps, step wait timeouts, preference recurrence, raw-input byte cap, rate-window floor, lock-wait report threshold, pending-entry age?
+* *Options*: (a) configurable with defaults; (b) compiled constants in the Timeouts table or the owning specification.
+* *Recommendation*: (b). They calibrate server algorithms; per-project tuning makes metrics incomparable across projects (`PM-MIG-5` triggers) and adds untestable combinations.
+* *Affected*: Timeouts (rows move to `fixed`), Phase Workflows, Domain Extensions § Tier-1 Routing, Store Schemas § Machine Configuration.
+* *Decision*: Operator 2026-09-28: (b) compiled constants.
+
+=== Z3-7 Derive what the server can observe
+
+* *Question*: Configure or derive providers, CI provider, merge queue, merge method default, base branch default, enabled domains, active profiles, outline and triage skills, cost table, envelope budget?
+* *Options*: (a) configure (current); (b) derive with an explicit override only where derivation can be wrong (`ci_provider`, `domains.*`, `merge_method`, `envelope_budget_tokens`).
+* *Recommendation*: (b). Server-side first; overrides exist only where a derivation input is ambiguous (self-hosted remotes, unusual layouts).
+* *Affected*: Domain Extensions (descriptor use, setup states `select-providers`, `merge-queue`, `detect-domains`), Dispatch & Effort § Cost Sizing (calibration store), Client Profiles (context budget field).
+* *Decision*: Operator 2026-09-28: (b) derive, with explicit overrides only for `ci_provider`, `domains.*`, `merge_method`, and `envelope_budget_tokens`.
+
+=== Z3-8 Remove legacy-only and consumerless keys
+
+* *Question*: Carry over `pr_strategy`, `pr_compact_max_changed_files`, `coverage`, `open_in_ide`, `build.queue.max_retries`, `auto_emit`, `parallelization_scope` default, `project_skills`, `bot_lists_provenance`, `temp_on_maintenance`, `plugin_cache_*`, `no_plan_body_days`, `checks_wait_timeout_seconds`?
+* *Options*: (a) keep for parity; (b) remove and report them in the import receipt.
+* *Recommendation*: (b). None has a `PM-MCP` consumer or reason (<<removal>>). `project_skills` is removed from configuration; whether project-local vocabulary skills become a feature is a separate question.
+* *Affected*: Domain Extensions § Tier 1 item 2, Store Schemas § Import Receipt (reasons), `03-skills` (catalogue inputs).
+* *Decision*: Operator 2026-09-28: (b) remove; `project_skills` is recorded as link:../later-improvements.adoc#_l_4_project_local_vocabulary_skills[Later Improvements L-4]. The import-receipt clause of option (b) is withdrawn with the import (clean cut, 2026-09-27).
+
+=== Z3-9 Finalize step selection
+
+* *Question*: How are finalize steps configured and how are new steps introduced?
+* *Options*: (a) full ordered step map with `offered_steps` (current); (b) compiled order and mandatory set, sparse lanes/params for optional steps, `finalize.step_catalogue` level for new steps, project steps as `{order, lane, project_script_id}`.
+* *Recommendation*: (b). Order is a descriptor property and never needs sorting in a file; one integer records which catalogue the team accepted; a declined step is an explicit `lane: off`.
+* *Affected*: Phase Workflows § Finalize roster, Domain Extensions (`setup.configure-finalize`, `setup.offer-new-steps`), Store Schemas, `PM-EXT-7` (offer rule restated).
+* *Decision*: Operator 2026-09-28: (b), as applied: the project's `finalize.pmwf` unit decides the steps and their order; mandatory steps are enforced by compiled invariants; `workflow.json` holds only sparse lanes and parameters and the `project_steps`; there is no `finalize.step_catalogue` level.
+
+=== Z3-10 Versioning before 1.0 (D63)
+
+* *Question*: Keep the `ConfigMigrationCommand` chain with `M001`, `baseline_version` and seed fingerprint, and the startup migration of server stores?
+* *Options*: (a) keep the chain for config and startup migration for stores (current); (b) no chain before 1.0: `format_version` everywhere, accept exactly the current version, refuse mismatches with `format_outdated`/`format_newer`, legacy only through `adopt-project`, one migration mechanism for all kinds decided at 1.0; (c) as (b) but keep startup migration for scope stores.
+* *Recommendation*: (b), evaluated in <<versioning>>. (c) reintroduces shims for the stores that change most often.
+* *Affected*: `PM-EXT-7` (rewritten), `PM-IMPL-2` (startup migration removed), `PM-MIG-3` (last bullet), Store Schemas § Format Versioning, Domain Extensions § Systematized Upgrades, Identifier Registry (migration identifier removed), `PM-WATCH-GEN-56`/`-57`, roadmap items for the chain.
+* *Decision*: Operator 2026-09-28: (b), as applied: an outdated team file is refused by format, and `setup.reconcile-config` offers a server-rendered rewrite to the current format; there is no legacy path (no `adopt-project`).
+
+=== Z3-11 In-flight configuration snapshot
+
+* *Question*: What does `config_hash` cover once files are sparse?
+* *Options*: (a) file bytes (current); (b) the effective configuration, including the digest of compiled defaults.
+* *Recommendation*: (b); otherwise a binary upgrade that changes a default would silently change in-flight plans. `config_drift` with `adopt`/`keep` stays.
+* *Affected*: Domain Extensions § Three-Surface Synchronization, Phase Workflows § execution manifest, State Catalogue § `config_drift`.
+* *Decision*: Operator 2026-09-28: (b) `config_hash` over the effective configuration including the digest of the compiled defaults; it also covers the project's `.pmwf` units and the derived facts the plan depends on.
+
+=== Z3-12 Enrolment schema and granularity (D64)
+
+* *Question*: One enrolment file or one per project; which fields?
+* *Options*: (a) one `enrolments.json` (current); (b) `enrolments/<project_id>.json` with per-file HMAC and lock; (c) enrolment inside `PS/`.
+* *Recommendation*: (b) with the fields of <<enrolment>>. Isolation of tamper and parse failures per project; the operator-owned directory stays separate from server-owned `projects/`, whose lifecycle starts later (adopt) and ends differently (release). `allowed_goals` is removed.
+* *Affected*: Store Schemas § Enrolment Store, Filesystem Layout (tree, permissions, lock list), CLI & Security § Enrolment Integrity, Job Runtime, Domain Extensions Tier 2 and § `project_script`, Store Schemas § Lock order.
+* *Decision*: Operator 2026-09-28: (b) `enrolments/<project_id>.json` with per-file HMAC sidecar and lock; `allowed_goals` removed.
+
+=== Z3-13 Server state keyed by project, located
+
+* *Question*: Where do learned budgets, resolver enablement, the job journal, the discovery cache and the cost calibration live?
+* *Options*: (a) machine-level stores keyed by project root (current, partly unspecified); (b) per-project store files keyed by budget key or resolver id.
+* *Recommendation*: (b): `PS/build-timings.json`, `PS/jobs/<job_id>.json`, `PS/discovery-cache.json`, `PS/cost-calibration.json`; resolver enablement in `local-config.json`. A moved checkout keeps its data; lock order gains `local-config` and `build-timings` after `lessons`.
+* *Affected*: Filesystem Layout, Store Schemas (lock order, new schemas), Job Runtime § Adaptive Timeout Learning, Timeouts § Legacy Timeout Import, Domain Extensions Tier 3.
+* *Decision*: Operator 2026-09-28: (b), as applied: `build-timings.json` and `jobs/<job_id>.json` per project; the discovery cache and the cost calibration are fact kinds in `derived-facts.json`, not files of their own; resolver enablement in `local-config.json`.
+
+=== Z3-14 Schemas for the stores without schema (D79)
+
+* *Question*: How are the schemaless stores specified, and does the epic header keep the name `status.json`?
+* *Options*: (a) full JSON Schemas for each, header keeps its name; (b) full JSON Schemas, header renamed `epic.json`; landing records defined by reference to the landing envelope.
+* *Recommendation*: (b), using the outlines in <<store-inventory>>. The rename ends the clash with the FSM `status.json`.
+* *Affected*: Store Schemas (new sections), Dispatch & Effort § Git-Distributed Epic Ledger, Filesystem Layout tree, MCP Tools (`pm://epic/**`), import mapping of the epic ledger.
+* *Decision*: Operator 2026-09-28: (b) full schemas, epic header renamed `epic.json`; the store `operator-auth.json` of the inventory is removed by link:client-architecture.adoc[Client Architecture] Z1-9.
+
+=== Z3-15 Lesson record (D80)
+
+* *Question*: Keep the Markdown file with `key=value` header, or change the format; keep the move-based application?
+* *Options*: (a) Markdown with `key=value` header (current); (b) Markdown with YAML front matter; (c) one JSON record with Markdown body revisions, in-file retirement and a claim instead of a move; (d) a directory per lesson (`lesson.json` + `body-rN.md`).
+* *Recommendation*: (c). Revisions with source lists and optional `golden_label`/`labelled_at` fit a structured record; one file keeps one digest and one transaction target; the claim removes the move, the carry-back veto and the `applied`/`stalled` location derivation. (d) is the fallback if human-readable body files on disk are wanted; `PM-IMPL-2` needs a wording change either way ("narratives stay Markdown text").
+* *Affected*: Store Schemas § Lesson Record and § Lesson Carry-Back Veto, Filesystem Layout (lesson tree), Phase Workflows (lesson creation, `pm_start` from lesson, delete-plan), `PM-IMPL-2`, `PM-WATCH-STORE-14`..`-20`.
+* *Decision*: Operator 2026-09-28: (c) semantics in (b) format: one Markdown file per lesson with YAML front matter (revisions with sources, claim instead of a move, in-file retirement, optional golden label); the file is never moved.
+
+=== Z3-16 Entry record (D84)
+
+* *Question*: Which fields are required, and are `entry` and `workspace_root` kept?
+* *Options*: (a) current schema; (b) drop `entry` and `workspace_root`, make `client_version`, `client_session_id`, `environment_match_tier` required (nullable where the host may provide none), `from_epic` required-nullable for plans and forbidden otherwise, `entry_id` in pending records.
+* *Recommendation*: (b). Missing is not empty; duplicates removed; the project root comes from the enrolment.
+* *Affected*: Store Schemas § Scope Entry Record, CLI & Security § `pm-mcp enter` and § Session-Start Scope Pointer, Filesystem Layout § Plan & Worktree Resolution, Client Profiles § identity tiers.
+* *Decision*: Operator 2026-09-28: (b), as applied: entry identity is appended as a row to the scope's `sessions.jsonl`; the pending record for a not-yet-created plan carries `entry_id` and `from_epic`.
+
+=== Z3-17 Import as a direct mapper
+
+NOTE: *Withdrawn.* The operator decided on 2026-09-27 that `PM-MCP` imports nothing from legacy `plan-marshall` (clean slate): there are no import verbs, no import receipts, and no import mapping. Decision Z3-17 is withdrawn and kept only as a record of the discussion.
+
+* *Question*: How does `adopt-project` map legacy configuration without `M001`?
+* *Options*: (a) run the migration chain from `M001` (current); (b) one direct mapper per verb writing sparse current-format files, with extended receipt reasons and a recorded removal trigger.
+* *Recommendation*: (b), mapping per <<import-mapping>>.
+* *Affected*: Store Schemas § Legacy Store Formats and § Import Receipt, CLI & Security § Legacy Import, `PM-MIG-3`, Timeouts § Legacy Timeout Import (target file moves).
+* *Decision*: Withdrawn 2026-09-27 (clean cut).
+
+=== Z3-18 Credential file format
+
+* *Question*: Keep `plan-marshall`'s credential file format (unversioned, open properties)?
+* *Options*: (a) keep (current); (b) `PM-MCP` format with `format_version` and closed properties, written by `pm-mcp operator credentials`, legacy entries mapped by `import-legacy`.
+* *Recommendation*: (b). The clean cut applies to operator files too; the import already maps.
+* *Affected*: Store Schemas § Credential Store, `PM-CRED-3`, `PM-IMPL-2`, `PM-MIG-3` (exceptions list).
+* *Decision*: Operator 2026-09-28: (b) the `PM-MCP` credential format with `format_version` and closed properties, written by the runtime on a `pm-mcp operator credentials` verb; the `import-legacy` clause is withdrawn with the import (clean cut, 2026-09-27).
+
+=== Z3-19 Retention
+
+* *Question*: Where does retention live and which keys remain?
+* *Options*: (a) git-tracked `system.retention` with `plan-marshall` keys (current); (b) operator `local-config.json` `retention` with four keys (`job_logs_days`, `archived_plans_days`, `superseded_lessons_days`, `arch_constraint_quiet_days`).
+* *Recommendation*: (b). The governed stores are machine-local; legacy keys without a `PM-MCP` store are removed.
+* *Affected*: Timeouts § Retention, Store Schemas § Evidence-Based Removal Sweeps, Filesystem Layout § Archives.
+* *Decision*: Operator 2026-09-28: (b) `retention` with four keys in the operator file `local-config.json`.
+* *Adjusted by round-4 C16 (2026-10-01)*: decided by the reviewer under the operator's delegation (at least 95% confidence): the key `superseded_lessons_days` is renamed `retired_lesson_bodies_days`, because the purge covers the body of every retired lesson, not only of superseded ones.

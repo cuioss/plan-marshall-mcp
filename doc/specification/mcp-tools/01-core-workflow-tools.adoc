@@ -1,0 +1,208 @@
+= MCP Tool & Resource Surface Specification: Surface Design & Core Workflow Tools
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../mcp-tools.adoc[MCP Tool & Resource Surface Specification] » Surface Design & Core Workflow Tools
+
+== Surface Design & Context Budget Discipline
+_See Requirement link:../../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+
+_See Requirement link:../../Requirements.adoc#PM-TECH-1[PM-TECH-1: Java 25+ & Quarkus MCP Runtime Foundation]_
+
+_See Requirement link:../../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Operator CLI & Paired Web Devices)]_
+
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-10[PM-WATCH-TOOL-10], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-12[PM-WATCH-TOOL-12]_
+
+=== Architectural Constraints
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-13[PM-WATCH-TOOL-13]_
+
+1. *Small, Stable Verb Set*: PM-MCP exposes a fixed set of top-level MCP tools (`pm_state`, `pm_do`, `pm_plans`, `pm_epics`, `pm_build`, `pm_lsp`, `pm_skills`, `pm_skill`, `pm_skill_file`) rather than one tool per workflow step or script; no tool creates a scope (<<bootstrap-entries>>). Across all phases and domains, the resident core tool surface remains constant (a job connection sees only its role's subset, <<job-bound-connections>>), and privileged operator actions are strictly excluded from the MCP tool surface (`PM-SEC-3`). The only additional tools are the operator-allowlisted upstream pass-through tools (xref:02-service-and-skill-tools.adoc#_selective_upstream_mcp_proxy_meta_provenance_pm_svc_3[Selective Upstream MCP Proxy & `_meta` Provenance (`PM-SVC-3`)]), which change only with the operator's allowlist and are never part of the core set. The set has no exception: no tool runs legacy `plan-marshall` scripts (xref:02-service-and-skill-tools.adoc#transitional-legacy-script-tool[Legacy Script Execution (Removed)]).
+2. *Portable Naming Convention*: Every core tool name conforms to the link:../identifiers/02-registry-stores-to-web.adoc#id-core-tool-name[core tool name grammar] and every upstream pass-through tool name to the link:../identifiers/02-registry-stores-to-web.adoc#id-upstream-tool-name[upstream tool name grammar] (Identifier Registry), ensuring identical identifiers across Claude Code, OpenCode, Antigravity, Codex, and raw model tool-calling APIs without escaping or translation.
+3. *Closed, Host-Portable Flat Schemas*: Every tool `inputSchema` conforms to JSON Schema Draft 2020-12 and declares `"additionalProperties": false` at the top-level object boundary. It uses only the subset every supported host and provider API accepts: a top-level `type: object` with `properties`, `required` (only parameters that are always required), and `additionalProperties`; per property `type`, `enum`, `pattern` without lookaround, `minimum`/`maximum`, `minLength`/`maxLength`, `default`, and `description`. Top-level `oneOf`/`anyOf`/`allOf`, `if`/`then`/`else`, `not`, and `const` are never used; the `$schema` and `title` members shown in this specification are documentation only and are not sent in `tools/list`. Rules the subset cannot express (mutually exclusive scope parameters, per-operation required parameters, path shape) are enforced by the server's argument validation and answered with the closed error of xref:04-errors-and-testing.adoc#protocol-errors-vs-domain-workflow-failure-states[Protocol Errors, Tool Execution Errors (`isError: true`) & Domain Workflow Failure States (`isError: false`)]; each such rule is stated in one line of the affected property's `description`. Milestone 0 verifies the final schemas by registering and calling them on every supported host.
+4. *TOON Text Output Only (No `outputSchema`)*: Tools intentionally omit `outputSchema` and `structuredContent`. Every tool result is returned in a single MCP `TextContent` block (`type: "text"`) encoded in deterministic TOON (link:../hypermedia-format.adoc[Hypermedia Format Specification]). This avoids resident output-schema token overhead while optimizing token density on every turn.
+5. *Zero Client-Supplied Filesystem Paths*: No workflow or service tool accepts absolute filesystem paths or worktree locations from the model. Worktrees, branches, and configuration files are resolved server-side from `plan_id` or `epic_id`.
+6. *On-Demand Preloading*: For hosts configured with `schema_residency: "on_demand"` in their client profile, the user entry command preloads `pm_state` and `pm_do` so workflow execution incurs zero schema-lookup round trips.
+7. *Canonical Identifiers*: Every identifier property (`plan_id`, `epic_id`, `entity` including an `entry_id`, `link`, `job_id`, `module`, skill `uri` and `section`) and every identifier in link `args` (`lesson_id`, recipe key, `plan_slug`) uses the grammar of the link:../identifiers.adoc[Identifier Registry] (`plan_id` and `epic_id`: link:../identifiers/01-general-rules-and-registry.adoc#id-plan-id[`plan_id`]; the derivation rules stay in link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); every `pattern` below equals the registry grammar, and every example in this specification conforms to it.
+8. *Model-Facing Minimality*: Every tool result and error payload, like every representation, carries only fields with an operational purpose for the model (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]). Implementation variants, derivation sources, internal versions and digests, confinement, timing, and audit identifiers (outside `internal_fault` and `file_unreadable`) are recorded in `audit.jsonl`, the job record, or the metrics store and served by the operator CLI `pm-operator` (for example `pm-operator status`); `ModelFacingFieldAuditTest` checks every result record against the registry of model-facing fields.
+9. *MCP Is Not the Operator or Web Surface*: The MCP endpoint `/mcp` and the Local API `/api/v1` are separate surfaces on the runtime's Unix socket (link:../runtime-model.adoc#local-api[Runtime & Interaction Model Specification, Local API]). No MCP tool, resource, or link reaches an `/api/v1` operator endpoint, the web device store, pairing, or the web access settings (`pm-operator web enable|disable`), and no `pm_do` argument selects one; `/mcp` is never served over TCP: the TCP listener the runtime opens while web access is enabled routes only the web app and `/api/v1/`, and never accepts the runtime token (link:../cli-and-security/03-web-server.adoc#web-listener[CLI, Coordination & Security Specification, Listener Exposure]).
+10. *Explicit Scope on Every Scoped Tool (`NO_PLAN` Sentinel)*: `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skill`, `pm_skills`, and `pm_skill_file` require exactly one of `plan_id` or, where the tool accepts epics, `epic_id`. `plan_id` is a real plan id or the literal `NO_PLAN`, a reserved value that cannot match the `plan_id` grammar (link:../identifiers/01-general-rules-and-registry.adoc#id-plan-id[Identifier Registry, `plan_id`]) and addresses the project's workspace scope and its main checkout (workspace-addressed, `PM-ARCH-4`, resolved from the `PM-MCP-Workspace` header). A call without a scope is refused with `invalid_arguments`; no tool infers a scope from an omitted parameter, and no tool takes a `scope: "workspace"` input (the `scope` enum stays in returned representations). Under `NO_PLAN`, `pm_state` and `pm_do` with `entity` address a bootstrap entry by its `entry_id` (<<bootstrap-entries>>). The sentinel mirrors `plan-marshall`'s `NO_PLAN` convention, applied to every scoped tool.
+
+== Core Workflow Tool Schemas (`pm_state`, `pm_do`)
+_See Requirement link:../../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_state, pm_do)]_
+
+[#bootstrap-entries]
+=== Bootstrap Entries: Scope Creation Without a Creation Tool
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-2[PM-WATCH-STORE-2]_
+
+No tool creates a scope. A plan or an epic is created by the bootstrap sub-workflow of its kind (`bootstrap-plan`, `bootstrap-epic`; link:../state-catalogue.adoc[State Catalogue], Bootstrap), a compiled-only entity unit hosted by the project's workspace scope. `pm-mcp enter` opens one for every `plan` or `epic` entry that names no live scope: the runtime writes the pending entry record `<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json` (link:../store-schemas/01-format-and-session-log.adoc#pending-entry-record[Store Schemas Specification, Pending Entry Record]), which holds the bootstrap's state, and `pm-mcp enter` prints `entry: <entry_id>` (link:../cli-and-security/01-cli-and-installer.adoc#_entry_identity_recording_pm_mcp_enter[CLI, Coordination & Security Specification, Entry Identity Recording]). The model addresses the entry with the ordinary verbs and the `entry_id` as entity of the workspace scope: `pm_state(plan_id: "NO_PLAN", entity: "<entry_id>")` and `pm_do(plan_id: "NO_PLAN", entity: "<entry_id>", link, args)`. Concurrent entries never share a state position, and nothing is created under `plans/` or `epics/` before the commit, so an abandoned entry leaves no scope; the pending-record sweep removes it (link:../runtime-model.adoc#periodic-sweep[Runtime & Interaction Model Specification, Periodic Sweep]).
+
+* *Ways to start are links*: What to work on is chosen through the links of the bootstrap (`start.choose`, the server-listed candidates in `facts`, the full lists in `pm://workspace/lessons` and `pm://workspace/recipes`, xref:03-resource-uris.adoc#_normative_resource_uri_templates[Resource URI Surface]); each source is a sub-workflow unit (`source-issue`, `source-lesson`, `source-recipe`, `source-pr`, `source-local-changes`, `source-epic-row`) that ends `done` with its source record or steps out. The user's words reach the server as the entry's free-text hint and as link `args` (request text, issue or pull request number, `lesson_id`, recipe key and `recipe_params`, `plan_slug`, posture, `review_outline`, base branch), each validated against the link's closed parameter schema (<<_two_stage_schema_validation_for_pm_do>>, Stage 2). No tool parameter and no CLI flag enumerates sources: a new way to start is one more unit and one more link.
+* *Commit in the `start.create-scope` transaction*: When the bootstrap commits (the `create` link of `start.ready` or `start-epic.ready`, whose primitive `start.create-scope` returns `created`, entering the terminal `start.committed` or `start-epic.committed`, or `refused{reason}`, returning to the ready state), the engine creates the scope from the gathered record in that transaction: it consumes the pending entry record (its session row becomes the first row of the new scope's session log `plans/<plan_id>/sessions.jsonl` or `epics/<epic_id>/sessions.jsonl` and the pending file is deleted, link:../store-schemas/01-format-and-session-log.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]), initializes `mcp/status.json`, fills `origin.epic_id` from the record's `from_epic` (the single carrier of epic membership, written by the emitted entry command, link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification], Single Epic Pointer) and sets that epic's queue row `running`, claims a lesson source (link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record, Claim]), takes the local-changes snapshot, and re-observes a pull request's head. The `pm_do` call that commits returns the first representation of the new scope (a plan at `init.classify`, an epic at the start of `epic.pmwf`); the model continues with `pm_state` and `pm_do` on the new `plan_id` or `epic_id`. A later call naming the consumed or swept `entry_id` is answered `scope_not_found`.
+* *Epic adoption*: An `epic` entry whose id names an existing git-tracked ledger (`.marshall/orchestrator/<epic_id>/` with `epic.json`) without machine scope is adopted (`adopt_epic:<epic_id>`, or directly for a requested id): the adoption's `start.create-scope` transaction (outcome `adopted`) consumes the pending entry record as above and creates only the machine scope from the ledger, which it never rewrites (link:../state-catalogue/09-bootstrap-and-lessons.adoc#state-start-epic.adopt[State Catalogue, `start-epic.adopt`]).
+* *Epic membership, both ways*: A plan whose `plan_id` equals a `launched` queue row of an epic is created only from that row's entry (`from_epic` naming that epic), and an entry whose `from_epic` names a row that is not `launched` is not committed (`epic_pointer_mismatch`, <<bootstrap-commit-recheck>>).
+
+[#bootstrap-commit-recheck]
+==== Bootstrap Commit Re-Check
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-15[PM-WATCH-TOOL-15]_
+The checks the bootstrap made while gathering can be invalidated before the commit (a concurrent plan takes the identifier, the operator releases the project, a team file is edited). The `start.create-scope` transaction therefore re-checks them under the workspace lock; a failing check creates nothing, keeps the pending entry record, and returns the entry to `start.ready` with `facts.commit_refused` (`reason`, `detail`) and the server-computed alternatives, so the model corrects the input (a new `plan_slug`) or relays the named operator command and commits again. The closed reasons:
+
+[cols="1,3"]
+|===
+|`reason` |Check and `facts`
+
+|`plan_id_taken`
+|The derived `plan_id` (or `epic_id`) names a live or archived scope, or (`epic_id`) an existing ledger, which is adopted instead of re-created (link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_id_derivation_phantom_id_refusal_guard[Phase Workflows Specification, Plan ID Derivation]); `facts` name where it exists and a free alternative slug. An archived identifier is never reused.
+
+|`lifecycle_closed`
+|The plan lifecycle is not offered in the project: the lifecycle gate, a compiled constant of the release, is closed and the project is not enrolled as a pilot (`pm-operator enrol --pilot`), or the project was released (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification, Enrolment, Lifecycle Gate & Release]).
+
+|`config_dirty`
+|A file under `.marshall/config/` (a team file or a workflow unit) is modified, staged, or untracked in the main checkout; `facts` name the porcelain state and the resolutions (commit or restore; after a stepped-out setup commit, `retry` of `setup.commit-changes`). A local-changes source is exempt: the file is then part of the captured change set.
+
+|`config_invalid`, `format_outdated`, `format_newer`
+|A team configuration file or a project workflow unit fails validation or has an unsupported `format_version` (xref:04-errors-and-testing.adoc#rejection-reasons[Closed Rejection Reasons]); `facts` name the file and the finding.
+
+|`integration_variant_unset`
+|An integration whose used features the `native` variant cannot serve has no operator choice of its variant; `facts` name the integrations and the operator command.
+
+|`lesson_unavailable`
+|The source lesson was claimed by another plan, retired, or no longer resolves `found` since `source-lesson` checked it; `facts` name its state.
+
+|`no_local_changes`
+|The local-changes snapshot taken at commit is empty (no dirty or staged path, no commit ahead of the base branch); `facts` name the base branch.
+
+|`pr_not_open`, `head_not_writable`
+|The re-observed pull request is no longer open, or its head branch can no longer be pushed to by the agent identity; `facts` name the pull request.
+
+|`epic_pointer_mismatch`
+|The `plan_id` equals a `launched` queue row of an epic while `from_epic` is absent or names another epic, or `from_epic` names a row that is not `launched`; `facts` name the epic and the row.
+|===
+
+The re-check is a transition of the bootstrap, not a rejection: the `pm_do` result is `isError: false` without a `rejected` block. Its reasons belong to the failure class `precondition` and, since no plan exists, are recorded in the audit log only and never counted per plan (xref:04-errors-and-testing.adoc#rejection-reasons[Closed Rejection Reasons & Failure Classes]). Parameter names follow the `<entity>_id` naming rule of the link:../identifiers.adoc[Identifier Registry] (`plan_slug`, `epic_id`, `plan_id`); this is a PM-MCP rule and deliberately differs from `plan-marshall`'s proposed ADR-023, which names the epic with the bare entity noun (`--epic`).
+
+=== `pm_state` — Query Authoritative Hypermedia State
+
+Returns the current hypermedia representation (`state`, `summary`, `skill` URI, domain `facts`, and valid `links`) for a `plan_id`, an `epic_id`, or the project's workspace scope (`plan_id: "NO_PLAN"`, resolved from the `PM-MCP-Workspace` header, `PM-ARCH-4`; it hosts `project-setup`). When `entity` (and optional `scope: "entity"`) is supplied, returns the entity-scoped representation: within a plan or epic the entity a model job works on (e.g., task envelope `envelope-2` or finding `F-12`; on a job connection the entity is bound to the job, <<job-bound-connections>>), under `NO_PLAN` a bootstrap entry by its `entry_id` (<<bootstrap-entries>>).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_state",
+  "description": "Return the current TOON hypermedia representation and valid links for a plan, epic, the project workspace, a job's entity, or a bootstrap entry.",
+  "type": "object",
+  "properties": {
+    "scope": {
+      "type": "string",
+      "enum": ["plan", "epic", "entity"],
+      "description": "Optional explicit scope discriminator (inferred from plan_id/epic_id/entity when omitted)."
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Identifier of the target plan scope, or the literal NO_PLAN for the project's workspace scope. Exactly one of plan_id or epic_id is required (server-enforced)."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Identifier of the target orchestrator epic scope. Mutually exclusive with plan_id."
+    },
+    "entity": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Optional entity identifier: within a plan or epic an entity such as 'envelope-1' or 'F-12' (on a job connection it must equal the job's entity, server-enforced); with plan_id NO_PLAN the entry_id printed by 'pm-mcp enter'."
+    }
+  },
+  "additionalProperties": false
+}
+----
+
+NOTE: Companion discovery tools `pm_plans` (zero-argument, `{"type": "object", "properties": {}, "additionalProperties": false}`) and `pm_epics` (one optional boolean `include_archived`, default `false`, `additionalProperties: false`) return a tabular TOON listing of active plans or epics in the enrolled workspace; `pm_epics` with `include_archived` also lists archived epics (`.marshall/archived-orchestrators/`, link:../filesystem-layout.adoc#archives[Filesystem Layout Specification, Plan & Epic Archives]) with their archival date. Both always return a `coverage` table with one row per scanned root (`root`, `exists`, `listed`, `entries_scanned`, `unreadable`), so zero rows are distinguishable from a root that was absent or not scanned. Each listing carries a `last_entered` column that marks one scope (`PM-CLIENT-6`): the scope whose session log (link:../store-schemas/01-format-and-session-log.adoc#scope-session-log[Store Schemas Specification, Scope Session Log]) holds the most recent row with the `client_session_id` that the request's `PM-MCP-Client-Session` header carries (link:../runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata); when the request carries no session identifier or no row matches it, the scope with the most recent session row (`last_seen_at`) in the project's workspace. This is the post-compaction scope pointer on hosts without session lifecycle hooks (link:../client-profiles/02-placeholders-and-detection.adoc#session-lifecycle-hook[Client Profiles Specification, Session Lifecycle Hook & Scope Pointer]).
+
+[#question-waiver-facts]
+==== Question Records & Waiver Requests in Representations
+
+`pm_state` and every `pm_do` result render open question records and waiver requests only as far as the model acts on them (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]); the records themselves are served by the resources `pm://plan/{plan_id}/questions` (`pm://workspace/questions` for the workspace scope) and `pm://plan/{plan_id}/waivers` (xref:03-resource-uris.adoc#_normative_resource_uri_templates[Resource URI Surface]) and by `pm-operator status`:
+
+* *Question state, `session` delivery*: `facts.questions` lists each open record the model must relay, with `question_id`, `question_text`, `default_assumption`, and its options `{branch_key, label, description, recommended}`; the state offers `answer_questions` (link:../hypermedia-format/01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Hypermedia Format Specification, Question, Waiver-Request & Exit Links]) and is a continuation stop point.
+* *Question state, `elicitation` or `web` delivery*: `facts.questions` lists only `question_id` and `delivery`; the server asks the human itself, and the state offers `wait:question:<question_id>`.
+* *Question state, `questions.mode: model`*: `facts.questions` renders the full record as for `session`, and the state offers `answer_questions`, whose answers carry the model's `confidence`; below the compiled threshold the record falls through to `auto` delivery.
+* *Waiver wait*: the remediation unit's server-side waiver-wait state renders `facts.waiver_request` (`gate`, the closed gate identifier) and the waiver hint in `facts.operator_command` (link:../hypermedia-format/01-representation-and-link-forms.adoc#operator-command-relay[Hypermedia Format Specification, Operator Commands]), which the model relays as information and never answers; the state offers only its implicit `wait:` and `cancel:` links.
+
+Deadlines, delivery resolution, channels of past answers, waiver consumptions, and the operator identity are recorded, never rendered. Answered questions reach the model only through their effect (an amendment, the next state) and, for the task envelope job launched after an asking envelope, as the answer in the envelope's `facts`.
+
+=== `pm_do` — Follow a Hypermedia Link
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-1[PM-WATCH-TOOL-1]_
+
+The sole state transition verb in PM-MCP. Executes the transition identified by `link` from the current representation of `plan_id`, `epic_id`, or the workspace scope (`plan_id: "NO_PLAN"`), passing any judgment parameters in `args`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_do",
+  "description": "Follow a hypermedia link from the current representation with its required free parameters.",
+  "type": "object",
+  "properties": {
+    "scope": {
+      "type": "string",
+      "enum": ["plan", "epic", "entity"],
+      "description": "Optional explicit scope discriminator."
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Identifier of the target plan scope, or the literal NO_PLAN for the project's workspace scope. Exactly one of plan_id or epic_id is required (server-enforced)."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Identifier of the target orchestrator epic scope. Mutually exclusive with plan_id."
+    },
+    "entity": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+      "description": "Optional entity identifier: within a plan or epic the entity whose link is followed (on a job connection it must equal the job's entity, server-enforced); with plan_id NO_PLAN the entry_id of a bootstrap entry."
+    },
+    "link": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}(:(question:)?[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?$",
+      "maxLength": 106,
+      "description": "Link identifier from the current representation (e.g., 'push', 'triage:F-12', 'wait:b-7f3a09c4e1d2b865', 'wait:question:Q-004')."
+    },
+    "args": {
+      "type": "object",
+      "default": {},
+      "description": "Free parameters required by the target link, validated server-side against the link's closed parameter schema."
+    }
+  },
+  "required": ["link"],
+  "additionalProperties": false
+}
+----
+
+==== Two-Stage Schema Validation for `pm_do`
+
+1. *Stage 1 (Tool Argument Validation)*: The server's own argument validator (plain Java over the flat schema and the rules stated in the property descriptions; no JSON Schema library) checks the payload: `additionalProperties: false`, valid `plan_id`/`epic_id`, exactly one scope, syntactic `link` pattern, `args` is a JSON object. A violation is a tool execution error: `isError: true`, `error_code: invalid_arguments`, the offending `parameter`, and the violated `rule` (xref:04-errors-and-testing.adoc#protocol-errors-vs-domain-workflow-failure-states[Protocol Errors, Tool Execution Errors (`isError: true`) & Domain Workflow Failure States (`isError: false`)]). The Quarkus MCP server runs with `quarkus.mcp.server.tools.input-validation-error=TOOL`, so its own parameter binding reports the same way.
+2. *Stage 2 (Workflow Engine Link Schema)*: Under the scope's exclusive lock, the engine resolves the active `LinkSpec` for `link` in the current state and validates `args` against the link's dynamically derived closed JSON Schema (`additionalProperties: false`, exact required free parameter keys, closed enum values, string length bounds, and integer ranges). If `args` fails Stage 2 validation or `link` is not offered in the current state, the engine returns `isError: false` with a structured `rejected` block and the fresh representation (see xref:04-errors-and-testing.adoc#protocol-errors-vs-domain-workflow-failure-states[Protocol Errors, Tool Execution Errors (`isError: true`) & Domain Workflow Failure States (`isError: false`)]).
+
+[#job-bound-connections]
+=== Job-Bound Connections
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-16[PM-WATCH-TOOL-16]_
+
+_See Requirement link:../../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Operator CLI & Paired Web Devices)]_
+
+Every sub-agent is a model job (job kind `llm`) that the runtime launches through the headless CLI of an enrolled harness (link:../dispatch-and-effort/05-model-job-launch.adoc#model-job-launch[Model Jobs & Effort Specification, Model Job Launch]); the host never starts one. The job connects back through the relay `pm-mcp serve --job`, which presents the job's token instead of the runtime token (link:../runtime-model.adoc#job-token[Runtime & Interaction Model Specification, Local Trust: Job Token]). The runtime resolves the job from the token on every request and binds the call to it, without connection state:
+
+* *Tool set*: `tools/list` and `tools/call` are limited to the `PM-MCP` tools of the job's class (link:../dispatch-and-effort/05-model-job-launch.adoc#job-tool-sets[Model Jobs & Effort Specification, Tool Sets]): for a `writer` job `pm_state`, `pm_do`, `pm_build`, `pm_lsp`, `pm_skill`, and `pm_skill_file`; for a `read_only` job `pm_state`, `pm_do`, `pm_skill`, `pm_skill_file`, and `pm_lsp` with its read operations only (`rename` is refused with `invalid_arguments`), without `pm_build`. `pm_plans`, `pm_epics`, `pm_skills`, and the upstream pass-through tools are never listed, and a call of an unlisted tool is the JSON-RPC error `-32602`.
+* *Resources*: `resources/list` and `resources/read` work as in a session: read-only, for every resource of the job's own project and `skill://pm/…` (xref:03-resource-uris.adoc#_normative_resource_uri_templates[Resource URI Surface]). The project boundary is the only read boundary; the entity binding below applies to tools, not to resources. A URI carries no project: the runtime resolves it in the job's project, taken from the job record, so a URI that names a plan or epic of another project is the resource read error `-32002` with `error_code: scope_not_found`, as in a session (xref:04-errors-and-testing.adoc[Errors & Testing]).
+* *Scope and entity*: The scope argument (`plan_id` or `epic_id`) and, for `pm_state` and `pm_do`, the `entity` argument must equal the job's; any other value is refused with `job_scope_mismatch` (`isError: true`), audited.
+* *Links*: The job's representation renders only the links of its entity, and never a link whose target starts a model job (the leaf rule, `PM-WF-5`); a `pm_do` naming any other link is rejected `link_not_available`. Deliverables reach the server only through the entity's `submit` links.
+* *End of the job*: The token is revoked with the job's fate; a later call carrying it is refused with `job_ended` (`isError: true`).
+* *No session identity*: A job connection appends no session row, triggers no client handover or identity mismatch, and takes its client profile from the job record; its audit records carry the `job_id` (link:../client-profiles/02-placeholders-and-detection.adoc#_the_three_identity_tiers[Client Profiles Specification, The Three Identity Tiers]).
+
+The harness-side tool allowlist of the launch command is defence in depth; the binding above is the enforcement.

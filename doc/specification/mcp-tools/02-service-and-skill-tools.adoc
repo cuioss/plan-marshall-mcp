@@ -1,0 +1,265 @@
+= MCP Tool & Resource Surface Specification: Service & Skill Tools
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../mcp-tools.adoc[MCP Tool & Resource Surface Specification] » Service & Skill Tools
+
+== Orthogonal Service Capability Tool Schemas (`pm_build`, `pm_lsp`)
+_See Requirement link:../../Requirements.adoc#PM-TOOL-2[PM-TOOL-2: Orthogonal Service Capability Tools (pm_build, pm_lsp)]_
+
+_See Requirement link:../../Requirements.adoc#PM-SVC-1[PM-SVC-1: Integrated Build Server & Working-Tree Hash Freshness]_
+
+_See Requirement link:../../Requirements.adoc#PM-SVC-2[PM-SVC-2: Warm Language Server Pool & Semantic Code Navigation]_
+
+_See Requirement link:../../Requirements.adoc#PM-SVC-4[PM-SVC-4: Orthogonal Service Access Outside Active Workflow Links]_
+
+_See Requirement link:../../Requirements.adoc#PM-IMPL-6[PM-IMPL-6: Native Build Output Parsers & Fallback Diagnostics]_
+
+Service tools provide deterministic build execution and warm language-server intelligence during implementation without advancing the workflow state machine directly (`PM-SVC-4`).
+
+=== `pm_build` — Enrolled Build Execution
+_Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH-JOB-11[PM-WATCH-JOB-11]_
+
+Submits or awaits a build job in the plan's worktree (or the primary repository checkout when `plan_id` is `NO_PLAN`; such a plan-less build is workspace-addressed, `PM-ARCH-4`, and writes its `change-ledger.jsonl` row, findings, and log into the workspace home `<PM_MCP_BASE>/projects/<project_id>/workspace/`) using one of the canonical build verbs (link:../job-runtime/02-confinement-and-environment.adoc#canonical-build-verbs[Job Runtime Specification, Canonical Build Verb Set]; the `command` enum below equals it). The gate scope of the run follows from `module` alone: without `module` the build runs whole-tree, with it only that module. The call blocks for one bounded or progress wait window (link:../timeouts/01-job-budgets-and-waits.adoc#bounded-wait[Timeouts & Budgets Specification]). The model never supplies shell commands or flags. On a job connection `pm_build` belongs to the tool set of `writer` jobs only: for a `read_only` job it is not listed, and a call of it is the JSON-RPC error `-32602` like every unlisted tool (xref:01-core-workflow-tools.adoc#job-bound-connections[Job-Bound Connections]).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_build",
+  "description": "Execute a canonical project build verb in the plan's worktree (or primary checkout when plan_id is NO_PLAN) via the integrated build runner.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Plan scope whose worktree the build runs in. The literal NO_PLAN runs in the primary repository checkout as a workspace-addressed request; its ledger row, findings, and log belong to the workspace scope."
+    },
+    "command": {
+      "type": "string",
+      "enum": ["clean", "compile", "test-compile", "module-tests", "integration-tests", "e2e", "coverage", "benchmark", "quality-gate", "arch-gate", "verify", "install", "clean-install", "package"],
+      "description": "Canonical build verb (job-runtime.adoc, Canonical Build Verb Set) resolved against the project's enrolled or compiled default template and enrolled wrapper."
+    },
+    "module": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,56}$",
+      "description": "Optional logical module identifier discovered in the project (never an arbitrary filesystem path); absent means a whole-tree run, present means that module only (gate scope follows from this argument, never from the verb); a module the project's discovery does not know is refused with invalid_arguments."
+    },
+    "test_filter": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.$#*-]{1,256}$",
+      "description": "Optional test class or method filter when command is 'module-tests' or 'integration-tests'."
+    },
+    "expect": {
+      "type": "string",
+      "enum": ["green", "red"],
+      "default": "green",
+      "description": "Declared intent of the run; 'red' marks a deliberately failing run (for example a test written before its fix)."
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^b-[0-9a-f]{16}$",
+      "description": "Optional job_id of a running build returned earlier by pm_build; the call then continues waiting on that build for one bounded window (PM-TOOL-2, PM-IMPL-4) instead of starting a new one; an unknown or finished job_id, or one of another scope, is refused with invalid_arguments."
+    }
+  },
+  "required": ["plan_id", "command"],
+  "additionalProperties": false
+}
+----
+
+==== `pm_build` TOON Output Contract
+
+`pm_build` never returns raw console output. It returns a structured TOON result containing:
+
+* `job_id`: unique build job identifier in the `b-` form of the link:../identifiers/01-general-rules-and-registry.adoc#id-job-id[`job_id` grammar] (e.g., `b-7f3a09c4e1d2b865`)
+* `status`: the closed job outcome enum (`succeeded`, `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate`; `PM-EXEC-4`, derived by link:../job-runtime/01-pipeline-and-subprocesses.adoc#outcome-derivation[Job Runtime Specification, Outcome Derivation]) plus the non-terminal `running`
+* `expectation`: present only on a terminal result of a call that supplied `expect`: `met` when the outcome matches the declared intent (`succeeded` for `green`; `failed` or `failed_unparsed` for `red`), otherwise `violated`; it never changes `status`
+* `summary`: counts of total/passed/failed/skipped tests and compiler/linter errors
+* `failures`: tabular TOON array of located compiler errors or test failures (`file`, `line`, `column`, `rule_or_test`, `message`)
+* `log_uri`: `pm://plan/{plan_id}/builds/{job_id}/log` (or `pm://workspace/builds/{job_id}/log` when `plan_id` is `NO_PLAN`; accompanied by the last 50 lines / 4 KB tail when `status == "failed_unparsed"`, `PM-IMPL-6`)
+
+*Recorded, never returned*: The working-tree digest the build ran against (`worktree_sha` with its `worktree_sha_version`, or `unavailable` with its `worktree_sha_failure`; link:../job-runtime/03-parsers-and-gates.adoc#worktree-sha[Job Runtime Specification, Working-Tree Hash]) is stamped on the job's `change-ledger.jsonl` row (`kind: "build"`) and in its job record, where the freshness gates read it; the model makes no decision on it. The allocated budget with its `budget_derivation`, the build template source, the job's `confinement`, the build-slot cap and its source, and the job timing are likewise job-record data, shown by `pm-operator status` (link:../hypermedia-format/01-representation-and-link-forms.adoc#model-facing-minimality[Hypermedia Format Specification, Model-Facing Minimality]).
+
+*Expected-red runs*: A failing run with `expect: red` returns `status: failed` with `expectation: met`, is recorded as `expected_red` in the change ledger, and files no finding; a passing run with `expect: red` returns `status: succeeded` with `expectation: violated`, and the change ledger records `expected_red_went_green`. An `expect: red` run never satisfies a freshness gate.
+
+=== `pm_lsp` — Warm Language Server Operations
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-3[PM-WATCH-TOOL-3]_
+
+Queries or applies verified workspace edits against the runtime's warm LSP pool keyed by `(worktree, language)`. `plan_id: "NO_PLAN"` addresses the main checkout of the project's workspace scope for the read operations; `rename` with `NO_PLAN` is refused with `invalid_arguments`, because an edit is applied only inside a plan's worktree. On the connection of a `read_only` model job `pm_lsp` serves its read operations only: `rename` is refused with `invalid_arguments` (parameter `op`; xref:01-core-workflow-tools.adoc#job-bound-connections[Job-Bound Connections]). The other argument rules the flat schema cannot express are answered the same way, naming the `parameter` and the `rule` (xref:04-errors-and-testing.adoc#protocol-errors-vs-domain-workflow-failure-states[Errors, Failure States & Protocol Testing]): a `path` with a `..` segment or resolving outside the worktree (rule `path_outside_worktree`), and a `path` whose language has no language server enrolled for the project (rule `no_language_server`, naming the language).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_lsp",
+  "description": "Execute a language-server operation against the warm LSP pool for a plan's worktree or the main checkout.",
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Plan scope identifying the target worktree, or the literal NO_PLAN for the main checkout of the workspace scope (refused for rename, server-enforced)."
+    },
+    "op": {
+      "type": "string",
+      "enum": [
+        "workspace_symbol",
+        "document_symbol",
+        "definition",
+        "references",
+        "hover",
+        "diagnostics",
+        "rename"
+      ],
+      "description": "Closed LSP operation to execute."
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$",
+      "description": "Repository-relative file path within the plan's worktree (required for document_symbol, definition, references, hover, diagnostics, rename; a '..' segment or a path resolving outside the worktree is refused with invalid_arguments)."
+    },
+    "line": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based line number (required for definition, references, hover, rename)."
+    },
+    "character": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based column counted in Unicode code points of the line (required for definition, references, hover, rename); the server converts to the language server's negotiated position encoding."
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Symbol search query (required for workspace_symbol)."
+    },
+    "new_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+      "maxLength": 128,
+      "description": "Replacement identifier for 'rename' operation."
+    }
+  },
+  "required": ["plan_id", "op"],
+  "additionalProperties": false
+}
+----
+
+*Position Semantics*: Every `pm_lsp` input and output position is 1-based in lines and in columns, and a column counts Unicode code points of the line as stored on disk. The server negotiates the LSP `positionEncoding` with the language server (preferring `utf-32`, then `utf-8`, falling back to `utf-16`) and converts positions in both directions from the file content; a position beyond the end of its line, or beyond the last line, is refused with `invalid_arguments` and never clamped.
+
+==== Warm LSP Pool Lifecycle (`PM-SVC-2`)
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-11[PM-WATCH-EXT-11], link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-4[PM-WATCH-TOOL-4]_
+
+* *Pool Keying & Lazy Spawn over `stdio`*: The runtime maintains a warm in-memory pool of LSP server child processes, shared by all host connections, keyed by `(canonical_worktree_path, language_id)` using language servers enrolled in the project's enrolment file `<PM_MCP_BASE>/enrolments/<project_id>.json`and managed via `org.eclipse.lsp4j:org.eclipse.lsp4j` over `stdio`. They are pool processes, not jobs: started through `pm-exec` with the job confinement but without a job record, and ended by their closed `stdin` when the runtime crashes. Processes start lazily on the first `pm_lsp` or Axis C symbol-edge query and shut down automatically after the language server idle timeout (`lsp_idle_timeout_seconds` in `machine-config.json`), when the plan worktree is removed, or when the runtime drains or stops; the idle, start, and request timeouts are defined in link:../timeouts/02-runtime-leases-operator-web.adoc#runtime-lifecycle[Timeouts & Budgets Specification, Runtime Lifecycle].
+* *Diagnostics (`diagnostics`)*: When the language server advertises the LSP 3.17 pull-diagnostics capability (`diagnosticProvider`), the runtime requests the file's current diagnostics with `textDocument/diagnostic`. Otherwise it returns the diagnostics the server last published for that file through the `textDocument/publishDiagnostics` notification, which the pool caches per document, and marks the result `source: published`.
+* *Server-Applied `WorkspaceEdit` (`rename`)*: When `op == "rename"`, the runtime validates that every target URI in the LSP `WorkspaceEdit` resolves inside the plan's worktree (`PM-SEC-2`), applies the text edits atomically on disk, notifies the warm LSP server (`textDocument/didChange`), and appends all modified file paths to the plan's `references.json` realized footprint. A server answer without a `WorkspaceEdit` is a third outcome, returned as `status: success, applied: false, reason: no_workspace_edit` with nothing changed. A malformed `documentChanges` entry refuses the whole edit instead of being dropped silently, and a rollback is reported as `rolled_back: true` only after the restored bytes, line endings included, are verified identical to the originals.
+* *Corpus Language Server*: The corpus language server is an enrollable language server of the meta-project domain (`marshall-plugin`, `pm-plugin-development` in `plan-marshall`), served through the existing `definition`, `references`, and `hover` operations with `plan-marshall`'s completeness bound: an empty answer means the index found none. It adds no operation and no pool tier.
+* *Restart Limit*: A language server that crashes is restarted at most the compiled retry limit (link:../job-runtime.adoc[Job Runtime Specification]); after the retries are exhausted, `pm_lsp` answers `lsp_unavailable` for that pool instance until its idle eviction or a runtime restart.
+
+=== Selective Upstream MCP Proxy & `_meta` Provenance (`PM-SVC-3`)
+_See Requirement link:../../Requirements.adoc#PM-SVC-3[PM-SVC-3: Selective Upstream MCP Proxy & Provenance Tagging]_
+
+The relay `pm-mcp serve` is the host's single MCP entry point: upstream MCP servers (such as external issue trackers or documentation indexes) are connected once by the runtime and reached through it, and the runtime acts as their selective filter and provenance boundary:
+
+1. *Operator-Owned Allowlist*: Upstream servers are configured only in the closed object `upstream_mcp` of the per-project operator file `<PM_MCP_BASE>/projects/<project_id>/local-config.json` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]): per server its id, its URL, its credential key `mcp-<server_id>`, and the tools re-exposed. The only writer is the runtime on the operator verb `pm-operator upstream allow|deny`, under `local-config.lock` (`PM-SEC-3`). Repository content, including the team configuration under `.marshall/config/`, never adds a server or a tool.
+2. *Pass-Through Surface & Schema Narrowing*: Allowlisted tools are listed to the host as `up_<server_id>_<tool>` next to the core `pm_*` tools, with unused optional parameters stripped from their `inputSchema` to conserve resident context budget. The pass-through set is computed per request from the request's `PM-MCP-Workspace` header and the allowlist; it changes only when the operator changes the allowlist, and hosts see the change at their next `tools/list`. Upstream resources and prompts are not passed through, and upstream skills are never re-exposed as PM-MCP vocabulary skills.
+3. *Server-Side Use by Workflow Steps*: A workflow step may call an allowlisted upstream tool server-side; its result enters plan stores only through the two-level guard for external text (the deterministic untrusted-ingestion validator, then the screener job, `PM-SEC-1`; link:../dispatch-and-effort/06-untrusted-text-screening.adoc#two-level-guard[Model Jobs & Effort Specification, Two-Level Guard for External Text]), never verbatim.
+4. *Provenance Tagging (`_meta` key `de.cuioss.pm-mcp/source`)*: Every tool result or resource proxied from an upstream MCP server is wrapped with `_meta: {"de.cuioss.pm-mcp/source": "upstream_mcp:<server_id>", "de.cuioss.pm-mcp/trusted": false}`, using PM-MCP's own `_meta` key prefix (MCP `_meta` key prefix convention) so that provenance never collides with or is overwritten by keys the upstream server sets, and routed through the two-level guard (`PM-SEC-1`) before any candidate data can enter plan stores.
+5. *Credential Isolation & Transport*: An upstream MCP server is reached only as a remote server over HTTPS through `de.cuioss:cui-http` (`PM-TECH-2`); the runtime starts no upstream server as a subprocess. The connection authenticates with the server-specific credential resolved from `CredentialStore` under the key `mcp-<server_id>` of the project; tokens from other providers are never forwarded.
+
+== Skill Architecture & Retrieval Tool Schemas (`pm_skill`, `pm_skills`, `pm_skill_file`)
+_See Requirement link:../../Requirements.adoc#PM-SKILL-1[PM-SKILL-1: Static Vocabulary Skills & Separation from Process Logic]_
+
+_See Requirement link:../../Requirements.adoc#PM-SKILL-2[PM-SKILL-2: Per-Project Skill Generation & Digest Integrity]_
+
+_See Requirement link:../../Requirements.adoc#PM-SKILL-3[PM-SKILL-3: Standard MCP Tool & Resource Skill Delivery]_
+
+_See Requirement link:../../Requirements.adoc#PM-SKILL-4[PM-SKILL-4: Dynamic State Context Injection via Representations]_
+
+_See Requirement link:../../Requirements.adoc#PM-CLIENT-2[PM-CLIENT-2: Data-Driven On-the-Fly Profile Translation]_
+
+=== Pure Vocabulary Skills & Dynamic Context Injection (`PM-SKILL-1`, `PM-SKILL-2`, `PM-SKILL-4`)
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-6[PM-WATCH-TOOL-6]_
+
+* *Pure Vocabulary Contract (`PM-SKILL-1`)*: All procedural sequencing, CLI invocations, file path templates, and phase transition rules live exclusively in the compiled workflow engine. Vocabulary skills (`skill://pm/<path>/SKILL.md`) contain strictly domain standards, quality rubrics, architectural principles, and judgment criteria.
+* *Server-Generated & Client-Cached Catalogue (`PM-SKILL-2`)*: Vocabulary skills are compiled into the runtime binary `pm-mcpd`, filtered by the project's enabled domains (derived, with the overrides of `.marshall/config/domains.json`), and translated on the fly for the active client profile (`PM-CLIENT-2`). Every rendered skill includes a deterministic `_meta.sha256` content digest (`_meta["de.cuioss.pm-mcp/sha256"]`: the SHA-256 of exactly the rendered bytes the client receives, after profile translation and domain filtering, so it changes exactly when those bytes change) enabling client-side caching and invalidation: the runtime is sessionless (link:../runtime-model.adoc[Runtime & Interaction Model Specification], Connection Metadata), so it offers no resource subscriptions and sends no `notifications/resources/updated` or `list_changed`; a client detects a changed skill by its digest, which travels only in `_meta` of the skill result, never as a TOON field of a listing or representation.
+* *Dynamic State Context Injection (`PM-SKILL-4`)*: Live plan facts (`plan_id`, active task summary, open findings count, and valid `links`) are injected into the turn's TOON hypermedia representation (`skill` + `facts` + `links`), never baked into static `SKILL.md` files.
+* *Core Conduct Vocabulary (`skill://pm/core/SKILL.md`)*: The always-loaded core skill (rendered in-band into the prompt file of every model job except the screener, link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification]) states at minimum: (1) a fix covers the whole co-reference population of the defect (derived with `pm_lsp references` or a search before editing), never only the named site; (2) every "only", "all", "none", or "the set is N" claim carries its enumeration and the scope it was derived over; (3) a case outside a closed vocabulary is reported with the vocabulary's out-of-set member, never mapped onto a stand-in member; (4) a re-derived count or coverage figure is checked against its population before it is reported; (5) plan state is read only through `pm_state` and `pm://` resources, never from `.marshall/` files; (6) the correction a rejection names is applied before the call is retried, and a rejected call shape is never resubmitted unchanged; (7) an action taken outside the offered links (a bypass of a sanctioned path, a direct `.marshall/` read or write) is reported with the `report_bypass` link (link:../hypermedia-format/01-representation-and-link-forms.adoc#self-report-link[Hypermedia Format Specification, Self-Report Link]).
+
+[#vocabulary-skill-rule-classification]
+=== Vocabulary Skill Rule Classification
+
+Every prescriptive rule that remains in a vocabulary skill after process ownership moved to the engine (`PM-ARCH-1`) carries exactly one class:
+
+* *`engine`*: Enforced by link omission or server-side validation. The skill only names the rule; it is a candidate for deletion from resident content.
+* *`check`*: Structural and violated in practice. Enforced by a deterministic check that needs no model call.
+* *`guidance`*: Semantic and not decidable by a deterministic check. It stays guidance and becomes a measurement subject of the link:../workflow-dsl/07-loop-back-diagrams-verification.adoc#behavioural-conformance-harness[Behavioural Conformance Harness] (`PM-TEST-6`); any automated gate on it runs only under a stated cost ceiling.
+
+Whether a `guidance` rule stays in resident content is decided by its recorded violation history (`PM-TEST-6` verdicts, audit rejections, and findings attributed to the rule); a rule with no recorded violation is a deletion candidate. The class is recorded per rule and carried into every behavioural scenario as its `enforcement_class`, so conformance reports group results by class: mechanically enforced rules and prose-only rules are different propositions and are never pooled into one rate.
+
+=== `pm_skill` — Retrieve Vocabulary Skill Content
+
+Fetches a rendered `SKILL.md` document by its canonical `skill://pm/.../SKILL.md` URI, with its supporting file list and section index, and its SHA-256 digest in `_meta`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pm_skill",
+  "description": "Retrieve a vocabulary skill document (SKILL.md) rendered for the active project and client profile.",
+  "type": "object",
+  "properties": {
+    "uri": {
+      "type": "string",
+      "pattern": "^skill://pm/[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*/SKILL\\.md$",
+      "maxLength": 256,
+      "description": "Canonical skill URI referenced in a state representation's 'skill' field."
+    },
+    "section": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,127}$",
+      "description": "Optional heading anchor from the document's section index; returns only that section."
+    },
+    "plan_id": {
+      "type": "string",
+      "pattern": "^([a-z0-9][a-z0-9-]{1,62}[a-z0-9]|NO_PLAN)$",
+      "description": "Plan scope used to resolve the client profile and project domain configuration, or the literal NO_PLAN for the workspace scope. Exactly one of plan_id or epic_id is required (server-enforced)."
+    },
+    "epic_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Epic scope used to resolve the client profile. Mutually exclusive with plan_id."
+    }
+  },
+  "required": ["uri"],
+  "additionalProperties": false
+}
+----
+
+* *Rendering Scope*: The addressed scope selects the rendering inputs: the client profile of the scope's latest session row and the project's enabled domains. With `NO_PLAN`, the profile comes from the workspace scope's latest session row and the domains from the project configuration. On a job connection the profile is the job's harness profile from the job record (xref:01-core-workflow-tools.adoc#job-bound-connections[Job-Bound Connections]).
+* *Section Index & Progressive Loading*: Every `pm_skill` and `pm_skill_file` result carries a section index computed by the server from the rendered document (`sections[]{anchor, title, level, bytes}`). Without `section`, the result carries the whole document beside the index; when the rendered document exceeds the server's inline threshold (one named constant, derived from the measured served-content distribution, link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Served-Content Ledger]), it carries the index instead of the body, with the total size, so the caller reads index first, then sections, then the whole document only when needed. With `section`, the result carries that section only, its `bytes`, and the index.
+* *Three Distinct Section Outcomes*: A `section` that the index does not contain returns a tool execution error with `error_code: section_not_found` (naming the available anchors); a document the server cannot read or render returns `error_code: file_unreadable`; a section that exists but has no content returns `bytes: 0` with an empty body. None of the three is ever rendered as a silent empty result.
+* *Served-Content Recording*: Every served read in a plan, epic, or workspace scope appends a row to the served-content ledger in the `metrics.json` of that scope (`uri`, `section`, `bytes`, `plan_id`, `phase`, and the `job_id` of a job connection, otherwise `null`; `phase` is null outside a plan), from which `record-metrics` publishes the per-document consumption. Host file reads are not observable and are never estimated.
+
+=== Companion Catalogue, Supporting File Tools & MCP Resource Parity (`pm_skills`, `pm_skill_file`, `resources/read`)
+
+* `pm_skills`: Accepts exactly one of `plan_id` (a plan id or `NO_PLAN`) or `epic_id` (`additionalProperties: false`) and returns the tabular TOON catalogue of all vocabulary skills active for the project's enabled domains (`uri`, `name`, `description`; the digests travel in `_meta`). Catalogue descriptions (skills and tool descriptions) are single-line and bounded by a length limit derived from the measured distribution of the resident surface (link:../client-profiles.adoc[Client Profiles Specification]); a build-time test enforces the bound. A change of description shape (for example from summary-shaped to trigger-shaped) is a separately justified change.
+* `pm_skill_file`: Accepts required `uri` (supporting file form of the link:../identifiers/02-registry-stores-to-web.adoc#id-skill-uri[skill URI grammar]), exactly one of `plan_id` (a plan id or `NO_PLAN`) or `epic_id`, and optional `section` with the same semantics as for `pm_skill` (`additionalProperties: false`) to retrieve progressive-disclosure reference files linked from a `SKILL.md`. Skill `resources/read` carries no scope argument; it renders with the client profile detected for the request (Tier 2 of link:../client-profiles/02-placeholders-and-detection.adoc#_the_three_identity_tiers[Client Profiles Specification, The Three Identity Tiers], `neutral` when nothing is detected; on a job connection the job's harness profile from the job record) and the enabled domains of the project named by the `PM-MCP-Workspace` header; it returns the whole document and publishes the section index in `_meta`; section reads are served by the two tools.
+* *Standard MCP Resource Template Parity (`PM-SKILL-3`)*: The runtime simultaneously exposes the RFC 6570 templates `skill://pm/{+path}/SKILL.md` and `skill://pm/{+path}/{file}` (`{+path}` = one or more `/`-separated lowercase segments) via standard MCP `resources/templates/list` and `resources/read`. Unadopted draft custom RPC methods (`skills/list`, `skills/get`) are not exposed.
+
+[#transitional-legacy-script-tool]
+== Legacy Script Execution (Removed)
+_See Requirement link:../../Requirements.adoc#PM-MIG-2[PM-MIG-2: Separate State Trees & Legacy Coexistence]_
+
+_See Requirement link:../../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-7[PM-WATCH-TOOL-7]_
+
+Removed by the clean cut: PM-MCP runs no legacy `plan-marshall` scripts; see `PM-MIG-2`. No MCP tool, client bundle artifact, or host permission rule exposes legacy script execution, at any migration stage. Projects not offered the plan lifecycle (lifecycle gate closed and not enrolled as a pilot, or released) keep running legacy `plan-marshall` beside PM-MCP, each in its own state tree.

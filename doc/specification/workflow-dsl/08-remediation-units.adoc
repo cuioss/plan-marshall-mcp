@@ -1,0 +1,240 @@
+= Workflow DSL & Engine Specification: Remediation Policy Units
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workflow DSL & Engine Specification] » Remediation Policy Units
+
+[#remediation-units]
+== Remediation Policy Units (`remediation.*`)
+_See Requirement link:../../Requirements.adoc#PM-WF-7[PM-WF-7: Remediation Policies, Loop-Back & Iteration Bounds]_
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-13[PM-WATCH-PHASE-13]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+Every blocking failure of a plan gets a bounded self-remedy through a remediation policy unit and then a defined fallback end; no failure waits for an operator decision. A remediation unit is an ordinary sub-workflow (`scope subworkflow`, one unit per failure class) that is project-owned like every other sub-workflow (xref:04-ast-node-model.adoc#project-owned-units[Project-Owned Workflow Units & Compiled Invariants]), rendered as a diagram, and scenario-testable. The server gathers the evidence; the model chooses the remedy from a closed action set the server validates: `retry` (re-run without changing code, reason `enum[flaky|infra|timeout]`), `fix` (change code or artifact and re-verify), the `loop_back` form of `fix` (the fix runs as Phase 5 remediation tasks), and `request_waiver` (a request to the operator). Every unit's actions are bounded by per-plan budgets, its compiled invariants (<<remediation-invariants>>) hold on every load and every plan instance version, and its exit contract is a subset of the domain outcomes `resolved | waived | exhausted | fix_requested` plus the control outcome `stepped_out`.
+
+[cols="2,3,3,2"]
+|===
+|Unit |Evidence (gather job) |Actions of `decide` |Domain outcomes (waivable gate)
+
+|`remediation.ci-failure`
+|Failed checks of `HEAD` through the provider module, logs parsed by the domain `log_parser` (kinds `compile`, `test`, `lint`, `infra`, `timeout`, `unknown`), and the base's CI result of the same checks in the same job: a red that the base shows with the same fingerprints is recorded `baseline_red` and never reaches `decide`
+|`retry` (re-run the checks), `fix` (in-branch commit, push, await the checks of the new `HEAD`), `loop_back`
+|`resolved`, `waived` (`ci_check:<name>`), `exhausted`, `fix_requested`
+
+|`remediation.review-findings`
+|Open findings without a terminal disposition (wait region, barrier re-fetch, self-review, security audit), structural refusals, and missing review evidence (`evidence_missing`); the screen job `remediation-review.screen` and the triage job `remediation-review.triage` (one disposition per finding group) precede the budget check
+|`retry` (window-gated per-bot re-trigger; never for `unregistered_kind` or `not_wired`), `fix` (in-branch; bound only at call sites after the pull request exists), `loop_back`; review-chain-terminus findings are fix-free, dependency-delta findings `FIX`-only
+|`resolved`, `waived` (`review_evidence[:<bot_kind>]`, `findings:<class>`; security findings are never waivable), `exhausted`, `fix_requested`
+
+|`remediation.analysis`
+|Every configured analysis provider's failed gate conditions and new issues, tagged by provider (`gate_failed`, `findings`, `undecidable`); the provider messages pass the screen job `remediation-analysis.screen`
+|`retry` (re-scan or re-trigger the provider, the remedy for `undecidable`), `fix` (in-branch)
+|`resolved`, `waived` (`analysis_gate:<provider>`, `findings:<provider>`), `exhausted`
+
+|`remediation.build-failure`
+|The failing build ledger row (`errors[]` by file and line) with the recorded `failed_build` fact (`deliverable`, `sweep`, or the finalize gate); a proven baseline-only red never reaches `decide`
+|`retry` (re-run the build, for no-verdict fates), `fix` (as remediation tasks)
+|`resolved`, `exhausted`, `fix_requested`
+
+|`remediation.merge-conflict`
+|Conflicting paths and hunks with the base commits that touched them (a `sync-baseline` or merge-path rebase)
+|`fix` (the model resolves the conflicted files in the checkout; the unit continues the rebase)
+|`resolved`, `exhausted`
+
+|`remediation.qgate-findings`
+|The phase's blocking Q-Gate findings, persisted by the Q-Gate worker and decided by the server
+|`fix` (a new job of the authoring state, or `plan.revise-tasks` in Phase 4); an unchanged artifact is refused `fix_unchanged`
+|`resolved`, `waived` (`qgate_findings:<phase>`), `exhausted`, `fix_requested`
+
+|`remediation.spend`
+|The spend report against the plan's budget anchor
+|none (degenerate unit: only the waiver wait; the spend ceiling is not raisable)
+|`resolved` (the spend report is within the ceiling), `waived` (a `met` waiver of the gate `spend` arrived during a bound waiver wait; `merge.gate-entry` consumes it), `exhausted`
+|===
+
+=== Call Sites & Default Budgets
+
+The budgets are call arguments of the project-owned phase units (the template values). The plan instance binds the *effective* ceiling per policy with its source (the template's call argument, a composition rule, or a `raise` waiver id), capped by the compiled hard limits `retry_budget` 5, `fix_budget` 5, and `waiver_wait_seconds` 86400 (xref:09-plan-instance.adoc#plan-instance[Plan Instance]). The shipped `waiver_wait_seconds` is `0`: a `request_waiver` then goes into the hand-back report instead of waiting.
+
+[cols="3,2,1,3"]
+|===
+|Call state (entered from) |Unit |Retry / fix / wait s |Routing
+
+|`refine.remediate-qgate`, `outline.remediate-qgate`, `plan.remediate-qgate` (the `blocking` verdict of `<phase>.qgate`)
+|`remediation.qgate-findings`
+|0 / 3 / 0
+|`resolved`, `waived` -> the phase exit (waived findings dispositioned accepted-by-waiver); `fix_requested` -> `refine.analyze`, `plan.revise-tasks`, or in Phase 3 an `auto` router state that routes by lane to `outline.deep` or `outline.light-regate`, with `facts.qgate_findings`; `exhausted`, `stepped_out` -> `plan.return` (which forwards to `finalize.hand-back` when the plan branch holds commits beyond the base)
+
+|`execute.remediate-build` (`execute.deliverable-build`, `execute.verify-sweep`), `land.remediate-build` (`land.verify-sweep`), `finalize.remediate-build` (`finalize.pre-push-quality-gate`)
+|`remediation.build-failure`
+|1 / 3 / 0
+|`resolved` -> in Phase 5 the `auto` router state `execute.route-build-cause`, which continues by `failed_build` (`deliverable` -> `execute.envelope-ready`, `sweep` -> `execute.verify-sweep`), in the `land` lane and Phase 6 the caller's one continuation (`finalize.settle-commit`); `fix_requested` -> remediation task allocation, whose commit enters the router `execute.route-commit-cause`; `exhausted`, `stepped_out` -> `finalize.hand-back` (outcome `returned` when the branch holds no commit beyond the base)
+
+|`finalize.remediate-ci` (`ci_failed` of the wait region and of `finalize.merge-evidence-wait`), `finalize.remediate-barrier-ci` (`ci_failed` of the pre-merge barrier; `actions=[retry,fix]`; `resolved`, `waived` -> `finalize.merge-gate`)
+|`remediation.ci-failure`
+|2 / 3 / 0
+|`resolved`, `waived` -> `finalize.next-step` completing `default:ci-verify`; `fix_requested` -> `finalize.allocate-remediation`; `exhausted`, `stepped_out` -> `finalize.hand-back`
+
+|`finalize.remediate-analysis` (`analysis_failed`)
+|`remediation.analysis`
+|1 / 3 / 0
+|As for CI, completing `default:analysis-roundtrip`
+
+|`finalize.remediate-review` (`findings_open`, `bot_refused_structural`, `review_evidence_missing`, `cap_exceeded`), `finalize.remediate-barrier` (`findings_untriaged` of the pre-merge barrier; `resolved`, `waived` -> `finalize.merge-gate`), `finalize.remediate-self-review` and `finalize.remediate-security-audit` (findings of `finalize.self-review` and `finalize.security-audit`, one call state per step; `actions=[retry,loop_back]`: before the pull request exists a fix runs only in the `loop_back` form)
+|`remediation.review-findings`
+|1 / 3 / 0
+|As for CI, completing `plan-marshall:automatic-review` in the wait region and its own step in each Settle-band call state
+
+|`finalize.remediate-sync-conflict` (`finalize.sync-baseline`), `finalize.remediate-merge-conflict` (`finalize.merge-sync`)
+|`remediation.merge-conflict`
+|0 / 2 / 0
+|`resolved` -> `finalize.settle-commit` (merge path: its re-verification); `exhausted`, `stepped_out` -> `finalize.hand-back`
+
+|`finalize.remediate-spend` (`spend_overrun` of `finalize.merge-gate`)
+|`remediation.spend`
+|– / – / 0
+|`resolved` -> `finalize.merge-gate`; `exhausted`, `stepped_out` -> `finalize.hand-back`
+|===
+
+In the finalize wait region one unit runs at a time, in the fixed order CI -> analysis -> review findings; a unit's await state watches only its own class at the new `HEAD`, and after `resolved` or `waived` verdict currency re-fires the region for every class that is stale at the new `HEAD` (xref:03-reference-excerpt.adoc#_reference_workflow_dsl_excerpt_finalize_pmwf[Reference Workflow Excerpt]). For a `land` plan the shipped composition rule binds every call with `actions=[retry]`, so `decide` offers only `retry` and `step_out`, and exhaustion hands the plan back with the user's change and the failure documented (xref:09-plan-instance.adoc#composition-rules[Composition Rules]).
+
+=== Unit Template
+
+Every unit follows one state template; the unit's own states are named `remediation-<class>.<state>`:
+
+1. *`gather`* (`composite_job`): The server's evidence job. It persists one failure envelope per failure `{failure_id, class, kind, source, file?, line?, message, fingerprint, excerpt_uri?}` (the fingerprint is class, kind, file, and normalized message; logs and excerpts live in the plan's evidence directory and are served as untrusted resources `pm://plan/{plan_id}/evidence/{evidence_id}`, never inlined beyond `message`; link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory]). A unit whose evidence carries externally authored text (review comments and bot findings, analysis-provider messages; never CI logs, which are level-1 only) writes the new items of the firing as one server-built batch (`batch-v1`, level-1-cleaned text in spotlighting delimiters, SHA-256 per item). Outcomes: `failures` -> `screen` when the batch holds items without a cached verdict, otherwise -> `triage` (review findings) or `budget-check`; `none` -> `resolved`; `all_waived` (every failure is covered by a consumed `met` waiver) -> `waived`. Constituent fates other than success map to `failures` with the kind `infra`, so a gathering problem is itself remediable.
+2. *`screen`* (`job llm screen role screen.effort each screen.batch-parts`, units with external text only): one zero-tool screener job per part of the batch's uncached items (one part, unless the batch exceeds the screening split bound; xref:02-units-jobs-decisions.adoc#model-job-states[Model Job States] item 6), whose verdicts are validated fail-closed and cached per scope by the text's SHA-256. A `suspicious` item is withheld: only its structured fields (author, file, line, kind) and `withheld: flagged by screener` reach a model; a withheld finding stays pending, so the unit ends through its budget and fallback (the hand-back report lists it) unless a `met` waiver covers it. The job's completion continues to `triage` (review findings) or `budget-check`.
+3. *`triage`* (`job llm triage role plan.phase-6-finalize.effort.triage`, review findings only): one read-only job per firing over every finding of the batch without a terminal disposition that is not withheld, grouped by `(domain, rule_id)`; it submits one disposition per group with per-finding exceptions (`triage-groups`), which the server writes per finding. It is entered only while such a finding remains, so `decide` asks for the remedy alone (guided step-in).
+4. *`budget-check`* (`auto remediation.check-budgets`): `budget_left` -> `decide`; `exhausted_wait` (every budget spent, `waiver_wait_seconds > 0`, and a failing gate waivable: the server files the waiver request) -> `waiver-wait`; `exhausted` -> the `exhausted` terminal. It precedes every entry into `decide`, so `decide` is never entered with no remedy left.
+5. *`decide`* (`link`, `facts remediation.failure-evidence`, one skill section): the model's one judgment. Each action link is guarded by `param:actions has <action>` and its budget predicate; `request_waiver (rationale: text[1..2000])` (rel `escalate`, form `submit`) by `predicate:remediation.waiver-requestable` (`waiver_wait_seconds > 0`, the failing gate on the closed waivable list, no request pending); the implicit `step_out` is never guarded. The server validates the choice: `retry` is refused with `retry_not_applicable` when the same fingerprints already failed after a retry with the same reason; `fix` is refused with `fix_unchanged` when the worktree or the artifact is unchanged since the previous attempt (this replaces the Q-Gate content-hash gate); non-waivable failures are marked `waivable: false` in the evidence.
+6. *`commit-fix`* (`call git.commit_and_push`, `message_mode=interactive`, `push_mode=always`) for in-branch fixes, reachable only where the call binds `fix` (every such call site lies after the pull request exists): `done` with `guard result.commit` -> `await`, and the fix attempt recorded by `remediation.record-fix-attempt` is charged in that returning transaction; `done` with `guard not result.commit` (nothing was committed: `fix_unchanged`) and `stepped_out` -> `decide`, uncharged. The `loop_back` and the Q-Gate and build `fix` enter the `fix_requested` terminal instead, charged by the link's primitive; the caller allocates the work and calls the unit again after the next verification, on the same counter.
+7. *`await`* (`composite_job`): re-verifies only the unit's class at the new `HEAD` (the checks, a re-scan, a bot re-review, the build): passing -> `resolved`; failing, interrupted, or cancelled -> `gather`.
+8. *`waiver-wait`* (`composite_job remediation.await-waiver`): the bounded wait for the operator, a server timer plus a watch of the waiver record (`OPERATOR_WAIVER`, `TIME`), no model turn: `raised` -> `budget-check` with the new ceiling; `waived` -> `waived`; `expired` -> `exhausted`; `interrupted` (a constituent fate other than success) -> `budget-check`, which re-enters the wait against the request's persisted `expires_at`, so a restart never extends it; `cancelled` -> `exhausted`.
+9. *Terminals*: `resolved` (`success`), `waived` (`success`, only in units whose class has a `met`-waivable gate), `exhausted` (`failure`), `fix_requested` (`unsettled`), declared only where reachable.
+
+*Budget accounting*: budgets are counted per plan and class in `mcp/status.json` `policy_counters` (link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]), persisted and never reset: re-entering a unit, a new `HEAD`, a loop-back, and a re-composition of the instance continue the same counter, and a `raise` waiver lifts only the effective ceiling. A fix is charged when its commit or artifact exists. A step-out consumes no budget and writes no waiver; a phase caller routes it to the same fallback as `exhausted`, and the gap record distinguishes `cause: stepped_out` (with the reason) from `cause: exhausted` (with the budget) (link:../store-schemas/14-plan-instance-waivers-questions.adoc#gap-record[Store Schemas Specification, Gap Record]).
+
+=== DSL Sketch: `remediation.ci-failure`
+
+[source,text]
+----
+workflow remediation.ci-failure version 1 format 1
+scope subworkflow
+param retry_budget: int[0..5]
+param fix_budget: int[0..5]
+param waiver_wait_seconds: int[0..86400]
+param actions: list<enum[retry|fix|loop_back]>
+start remediation-ci.gather
+
+state remediation-ci.gather
+  phase inherit
+  composite_job remediation.gather-ci-evidence   # provider logs, log_parser, base CI result
+    failures        -> remediation-ci.budget-check
+    none            -> remediation-ci.resolved
+    all_waived      -> remediation-ci.waived
+    cancelled       -> remediation-ci.budget-check
+
+state remediation-ci.budget-check
+  phase inherit
+  auto remediation.check-budgets
+    budget_left     -> remediation-ci.decide
+    exhausted_wait  -> remediation-ci.waiver-wait
+    exhausted       -> remediation-ci.exhausted
+
+state remediation-ci.decide
+  phase inherit
+  skill pm/finalize/ci-triage
+  facts remediation.failure-evidence
+  link retry retry [submit] (reason: enum[flaky|infra|timeout])
+    guard param:actions has retry and predicate:remediation.retry-budget-left
+    do remediation.rerun-checks
+      rerun_started -> remediation-ci.await-ci
+  link fix fix [submit] (summary: text[1..500])
+    guard param:actions has fix and predicate:remediation.fix-budget-left
+    do remediation.record-fix-attempt
+      recorded      -> remediation-ci.commit-fix
+  link loop_back loop_back [submit] (remediation_summary: text[1..2000])
+    guard in_worktree and param:actions has loop_back and predicate:remediation.fix-budget-left
+    do remediation.request-loop-back
+      requested     -> remediation-ci.fix-requested
+  link escalate request_waiver [submit] (rationale: text[1..2000])
+    guard predicate:remediation.waiver-requestable
+    do remediation.request-waiver
+      requested     -> remediation-ci.waiver-wait
+
+state remediation-ci.commit-fix
+  phase inherit
+  call git.commit_and_push (message_mode=interactive, push_mode=always)
+    done            -> remediation-ci.await-ci   # the fix is charged
+      guard result.commit
+    done            -> remediation-ci.decide     # nothing committed: not charged
+      guard not result.commit
+    stepped_out     -> remediation-ci.decide
+
+state remediation-ci.await-ci
+  phase inherit
+  composite_job ci.watch-checks                  # only the CI checks of the new HEAD
+    passed          -> remediation-ci.resolved
+    failed          -> remediation-ci.gather
+    interrupted     -> remediation-ci.gather
+    cancelled       -> remediation-ci.gather
+
+state remediation-ci.waiver-wait
+  phase inherit
+  composite_job remediation.await-waiver         # bounded by waiver_wait_seconds
+    raised          -> remediation-ci.budget-check
+    waived          -> remediation-ci.waived
+    expired         -> remediation-ci.exhausted
+    interrupted     -> remediation-ci.budget-check
+    cancelled       -> remediation-ci.exhausted
+
+state remediation-ci.resolved terminal resolved success
+  phase inherit
+
+state remediation-ci.waived terminal waived success
+  phase inherit
+
+state remediation-ci.exhausted terminal exhausted failure
+  phase inherit
+
+state remediation-ci.fix-requested terminal fix_requested unsettled
+  phase inherit
+----
+
+The only resting link state is `remediation-ci.decide`, which also offers the implicit `step_out`. Every cycle passes a job state (`gather`, `await-ci`, `waiver-wait`) or a `submit` link (Rule 11); the `budget-check` -> `waiver-wait` -> `budget-check` cycle awaits `OPERATOR_WAIVER` or `TIME`. The caller binds the arguments, for example `call remediation.ci-failure (retry_budget=2, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix,loop_back])`, and routes `resolved`, `waived`, `exhausted`, `fix_requested`, and `stepped_out` (Rule 6).
+
+[#remediation-invariants]
+=== Compiled Invariants of Remediation Units
+_Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-17[PM-WATCH-DSL-17]_
+
+The invariants extend the table of compiled invariants (xref:04-ast-node-model.adoc#project-owned-units[Project-Owned Workflow Units & Compiled Invariants], item 5); they are checked over every `remediation.*` unit, its call sites, and every plan instance version, and `DefaultUnitInvariantTest` refuses a weakened fixture for each.
+
+[cols="1,6"]
+|===
+|Invariant |Check
+
+|`INV-REM-1`
+|Contract: the unit declares `retry_budget` and `fix_budget` as `int[0..5]`, `waiver_wait_seconds` as `int[0..86400]`, and `actions` as a `list<enum[…]>` of its actions (`remediation.spend`: `waiver_wait_seconds` only); its terminals are the reachable subset of `resolved` (`success`), `waived` (`success`), `exhausted` (`failure`), and `fix_requested` (`unsettled`), with `waived` only for a class with a `met`-waivable gate (CI, review findings, analysis, Q-Gate), and every declared terminal is reachable.
+
+|`INV-REM-2`
+|No dead end: every entry into `decide` passes `budget-check`; every `retry`, `fix`, and `loop_back` link of `decide` is guarded by its budget predicate and by `param:actions has <action>`, `request_waiver` by `remediation.waiver-requestable`; nothing withholds the implicit `step_out`.
+
+|`INV-REM-3`
+|Waived path: the `waived` terminal is entered only from the gather job's `all_waived` or the waiver wait's `waived`, never from a link; the waiver wait is the unit's only state awaiting `OPERATOR_WAIVER`, is a `composite_job` bounded by `waiver_wait_seconds`, and is entered only when `waiver_wait_seconds > 0`; no primitive of the unit writes a waiver (`INV-GEN-2`).
+
+|`INV-REM-4`
+|Nested commits: a call of `git.commit_and_push` inside the unit routes `stepped_out`, and `done` without a commit, back to `decide` (a server step-out with `cause: condition` is exempt: it unwinds every frame to the phase's fallback without taking this transition); a fix is charged only in the transaction that returns `done` with a commit (or, for a fix that runs in the caller, when its artifact exists).
+
+|`INV-REM-5`
+|Callers: every call site in a plan-scope unit routes `exhausted` and `stepped_out` to the phase's fallback state (`plan.return` in Phases 1–4, which forwards committed work beyond the base to `finalize.hand-back`; `finalize.hand-back` afterwards), `waived` to the continuation completing the class's step `waived`, and `fix_requested` to an authoring or allocation state; every bound and every effective ceiling of every instance version is at most the compiled hard cap (retry 5, fix 5, wait 86400 s).
+
+|`INV-REM-6`
+|Accounting: the counters are per plan and class, charged only by the unit's primitives, and never reset by re-entry, a new `HEAD`, a loop-back, or a re-composition.
+|===

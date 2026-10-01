@@ -1,0 +1,139 @@
+= Hypermedia Format & TOON Encoding Specification: Link Relation & Identifier Grammar
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../hypermedia-format.adoc[Hypermedia Format & TOON Encoding Specification] » Link Relation & Identifier Grammar
+
+== Closed Link Relation & Identifier Grammar
+_See Requirement link:../../Requirements.adoc#PM-WF-2[PM-WF-2: Closed Link Relation Grammar & Link Forms]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-3[PM-WF-3: Capability Enforcement by Link Omission]_
+
+_See Requirement link:../../Requirements.adoc#PM-WF-4[PM-WF-4: Entity-Scoped Links & Fine-Grained Concurrency]_
+
+=== Closed Link Relations (`rel`)
+
+Every link's `rel` column is drawn from a closed enumeration of 10 relation identifiers:
+
+[cols="1,1,3"]
+|===
+|`rel` Value |Allowed Forms |Semantic Meaning
+
+|`next`
+|`noop`, `submit`
+|Default forward transition along the primary workflow path.
+
+|`alt`
+|`noop`, `submit`
+|Alternative forward transition (e.g., `skip_recipe` to proceed with standard planning, or re-committing before push). The planning lane is never a model-selected link: it is computed by the server.
+
+|`retry`
+|`noop`, `submit`
+|Repeat the last failed deterministic operation (build, push, CI fetch, re-scan, bot re-trigger) without changing code. The `retry` of a remediation policy's `decide` state is a `submit` link carrying `reason:enum[flaky\|infra\|timeout]`, bounded by the policy's retry budget.
+
+|`fix`
+|`noop`, `submit`
+|Enter a remediation sub-state or allocate fix tasks for a failed build or gate finding; the `fix` of a remediation policy's `decide` state is bounded by the policy's fix budget.
+
+|`loop_back`
+|`noop`, `submit`
+|Return from `finalize` to `execute` in the plan's worktree by allocating fresh remediation tasks (the `loop_back` form of a remediation policy's `fix`, which returns `fix_requested` to its caller and is bounded by the policy's fix budget), or re-author the outline (`loop_back_outline`, bounded by the loop-back budget).
+
+|`submit`
+|`submit`
+|Deliver model-authored judgment output to the server, from the main session or from a model job for its bound entity.
+
+|`wait`
+|`wait`
+|Block on a running asynchronous job (a model job included) or composite wait state.
+
+|`escalate`
+|`submit`
+|File a request for operator action (`request_waiver`, xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Question, Waiver-Request & Exit Links]). The request is a record the operator answers only with an operator verb; the model never waits on the operator inside the call, and no link requests an operator decision.
+
+|`abort`
+|`noop`, `submit`
+|Cancel a running job (`cancel:<job_id>`), leave the current sub-process (`step_out`, which unwinds one frame and returns the control outcome `stepped_out` to its caller), or end the plan through its phase's fallback route (`hand_back`, plan scope only); xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Question, Waiver-Request & Exit Links]. Ending a plan or epic as `aborted` is never a link: it is the operator verb `pm-operator abort`.
+
+|`emit`
+|`noop`, `submit`
+|Epic-only relation: mark a staged plan in the epic ledger as launched and emit the host entry command that opens the plan's bootstrap with the source `epic_row`.
+|===
+
+[#link-identifier-grammar]
+=== Link Identifier Grammar (`<action>`, `<action>:<entity_id>`, `<action>:question:<question_id>`)
+
+Link identifiers (`link` column) are server-derived, stateless tokens of the form `<action>`, `<action>:<entity_id>`, or `<action>:question:<question_id>`. Their grammar and length bounds (action name, entity identifier, and the whole link identifier) are defined in the link:../identifiers/01-general-rules-and-registry.adoc#id-link-id[Identifier Registry]; the three forms have the following semantics:
+
+1. *Scope-Wide Link (`<action>`)*: An action name alone (for example `push`, `commit`, `refine`, `outline`, `loop_back`, `ask`, `answer_questions`, `request_waiver`, `hand_back`, `step_out`, and the `resume` of a `job_incomplete` condition on a fan-out model job state); it applies to the entire `plan_id` or `epic_id` scope.
+2. *Entity-Addressed Link (`<action>:<entity_id>`)*: An action name, `:`, and a link:../identifiers/01-general-rules-and-registry.adoc#id-entity-id[entity identifier] (for example `submit:TASK-004`, `ask:TASK-004`, `revise:TASK-004`, `resume:envelope-2`, `wait:b-3f9a2c417e0d8b65`, `cancel:b-3f9a2c417e0d8b65`, `wait:l-7c01de9a3f2b4e58`, `wait:finalize.concurrent-wait`, and for a fan-out model job state `wait:setup.enrich-architecture` and `cancel:setup.enrich-architecture`, which address the state); it is validated against both the scope's state and the addressed `<entity_id>`'s state under the scope lock (`PM-WF-4`).
+3. *Question-Addressed Link (`<action>:question:<question_id>`)*: An action name, `:question:`, and a link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[`question_id`]; it addresses an open question record of the scope. The only such link is `wait:question:<question_id>` (for example `wait:question:Q-004`), the bounded long-poll of a question state whose record is delivered by elicitation or on a paired web device (xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Question, Waiver-Request & Exit Links]); it is valid only while that record is open.
+
+=== Free Parameter Descriptor Grammar (`free` Column)
+
+The `free` column specifies the closed schema for `pm_do(..., args)` in compact human- and model-readable form:
+
+[source,ebnf]
+----
+free_spec     = "" | param_decl , { "," , param_decl } ;
+param_decl    = param_name , ":" , param_type , [ "?" ] ;
+param_name    = lowercase_alpha , { lowercase_alpha | digit | "_" } ;
+param_type    = scalar_type
+              | "list<" , scalar_type , ">" ;
+scalar_type   = "text" , [ int_range ]
+              | "int" , [ int_range ]
+              | "enum[" , enum_val , { "|" , enum_val } , "]"
+              | schema_ref ;
+schema_ref    = "schema[" , schema_name , "]" ;
+schema_name   = lowercase_alpha , { lowercase_alpha | digit | "-" } ;   (* identifiers.adoc, named parameter schema *)
+int_range     = "[" , int , ".." , int , "]" ;
+enum_val      = alpha , { alpha | digit | "_" | "-" } ;
+int           = "0" | nonzero_digit , { digit } ;
+alpha         = lowercase_alpha | uppercase_alpha ;
+lowercase_alpha = ? ASCII "a".."z" ? ;
+uppercase_alpha = ? ASCII "A".."Z" ? ;
+digit         = "0" | nonzero_digit ;
+nonzero_digit = ? ASCII "1".."9" ? ;
+----
+
+`param_name` is bounded as registered in the link:../identifiers/01-general-rules-and-registry.adoc#id-param-name[Identifier Registry]. `param_type` mirrors the DSL `type_spec` (link:../workflow-dsl.adoc[Workflow DSL Specification]): lists use the single syntax `list<…>` (for example `paths:list<text>?`), enum values may contain upper case (`enum[FIX|SUPPRESS|ACCEPT]`), and there is no free-form object type: the only object-valued type is the named schema reference `schema[<schema_name>]` (<<named-parameter-schemas>>), also as a list element (`list<schema[<schema_name>]>`).
+
+[#named-parameter-schemas]
+==== Named Parameter Schemas
+
+A parameter of type `schema[<schema_name>]` takes a JSON object as its value; the server validates it against the closed JSON Schema (`additionalProperties: false` at every object level) registered under `<schema_name>`, in the same in-process validation as every other parameter (link:../workflow-dsl/05-primitives.adoc#independent-transition-validation[Workflow DSL Specification, Independent Server-Side Transition & Parameter Validation], step `P`). A violation is rejected with `invalid_link_args`, and `rejected.detail` names the parameter and the JSON pointer of the offending member. `schema_name` follows the link:../identifiers/01-general-rules-and-registry.adoc#id-schema-name[Identifier Registry, named parameter schema] grammar. Named schemas are compiled into the binary beside the workflow definitions and are closed: a new name, or a change of a registered schema, ships only with a workflow version. A `schema[…]` type naming an unregistered schema fails DSL validation (Rule 1, link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Static Verification Rules]). A named schema describes only model-supplied members; server-owned fields are never part of it, and a payload carrying one is rejected by `additionalProperties: false`.
+
+[cols="1,3,2"]
+|===
+|`schema_name` |Content |Used by
+
+|`question-envelope`
+|The model-supplied part of a question record (`BatchedQuestionEnvelope` without the server-owned `question_id`, `class`, `origin`, and `source_entity`): `question_text`, `default_assumption`, and `options` as objects `{branch_key, label, description, recommended?}`; definition in link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-envelope-schema[Model Jobs & Effort Specification, Question Records]
+|`ask` and `ask:TASK-NNN` (`question:schema[question-envelope]`); the `questions:list<schema[question-envelope]>?` parameter of the `submit` link of a refine or outline entity
+
+|`question-answer`
+|One answer to an open question record: `question_id` (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), `branch_key` (one of the record's option keys), optional `text` (`1..2000` characters, recorded with the answer and, where the answer changes intent, in the amendment), and `confidence` (integer `0..100`), required for a record in `questions.mode: model` and refused with `invalid_link_args` on any other record; definition in link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-records[Model Jobs & Effort Specification, Question Records]
+|`answer_questions` (`answers:list<schema[question-answer]>`)
+
+|`triage-groups`
+|The triage of one gather firing: one entry per finding group `(domain, rule_id)` of the firing's batch with its disposition (`FIX`, `SUPPRESS`, `ACCEPT`), `reply_text` (`1..4000` characters), optional `requirement_refs`, and `population` for `FIX`, plus per-finding exceptions (`finding_id` with its own disposition and reply); a finding withheld by the screener is never part of it; definition in link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batched-triage[Model Jobs & Effort Specification, Batched Triage]
+|`submit:triage-groups` of the triage job of a gather firing (`triage:schema[triage-groups]`)
+
+|`simplify-proposal`
+|One simplification the read-only simplify job proposes: `file` (a repository-relative path of the plan footprint), `change` (`1..4000` characters, what to change), `rationale` (`1..2000` characters); the server records it as a proposal record with its `proposal_id` (link:../identifiers/02-registry-stores-to-web.adoc#id-proposal-id[Identifier Registry, `proposal_id`]) and never applies it itself
+|`submit:simplify` of the simplify job (`proposals:list<schema[simplify-proposal]>`)
+|===
+
+NOTE: Boolean parameters are prohibited in workflow transitions to preserve explicit closed-enum intent (e.g., `decision:enum[approve|reject]` rather than `approved:bool`). A trailing `?` marks an optional parameter (such as `paths:list<text>?` or `questions:list<schema[question-envelope]>?`).
+
+=== Direct In-Band Multi-Line Text Payloads (`PM-WF-2`, `PM-WF-6`)
+
+Because `pm_do(scope_id, link, args)` is transported as a structured JSON-RPC 2.0 request over `stdio`, parameters of type `text[min..max]` accept arbitrary multi-line UTF-8 strings (including Markdown headings `#`, fenced code blocks, quotes, shell metacharacters, and Unicode) directly in `args`:
+
+* *No Scratch-File Staging*: The model never invokes host `Write` or `Edit` tools on `.marshall/` files and never creates staging files of the kind `plan-marshall` needed (`.plan/temp/*-commit-msg.txt`, `work/ci-bodies/*.md`, `work/pending-tasks/*.json`, `work/lesson-body-*.md`). This is a model-facing rule, not a prevention: host file tools can still write `.marshall/`. The runtime detects such a write after the fact, on the next transition that reads a digest-protected store (the `integrity_breach` condition with kind `store_tampered`, which pauses the scope; link:../store-schemas.adoc[Store Schemas Specification], § Store Digest Verification); writes to files outside the digest-protected set are not detected.
+* *Single-Turn Atomic Validation & Persistence*: When the model follows a `submit` link such as `commit` (`message:text[1..2000]`), `submit:outline` (`outline:text[1..65536]`), `create_pr` (`body:text[1..32768]`), or `retitle` (`pr_title:text[1..72]`), the server validates both the parameter bounds and the domain content grammar in-process before persisting the target store or streaming the payload to a child tool via `stdin` (`PM-EXEC-5`).
+* *Self-Correcting Validation Feedback*: If a submitted multi-line payload violates a structural rule (for example, an `outline` missing a `(read|write-new|write-replace|write-conditional|delete)` file-intent suffix, or a `message` violating Conventional Commits syntax), the server leaves the state unmutated and returns `rejected.reason = "invalid_link_args"` with exact line-level `detail` alongside the current TOON representation so the model can resubmit immediately in the next turn. `rejected.detail` names the offending parameter or token, the expected shape (the schema fragment), and one corrected example.

@@ -1,0 +1,252 @@
+= Timeouts & Budgets Specification: Runtime Lifecycle, Leases, Operator & Web
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../timeouts.adoc[Timeouts & Budgets Specification] » Runtime Lifecycle, Leases, Operator & Web
+
+[#runtime-lifecycle]
+== Runtime Lifecycle
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[runtime-start-timeout]]Runtime start timeout
+|`5` for a runtime started on demand to answer an authenticated round trip.
+|fixed
+|—
+|every `pm-mcp` or `pm-operator` command that starts the runtime on demand (the `pm-mcp serve` relay included), which holds `locks/runtime-start.lock` until its authenticated round trip succeeds or this timeout expires; `pm-operator status` waiting for a live runtime's answer
+|The relay answers pending requests with the JSON-RPC error `runtime_unavailable` and retries on the next request; every other command fails with a diagnostic naming `logs/daemon.log`; `pm-operator status` reports "not responding".
+|link:../runtime-model.adoc#_start_modes[Runtime Model, Start Modes]; link:../runtime-model.adoc#_failure_semantics[Runtime Model, Failure Semantics]
+
+|[[project-recovery-wait]]Project recovery wait
+|`10` for a call addressing a project whose per-project recovery (lazy or background pass) has not finished.
+|fixed
+|—
+|every MCP call addressing a project (by scope or `PM-MCP-Workspace`) after a runtime start
+|The call returns the retryable error `runtime_recovering` (`isError: true`); the recovery continues, and a repeated call is served once it has finished. Nothing of the call is executed.
+|link:../runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]; link:../mcp-tools.adoc[MCP Tools] (closed error codes)
+
+|[[drain-timeout]]Drain timeout
+|`600`
+|`drain_timeout_seconds` in `machine-config.json`
+|minimum `0` (`0` terminates running jobs at once)
+|running jobs at `SIGTERM`/`SIGINT` / `pm-operator drain`; the wait of `pm-operator drain` for the runtime's exit
+|Remaining job groups are terminated (xref:01-job-budgets-and-waits.adoc#grace-period[Grace period]) and recorded `killed`, their build and model slots released and their job tokens revoked, and `queued` jobs recorded `killed`; warm language servers are shut down; merge-queue and review-bot leases are left in place and handled at the next start like those of a crash (<<leases>>); the runtime exits. `pm-operator drain` waits for the exit up to the drain timeout plus the xref:01-job-budgets-and-waits.adoc#grace-period[Grace period] plus a fixed `10`, then reports that the runtime is still draining.
+|link:../runtime-model.adoc#_drain_stop_upgrade[Runtime Model, Drain, Stop & Upgrade]
+
+|[[stalled-threshold]]Stalled threshold
+|`600` since the last transition or model call of a non-terminal scope without pending condition or awaited event; a scope waiting on a question in `questions.mode: operator` is listed from the question's creation on, without threshold.
+|fixed (compiled constant; the `plan_stalled` record feeds metrics, which must stay comparable across machines)
+|—
+|plans and epics
+|The scope is reported `stalled` in `pm-operator status`, the web app, and the epic view, and one `plan_stalled` audit record is appended per episode; nothing changes in a model-facing representation.
+|link:../runtime-model.adoc#stalled-plans[Runtime Model, Stalled Plans]
+
+|[[pending-entry-max-age]]Pending entry record maximum age
+|`86400`
+|fixed (compiled constant; no legitimate machine difference)
+|—
+|`<PM_MCP_BASE>/projects/<project_id>/pending/<entry_id>.json`, with the bootstrap state it holds (age since `created_at`)
+|Removed and audited, one audit record each, by the project's recovery sweep and by the <<periodic-sweep-interval>> (age is the only evidence; the runtime keeps no connections); the bootstrap ends without a terminal and a later call naming the `entry_id` is `scope_not_found`. The bootstrap does no age check of its own.
+|link:../runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]; link:../runtime-model.adoc#periodic-sweep[Runtime Model, Periodic Sweep]
+
+|[[periodic-sweep-interval]]Periodic runtime sweep interval
+|`3600` between two runs of the runtime's periodic sweep over all enrolled projects.
+|fixed (compiled constant)
+|—
+|pending entry records older than the <<pending-entry-max-age>>
+|Each run removes the expired pending entry records, with one audit record each.
+|link:../runtime-model.adoc#periodic-sweep[Runtime Model, Periodic Sweep]
+
+|[[lsp-idle-timeout]]Language server idle timeout
+|`900` without a request to the instance.
+|`lsp_idle_timeout_seconds` in `machine-config.json`
+|minimum `60`
+|warm LSP pool instances
+|Clean eviction (`shutdown` → `exit` → `SIGTERM` after xref:01-job-budgets-and-waits.adoc#grace-period[Grace period]); the next request starts a new instance lazily.
+|link:../job-runtime/01-pipeline-and-subprocesses.adoc#_warm_language_server_pool_orthogonal_service_access_pm_svc_2_pm_svc_4_pm_tool_2[Job Runtime, Warm Language Server Pool]; link:../mcp-tools.adoc[MCP Tools] (Warm LSP Pool Lifecycle)
+
+|[[lsp-start-timeout]]Language server start timeout
+|`120` from spawn to the `initialize` response.
+|`lsp_start_timeout_seconds` in `machine-config.json`
+|minimum `10`
+|warm LSP pool instances
+|The instance is terminated; `pm_lsp` reports the failure and an Axis C resolver reports `NOT_RUN` with `FAILED_TO_START`.
+|link:../domain-extensions.adoc[Domain Extensions] (Explicit Non-Run Reporting)
+
+|[[lsp-request-timeout]]Language server request timeout
+|`60` per request.
+|`lsp_request_timeout_seconds` in `machine-config.json`
+|minimum `5`
+|`pm_lsp` operations and Axis C symbol-edge queries
+|The request is cancelled (`$/cancelRequest`); `pm_lsp` reports a timeout, never an empty result, and an Axis C resolver reports `NOT_RUN` with `TIMEOUT`.
+|link:../domain-extensions.adoc[Domain Extensions] (Explicit Non-Run Reporting)
+
+|[[lock-wait-threshold]]Transaction lock acquisition
+|No timeout: transaction locks are held for one transaction only (link:../store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas, Transaction Locks]); long-lived claims are leases (<<leases>>). A reporting threshold of `30` watches every wait without aborting it.
+|fixed (the threshold feeds a `PM-MIG-5` trigger, which must not vary per machine)
+|—
+|runtime
+|The wait continues; the lock manager appends one `lock_wait_exceeded` audit record (lock, holder, waited time), which counts as a `PM-MIG-5` integrity trigger event.
+|link:../runtime-model.adoc#_in_process_lock_manager[Runtime Model, In-Process Lock Manager]
+|===
+
+[#leases]
+== Leases & Heartbeats
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[merge-lease]]Merge holder lease
+|`lease_expires_at = heartbeat_at + 900`; every transition of the holding plan inside the rebase-to-merge critical section is a heartbeat and refreshes `heartbeat_at`.
+|fixed
+|—
+|`holder` of `state/merge-queue.json`
+|The holder is reclaimed in the next admission transaction (stale-holder reclaim); an orphaned holder whose expiry passed without adoption is released.
+|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]; link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|[[build-slot-lease]]Build slot lease
+|`lease_expires_at = acquired_at + t + 5` (the job's allocated budget plus the termination grace period).
+|derived
+|—
+|`state/build-slots.json`
+|The slot is released once its job has settled; a slot whose job was recorded `killed` at a runtime restart is released at once.
+|link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|[[model-slot-lease]]Model slot lease
+|`lease_expires_at = acquired_at + t + 5` (the model job's allocated budget, xref:01-job-budgets-and-waits.adoc#model-job-budget[Model job budget], plus the termination grace period); the machine cap is `model_slots` (compiled default `2`), at most one writer job per plan.
+|cap: `model_slots` in `machine-config.json`
+|cap `1`..`16`
+|`state/model-slots.json`
+|The slot is released once its job has settled; a slot whose job was recorded `killed` at a runtime restart is released at once; the next `queued` job is admitted (xref:01-job-budgets-and-waits.adoc#model-slot-wait[Model slot wait]).
+|link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|[[job-token-lifetime]]Job token lifetime
+|From the model job's spawn to the transaction that records its fate; no time expiry of its own.
+|fixed
+|—
+|the job token of a model job (`PM-MCP-Job-Token`)
+|Revoked with the fate; every later request with it is refused `job_ended`.
+|link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas, Job Record]; link:../identifiers/02-registry-stores-to-web.adoc#id-job-token[Identifier Registry, Job Token]
+
+|[[review-bot-window-claim]]Review-bot window claim
+|`reset_at` of the window (xref:01-job-budgets-and-waits.adoc#review-bot-windows[Review bot windows]).
+|—
+|—
+|`state/review-bot-windows.json`
+|—
+|link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]
+
+|[[orphaned-lease-release]]Orphaned lease release
+|Positive evidence only: owning scope terminal, archived, or gone; or `lease_expires_at` passed without adoption; or (build or model slot) its job recorded `killed`.
+|—
+|—
+|every lease marked `orphaned_at`
+|Released and audited.
+|link:../runtime-model.adoc#per-project-recovery[Runtime Model, Per-Project Recovery]
+
+|[[session-last-seen-refresh]]Session row `last_seen_at` refresh interval
+|`60`: `last_seen_at` of the last row is refreshed at most once per interval per scope, by a journaled replace.
+|fixed (compiled constant)
+|—
+|`last_seen_at` of the last row of a scope's `sessions.jsonl`
+|—
+|link:../store-schemas/01-format-and-session-log.adoc#_scope_session_log_sessions_jsonl[Store Schemas, Scope Session Log]
+|===
+
+[#operator-waivers-questions]
+== Operator, Waivers & Questions
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[waiver-expiry]]Waiver
+|No time expiry and not bound to `HEAD`: a `met` waiver can be set until the gate's fallback is taken and applies to every later evaluation of its gate until the plan ends or `unwaive` revokes it (refused once consumed); a revoked `raise` lowers the ceiling from the next budget check.
+|—
+|—
+|`waivers.jsonl`
+|—
+|link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-record[Store Schemas, Waiver Record]
+
+|[[waiver-request-expiry]]Waiver request
+|`expires_at = requested_at + waiver_wait_seconds` (xref:01-job-budgets-and-waits.adoc#waiver-wait[Waiver wait]).
+|as waiver wait
+|as waiver wait
+|`waiver_requests[]`
+|Recorded `expired`; the hand-back comment names it.
+|link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-request-record[Store Schemas, Waiver Request Record]
+
+|[[integrity-pause]]Integrity pause
+|No expiry: an `integrity_breach` condition ends only by `accept-edit` (re-baseline and re-verification) or, for a plan or epic scope, the operator's `abort`; a workspace breach and a lesson breach end only by `accept-edit`; a breached pending entry record ends by `accept-edit` or by the pending-record sweep.
+|—
+|—
+|plan, epic, and workspace scopes, single lessons, and single bootstrap entities (a tampered enrolment pauses every running plan of the project)
+|—; the deadlines of a pending question or waiver request are held and processed after the pause ends.
+|link:../cli-and-security/02-credentials-and-operator.adoc#operator-integrity-pause[CLI & Security, Integrity Pause]
+
+|[[access-grant-lifetime]]Access grant
+|No time expiry: a grant holds until the plan ends.
+|—
+|—
+|`grants.jsonl` of a plan
+|—
+|link:../store-schemas/15-screening-and-grants.adoc#grant-record[Store Schemas, Access Grant Record]
+
+|[[credential-expiring-window]]Credential expiry warning window
+|`14` days before `expires_at`.
+|fixed
+|—
+|credential entries with a known `expires_at` (`pm-operator credentials status`, the project setup credential verification)
+|Not an expiry: the entry is reported `expiring` to the operator; it is never refused and never reported in a model-facing representation, since an expiring credential still works.
+|link:../cli-and-security/02-credentials-and-operator.adoc#operator-credential-cli[CLI & Security, Operator Credential CLI]; link:../store-schemas/12-machine-stores.adoc#credential-store[Store Schemas, Credential Store]; link:../domain-extensions/04-setup-state-machine.adoc#setup-verify-credentials[Domain Extensions, Setup Credential Verification]
+|===
+
+[#web-access]
+== Web Access
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-15[PM-WATCH-CLI-15]_
+
+The runtime owns every value of this section: it serves web access itself, on its web listener (link:../runtime-model.adoc#_transport_endpoint[Runtime Model, Transport Endpoint]).
+
+[cols="2,3,2,2,2,3,2"]
+|===
+|Name |Value / derivation |Configurable? |Floor / cap |Applies to |Behaviour on expiry |Defined for
+
+|[[pairing-code-ttl]]Pairing code lifetime
+|`300` from issue.
+|fixed (compiled constant)
+|—
+|the open pairing code of `pm-operator web pair` / `pm-operator web open`
+|Redemption yields `400` (`pairing_invalid`) and `web_pairing_failed`; the operator issues a new code.
+|link:../cli-and-security/03-web-server.adoc#web-pairing[CLI & Security, Pairing Protocol]
+
+|[[pairing-attempt-limit]]Pairing failed-attempt limit
+|`5` failed redemptions of one open pairing (an attempt budget, not a duration).
+|fixed (compiled constant)
+|—
+|the open pairing code
+|The failure that reaches the limit invalidates the open pairing; a later redemption, even with the right code, yields `400` (`pairing_invalid`).
+|link:../cli-and-security/03-web-server.adoc#web-pairing[CLI & Security, Pairing Protocol]
+
+|[[device-idle-expiry]]Device idle expiry
+|`90` days since `last_used_at`.
+|fixed (compiled constant)
+|—
+|paired devices in `state/web-devices.json`
+|The next request is answered `401`; the record is removed with `web_device_revoked` (`reason: idle_expired`).
+|link:../cli-and-security/03-web-server.adoc#web-devices[CLI & Security, Paired Devices]; link:../store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas, Web Access Records]
+
+|[[device-last-used-granularity]]`last_used_at` write granularity
+|`60`: `last_used_at` is written at most once per interval per device.
+|fixed (compiled constant)
+|—
+|`last_used_at` of paired devices
+|—
+|link:../cli-and-security/03-web-server.adoc#web-devices[CLI & Security, Paired Devices]; link:../store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas, Web Access Records]
+|===

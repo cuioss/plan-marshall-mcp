@@ -1,0 +1,440 @@
+= Store Schemas Specification: Workflow State Store
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Workflow State Store
+
+== Workflow State Store (`mcp/status.json`)
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-1[PM-WATCH-PHASE-1], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-40[PM-WATCH-PHASE-40], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-69[PM-WATCH-PHASE-69], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-3[PM-WATCH-STORE-3]_
+
+Tracks the authoritative state machine position, phase, persisted sub-workflow `call_stack`, active jobs and the job bound to the current job state (`active_job`), the pending condition overlay, the plan instance version in force, the remediation policy counters, pending waiver requests, recorded gaps, per-step outcome records, the plan outcome, and composite wait facts for a plan, an epic, or the project's workspace scope (`PM-ARCH-6`, `PM-WF-7`, `PM-WF-13`, `PM-WF-16`, `PM-IMPL-7`). The plan's instance files, waivers, questions, and evidence are separate stores (xref:14-plan-instance-waivers-questions.adoc#plan-instance[Plan Instance, Waivers, Questions & Evidence]). Store digests live in the sidecar `mcp/digests.json` (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]). The values of the `state` field (and the `phase` value each state carries) are catalogued in the link:../state-catalogue.adoc[State Catalogue].
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/status.json",
+  "title": "WorkflowStatusStore",
+  "type": "object",
+  "required": [
+    "format_version",
+    "scope_type",
+    "scope_id",
+    "phase",
+    "state",
+    "loop_back_iteration",
+    "updated_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "scope_type": {
+      "type": "string",
+      "enum": ["plan", "epic", "workspace"]
+    },
+    "scope_id": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
+      "description": "Plan ID or Epic ID in the canonical plan ID grammar (identifiers.adoc, plan_id); null only when scope_type == 'workspace'."
+    },
+    "main_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Base-branch HEAD the plan was created against (git rev-parse origin/<base_branch>); written once by phase-1-init and re-stamped only by the sync-baseline and branch-cleanup rebases. Absent only before phase-1-init has stamped it, where consumers treat the baseline as unknown; plans are never imported from plan-marshall (PM-MIG-2)."
+    },
+    "origin": {
+      "type": "object",
+      "description": "Plan scopes only: immutable provenance stamped once by the start.create-scope transaction of the plan bootstrap (bootstrap-plan) from its source record. Never rewritten by re-entry.",
+      "required": ["source", "stamped_at"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "enum": ["request", "issue", "lesson", "recipe", "local_changes", "pr", "epic_row"] },
+        "source_ref": { "type": ["string", "null"], "description": "Issue number, lesson_id, recipe_id, the adopted pull request's number (source pr), or the plan_id of the bound epic queue row (source epic_row, equal to the plan's own id); null for a free-text request and for local_changes." },
+        "epic_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Copied by the start.create-scope transaction of the plan bootstrap from the pending entry record's from_epic (required for source epic_row, whose queue row the same transaction sets running); the single carrier of epic membership of an existing plan (session rows carry none); no tool parameter carries epic membership." },
+        "stamped_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "phase-1-init",
+        "phase-2-refine",
+        "phase-3-outline",
+        "phase-4-plan",
+        "phase-5-execute",
+        "phase-6-finalize",
+        "completed",
+        "aborted",
+        "orchestrator",
+        "workspace"
+      ],
+      "description": "completed for every plan that ended through finalize.archive-plan, whatever its outcome (merged, handed_back, returned, no_change); aborted for a plan or epic ended by the operator's abort, delete-plan, or the integrity resolution."
+    },
+    "outcome": {
+      "type": ["string", "null"],
+      "enum": ["merged", "handed_back", "returned", "no_change", "aborted", null],
+      "description": "Plan scopes only: the plan outcome, written by the transaction that enters the terminal (finalize.archive-plan for merged, handed_back, returned, and no_change, the last for an empty recipe harvest with merge_outcome no_pr; the entry into plan.aborted for aborted); required (non-null) once phase is completed or aborted, null before. Copied into the landing record beside merge_outcome."
+    },
+    "instance_version": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Plan scopes only: the plan instance version in force (instance/plan.v<N>.pmwf, Plan Instance); written by the transaction that composed it. A version composed by an operator or configuration event (config_adopted, waiver) is in force from the next transition; a version composed by a server event (outline, plan, fallback, empty_harvest, deliverable_removed) is in force for the rest of its composing chain, from the transition that enters its target state (Store Schemas, Plan Instance). Null only for epic and workspace scopes."
+    },
+    "setup_run": {
+      "type": ["string", "null"],
+      "enum": ["first_run", "reconcile", null],
+      "description": "Workspace scope only: recorded by setup.entry for the current project-setup run (first_run when .marshall/config/ was absent at entry, else reconcile), so an interrupted first run keeps its first-run path; setup.seed-build-map exits by it."
+    },
+    "state": {
+      "type": "string",
+      "description": "Fully qualified workflow state ID (e.g. 'finalize.concurrent-wait' or 'git.compose-message' when inside a subworkflow). Every state ID is catalogued in state-catalogue.adoc."
+    },
+    "call_stack": {
+      "type": "array",
+      "description": "Active compound sub-workflow call frames (PM-WF-16), ordered bottom-to-top (maxItems: 4).",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "required": ["caller_workflow_id", "caller_state_id", "caller_phase", "subworkflow_id", "bound_args", "pushed_at"],
+        "additionalProperties": false,
+        "properties": {
+          "caller_workflow_id": { "type": "string" },
+          "caller_state_id": { "type": "string" },
+          "caller_phase": { "type": "string" },
+          "subworkflow_id": { "type": "string" },
+          "bound_args": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "pushed_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "worktree_path": {
+      "type": ["string", "null"],
+      "description": "Plan scopes only: worktree presence. Canonical absolute path (Path.toRealPath()) of the plan's worktree root, the working directory of the plan's jobs (model jobs included); set in the transaction that records the worktree's creation and set to null in the same transaction that records its removal, so no store points at a removed worktree. Null (or absent) while the plan has no worktree: Phases 1-4 and Phase 6 after branch-cleanup. The plan directory itself never moves. Loop-back transitions are permitted only while it is non-null (in_worktree guard); jobs run in it while it is non-null."
+    },
+    "entry_baseline": {
+      "type": ["object", "null"],
+      "description": "Plan scopes only: main-checkout porcelain state recorded once in the plan's creation transaction (the start.create-scope transaction of the plan bootstrap). A path of the main checkout outside .marshall/local/ that is absent from it or whose digest changed is a hard error in every phase (the transition raises the footprint_violation condition, attributed to the plan); baseline paths are rendered as facts.baseline_dirty, never block, and are never offered for revert. A reader that finds it null counts every dirty path as new (fail-closed).",
+      "required": ["recorded_at", "head_sha", "paths"],
+      "additionalProperties": false,
+      "properties": {
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "porcelain", "digest"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": "string" },
+              "porcelain": { "type": "string", "description": "Two-character git status --porcelain code." },
+              "digest": { "type": "string", "description": "Blob SHA of the working-tree content, or 'deleted'." }
+            }
+          }
+        }
+      }
+    },
+    "continuation_policy": {
+      "type": "string",
+      "enum": ["stop_at_phase_boundary", "stop_on_issue_only"],
+      "default": "stop_at_phase_boundary",
+      "description": "Operator continuation policy, the plan's only autonomy setting: initialised at plan creation from the operator's local-config.json continuation.default_policy (then machine-config.json project_defaults, then the compiled default stop_at_phase_boundary), changed only by the operator verb pm-operator continuation-policy (no link changes it); rendered in every representation's facts."
+    },
+    "merge_outcome": {
+      "type": ["string", "null"],
+      "enum": ["merged", "enqueued_not_landed", "declined", "no_pr", "dequeued", "local_only", "handed_back", "awaiting_human_merge", null],
+      "description": "Plan scopes only: server-derived from one observation of the provider's pull-request state (ci.pr-observe) and git through the Merge Outcome Mapping; required (non-null) once phase == completed, and never set from a failed observation. enqueued_not_landed only when the handed_back fallback archived the plan while its pull request was still queued; handed_back for a plan whose fallback (finalize.hand-back) left its pull request open; awaiting_human_merge for a plan whose pre-merge barrier passed while the operator's merge.auto_merge is false, its pull request marked ready and left open for a human merge."
+    },
+    "owed": {
+      "type": ["array", "null"],
+      "description": "Plan scopes only: owed items (Owed Item Record). Written explicitly by emit-landing and archive-plan, as [] when nothing is owed; null or absent means never asked. Survives archival.",
+      "items": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/owed-item.json" }
+    },
+    "branch_name": {
+      "type": ["string", "null"]
+    },
+    "branch_pushed_at": {
+      "type": ["object", "null"],
+      "description": "Set by the first successful push of the plan branch and refreshed (at, head_sha) by every later successful push (Workflow DSL, git.commit_and_push Stage 6); drives the push-barrier decision (first push vs. parity-probe re-entry) and is the last recorded push a lease falls back to.",
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "loop_back_iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of loop-back iterations begun (the loop_back form of a remediation policy's fix, and loop_back_outline); the label of step firings and loop_backs[], never a bound: the bounds are the policy counters and the outline loop-back counter. Never reset."
+    },
+    "outline_loop_backs": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Plan scopes only: loop_back_outline transitions taken, bounded by the compiled loop-back budget (timeouts.adoc, Remediation Budgets), raised only by a fix_budget:qgate-findings raise waiver; never reset."
+    },
+    "policy_counters": {
+      "type": "object",
+      "description": "Plan scopes only: consumed budgets per remediation policy class (ci-failure, review-findings, build-failure, merge-conflict, qgate-findings, analysis, spend), counted per plan and class, persisted, never reset by re-entering the unit, by a new HEAD, or by a re-composition; the effective ceilings are the bound arguments of the plan instance.",
+      "propertyNames": { "enum": ["ci-failure", "review-findings", "build-failure", "merge-conflict", "qgate-findings", "analysis", "spend"] },
+      "additionalProperties": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/policy-counter.json" }
+    },
+    "waiver_requests": {
+      "type": "array",
+      "description": "Plan scopes only: waiver requests filed by request_waiver (Waiver Request Record); at most one pending at a time.",
+      "items": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/waiver-request.json" }
+    },
+    "gaps": {
+      "type": "array",
+      "description": "Plan scopes only: why the plan did not end merged (Gap Record); written by the transaction that takes a fallback, by the removal of a deliverable, and by a local-only or provider-refused end.",
+      "items": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/gap-record.json" }
+    },
+    "settle_trigger": {
+      "type": ["object", "null"],
+      "description": "Written by the transition entering finalize.settle-commit; drives push_mode=post_pr_conditional (push iff order > 20). A non-step caller (execute.exit-barrier, land.exit-barrier, finalize.adopt-pr) records step_id null and order 0 (no push). Cleared when finalize.settle-commit is left.",
+      "required": ["step_id", "order", "caller_state"],
+      "additionalProperties": false,
+      "properties": {
+        "step_id": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9-]{0,63}$" },
+        "order": { "type": "integer", "minimum": 0 },
+        "caller_state": { "type": "string" }
+      }
+    },
+    "watch_restarts": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Plan scopes only: explicit restarts of the current wait-region firing after watch_interrupted (finalize.restart-watch), bounded by the compiled watch restart budget; reset when the wait region fires anew."
+    },
+    "loop_backs": {
+      "type": "array",
+      "description": "One record per completed loop-back iteration (workflow-dsl.adoc, Productive vs Unproductive Loop-Backs); server-derived from the change ledger and the findings store.",
+      "items": {
+        "type": "object",
+        "required": ["iteration", "productive", "fix_commits", "findings_raised", "findings_self_seeded"],
+        "additionalProperties": false,
+        "properties": {
+          "iteration": { "type": "integer", "minimum": 1 },
+          "productive": { "type": "boolean" },
+          "fix_commits": { "type": "integer", "minimum": 0 },
+          "findings_raised": { "type": "integer", "minimum": 0 },
+          "findings_self_seeded": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "refine_relaunch_count": { "type": "integer", "minimum": 0, "maximum": 1, "description": "Relaunches of refine.analyze after answered questions; the relaunch ceiling is 1 (phase-workflows.adoc, Phase 2)." },
+    "outline_relaunch_count": { "type": "integer", "minimum": 0, "maximum": 1, "description": "Relaunches of outline.deep after answered questions; the relaunch ceiling is 1 (state-catalogue.adoc, outline.awaiting_answers)." },
+    "metadata": {
+      "type": "object",
+      "description": "Plan-level metadata including planning_lane (light, deep, land for source local_changes, or adopt for source pr; land and adopt are fixed at plan creation and outside the ratchet), lane_escalated and escalation_trigger (the one-way light -> deep ratchet), phase_2_mode (full, or collapsed_light while a light plan's Phase 2 is folded into the light envelope; phase-workflows.adoc, Planning Lanes), complexity, domains, recipe_id, scope_estimate, the immutable scope_estimate_pre_route, scope_estimate_provenance[] (phase-workflows.adoc, Deterministic Init Classifiers), pr_title, and pr_title_stale ({transition, at} of the scope-shrinking transition that made the title stale, or null; cleared by the retitle submission in create-pr)."
+    },
+    "freshness_reconcile": {
+      "type": ["object", "null"],
+      "description": "Recorded by git.commit_and_push when any mutates_source finalize step commits after the latest successful build (not only steps at order >= 10; for example architecture-refresh at 9 on re-entry), matching phase-workflows.adoc, Finalize Commit Instrumentation item 3. Never recorded when no successful build exists (prior_build_worktree_sha is required); the refusal then names no_successful_build.",
+      "required": ["commit_sha", "step_id", "prior_build_worktree_sha", "worktree_sha_version", "recorded_at"],
+      "additionalProperties": false,
+      "properties": {
+        "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "step_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9-]{0,63}$" },
+        "prior_build_worktree_sha": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "worktree_sha_version": { "type": "integer", "const": 1, "description": "Hash version of prior_build_worktree_sha (job-runtime.adoc, Working-Tree Hash, rule 4); gates compare only equal versions." },
+        "recorded_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "amendments": {
+      "type": "array",
+      "description": "Append-only intent changes after refinement: question answers that change intent (user answers through any delivery, model self-answers and the main-session model's task-question answer, recorded assumptions on expiry or in questions.mode none), the narrowed continuation of a refuted hypothesis, and in-triage refutations that redefine intent.",
+      "items": {
+        "type": "object",
+        "required": ["amendment_id", "at", "phase", "source", "text"],
+        "additionalProperties": false,
+        "properties": {
+          "amendment_id": { "type": "string", "pattern": "^A-[0-9]+$" },
+          "at": { "type": "string", "format": "date-time" },
+          "phase": { "type": "string" },
+          "source": { "type": "string", "enum": ["user", "model", "assumption", "refutation"], "description": "user: a human answer (channel user_relayed, elicitation, web); model: a model answer (channel model) or a model judgment such as continue_narrowed; assumption: the recommended option or default_assumption applied; refutation: an in-triage refutation, or the premise evidence of a lesson source carried from the bootstrap (continue of the source-lesson premise state), written by the plan's creation transaction." },
+          "question_id": { "type": ["string", "null"], "pattern": "^Q-[0-9]{3,6}$", "description": "The question record the answer belongs to; null for an amendment without a question." },
+          "text": { "type": "string", "minLength": 1 },
+          "supersedes": { "type": ["string", "null"], "pattern": "^A-[0-9]+$" }
+        }
+      }
+    },
+    "steps": {
+      "type": "object",
+      "description": "One record per step id of the plan instance (Phase 5 verification steps and Phase 6 finalize steps).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["outcome", "firings"],
+        "additionalProperties": false,
+        "properties": {
+          "outcome": { "type": "string", "enum": ["unverified", "running", "done", "failed", "skipped", "waived", "indeterminate"], "description": "running while a firing is open; waived when a remediation policy's waived terminal completed the step (replaces the former skipped_by_operator)." },
+          "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+          "work_performed": { "type": ["boolean", "null"] },
+          "landing_delivery": { "type": ["string", "null"], "enum": ["verified", "incomplete", "failed", "pending", null], "description": "emit-landing only: read-back verification of the appended landing envelope; pending when the envelope is kept in the plan directory as landing-envelope.json (Kept Landing Envelope) because the epic linkage is indeterminate." },
+          "skip_reason": { "type": ["string", "null"] },
+          "waiver_ref": { "type": ["string", "null"], "pattern": "^W-[0-9]+$", "description": "waived only: the waiver whose consumption admitted the step's gate (Waiver Record)." },
+          "skip_basis": {
+            "type": ["object", "null"],
+            "description": "Last verdict-currency decision (phase-workflows.adoc, Skip Basis).",
+            "required": ["verdict", "h_rec", "h_cur", "changed_paths_count"],
+            "additionalProperties": false,
+            "properties": {
+              "verdict": { "type": "string", "enum": ["CURRENT_SAME_HEAD", "PRESERVED_INPUTS_UNAFFECTED", "STALE_MISSING_ANCHOR", "STALE_REBASE_ADVANCED", "STALE_UNSCOPED_HEAD_CHANGE", "STALE_INPUTS_MODIFIED"] },
+              "h_rec": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+              "h_cur": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "changed_paths_count": { "type": "integer", "minimum": 0 },
+              "inputs_touched": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "assurance_verdict": { "type": ["string", "null"], "enum": ["checked", "degraded", "not_reached", "never_performed", "attempted_over_empty_scope", null] },
+          "firings": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["fired_at", "cause", "loop_back_iteration", "outcome"],
+              "additionalProperties": false,
+              "properties": {
+                "fired_at": { "type": "string", "format": "date-time" },
+                "cause": { "type": "string", "enum": ["first", "loop_back", "failure", "error", "input_changed"] },
+                "loop_back_iteration": { "type": "integer", "minimum": 0 },
+                "job_id": { "type": ["string", "null"], "pattern": "^[bcglp]-[0-9a-f]{16}$", "description": "The model job (kind llm) of the firing, when the step runs one; null otherwise." },
+                "outcome": { "type": "string", "enum": ["running", "done", "failed", "skipped", "waived", "indeterminate"], "description": "running from the firing's opening until its single completion (Rule 9 per firing); re-entry continues an open firing." },
+                "head_at_completion": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+                "productive": { "type": ["boolean", "null"], "description": "The firing produced a commit or filed a finding (server-derived); null while the firing runs." },
+                "refused": { "type": ["string", "null"], "description": "Reason when a requested outcome change was refused." },
+                "proposals": { "type": "array", "description": "simplify only: the proposal records of the firing's submit:simplify (schema simplify-proposal); disposition open until the main session's apply link of finalize.simplify-apply records accepted or declined. Never applied by the server.",
+                  "items": { "type": "object", "required": ["proposal_id", "file", "change", "rationale", "disposition"], "additionalProperties": false,
+                    "properties": { "proposal_id": { "type": "string", "pattern": "^SP-[0-9]+$" }, "file": { "type": "string" }, "change": { "type": "string", "maxLength": 4000 }, "rationale": { "type": "string", "maxLength": 2000 }, "disposition": { "type": "string", "enum": ["open", "accepted", "declined"] } } } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "active_jobs": {
+      "type": "object",
+      "description": "The jobs of the scope's current job state. For a composite_job state its constituent jobs; for a fan-out job llm state (workflow-dsl.adoc, job llm ... each) one model job per entity of the state.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["job_id", "kind", "status", "started_at"],
+        "properties": {
+          "job_id": { "type": "string", "pattern": "^[bcglp]-[0-9a-f]{16}$" },
+          "kind": { "type": "string", "enum": ["build", "git", "ci", "project_script", "llm"] },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "succeeded", "failed", "failed_unparsed", "refused", "cancelled", "timed_out", "killed", "indeterminate"],
+            "description": "The job record's status while it is queued or running (queued: waiting for a build or model slot, its budget not yet started), else its fate."
+          },
+          "started_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "active_job": {
+      "type": ["object", "null"],
+      "description": "Binding of the current job or composite_job state to its job (workflow-dsl.adoc, Job State Entry & Binding; PM-ARCH-7); a fan-out job llm state binds like a composite_job state: the bound id is the state id and its jobs are the active_jobs entries. Written in the same journaled transaction as the state change that enters the state (and the enqueue of the job, or the started outcome that returned its id); cleared in the transaction that leaves the state. Re-entry with a bound queued or running job only waits; a bound job recorded killed after a runtime restart settles the state with the outcome killed and is never re-enqueued. Null when the current state is not a job state.",
+      "required": ["state_id", "job_id"],
+      "additionalProperties": false,
+      "properties": {
+        "state_id": { "type": "string", "description": "The job, composite_job, or fan-out job llm state the job is bound to; equals state while set." },
+        "job_id": { "type": "string", "pattern": "^([bcglp]-[0-9a-f]{16}|[a-z][a-z0-9_-]{0,31}(\\.[a-z][a-z0-9_-]{0,31})*)$", "description": "The bound job_id (identifiers.adoc, job_id), or the state's own identifier (the state_id) for a composite_job state and for a fan-out job llm state (workflow-dsl.adoc, job llm ... each), whose jobs, one per entity, are the active_jobs entries." }
+      }
+    },
+    "pending_condition": {
+      "type": ["object", "null"],
+      "description": "Engine-owned condition overlay on the current state (state-catalogue.adoc, Conditions; workflow-dsl.adoc, Condition Overlays). While set, state, phase, and call_stack are unchanged, the representation carries condition: <kind>, and only the condition's links are offered (none for integrity_breach, which rejects every pm_do with integrity_paused). precondition_unmet is an engine-raised precondition a bounded retry re-checks (facts.reason: credential_missing, credential_check_failed, credentials_file_insecure, config_changed, ledger_unreadable, format_outdated, format_newer, grant_missing for a cross-project access without an operator grant, harness_capability_missing for a model job whose harness lacks a capability its job class needs, harness_unsupported for a model job refused harness_not_enrolled or harness_version_unsupported or on a harness without a headless template, harness_tampered for a model job refused because harnesses.json failed its HMAC check, prompt_composition_failed, push_remote_indeterminate), with facts.operator_command naming the operator verb that removes the cause. At most one per scope; null when none.",
+      "required": ["kind", "facts", "raised_at"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string", "enum": ["integrity_breach", "footprint_violation", "job_incomplete", "config_drift", "guard_indeterminate", "precondition_unmet"] },
+        "remedy_attempts": { "type": "integer", "minimum": 0, "default": 0, "description": "Self-remedy attempts of this condition instance, bounded by the compiled condition budget (timeouts.adoc, Remediation Budgets); on exhaustion the phase's fallback is taken with the condition as the gap. Not counted for integrity_breach, which has no self-remedy." },
+        "integrity": {
+          "type": ["object", "null"],
+          "description": "integrity_breach only (required then): the breached store; the scope is paused without link until accept-edit re-baselines it and the engine re-verifies, or abort ends the scope.",
+          "required": ["kind", "store", "recorded_digest", "current_digest"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "type": "string", "enum": ["store_tampered", "enrolment_tampered"] },
+            "store": { "type": "string", "description": "Relative store path, or the enrolment file of the project." },
+            "recorded_digest": { "type": "string" },
+            "current_digest": { "type": ["string", "null"], "description": "null when the file is missing." }
+          }
+        },
+        "facts": { "type": "object", "description": "Facts of the condition rendered into the representation (offending files, instance diff, reason, operator_command naming the operator verb that removes the cause)." },
+        "raised_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "facts": {
+      "type": "object",
+      "description": "State-specific facts rendered into the TOON representation (e.g. ci_status, bot_status)."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
+----
+
+* *Step Records Count Firings*: Every firing of a step appends to its `firings[]`; a re-fire never replaces the history. When `VerdictCurrencyEvaluator` decides to re-fire, the step's `outcome` is set to `unverified` before the step runs and is then replaced by the new firing's terminal outcome, so a prior `done` never survives a re-fire. The current `outcome` and `head_at_completion` are always those of the last firing; no force flag exists. A requested outcome change that the engine refuses appends a firing with `refused` set and leaves no stale outcome silently current. Re-fire counts per cause are `firings` minus one, grouped by `cause`, never counted from log lines. A record without `assurance_verdict` reads `unadjudicated`, never as a pass.
+* *Origin and Epic Linkage*: Epic membership has one carrier, `origin.epic_id`: `pm-mcp enter --from-epic` writes `from_epic` into the pending entry record (xref:01-format-and-session-log.adoc#pending-entry-record[Pending Entry Record]), `source-epic-row` verifies the queue row, and the `start.create-scope` transaction of the plan bootstrap copies it into `origin.epic_id`; no tool parameter and no session row carries epic membership. Every consumer (landing emission, outbox link offering, epic observation) reads epic membership from `origin.epic_id` through one resolver, which derives `epic_linkage`: `not_orchestrated` iff `origin.epic_id` is null, `indeterminate` iff it is set but the epic's header `epic.json` (xref:04-epic-and-change-ledger.adoc#epic-header[Epic Header (`epic.json`)]) is absent or unreadable, otherwise `orchestrated`. `indeterminate` is never read as `not_orchestrated`.
+* *Amendments*: Every intent-changing answer after refinement appends an `amendments[]` entry with its `question_id`; every later representation that renders the request (outline review, `create-pr`, landing) includes the amendments in order.
+* *No Operator Decision State*: The store holds no pending operator decision and no merge authorization: the operator acts only through waivers (xref:14-plan-instance-waivers-questions.adoc#waiver-record[Waiver Record]), cross-project access grants (xref:15-screening-and-grants.adoc#grant-record[Access Grant Record]), `abort`, `delete-plan`, and the integrity resolutions, none of which waits in this store.
+
+[#merge-outcome-mapping]
+=== Merge Outcome Mapping
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-19[PM-WATCH-DISP-19], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-82[PM-WATCH-PHASE-82]_
+
+The plan's `merge_outcome` (this store) and the landing's `merge_state` (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_landing_envelope_emit_landing[Phase Workflows Specification, Landing Envelope]) are two enumerations with different consumers, derived from *one* observation through *one* table. The observation is the result of `ci.pr-observe` (`pr_state`: `open`, `merged`, `closed`; `queue_state`: `not_queued`, `queued`, `ejected`, `unobservable`; `merge_commit_sha`, `head_sha`, `observed_at`), together with the plan's own facts where no pull request exists. No other rule derives either value, and a test (`MergeOutcomeMappingTest`) asserts the table row by row for both enumerations.
+
+[cols="3,2,2"]
+|===
+|Observation (at landing or archive) |`merge_outcome` |`merge_state`
+
+|`merged`, the merge commit on the base branch
+|`merged`
+|`landed`
+
+|`open`, `queued` (archived by the `handed_back` fallback while queued, with the owed item `post_merge_cleanup`)
+|`enqueued_not_landed`
+|`enqueued_not_landed`
+
+|`open` or `closed`, `ejected` (the pull request left the queue unmerged)
+|`dequeued`
+|`open` or `closed`, as observed
+
+|`closed` unmerged (closed outside the plan)
+|`declined`
+|`closed`
+
+|`open`, not merged, left open by the `handed_back` fallback (`finalize.hand-back`)
+|`handed_back`
+|`open`
+
+|`open`, not merged, marked ready for review and left open by the ready form of `finalize.hand-back` (the pre-merge barrier passed while the operator's `merge.auto_merge` is `false`; plan fact: gap `cause: auto_merge_off`)
+|`awaiting_human_merge`
+|`open`
+
+|No pull request (a `returned` plan, a recipe with an empty harvest, or a hand-back before any pull request)
+|`no_pr`
+|`not_applicable`
+
+|No push remote (derived fact `push_remote` empty)
+|`local_only`
+|`not_applicable`
+
+|Observation failed (`unobservable`, provider unavailable, or any other failed read)
+|none: the plan is not archived and `completed` is not entered; `archive-plan` re-observes
+|`unknown` (a missing fact of the landing)
+|===
+
+The former landing values `not_applicable_after_merge` (now `not_applicable`) and `unclassified` do not exist; the table leaves no observation unmapped.

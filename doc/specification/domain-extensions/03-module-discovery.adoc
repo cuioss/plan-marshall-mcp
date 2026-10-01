@@ -1,0 +1,120 @@
+= Domain Extensions, Build Map & Configuration Split Specification: Module Discovery, Build Map & Architecture Queries
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../domain-extensions.adoc[Domain Extensions, Build Map & Configuration Split Specification] » Module Discovery, Build Map & Architecture Queries
+
+== Module Discovery, Build Map & Architecture State Machine
+_See Requirement link:../../Requirements.adoc#PM-EXT-3[PM-EXT-3: Module Discovery, Build Map & Architecture Enrichment]_
+
+`PM-MCP` moves deterministic module discovery, dependency graph construction, verification routing (`derive-verification`), and architecture queries into the daemon while keeping semantic module enrichment (`responsibility`, `purpose`, `key_packages`) as model judgment.
+
+=== Server-Owned Module Discovery & Enrolled Discovery Jobs
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-6[PM-WATCH-EXT-6], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-7[PM-WATCH-EXT-7]_
+
+Module discovery combines compiled-in descriptor parsers with optional enrolled build-tool discovery jobs, caching the resulting structural snapshot in server state keyed by the repository's descriptor tree hash (the derived fact `module_discovery` of the project's `derived-facts.json`, link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-fact-kinds-discovery-calibration[Store Schemas Specification, Derived fact kinds]); the enrolled discovery job templates below are compiled defaults that the project's enrolment may override (`build.discovery_templates`):
+
+[cols="1,2,2,3"]
+|===
+|Build System |Compiled-In Descriptor Parser |Enrolled Discovery Job Template |Extracted Module Facts
+
+|Maven
+|`pom.xml` (StAX / DOM parser in `pm-core`)
+|`help:all-profiles dependency:tree -DoutputType=text`
+|Module coordinates (`groupId:artifactId`), packaging (`pom`, `jar`, `war`), parent/reactor hierarchy, active & optional profiles, test directory presence, Java package roots.
+
+|Gradle
+|`settings.gradle(.kts)`, `build.gradle(.kts)`
+|`properties dependencies tasks --console=plain`
+|Subproject paths, applied plugins, source sets (`main`, `test`, `integrationTest`), inter-project and external dependencies.
+
+|npm / Node
+|`package.json`, `workspaces` globs
+|*(Pure descriptor parse; no subprocess required)*
+|Workspace packages, scripts (`build`, `test`, `lint`), `dependencies` / `devDependencies`, TypeScript `tsconfig.json` presence.
+
+|Python (`pyproject`)
+|`pyproject.toml` (TOML parser in `pm-core`)
+|*(Pure descriptor parse + line-oriented import scan)*
+|Project metadata, `[project.dependencies]`, `[tool.pytest]`, `[tool.mypy]`, `[tool.ruff]`, top-level package directories and test roots.
+
+|Documentation (`documentation`)
+|`doc/` or `docs/` directory holding `.adoc` or `.md` files at any depth, or a root `README.adoc` (mirrors `pm-documents` `discover_modules`)
+|*(Pure file-tree scan; no subprocess required)*
+|One `documentation` module (build system `documentation`) with its documentation root and its outbound `component_refs` (cross-document references, materialized at discovery time for the `documentation` resolver).
+
+|Plugin bundles (`marshall-plugin`)
+|`marketplace/.claude-plugin/marketplace.json` plus one `.claude-plugin/plugin.json` per bundle (mirrors `pm-plugin-development` `plugin_discover.py`, active only when the marketplace is named `plan-marshall`)
+|*(Pure descriptor parse; no subprocess required)*
+|One module per bundle (build system `marshall-plugin`): skills, agents, and commands as packages with their frontmatter descriptions, and outbound `component_refs` to other bundles.
+|===
+
+* **Python Import Scan (Deliberate Simplification)**: The Python import scan is a line-oriented scanner in Java: it reads only `import x[.y]` and `from x[.y] import ...` lines (leading whitespace allowed, continuation lines and parenthesized import lists joined), and builds no full Python AST. *Deliberate simplification vs. `plan-marshall`*, which parses with Python's `ast` module: imports produced dynamically (`importlib`, `__import__`) or hidden in string literals are not seen, and an `import` line inside a multi-line string may be read as an import; both errors are accepted because the scan only derives module edges, never a gate verdict.
+
+* **Live Crawl, Snapshot as Cache**: Discovery always crawls the live worktree, including uncommitted descriptors. The descriptor tree hash covers the live descriptor content, not `HEAD`. The persisted snapshot is a denormalized cache, never the gatekeeper: a module directory present on disk but absent from the snapshot is still discovered.
+* **In-Process Crawl vs. Lazy Discovery Jobs**: The in-process crawl (compiled-in descriptor parsers and file-tree scans) issues no child process except `git rev-parse --git-common-dir`. Enrolled discovery jobs (the job templates above) run lazily, only when a fact that only they provide is requested, and always as enrolled jobs of the job runtime, never as ad-hoc subprocesses of the crawl.
+* **Per-Descriptor Failure Isolation**: A malformed descriptor (the root descriptor or one workspace member) is reported for its module with the parse diagnostic and does not abort discovery of the remaining modules.
+* **Build-File Dependency Parser**: Each build domain (Maven, Gradle, npm, `pyproject`) provides, next to its descriptor parser, a build-file dependency parser: it claims its build files (`pom.xml`, `build.gradle(.kts)` and `settings.gradle(.kts)`, `package.json`, `pyproject.toml`) and returns the ecosystem-qualified third-party coordinates a file declares at a given revision (`maven:<groupId>:<artifactId>`, `npm:<name>`, `pypi:<name>`) with their scope, or a parse diagnostic. The pre-merge Dependency Delta Check consumes it (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#dependency-delta[Phase Workflows Specification, Dependency Delta Check]); a changed build file that no parser claims, or that fails to parse, makes that check `indeterminate`.
+
+=== Build Map & Deterministic `derive-verification` (ADR-004)
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-9[PM-WATCH-EXT-9]_
+
+The file-to-build contract lives in the team file `.marshall/config/build-map.json` (`routes`, link:../store-schemas/08-project-configuration-local.adoc#config-build-map-json[Store Schemas Specification, `build-map.json`]; called the build map, `build.map` in `plan-marshall`): a domain-keyed inventory `{"<domain>": [{"glob", "role", "build_class"}]}` with roles `production`, `test`, and `config` and the closed build classes `compile`, `module-tests`, `verify`, and `none`. Phase 4 (`plan`) calls `derive-verification` with each task's changed-artifact list and stamps the returned canonical command set into the task's `verification.commands`; Phase 5 (`execute`) runs the stamped commands. The seeding, editing, and reseeding rules mirror `plan-marshall` (`manage-config/scripts/_cmd_build_map.py`, `manage-config/standards/data-model.md` § build.map, `marshall-steward/references/build-map-setup.md`, `phase-4-plan/SKILL.md`), verified at plan-marshall commit `1d4a1da37`; re-verify against the latest `plan-marshall` version before implementing.
+
+* **Seeding from Axis B**: The seed collects every build-system descriptor's `classifyGlobs()` routes under its served domain key, keeps a domain's routes only when that domain's Axis-A applicability matches at least one discovered module, prunes routes that match no git-tracked file, and stamps each route with `classifyBuildClass()`. Because applicability needs discovered modules, seeding happens only in `setup.seed-build-map` after `setup.discover-modules`; nothing else creates `build-map.json`.
+* **Write-Once Seed, Direct Edits**: A seed never overwrites an existing `build-map.json`. Corrections are made directly to the seeded entries — through the `customize_routes` link of `setup.seed-build-map`, or by a committed edit of `.marshall/config/build-map.json` — and there is no separate override layer. `customize_routes` therefore edits the seeded block itself and is not an exception to write-once: write-once constrains the seeder, not the user.
+* **Explicit Reseed Only**: The seeded block is re-derived only through `setup.reseed-build-map`. On every reconcile run with an existing `build-map.json`, the `auto` probe `setup.probe-build-map` compares the persisted block with the live derivation (per domain, added and removed globs). When they agree it reports `in_sync` and no question arises; on drift it raises a workspace question record and enters `setup.reseed-build-map`, whose options are `reseed_build_map` (replace the whole block with the live derivation, discarding hand edits) and `keep_build_map` (preserve the persisted block) (xref:04-setup-state-machine.adoc#setup-questions[Setup choices by owner]). A reseed happens only on the answer `reseed_build_map`: the expiry of the question wait records `keep_build_map` as an assumption, so a hand edit is never discarded without an answer, and the drift is asked again on the next reconcile run (`plan-marshall`: `build-map drift`, `build-map seed --force`, upgrade nested gate `build-map-reseed`).
+* **Separate Glob Dialect**: Build-map routes use the **`fnmatch` glob dialect**, which is kept strictly separate from the Axis-A `provides_file_globs` domain-detection dialect. A path-bearing route matches the whole repository-relative path (a single `*` spans `/`; routes never use `**`), and a bare-basename route (no `/`, e.g. `pom.xml`) matches that file name at any depth.
+* **Fail-Closed Read Invariant**: `derive-verification` reads `build-map.json` fail-closed. If it is absent, malformed, at another `format_version`, or holds an entry with an unknown `role` or `build_class`, the engine refuses verification derivation with an explicit diagnostic (`build_map_invalid` or `build_map_unseeded`) rather than returning an empty verification set. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `build-map read` also fails closed, but its deriver and build-decision readers degrade an absent `build.map` to an empty map instead of refusing.
+* **Canonical Command Resolution Rules**:
+  - Production paths (`role == "production"`, `build_class == "compile"`) resolve `compile` on the owning module.
+  - Test paths (`build_class == "module-tests"`) resolve `test-compile` + `module-tests` on the owning module (Maven Failsafe `*IT`/`IT*`/`*ITCase` test paths route to `verify`).
+  - Build/lint/packaging config paths (`role == "config"`, `build_class == "verify"`) resolve `verify` for the affected module.
+  - Documentation or non-compiled path claims (`build_class == "none"`) require zero build jobs and route only to applicable doc/plugin validators.
+
+=== Architecture Query Resources (`pm://architecture/...`)
+_See Requirement link:../../Requirements.adoc#PM-TOOL-3[PM-TOOL-3: Read-Only MCP Resource URI Surface]_
+
+_Implementation watch: link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-5[PM-WATCH-EXT-5], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-8[PM-WATCH-EXT-8], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-10[PM-WATCH-EXT-10], link:../../implementation-watch/domain-extensions.adoc#PM-WATCH-EXT-25[PM-WATCH-EXT-25]_
+
+Instead of invoking Python CLI scripts via Bash to inspect repository structure, the model reads server-computed MCP resources under `pm://architecture/`:
+
+[cols="2,3"]
+|===
+|Resource URI |Returned TOON Payload
+
+|`pm://architecture/overview`
+|Project-wide module inventory, active domains, resolver status reports, and enrichment completion status.
+
+|`pm://architecture/modules/{module_id}`
+|Complete discovered facts, active profiles, resolved `skill://` URIs, key packages, and persisted semantic enrichment for `<module_id>`.
+
+|`pm://architecture/files`
+|Tier-0 file inventory of the working tree (the zero-configuration floor every higher discovery tier degrades to): file categories (content classes and file types) with their counts, plus a coverage block `{files_scanned, excluded{reason: n}, complete}` (git-ignored, binary, size-capped, and unreadable paths counted per reason). A zero count is honest only when `files_scanned > 0` and `complete: true`; otherwise the category renders `indeterminate`, never `0`. Content search (which files contain a string) stays with the host's search tool for leaf workers (link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification], Mandatory MCP Tool Inclusion); the server adds no search verb (`PM-TOOL-5`).
+
+|`pm://architecture/files?path={rel_path}`
+|Owning module (`which-module`) resolved via module roots and Axis-D `PathAttributionMerge`, plus matching `build.map` route.
+
+|`pm://architecture/files/{+path}/neighbours`
+|File-level neighbours of one repository-relative file: the files it imports (resolved by the same scanners as the Axis-C resolvers, unresolvable imports listed as `unresolved[]`), its paired test or production file (by the owning build system's source-set convention, `none` when there is none), and its owning module. The light gate `init.light-gate` counts `|neighbours|` from this resource (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#light-gate[Phase Workflows Specification, Light Gate]).
+
+|`pm://architecture/graph`
+|Merged Axis-C dependency graph (`MergedDependencyEdge[]` with `resolverIds` provenance) and topological layers.
+
+|`pm://architecture/neighbours/{module_id}`
+|Direct upstream dependencies and direct downstream consumers of `<module_id>`, annotated with resolver provenance.
+
+|`pm://architecture/impact?modules={csv}`
+|Transitive downstream blast radius and derived verification set (`derive-verification`) for the specified modules or active plan footprint. The impact closure is the specified modules, their transitive reverse dependents, and every repository-wide test module (a module whose tests check the whole tree, such as a naming or architecture test), whether or not it depends on the specified modules.
+
+|`pm://architecture/drift`
+|Descriptor regression and module-diff report comparing the current working tree against the structural module snapshot, the derived fact `module_discovery` of the project's `derived-facts.json`, which is the only structural module snapshot (`.marshall/project-architecture/` holds only the enrichment): `changed[]` for modules whose comparison is certified as different, and `indeterminate[]{module, reason}` for modules the hash surface cannot certify. An uncertifiable comparison is `indeterminate`, never `changed`.
+|===
+
+* **Resource Contracts**: Every `pm://architecture/*` resource documents its arguments, its payload, and its zero-result and error semantics. An empty result is returned only for a population that was actually examined; a resource that could not examine its population returns an explicit error or `indeterminate` entry, never an empty list.
+* **Empty Graph Is Not Clean**: When the project has at least 2 modules and the merged graph holds 0 edges, `pm://architecture/graph`, `pm://architecture/neighbours/{module_id}`, and `pm://architecture/impact` answer `indeterminate` (with the resolver status reports), never an empty edge set, and every gate reading the graph treats that answer as `indeterminate`.
+* **Two Capability Vocabularies**: Capability status uses two distinct vocabularies that are never mixed: `derivable` / `not_derivable` for derivation capabilities (a discovery tier or resolver can produce the fact) and `available` / `unavailable` for content capabilities (the content can be read or searched).

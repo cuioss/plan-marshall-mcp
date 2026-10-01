@@ -22,8 +22,9 @@ the answer is a representation of that state together with the valid next transi
 (hypermedia-driven workflow). The model follows links and contributes judgment only; the server
 owns the state machine.
 
-The design is described in the [concept documents](doc/concept/README.adoc); the order in which it is
-built is in the [roadmap](doc/roadmap.adoc).
+The normative requirements are defined in [Requirements](doc/Requirements.adoc), the technical
+implementation blueprints in [Specification](doc/Specification.adoc), and the delivery order in the
+[Roadmap](doc/roadmap.adoc).
 
 > [!NOTE]
 > The project is at its very beginning: the build currently produces a Quarkus application with a
@@ -41,7 +42,7 @@ built is in the [roadmap](doc/roadmap.adoc).
 Java 25, Quarkus (via `de.cuioss:cui-quarkus-parent`),
 [Quarkus MCP Server](https://github.com/quarkiverse/quarkus-mcp-server),
 [cui-http](https://github.com/cuioss/cui-http) and [TokenSheriff](https://github.com/cuioss/TokenSheriff).
-See [Technology](doc/concept/10-technology.adoc).
+See [Technology Requirements](doc/requirements/09-technology.adoc).
 
 ## Build
 

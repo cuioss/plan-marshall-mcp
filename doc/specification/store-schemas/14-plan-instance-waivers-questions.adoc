@@ -1,0 +1,415 @@
+= Store Schemas Specification: Plan Instance, Waivers, Questions & Evidence
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Plan Instance, Waivers, Questions & Evidence
+
+[#plan-instance]
+== Plan Instance (`instance/plan.v<N>.pmwf`, `instance/composition.jsonl`)
+_See Requirement link:../../Requirements.adoc#PM-WF-13[PM-WF-13: Finalize Step Ordering Bands, Verdict Currency & Pre-Merge Barrier]_
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-41[PM-WATCH-STORE-41]_
+
+_See Requirement link:../../Requirements.adoc#PM-EXT-7[PM-EXT-7: Configuration Versioning, Validation & Zero-CoT Upgrades]_
+
+Every plan executes its own *plan instance*: a DSL unit, stored per version as `instance/plan.v<N>.pmwf`, that the server composes from the templates (the compiled defaults and the project-owned `.marshall/config/*.pmwf`, the `remediation.*` policy units, link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification, Project-Owned Workflow Units & Compiled Invariants]), the composition rules (<<composition-rules>>), and the plan's facts. Facts stay where they are owned and are never copied into the instance: configuration in its stores (xref:07-project-configuration.adoc#project-configuration-store[Project Configuration]), waivers in `waivers.jsonl` (<<waiver-record>>), plan facts (lane, deliverables, footprint, tasks) in the plan stores. The instance carries their *effect* with provenance. It replaces the former `execution-manifest.json` (the step list is the instance) and the former `config_hash` snapshot (the instance header).
+
+* *Storage*: Each version is an immutable file `plans/<plan_id>/instance/plan.v<N>.pmwf` (`N` from `1`, never rewritten, never deleted while the plan exists); the instance is always referred to by this file, and its header `version` is the plan's `instance_version` (link:../identifiers/02-registry-stores-to-web.adoc#id-instance-version[Identifier Registry, Plan Instance Version]). The version in force is `instance_version` of the plan's `mcp/status.json` (xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store]). A version composed by an operator or configuration event (`config_adopted`, `waiver`) is in force from the transition after the one that composed it, never mid-state; a version composed by a server event (`outline`, `plan`, `fallback`, `empty_harvest`, `deliverable_removed`) is in force for the rest of its composing chain, from the transition that enters its target state, so every `auto` state of that chain (for example `finalize.next-step` after `plan.return`) selects from the new version. Completed firings, step records, and history always refer to the version in force when they happened; history is never rewritten.
+* *Header*: The first element of every version is its instance header (schema below), which names every input by digest; the DSL body follows. In the `.pmwf` file the header is the single `instance` line after the `workflow` line, serialized as one line of canonical JSON (keys sorted, no insignificant whitespace, UTF-8), so its digest is reproducible (link:../workflow-dsl/09-plan-instance.adoc#instance-header-grammar[Workflow DSL Specification, Instance Header Grammar]). `pm://plan/{plan_id}/instance[/{version}]` returns the DSL text with its header, `pm://plan/{plan_id}/diagram` renders the version in force (active state, pruned elements with reason, waived gates with waiver id), and `pm-operator status` names the version and its last composition event (link:../mcp-tools/03-resource-uris.adoc#_normative_resource_uri_templates[MCP Tools Specification, Resource URI Templates]).
+* *Invariants per Version*: The compiled invariants are checked on every composed version before it is written; a version that fails them is never written (the composing transition is refused, and for a server event the plan takes the phase's fallback route with the failed invariant as the gap).
+* *Position Rule*: A version is valid only if it contains the current state and every state of the `call_stack` (the adopt rule of the bound unit copy, link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification]). State ids are stable across versions, so the current position maps onto the new version unchanged. An operator-triggered event whose version fails the rule is refused (a configuration candidate is then kept, a waiver verb is refused with `position_not_contained`); a server event (`fallback`, `empty_harvest`, `deliverable_removed`, `outline`, `plan`) is composed in the transaction that enters its target state, so the version always contains it.
+* *Sub-Units*: The header lists every sub-unit the instance calls (`git.commit_and_push`, the `remediation.*` units) by id and digest; each call site carries its bound arguments with provenance, so one sub-unit serves every call site and is never expanded inline. The verified text of each bound sub-unit is kept as `plans/<plan_id>/mcp/units/<digest>.pmwf` (`<digest>` the SHA-256 of the unit text): content-addressed, written once in the transaction that composes the first version naming the digest, never rewritten, covered by the plan's digest sidecar, and read by the engine instead of the project copy while a version naming it is in force, so an edit of `.marshall/config/*.pmwf` never changes a running call.
+* *Readers*: Every former reader of the execution manifest reads the instance: Phase 5 and Phase 6 step selection, verdict currency, and the retrospective's step admission, which reads the version in force when the step would have fired (`not_admitted` = pruned, with the prune reason).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/plan-instance-header.json",
+  "title": "PlanInstanceHeader",
+  "type": "object",
+  "required": ["format_version", "plan_id", "version", "event", "composed_at", "inputs", "lane", "steps", "pruned", "policy_calls", "waived_gates"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "plan_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" },
+    "version": { "type": "integer", "minimum": 1, "description": "instance_version (identifiers.adoc, instance version)." },
+    "event": { "$ref": "#/$defs/composition_event" },
+    "composed_at": { "type": "string", "format": "date-time" },
+    "inputs": {
+      "type": "object",
+      "required": ["config_hash", "templates", "sub_units", "composition_rules", "plan_facts_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "config_hash": { "type": "string", "description": "SHA-256 over the effective configuration (Project Configuration, item 6), read from the plan's worktree while worktree_path is set, else from the main checkout. Re-computed at every phase handshake and at Phase 6 entry: a differing value yields a candidate version that is adopted only when identical, else the config_drift condition (adopt / keep)." },
+        "templates": { "type": "array", "items": { "$ref": "#/$defs/unit_ref" }, "description": "The phase units the instance was composed from." },
+        "sub_units": { "type": "array", "items": { "$ref": "#/$defs/unit_ref" }, "description": "Every sub-unit a call site of the instance calls." },
+        "composition_rules": { "type": "object", "required": ["revision", "digest"], "additionalProperties": false, "properties": { "revision": { "type": "string" }, "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
+        "plan_facts_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Digest over the plan facts read (lane, posture, deliverables, tasks, declared footprint, waivers.jsonl up to the composing event)." },
+        "realized_footprint_digest": { "type": ["string", "null"] },
+        "change_type": { "type": ["string", "null"] },
+        "providers_digest": { "type": ["string", "null"] }
+      }
+    },
+    "lane": { "type": ["string", "null"], "enum": ["light", "deep", "land", "adopt", null], "description": "null only in version 1 of a plan whose lane is not yet known (both lanes open)." },
+    "posture": { "type": ["string", "null"], "enum": ["minimal", "standard", "full", null], "description": "The posture commit option of the plan bootstrap, else the projection; a plan fact whose effect is the posture prunes, composed from version 1 (event start) on." },
+    "steps": {
+      "type": "object",
+      "required": ["phase_5_verification", "phase_6"],
+      "additionalProperties": false,
+      "properties": {
+        "phase_5_verification": { "type": "array", "items": { "type": "string" } },
+        "phase_6": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9-]{0,63}$" } }
+      }
+    },
+    "pruned": {
+      "type": "array",
+      "description": "Every template element the composition left out, with the rule and the fact that pruned it.",
+      "items": {
+        "type": "object",
+        "required": ["element", "id", "reason", "source_fact"],
+        "additionalProperties": false,
+        "properties": {
+          "element": { "type": "string", "enum": ["step", "state", "link", "policy_action"] },
+          "id": { "type": "string", "description": "step_id, state_id, <state_id>/<action>, or <call_site>/<action>." },
+          "reason": { "$ref": "#/$defs/prune_reason" },
+          "source_fact": { "type": "string", "description": "Effective configuration key, derived fact kind, plan fact, or composition event that caused the prune." }
+        }
+      }
+    },
+    "policy_calls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["call_site", "unit", "args"],
+        "additionalProperties": false,
+        "properties": {
+          "call_site": { "type": "string", "description": "state_id of the calling state." },
+          "unit": { "type": "string", "enum": ["remediation.ci-failure", "remediation.review-findings", "remediation.build-failure", "remediation.merge-conflict", "remediation.qgate-findings", "remediation.analysis", "remediation.spend"] },
+          "args": {
+            "type": "object",
+            "description": "Effective bound arguments: retry_budget, fix_budget, waiver_wait_seconds (integers) and actions (the allowed decide actions); each value carries its provenance.",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["value", "source"],
+              "additionalProperties": false,
+              "properties": {
+                "value": {},
+                "source": { "type": "string", "enum": ["template", "composition_rule", "waiver"] },
+                "file": { "type": ["string", "null"], "description": "template: the unit file whose call argument is the value." },
+                "waiver_id": { "type": ["string", "null"], "pattern": "^W-[0-9]+$", "description": "waiver: the raise waiver that set the ceiling." }
+              }
+            }
+          }
+        }
+      }
+    },
+    "waived_gates": {
+      "type": "array",
+      "items": { "type": "object", "required": ["gate", "waiver_id"], "additionalProperties": false, "properties": { "gate": { "type": "string" }, "waiver_id": { "type": "string", "pattern": "^W-[0-9]+$" } } }
+    }
+  },
+  "$defs": {
+    "unit_ref": { "type": "object", "required": ["unit", "digest", "origin"], "additionalProperties": false, "properties": { "unit": { "type": "string" }, "file": { "type": ["string", "null"] }, "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "origin": { "type": "string", "enum": ["default", "project"] } } },
+    "composition_event": { "type": "string", "enum": ["start", "outline", "plan", "config_adopted", "waiver", "fallback", "empty_harvest", "deliverable_removed"] },
+    "prune_reason": { "type": "string", "enum": ["posture", "provider_unconfigured", "footprint_disjoint", "change_type_exempt", "recipe_override", "local_only", "land_lane", "auto_merge_off", "empty_harvest", "returned", "handed_back"] }
+  }
+}
+----
+
+*Composition Events*: The closed `composition_event` enum (link:../identifiers/02-registry-stores-to-web.adoc#id-composition-event[Identifier Registry]): `start` (version 1 in the plan's creation transaction: init and refine routes, both lanes open, posture prunes), `outline` (lane known, the other lane pruned), `plan` (tasks and steps known; provider and footprint prunes; budgets bound), `config_adopted` (an adopted configuration or template change), `waiver` (a `met` waiver, a `raise`, or an `unwaive`), `fallback` (the post-run-only form of the `returned` and `handed_back` routes, pruned steps with reason `returned` / `handed_back`), `empty_harvest` (post-run-only, steps below `900` pruned with reason `empty_harvest`), and `deliverable_removed`. A loop-back re-runs `outline` and `plan`. Every version has exactly one event.
+
+*Composition Log (`instance/composition.jsonl`)*: One line per composition attempt, appended in the transaction that evaluates the composition:
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/composition-record.json",
+  "title": "CompositionRecord",
+  "type": "object",
+  "required": ["format_version", "event", "result", "version", "trigger", "input_digests", "recorded_at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "event": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/plan-instance-header.json#/$defs/composition_event" },
+    "result": { "type": "string", "enum": ["composed", "identical_adopted", "kept", "refused"], "description": "identical_adopted: a configuration candidate equal in effect to the version in force (no new version); kept: the config_drift condition resolved keep (no new version); refused: the position rule or an invariant refused the version (reason in cause)." },
+    "version": { "type": ["integer", "null"], "minimum": 1, "description": "The composed version; null unless result == composed." },
+    "trigger": { "type": "string", "enum": ["server", "operator"] },
+    "cause": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gate": { "type": ["string", "null"], "description": "fallback: the gate or condition whose exhaustion took the fallback." },
+        "fallback_cause": { "type": ["string", "null"], "enum": ["exhausted", "stepped_out", "hand_back", "condition", "question_expired", "provider_refused", "auto_merge_off", "local_only", null] },
+        "waiver_id": { "type": ["string", "null"], "pattern": "^W-[0-9]+$" },
+        "deliverable_id": { "type": ["string", "null"], "pattern": "^D[0-9]+$" },
+        "from_config_hash": { "type": ["string", "null"] },
+        "to_config_hash": { "type": ["string", "null"] },
+        "refusal": { "type": ["string", "null"], "enum": ["position_not_contained", "invariant_failed", null] }
+      }
+    },
+    "input_digests": { "type": "object", "additionalProperties": { "type": "string" } },
+    "diff_summary": { "type": ["object", "null"], "description": "Pruned elements added and removed, ceilings changed, gates waived or unwaived, relative to the previous version." },
+    "recorded_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+[#composition-rules]
+=== Composition Rules
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-89[PM-WATCH-PHASE-89]_
+
+The land restriction (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane]), the local-only prunes, and every former manifest prune predicate are *data*: one declarative rule file, versioned like the templates, whose rules map a plan fact or an effective configuration value to prunes and policy bindings. Its revision and digest are an input of every instance header.
+
+* *Location*: The shipped default rule file is compiled into the binary (`composition-rules.json`, with its `revision`); it has no project copy in `.marshall/config/` and no operator file overrides it. The phase and sub-workflow templates are already team-owned copies in `.marshall/config/*.pmwf`; only team overrides of the composition rules (and of units that are not project-owned) are deferred (link:../../later-improvements.adoc#_l_5_team_overrides_of_templates_and_composition_rules[Later Improvements, L-5]); until then the shipped rule file applies to every project.
+* *Rule Shape*: Each rule has a `when` predicate over one fact (`lane`, `posture`, `derived.push_remote`, `change_type`, a provider configuration key, the operator key `merge.auto_merge`, `recipe_id`), and a `then` of `prune` entries (`element`, `id`, `reason` from the prune-reason enum) and `bind` entries (a policy call site and the argument it fixes, for example `actions: [retry]`). A rule never adds an element that no template declares, never raises a budget, and never names a gate; the compiled invariants are checked on the result.
+* *Shipped Rules*: `lane = land` binds every policy call with `actions: [retry]` (no `fix`; `decide` offers `retry` and `step_out`) and prunes task allocation, `loop_back`, and in-branch fix links with reason `land_lane`; an empty `derived.push_remote` prunes `push`, `create-pr`, `ci-verify`, `automatic-review`, and `analysis-roundtrip` with reason `local_only` and keeps `pre-push-quality-gate` and `pre-submission-self-review` (*deliberate change vs. `plan-marshall`*, which drops them); `merge.auto_merge = false` prunes the merge execution, the states `finalize.merge-dispatch`, `finalize.merge-queue-wait`, and `finalize.merge-queue-exit`, with reason `auto_merge_off` (source fact `merge.auto_merge`), so `finalize.merge-barrier` routes `pass` to the ready form of `finalize.hand-back` and the plan ends `handed_back` with `merge_outcome: awaiting_human_merge`; the posture, provider, footprint, change-type, and recipe prunes carry the reasons of the same names.
+
+[#waiver-record]
+== Waiver Record (`waivers.jsonl`, `waiver-consumptions.jsonl`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Operator CLI & Paired Web Devices)]_
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-38[PM-WATCH-STORE-38]_
+
+A waiver is the operator's only influence on the gates and budgets of a running plan: it declares a waivable gate met (`mode: met`) or raises a remediation budget ceiling (`mode: raise`). `plans/<plan_id>/waivers.jsonl` is append-only and has exactly one writer, the runtime executing an operator verb (`pm-operator waive` / `unwaive`, link:../cli-and-security/02-credentials-and-operator.adoc#operator-waive[CLI, Coordination & Security Specification, Waivers]); no primitive has a write capability for it (compiled invariant `INV-GEN-2`). Every line is mirrored to `audit.jsonl`, and every `waived` or `revoked` line composes a new plan instance version (event `waiver`).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/waiver-record.json",
+  "title": "WaiverRecord",
+  "type": "object",
+  "required": ["format_version", "event", "waiver_id", "reason", "operator", "at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "event": { "type": "string", "enum": ["waived", "revoked"] },
+    "waiver_id": { "type": "string", "pattern": "^W-[0-9]+$" },
+    "gate": { "type": "string", "description": "waived only: a closed gate identifier (identifiers.adoc, waivable gate identifier); a met waiver names a gate (spend included), a raise a fix_budget:<policy> or retry_budget:<policy>." },
+    "mode": { "type": "string", "enum": ["met", "raise"] },
+    "value": { "type": ["integer", "null"], "minimum": 0, "description": "raise only: the new absolute ceiling, above the effective ceiling in force and at most the compiled hard cap (timeouts.adoc, Remediation Budgets)." },
+    "reason": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Mandatory on waived and on revoked." },
+    "reason_class": { "type": "string", "enum": ["gate_false_positive", "gate_not_applicable", "tooling_unavailable", "deliberate_deferral", "unknown"], "description": "waived only: the operator's class of the reason (default unknown); mirrored into the audit log with the gate, where the Artifact Gate recurrence count and the lessons-capture signal read it." },
+    "request_id": { "type": ["string", "null"], "pattern": "^WR-[0-9]+$", "description": "The waiver request it answers, when the operator answers one." },
+    "operator": {
+      "type": "object",
+      "required": ["channel", "os_principal"],
+      "additionalProperties": false,
+      "properties": {
+        "channel": { "type": "string", "enum": ["cli", "web"] },
+        "device_id": { "type": ["string", "null"], "pattern": "^dev-[0-9a-f]{12}$" },
+        "os_principal": { "type": "string" }
+      }
+    },
+    "at": { "type": "string", "format": "date-time", "description": "created_at of a waived line, revoked_at of a revoked line." }
+  },
+  "allOf": [
+    { "if": { "properties": { "event": { "const": "waived" } } }, "then": { "required": ["gate", "mode", "reason_class"] } },
+    { "if": { "properties": { "mode": { "const": "raise" } }, "required": ["mode"] }, "then": { "required": ["value"], "properties": { "value": { "type": "integer" } } } }
+  ]
+}
+----
+
+* *Plan-Scoped, not HEAD-Bound*: A `met` waiver applies to every evaluation of its gate after it is set, for the rest of the plan (a known-flaky check stays waived after a later push). It can be set at any time until the gate's fallback is taken, including before the plan's first transition and after a failing evaluation; once the fallback of the gate was taken or the plan has ended it is refused (`plan_ended`). The spend check has one evaluation point (`merge.gate-entry`); the operator passes it only with a `met` waiver of gate `spend`.
+* *Raise*: `raise` sets the new absolute ceiling of `fix_budget:<policy>` or `retry_budget:<policy>`; `spend` is not raisable. The consumed budget stays the per-plan counter of the status store, so a re-composition never resets it (xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store], `policy_counters`). A value at or below the effective ceiling, or above the compiled hard cap, is refused (`raise_out_of_range`). Revoking a `raise` (`unwaive`) lowers the ceiling from the next budget check on: a counter already above the restored ceiling reads exhausted there, and the unit takes its fallback; no refusal applies to the revocation.
+* *Consumption*: A waivable gate admits a failure only through the primitive `waiver.lookup`, which appends one line per evaluation that relies on a `met` waiver to `plans/<plan_id>/waiver-consumptions.jsonl` (`{format_version, waiver_id, gate, at, state_id, head_sha, covered[]}`, `covered` naming the check names, finding ids, or provider conditions it admitted). `waiver-consumptions.jsonl` has exactly one writer, `waiver.lookup`; the waiver store itself is never written by a primitive. Every consumption is listed in the pull request comment and the landing record.
+* *Refusals*: `not_waivable` (an unknown gate or one on the non-waivable list: integrity breaches, the footprint and main-checkout guards, job confinement, credentials, security findings, the operator boundary, a build failure, a merge conflict, a provider refusal of the merge), `plan_ended`, `already_consumed` (`unwaive` of a waiver with at least one consumption), `raise_out_of_range`, `position_not_contained` (<<plan-instance>>, Position Rule).
+
+[#waiver-request-record]
+=== Waiver Request Record (`mcp/status.json` → `waiver_requests[]`)
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-40[PM-WATCH-STORE-40]_
+
+A model's `request_waiver` in a remediation unit's `decide` state (offered only when the call's `waiver_wait_seconds > 0` and the failing gate is waivable) files a request and enters the waiver wait. A waiver request is never a question record: it is answered only through the operator channel (`waive` / `unwaive`), never by a model-relayed answer (link:../phase-workflows/01-planning-phases-1-2.adoc[Phase Workflows Specification, Questions]).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/waiver-request.json",
+  "title": "WaiverRequest",
+  "type": "object",
+  "required": ["request_id", "gate", "rationale", "requested_at", "expires_at"],
+  "additionalProperties": false,
+  "properties": {
+    "request_id": { "type": "string", "pattern": "^WR-[0-9]+$" },
+    "gate": { "type": "string", "description": "The waivable gate or budget the request names." },
+    "policy": { "type": ["string", "null"], "description": "The remediation unit that filed it." },
+    "rationale": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "evidence_uri": { "type": ["string", "null"], "description": "pm://plan/{plan_id}/evidence/{evidence_id} of the failure the request is about." },
+    "requested_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time", "description": "requested_at plus the bound waiver_wait_seconds." },
+    "outcome": { "type": ["string", "null"], "enum": ["waived", "raised", "expired", null], "description": "null while pending; expired also when abort or delete-plan ends the plan while the request is pending." },
+    "waiver_id": { "type": ["string", "null"], "pattern": "^W-[0-9]+$" },
+    "pr_comment_ref": { "type": ["string", "null"], "description": "Provider id of the idempotent request comment (label pm-mcp:waiver-requested)." }
+  }
+}
+----
+
+The request is announced as an MCP log notification to the connected host, listed by `pm-operator waivers <plan> --pending`, `pm-operator status`, and the web app, and posted as an idempotent pull request comment with the label `pm-mcp:waiver-requested` when a pull request exists. The hand-back comment names an expired request.
+
+[#policy-counter]
+=== Remediation Budget Accounting (`mcp/status.json` → `policy_counters`)
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-39[PM-WATCH-STORE-39]_
+
+Budgets are counted per plan and policy class, persisted, and never reset: re-entering a unit, a new `HEAD`, a loop-back, and a re-composition of the instance continue the same counter; a `raise` waiver lifts only the effective ceiling carried in the instance. A step-out consumes no budget.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/policy-counter.json",
+  "title": "PolicyCounter",
+  "type": "object",
+  "required": ["retry_used", "fix_used"],
+  "additionalProperties": false,
+  "properties": {
+    "retry_used": { "type": "integer", "minimum": 0 },
+    "fix_used": { "type": "integer", "minimum": 0, "description": "Charged when the fix's commit or artifact exists; an unchanged artifact or an empty commit is refused fix_unchanged and not charged; an uncommitted fix whose commit call stepped out is not charged." },
+    "last_retry": {
+      "type": ["object", "null"],
+      "description": "The last retry and the failure fingerprints it answered; a retry with the same reason over the same fingerprints is refused retry_not_applicable.",
+      "required": ["reason", "fingerprints"],
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "type": "string", "enum": ["flaky", "infra", "timeout"] },
+        "fingerprints": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+      }
+    }
+  }
+}
+----
+
+[#gap-record]
+=== Gap Record (`mcp/status.json` → `gaps[]`)
+_Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-90[PM-WATCH-PHASE-90]_
+
+Every fallback of a plan (link:../phase-workflows/06-finalize-re-entry-and-merge.adoc[Phase Workflows Specification, Plan Outcomes]) records why the plan did not end `merged`; the gaps are listed in the hand-back comment of the pull request, the landing record, and the retrospective.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/gap-record.json",
+  "title": "GapRecord",
+  "type": "object",
+  "required": ["cause", "phase", "state_id", "recorded_at"],
+  "additionalProperties": false,
+  "properties": {
+    "cause": { "type": "string", "enum": ["exhausted", "stepped_out", "hand_back", "condition", "question_expired", "provider_refused", "auto_merge_off", "local_only", "deliverable_removed"], "description": "exhausted: a budget was spent (budget names it); stepped_out: a sub-process stepped out, by the model with budget left (reason) or by the server (step_out_cause); hand_back: the model's hand_back link (reason); condition: a condition's self-remedy budget was spent (condition names it); question_expired: an unanswered question whose class fallback is returned; provider_refused: the provider refused the merge action; auto_merge_off: the pre-merge barrier passed while the operator's merge.auto_merge is false, so the ready pull request awaits a human merge (not a failure); local_only: the plan ended on a local branch because no push remote exists (not a failure); deliverable_removed: a deliverable removed as infeasible." },
+    "gate": { "type": ["string", "null"], "description": "The gate or failure class the gap is about." },
+    "policy": { "type": ["string", "null"] },
+    "budget": { "type": ["string", "null"], "description": "exhausted only: retry_budget, fix_budget, waiver_wait, spend, loop_back_outline, condition, watch_restart, step_refire, or server_rule_retry (a bounded server rule such as create_failed of finalize.create-pr)." },
+    "condition": { "type": ["string", "null"] },
+    "step_out_cause": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]*$", "description": "stepped_out only: step_out for the model's step-out, else the cause of the server step-out (for example attempts_exhausted, push_state_unknown, oracle_failed)." },
+    "reason": { "type": ["string", "null"], "maxLength": 2000, "description": "stepped_out and hand_back: the model's reason." },
+    "question_id": { "type": ["string", "null"], "pattern": "^Q-[0-9]{3,6}$" },
+    "deliverable_id": { "type": ["string", "null"], "pattern": "^D[0-9]+$" },
+    "request_id": { "type": ["string", "null"], "pattern": "^WR-[0-9]+$", "description": "An expired waiver request of the same gate." },
+    "evidence_uri": { "type": ["string", "null"] },
+    "phase": { "type": "string" },
+    "state_id": { "type": "string" },
+    "recorded_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+A step-out consumes no budget and writes no waiver; the begun step is recorded `failed` on the fallback entry.
+
+[#question-record]
+== Question Record (`questions.jsonl`)
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
+_Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-40[PM-WATCH-STORE-40]_
+
+Every content question is a server-owned question record, created by a model job through an `ask` link (`ask:TASK-NNN` on a task envelope entity, and each item of the `questions` list of a refine or outline `submit`) or by a server primitive (init classifiers, the optional outline review, workspace setup choices that write team configuration). The store is append-only, one file per scope: `plans/<plan_id>/questions.jsonl`, `epics/<epic_id>/questions.jsonl`, and `workspace/questions.jsonl`. Overrides (waivers, access grants, `abort`, integrity resolutions), choices that write operator configuration, and the choices of a bootstrap (links of `start.choose`, which run before any scope exists) are never question records.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/question-record.json",
+  "title": "QuestionRecord",
+  "type": "object",
+  "required": ["format_version", "event", "question_id", "at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "event": { "type": "string", "enum": ["asked", "answered", "cancelled"] },
+    "question_id": { "type": "string", "pattern": "^Q-[0-9]{3,6}$" },
+    "class": { "type": "string", "enum": ["init", "clarification", "review", "task", "setup", "ask"], "description": "asked only. ask: an optional model-initiated question outside the other classes." },
+    "origin": { "type": "string", "enum": ["model", "server"] },
+    "source_entity": { "type": ["string", "null"], "description": "Entity that asked (task id, or the job_id of a refine or outline job), null for a scope-level question." },
+    "envelope": {
+      "type": "object",
+      "description": "asked only: the question-envelope (Hypermedia Format Specification, Named Parameter Schemas); options are server-owned for server-raised questions.",
+      "required": ["question_text", "options"],
+      "properties": {
+        "question_text": { "type": "string", "minLength": 1 },
+        "default_assumption": { "type": ["string", "null"] },
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "type": "object", "required": ["branch_key", "label"], "properties": { "branch_key": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$" }, "label": { "type": "string" }, "description": { "type": ["string", "null"] }, "recommended": { "type": "boolean" } } }
+        }
+      }
+    },
+    "mode": { "type": "string", "enum": ["operator", "model", "none", "auto"], "description": "asked only: the effective questions.mode of the class, resolved at creation." },
+    "delivery": { "type": ["string", "null"], "enum": ["session", "elicitation", "web", null], "description": "asked only: the effective questions.delivery, resolved per question at creation; null in mode none and for a model-mode answer accepted at creation." },
+    "expires_at": { "type": ["string", "null"], "format": "date-time", "description": "asked only: at plus questions.wait_seconds in mode auto; null in mode operator (no deadline) and when answered at creation." },
+    "branch_key": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$", "description": "answered only: validated against the options of the asked line." },
+    "text": { "type": ["string", "null"], "maxLength": 2000 },
+    "channel": { "type": "string", "enum": ["user_relayed", "elicitation", "web", "assumption", "model"], "description": "answered only. assumption: mode none or the class fallback on expiry; model: a model-mode self-answer at or above the threshold, or the main-session model's answer to an expired task question (answer_questions)." },
+    "confidence": { "type": ["integer", "null"], "minimum": 0, "maximum": 100, "description": "channel model in mode model: the self-answer's confidence score." },
+    "closure": { "type": "string", "enum": ["answered", "assumed"], "description": "answered only: assumed when channel is assumption." },
+    "amendment_id": { "type": ["string", "null"], "pattern": "^A-[0-9]+$", "description": "answered only: the amendments[] entry the answer created, when it changed intent." },
+    "at": { "type": "string", "format": "date-time", "description": "asked_at, answered_at, or cancelled_at." }
+  },
+  "allOf": [
+    { "if": { "properties": { "event": { "const": "asked" } } }, "then": { "required": ["class", "origin", "envelope", "mode", "delivery", "expires_at"] } },
+    { "if": { "properties": { "event": { "const": "answered" } } }, "then": { "required": ["branch_key", "channel", "closure"] } }
+  ]
+}
+----
+
+* *Answer Validation*: Every channel passes the same validation: an unknown `branch_key` is refused `invalid_link_args`, a second answer `already_answered`, an answer after expiry `question_expired`. A model-relayed answer (`channel: user_relayed`) is accepted for content questions only.
+* *Modes*: `operator` delivers to a human and waits without deadline (the plan shows `awaiting_user` and is listed by stalled-plan detection, link:../runtime-model.adoc#stalled-plans[Runtime & Interaction Model Specification, Stalled Plans]); `model` accepts the model's self-answer at or above the compiled refine confidence threshold (`95`), otherwise continues as `auto`; `none` applies the `recommended` option or `default_assumption` at once (`channel: assumption`); `auto` delivers per `questions.delivery`, waits `questions.wait_seconds` (link:../timeouts/01-job-budgets-and-waits.adoc#question-wait[Timeouts & Budgets Specification, Question Wait]), then takes the compiled fallback of the class.
+* *Closure*: A question is closed by exactly one `answered` or `cancelled` line; `abort` and `delete-plan` cancel every open question of the plan. An expiry held by an integrity pause is processed only after the pause ends.
+* *Amendments*: An answer creates an `amendments[]` entry only when it changes intent (refine answers still go to `request.md`); the entry names the `question_id` (xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store]).
+
+[#evidence-directory]
+== Evidence Directory & Failure Envelope (`evidence/`)
+
+Each remediation unit's gather state gathers per failure class, either by one server-side gathering job (CI logs, provider observations) or, for a class read from the plan's own stores (build, review, qgate, spend, merge conflict), inside the gather state's own transaction (link:../job-runtime/03-parsers-and-gates.adoc#evidence-gathering[Job Runtime Specification, Evidence Gathering]) and records its failures in the plan's evidence directory: the append-only `plans/<plan_id>/evidence/failures.jsonl` (one failure envelope per line) and one excerpt file `plans/<plan_id>/evidence/<evidence_id>.log` per stored log excerpt. Excerpts are untrusted content, redacted before they are written, exposed only as the resource `pm://plan/{plan_id}/evidence/{evidence_id}`, and never inlined into a representation beyond the envelope's `message`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/failure-envelope.json",
+  "title": "FailureEnvelope",
+  "type": "object",
+  "required": ["format_version", "failure_id", "gather_job_id", "gather_state_id", "class", "kind", "source", "message", "fingerprint", "waivable", "recorded_at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "failure_id": { "type": "string", "pattern": "^FL-[0-9]+$" },
+    "gather_job_id": { "type": ["string", "null"], "pattern": "^[bcglp]-[0-9a-f]{16}$", "description": "The gathering job; null for a class gathered from the plan's stores inside the gather state's transaction." },
+    "gather_state_id": { "type": "string", "description": "The gather state of the remediation unit that recorded the failure." },
+    "class": { "type": "string", "enum": ["ci", "build", "review", "analysis", "merge_conflict", "qgate", "spend"] },
+    "kind": { "type": "string", "description": "Closed per class: ci compile|test|lint|infra|timeout|unknown; build compile|test|quality_gate|arch_gate|unparsed; review finding|evidence_missing; analysis gate_condition|issue|undecidable; merge_conflict conflict|remote_moved (the plan branch's remote moved under a rejected lease; source: the observed remote_sha); qgate finding; spend overrun." },
+    "source": { "type": "string", "description": "check name, build job id, finding id, analysis provider, conflicting path, or spend class." },
+    "file": { "type": ["string", "null"] },
+    "line": { "type": ["integer", "null"], "minimum": 1 },
+    "message": { "type": "string", "maxLength": 400, "description": "One redacted line; untrusted." },
+    "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 over class, kind, file, and the normalized message; recognises a repeated failure (retry_not_applicable)." },
+    "excerpt_uri": { "type": ["string", "null"] },
+    "baseline": { "type": "boolean", "default": false, "description": "The failure is present with the same fingerprint on the base (Job Runtime, Baseline Separation)." },
+    "gate": { "type": ["string", "null"], "description": "The waivable gate identifier the failure falls under; null when not waivable." },
+    "waivable": { "type": "boolean" },
+    "recorded_at": { "type": "string", "format": "date-time" }
+  }
+}
+----

@@ -1,0 +1,107 @@
+= MCP Skills Extension (SEP-2640)
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:../Requirements.adoc[Requirements] » xref:README.adoc[Discussions] » MCP Skills Extension
+
+Analysis behind the skill-delivery decision in xref:../requirements/03-skills.adoc[Skill Model].
+
+== Sources
+
+* Specification: https://github.com/modelcontextprotocol/ext-skills[modelcontextprotocol/ext-skills] (`specification/stable/skills.mdx`)
+* SEP: https://modelcontextprotocol.io/seps/2640-skills-extension[SEP-2640: Skills Extension] (status Final, extensions track)
+* Skill format: https://agentskills.io/specification[Agent Skills specification]
+
+== What the extension is
+
+The extension `io.modelcontextprotocol/skills` defines how to serve Agent Skills over MCP. It is a *transport binding only*: the skill format (directory layout, YAML frontmatter, naming, progressive disclosure) is delegated to the Agent Skills specification. Each file of a skill is an MCP resource, conventionally under `skill://<skill-path>/<file-path>`, and is read with the existing `resources/read`.
+
+=== Methods
+
+`skills/list`::
+Enumerates the server's skills. Each entry is a complete manifest: the `SKILL.md` URI, the verbatim frontmatter as JSON, and `resources` — every file with a `sha256` digest and size, or the string `"dynamic"`. A listing may be empty or partial.
+
+`skills/get`::
+Returns one entry by `SKILL.md` URI. Used to refresh after a digest mismatch and to obtain skills omitted from a partial listing.
+
+`resources/directory/read` (optional, `directoryRead` capability)::
+Lists direct children of a directory resource, non-recursively. Does not extend the manifest.
+
+=== Capability declaration
+
+[source,json]
+----
+{
+  "capabilities": {
+    "resources": {},
+    "extensions": {
+      "io.modelcontextprotocol/skills": { "directoryRead": true }
+    }
+  }
+}
+----
+
+== Normative rules relevant to plan-marshall-mcp
+
+Activation::
+Reading a `SKILL.md` via `resources/read` does not activate a skill. Activation happens only through the host's skill-loading path, which verifies content and applies approval.
+
+Integrity::
+Every file read is verified against the entry's digest and size; the parsed frontmatter must match the entry field by field. Reads of files not listed in the held entry are verification failures. Digests are unsigned and explicitly *not* a security boundary.
+
+Approval binding::
+A persisted per-skill approval is bound to the entry's full `resources` set. Any change — a file rotated, added or removed — revokes it.
+
+No implicit execution::
+"Hosts MUST NOT allow MCP-served skill content to cause host-side code execution without explicit per-skill user approval." This covers declarative fields (hooks, frontmatter scripts) and skill instructions that direct the model to a host code-execution tool. The gate applies to code-execution tool calls issued while the model acts on an MCP-served skill.
+
+No permission widening::
+`allowed-tools` and similar frontmatter fields are ignored for MCP-origin skills unless the user explicitly approves the grant for that skill.
+
+Origin::
+Skill content is tagged with its originating server (a host-assigned label, not the self-reported server name). A skill from server A must not cause reads against server B without per-call approval naming both.
+
+Names::
+Names are labels, not identifiers. Identity is (server, URI). Collisions — within one listing or across origins including filesystem skills — are never resolved by silent replacement.
+
+Lazy retrieval and caching::
+Files are fetched on need only. On-disk caches must be excluded from filesystem skill discovery, protected from modification or re-verified on each access, and retain MCP origin permanently.
+
+Dynamic skills::
+`resources: "dynamic"` offers no integrity and cannot be content-bound. Hosts MAY decline such skills.
+
+Limits::
+512 files and 16 MiB per skill.
+
+Not addressed::
+State, sessions, versioning and parameterization of skills. A packed/archive retrieval form was removed during review, so executable bits and symlinks cannot be carried.
+
+== Assessment
+
+=== What the extension provides
+
+* A standard way to ship workflow instructions alongside the tools they describe, from the same server.
+* A complete-manifest listing that lets a host build its registry without fetching files.
+* Consistency checking between listing and content, and approval bound to content.
+* Origin-tagging and collision rules that prevent impersonation.
+
+=== What it does not provide
+
+* *Execution.* A skill is text. Nothing runs on the server because of a skill; anything a skill asks for runs on the host.
+* *State.* Skills are point-in-time and unparameterized. They cannot express "the next step for this plan".
+
+=== Consequence for plan-marshall-mcp
+
+Serving today's plan-marshall skills unchanged over MCP would gain little and cost much: every Bash call those skills trigger falls under the per-skill execution approval gate, and every release changes digests and revokes approvals. The extension is valuable only in combination with tools that perform the work server-side:
+
+* Skills served over MCP never instruct host code execution — they instruct *MCP tool calls*, which are outside the execution gate and subject only to the host's normal per-tool permission.
+* Skills are static vocabulary with real digests (xref:../requirements/03-skills.adoc[Skill Model]); per-plan, per-state content is delivered as tool results, not as dynamic skills (xref:../requirements/02-workflow.adoc[Hypermedia Workflow]).
+* Where a host does not implement the extension, the same skill text is available through a tool, so the design does not depend on host support.
+
+=== Ideas worth adopting independently
+
+* Per-file digest manifests to detect stale or tampered skill content deterministically.
+* Never resolving name collisions silently.
+* Separating transport ("bytes were read") from activation ("the skill is in effect").
+* Origin-scoped reads as the statement of the confused-deputy rule.

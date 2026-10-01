@@ -1,0 +1,256 @@
+= Store Schemas Specification: Project Enrolment Store
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Project Enrolment Store
+
+[#enrolment-store]
+== Project Enrolment Store (`<PM_MCP_BASE>/enrolments/<project_id>.json`)
+
+One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, holding the operator-authorized project root, build wrappers with their pinned files, pinned host tools, the canonical and discovery command templates, provider verification overrides, language servers, approved out-of-process project scripts, operator budgets, the Landlock write paths, and the captured build environment (`PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`, `PM-EXT-6`). Written exclusively via the operator channel (`pm-operator enrol`, link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). The set of enrolled projects is the directory listing; the operator-owned `enrolments/` directory is separate from the server-owned `projects/`.
+
+* *Integrity*: Every write of an enrolment file (an operator verb, executed by the runtime on the request of `pm-operator`, which writes no store) runs under its own lock `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock`, and the runtime also writes its sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac`, the lowercase-hex HMAC-SHA-256 over the exact bytes of the canonical file the runtime wrote, keyed with the operator-lane secret from the OS keyring (service `de.cuioss.pm-mcp`; on hosts without a keyring `<PM_MCP_BASE>/state/enrolment-hmac.key`, mode `0600`), which only `pm-mcpd` reads; the key never leaves the runtime. The runtime verifies a project's file before serving the project for the first time after start and before every verify-not-resolve check, and refuses with `enrolment_tampered` on mismatch (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-integrity[CLI, Coordination & Security Specification, Enrolment Integrity]).
+* *Isolation*: A tampered, unreadable, or schema-invalid enrolment file blocks only its own project; every other project is served. `project_root` is unique across all enrolment files; the operator CLI checks it at every enrolment write and the runtime at start, and a duplicate root blocks both projects with `enrolment_root_conflict` until the operator resolves it.
+* *Closed and Exact*: The schema is closed at every level (`additionalProperties: false`), and a file whose `format_version` is not the binary's is refused (`format_outdated` or `format_newer`, naming the file, xref:01-format-and-session-log.adoc#format-versioning[Format Versioning & Atomic Write Discipline]).
+* *Templates Decide What Runs*: A build job runs the canonical template of its build system and verb (`build.canonical_templates`), or the compiled default when none is enrolled; there is no goal allowlist per wrapper. The typed placeholder `{module}`, the only one, is validated at job time; a verb that needs a build profile names it literally in its template (for example `"integration-tests": ["verify", "-Pintegration-tests", "-pl", "{module}"]`) (link:../domain-extensions/06-configuration.adoc#enrolled-argument-templates[Domain Extensions Specification, Tier 2]).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/enrolment.json",
+  "title": "ProjectEnrolment",
+  "type": "object",
+  "required": ["format_version", "project_id", "project_root", "enrolled_at", "wrappers", "host_tools", "build", "providers", "project_scripts", "language_servers", "command_budgets", "write_paths", "build_environment"],
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Argument vector; the typed placeholder {module} (the only placeholder; build profiles are named literally) may appear only inside the one optional nested array, the module-argument group, which a whole-tree job omits (domain-extensions.adoc, Optional Module-Argument Group); validated at job time; shell metacharacters and the forbidden free flags are refused at enrolment.",
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "The module-argument group; at most one per vector." }
+        ]
+      }
+    }
+  },
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Enrolment identifier (identifiers.adoc, project_id); equals the file name." },
+    "project_root": { "type": "string", "minLength": 1, "description": "Canonical absolute path of the repository main checkout; unique across all enrolment files." },
+    "enrolled_at": { "type": "string", "format": "date-time" },
+    "pilot": { "type": "boolean", "default": false, "description": "Set and cleared only by re-running pm-operator enrol with or without --pilot; clearing it affects only later start.create-scope calls, live plans and epics continue. While the compiled lifecycle gate of the release is closed, plans and epics are created only in a project with pilot true (lifecycle_closed otherwise); without effect once the gate is open (cli-and-security.adoc, Lifecycle gate)." },
+    "wrappers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "relative_path", "sha256", "pinned_files", "interpreter"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "enum": ["mvnw", "gradlew", "pw"] },
+          "relative_path": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "pinned_files": {
+            "type": "array",
+            "description": "Files that decide which tool runs and with which flags: wrapper jar and properties, .mvn/maven.config, .mvn/jvm.config, gradle.properties (where present at enrolment); a listed path with sha256 null must stay absent.",
+            "items": {
+              "type": "object",
+              "required": ["relative_path", "sha256"],
+              "additionalProperties": false,
+              "properties": {
+                "relative_path": { "type": "string", "minLength": 1 },
+                "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
+              }
+            }
+          },
+          "interpreter": { "type": ["string", "null"], "enum": ["python3", null], "description": "Enrolled host tool that runs an interpreter-based wrapper; required (python3) for pw, null otherwise." }
+        }
+      }
+    },
+    "host_tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "executable_path", "sha256", "version"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "enum": ["git", "gh", "glab", "python3", "npm", "npx"] },
+          "executable_path": { "type": "string", "minLength": 1, "description": "Resolved absolute path (no PATH lookup at runtime)." },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "version": { "type": ["string", "null"], "description": "Version printed at enrolment; informational." }
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "required": ["canonical_templates", "discovery_templates"],
+      "additionalProperties": false,
+      "properties": {
+        "canonical_templates": {
+          "type": "object",
+          "description": "Per build system and canonical verb (job-runtime.adoc, Canonical Build Verb Set) the argument vector of the build job; an absent entry means the compiled default template.",
+          "propertyNames": { "enum": ["maven", "gradle", "npm", "pyproject"] },
+          "additionalProperties": {
+            "type": "object",
+            "propertyNames": { "pattern": "^[a-z][a-z0-9-]{0,31}$", "description": "canonical verb" },
+            "additionalProperties": { "$ref": "#/$defs/argv" }
+          }
+        },
+        "discovery_templates": {
+          "type": "object",
+          "description": "Per build system the argument vectors of the lazy discovery jobs (domain-extensions.adoc, Server-Owned Module Discovery), keyed by template name; an absent entry means the compiled default.",
+          "propertyNames": { "enum": ["maven", "gradle", "npm", "pyproject"] },
+          "additionalProperties": {
+            "type": "object",
+            "propertyNames": { "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+            "additionalProperties": { "$ref": "#/$defs/argv" }
+          }
+        }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "description": "Per CLI provider the argument vector that replaces the compiled provider verification (for example a gh host flag); an absent entry means the compiled verification.",
+      "propertyNames": { "enum": ["git", "github", "gitlab"] },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["verify_argv"],
+        "additionalProperties": false,
+        "properties": {
+          "verify_argv": { "$ref": "#/$defs/argv" }
+        }
+      }
+    },
+    "project_scripts": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9-]{0,63}$", "description": "project_script_id (identifiers.adoc)" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["script_path", "sha256", "interpreter", "binding", "argument_schema", "max_timeout_seconds"],
+        "additionalProperties": false,
+        "properties": {
+          "script_path": { "type": "string", "minLength": 1, "description": "Repository-relative path of the script." },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "interpreter": { "type": "string", "enum": ["python3"], "description": "Enrolled host tool that runs the script; its own digest is verified from host_tools." },
+          "binding": {
+            "type": "object",
+            "required": ["worker_kind", "target"],
+            "additionalProperties": false,
+            "properties": {
+              "worker_kind": { "type": "string", "enum": ["finalize_step", "recipe_harvester", "log_parser", "module_discovery", "edge_resolver"] },
+              "target": { "type": "string", "minLength": 1, "description": "The step id, recipe key, or build system the script serves." }
+            }
+          },
+          "argument_schema": {
+            "type": "object",
+            "description": "Inline JSON Schema (draft 2020-12 subset: type, properties, required, additionalProperties false, enum, pattern, minimum, maximum, maxLength) of the script's arguments; validated as a schema at enrolment and applied to every job request."
+          },
+          "max_timeout_seconds": { "type": "integer", "minimum": 10, "description": "Budget of every run of the script; no learning, no escalation (timeouts.adoc, Job Budgets)." }
+        }
+      }
+    },
+    "language_servers": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9-]{0,31}$", "description": "language_id (identifiers.adoc)" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["executable_path", "sha256", "args"],
+        "additionalProperties": false,
+        "properties": {
+          "executable_path": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "args": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "command_budgets": {
+      "type": "object",
+      "description": "Operator budgets in seconds per budget key (<build_system>:<verb>[@<module_id>], git:<operation>, ci:<operation>, llm:<role_key>); clamped up to the engine or role floor, may exceed the escalation cap, recorded as budget_derivation operator (timeouts.adoc, Job Budgets).",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,31}:[a-z][a-z0-9.-]{0,63}(@[A-Za-z0-9][A-Za-z0-9_.-]{0,56})?$", "maxLength": 155 },
+      "additionalProperties": { "type": "integer", "minimum": 1 }
+    },
+    "write_paths": {
+      "type": "array",
+      "description": "Build toolchain cache directories added to the Linux Landlock write set of this project's jobs (job-runtime.adoc, Linux Filesystem Confinement); never under <PM_MCP_BASE>.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "build_environment": {
+      "type": "object",
+      "description": "Environment values captured by the operator CLI at enrolment (job-runtime.adoc, Job Environment); credential-pattern variable names are refused.",
+      "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" },
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}
+----
+
+[#project-store-identity]
+=== Project Store Identity (`<PM_MCP_BASE>/projects/<project_id>/store.json`)
+_Implementation watch: link:../../implementation-watch/cli-and-security.adoc#PM-WATCH-CLI-23[PM-WATCH-CLI-23]_
+
+The per-project machine store records the main checkout it belongs to. `pm-operator enrol` writes `store.json` once, when it creates the store, under the project's workspace lock (`locks/workspace.lock`); nothing changes it afterwards. `pm-operator unenrol` removes only the enrolment file and its sidecar and leaves the store with this record in place (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). Enrolling the same `project_id` again reuses the store only when the new `project_root` equals the recorded one; otherwise the enrolment is refused (`project_store_root_mismatch`), naming both roots.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/project-store.json",
+  "title": "ProjectStoreIdentity",
+  "type": "object",
+  "required": ["format_version", "project_id", "project_root", "created_at"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "project_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "Equals the store directory name." },
+    "project_root": { "type": "string", "minLength": 1, "description": "Canonical absolute path of the main checkout at the enrolment that created the store." },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+[#harness-enrolment-store]
+== Harness Enrolment Store (`<PM_MCP_BASE>/harnesses.json`)
+_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-33[PM-WATCH-DISP-33]_
+
+One machine-wide file holds the harness CLIs that may run model jobs (job kind `llm`, xref:10-job-and-lesson-records.adoc#job-record[Job Record]). A harness is enrolled per machine, not per project, with `pm-operator enrol-harness <client_id>` (link:../cli-and-security/02-credentials-and-operator.adoc#operator-enrol-harness[CLI, Coordination & Security Specification, Harness Enrolment]): the runtime resolves the executable path once (no `PATH` lookup at job time), runs the profile's version probe, and records path, digest, and version, and nothing else: the file holds no environment value, no variable name, and no credential, because `PM-MCP` never stores or exports a harness's authentication (the harness uses its own login). Written only by the runtime on that verb and on an accepted self-update, under `locks/harnesses.lock`, with an HMAC sidecar `harnesses.json.hmac` like that of the project enrolments (same key, verified before every model-job spawn).
+
+* *Self-Update Within Range*: Harness CLIs update themselves. At every spawn the runtime re-probes the version and re-digests the executable; a changed digest or version inside the client profile's supported version range (`headless.supported_versions`, link:../client-profiles.adoc[Client Profiles Specification]) is accepted: in the accepting transaction the runtime, the file's only writer, rewrites `harnesses.json` and its HMAC sidecar under `locks/harnesses.lock` with the new version and digest, and an `operator` audit record `harness_updated` names the old and new version and digest. A version outside the range, or a harness not enrolled, refuses the job (`harness_version_unsupported`, `harness_not_enrolled`), and the job state raises `precondition_unmet` (reason `harness_unsupported`) naming the operator command.
+* *Tampered File*: An HMAC mismatch refuses the model job (`refused`, with a `security` audit record `enrolment_tampered`), and the model-job state raises `precondition_unmet` with reason `harness_tampered`, naming `pm-operator enrol-harness <client>`. That verb is the re-baseline: after showing path, version, and digest of the named client for confirmation it rewrites the file and its sidecar with the named client only; entries of other clients in a file that failed its check are not carried over, and each of those clients must be enrolled again with its own `enrol-harness`. There is no pause and no `accept-edit` form for this file; the condition's `retry` re-checks within the condition budget, after which the phase's fallback is taken (link:../cli-and-security/02-credentials-and-operator.adoc#operator-enrol-harness[CLI, Coordination & Security Specification, Harness Enrolment]).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/harnesses.json",
+  "title": "HarnessEnrolmentStore",
+  "type": "object",
+  "required": ["format_version", "harnesses"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "harnesses": {
+      "type": "object",
+      "propertyNames": { "enum": ["claude", "opencode", "codex"], "description": "client_id of a profile with a headless template (antigravity and neutral have none in v1)." },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["executable_path", "sha256", "version", "enrolled_at", "updated_at"],
+        "additionalProperties": false,
+        "properties": {
+          "executable_path": { "type": "string", "minLength": 1, "description": "Resolved absolute path." },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Digest of the executable at the last accepted probe." },
+          "version": { "type": "string", "minLength": 1, "description": "Version printed by the profile's version probe at the last accepted probe." },
+          "enrolled_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time", "description": "Last accepted self-update (equals enrolled_at before the first)." }
+        }
+      }
+    }
+  }
+}
+----

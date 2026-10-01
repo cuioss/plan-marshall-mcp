@@ -5,12 +5,16 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 ## Project
 
 plan-marshall-mcp (PM-MCP) is a local MCP server that takes over the process logic of plan-marshall
-through a hypermedia-driven workflow. The design lives in `doc/concept/` (start at
-`doc/concept/README.adoc`); it describes the target state, most of which is not implemented yet.
+through a hypermedia-driven workflow. The design describes the target state, most of which is not
+implemented yet: requirements in `doc/Requirements.adoc` (modules in `doc/requirements/`), technical
+specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
+`doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
+`doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification).
 
 Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
 `@QuarkusIntegrationTest` integration tests against the packaged application. No container image
-is built (the target is a native `pm-mcp` binary on the host, `doc/concept/10-technology.adoc`).
+is built (the target is native binaries on the host: the always-on daemon `pm-mcpd`, reached through
+the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
 
 ## Modules
 
@@ -18,8 +22,13 @@ is built (the target is a native `pm-mcp` binary on the host, `doc/concept/10-te
 |---|---|
 | `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
 
-New modules from the concept (daemon, command-line modes of `pm-mcp`, Skills extension, domain
-support) are added with their first code, not as empty shells.
+Roadmap Milestone 1 creates the target module structure in one step (PM-IMPL-1 in
+`doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus daemon
+assembly), beside the aggregators `pm-modules` (library modules, with the nested `pm-providers`)
+and `pm-clients`. The only listing of the modules, their dependencies and the specification each
+implements is `doc/specification/module-structure.adoc`; name modules from there and never repeat the
+listing elsewhere. Every module gets minimal real code and tests, never an empty shell. The table above
+and the build commands below change with that milestone.
 
 ## Development Notes
 
@@ -86,8 +95,23 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 ## Documentation
 
-AsciiDoc (`.adoc`) for all project documentation. Concept decisions go into `doc/concept/`,
-analyses and variants into `doc/concept/discussions/`. Don't create new documents without asking.
+AsciiDoc (`.adoc`) for all project documentation. Requirements go into `doc/requirements/`,
+technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`),
+analyses and variants into `doc/discussions/`. Documentation of the implemented system goes into three
+trees: concepts (`doc/Concepts.adoc`, `doc/concepts/`), developer (`doc/DeveloperGuide.adoc`,
+`doc/developer/`) and user (`doc/UserGuide.adoc`, `doc/user/`). Don't create new documents without asking,
+except topic documents inside those three trees written by `traced-implementation`.
+
+Every concrete implementation follows the project skill `traced-implementation`: each planned task traces
+to its requirements, specification sections and watch items (the _Implementation watch_ line below a
+heading, plus `doc/implementation-watch/cross-cutting.adoc`) and assigns each specified statement its
+destination (code, test, concept, developer or user documentation); after implementation, coverage is
+verified against all three; a requirement the implementation proves wrong is corrected (with evidence) in
+the same plan, never worked around in code; the same PR writes the concept, developer and user
+documentation for the slice from the specification and watch corpus (describing the implemented system,
+verified against the code), deletes the implemented specification sections and watch items, and links each
+requirement to its classes, tests and documentation (`Implementation:` / `Verified by:` / `Documentation:`
+lines).
 
 ## Git Workflow
 
