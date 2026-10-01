@@ -24,8 +24,8 @@ the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specifi
 
 Roadmap Milestone 0 creates the target module structure in one step (PM-IMPL-1 in
 `doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus daemon
-assembly), beside the aggregators `pm-mcp-modules` (library modules, with the nested `pm-mcp-providers`)
-and `pm-mcp-clients`. The only listing of the modules, their dependencies and the specification each
+assembly), beside the aggregators `pm-modules` (library modules, with the nested `pm-providers`)
+and `pm-clients`. The only listing of the modules, their dependencies and the specification each
 implements is `doc/specification/module-structure.adoc`; name modules from there and never repeat the
 listing elsewhere. Every module gets minimal real code and tests, never an empty shell. The table above
 and the build commands below change with that milestone.
