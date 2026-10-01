@@ -41,7 +41,7 @@ None. Antigravity cannot run this as long as its server entry is global: both wo
 
 ## Reading the report
 
-`redelivered_exactly_once` of `trials`, `redelivery_reasons` (`connection_closed` when the host's session ends observably, `lease_expired` when the host calls without a session), `duplicate_submits`, `escalate_calls`, `escalate_probe_answer`, `peak_concurrent_writers`.
+`redelivered_exactly_once` of `trials`, `redelivery_reasons` (`connection_closed` when the host's session ends observably, `lease_expired` when the host calls without a session), `duplicate_submits`, `late_submits_refused` (an observation, not part of the verdict: a killed worker cannot submit late, so the count is above zero only when a live worker outran its lease; the refusal itself is proven by the stub's unit test), `escalate_calls`, `escalate_probe_answer`, `peak_concurrent_writers`.
 
 Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

@@ -10,7 +10,7 @@ import statistics
 
 import harness as hx
 
-CRITERIA = json.loads((pathlib.Path(__file__).resolve().parents[1] / "criteria.json").read_text())
+CRITERIA = json.loads((pathlib.Path(__file__).resolve().parents[1] / "criteria.json").read_text(encoding="utf-8"))
 
 
 def _lines(path):
@@ -115,7 +115,7 @@ def _overlaps(events):
     return count
 
 
-def _failure_mode(metrics, outputs):
+def _failure_mode(metrics, outputs, harness):
     if metrics["done"] and not metrics["foreign_tool_calls"] and not metrics["aborted_waits"]:
         return None
     if metrics["foreign_tool_calls"]:
@@ -124,7 +124,7 @@ def _failure_mode(metrics, outputs):
         return "wait call aborted"
     last = ""
     for records in outputs.values():
-        total = hx.total("claude", records)
+        total = hx.total(harness, records)
         if total and total.get("result"):
             last = total["result"]
     if "?" in last:
@@ -236,7 +236,7 @@ def v1(run_dir, meta, events, outputs, result):
 def v2(run_dir, meta, events, outputs, result):
     crit = CRITERIA[meta["v"]]
     metrics = _loop_metrics(events)
-    metrics["failure_mode"] = _failure_mode(metrics, outputs)
+    metrics["failure_mode"] = _failure_mode(metrics, outputs, meta["harness"])
     comp = [stamp for records in outputs.values() for stamp in hx.compactions(records)]
     if comp:
         metrics["compactions_seen"] = len(comp)
@@ -288,7 +288,9 @@ def v4(run_dir, meta, events, outputs, result):
                "orphans": worker.get("orphans"),
                "calls_after_sigterm": len([e for e in _of(events, "wait_start")
                                            if e["t_ms"] >= worker.get("sigterm_ms", 0)]),
-               "result_event_emitted": any(hx.total("claude", r) for r in outputs.values())}
+               "result_event_emitted": any(hx.total(meta["harness"], r) for r in outputs.values())}
+    if metrics["orphans"] is None:
+        return metrics, "incomplete"
     ok = (metrics["exit_after_s"] is not None and metrics["exit_after_s"] <= crit["max_sigterm_exit_s"]
           and metrics["orphans"] <= crit["max_orphans"])
     return metrics, "pass" if ok else "fail"

@@ -31,6 +31,8 @@ python3 .claude/skills/test-pull/scripts/pull.py status <run>
 python3 .claude/skills/test-pull/scripts/pull.py report v4
 ```
 
+Antigravity (`agy`) takes one `--cell <cell>` per command, each after the previous run ended.
+
 Add `--smoke` for a short trial run that is never recorded. `--model` overrides the small model of the
 harness.
 

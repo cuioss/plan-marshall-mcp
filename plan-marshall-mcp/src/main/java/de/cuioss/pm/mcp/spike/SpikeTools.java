@@ -206,8 +206,11 @@ public class SpikeTools implements McpTrafficListener {
     private ToolResponse pullSubmit(ToolArguments args) {
         var connection = identify(args);
         var values = args.args();
-        var submission = engine.submit(connection, String.valueOf(values.get("task_id")),
-                String.valueOf(values.get("decision")), (String) values.get("rationale"));
+        if (!(values.get("task_id") instanceof String taskId) || !(values.get("decision") instanceof String decision)) {
+            log.log("submit_refused", connection, new JsonObject().put("reason", "missing_argument"));
+            return ToolResponse.error("{\"accepted\":false,\"reason\":\"missing_argument\"}");
+        }
+        var submission = engine.submit(connection, taskId, decision, (String) values.get("rationale"));
         var body = new JsonObject().put("accepted", submission.accepted()).put("reason", submission.reason())
                 .encode();
         return submission.accepted() ? ToolResponse.success(body) : ToolResponse.error(body);

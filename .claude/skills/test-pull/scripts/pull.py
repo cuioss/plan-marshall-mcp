@@ -237,8 +237,6 @@ class Supervisor:
         exited = now_ms()
         time.sleep(2)
         orphans = subprocess.run(["pgrep", "-g", str(worker.process.pid)], capture_output=True, text=True).stdout.split()
-        if code is None:
-            kill_group(worker.process.pid, signal.SIGKILL)
         kill_group(worker.process.pid, signal.SIGKILL)
         self.result["workers"].append(worker.summary(
             sigterm_ms=sent, exit_after_ms=None if code is None else exited - sent, orphans=len(orphans)))
@@ -280,10 +278,13 @@ class Supervisor:
             victim.wait(10)
             delivered = [e for e in self.events()[:index + 1]
                          if e["event"] == "delivery" and e["connection"] == event["connection"]]
-            task_id = delivered[-1]["task_id"] if delivered else None
-            trials.append({"task_id": task_id, "connection": event["connection"], "killed_ms": now_ms()})
             workers.append(start())
-            self.wait_event(lambda e: e["event"] == "submit" and e.get("task_id") == task_id, 300, seen)
+            if delivered:
+                task_id = delivered[-1]["task_id"]
+                trials.append({"task_id": task_id, "connection": event["connection"], "killed_ms": now_ms()})
+                self.wait_event(lambda e: e["event"] == "submit" and e.get("task_id") == task_id, 300, seen)
+            # Deliveries that happened while waiting are skipped on purpose: a kill must fall between a
+            # delivery and its submit, and those tasks may already be submitted.
             seen = len(self.events())
         self.result["trials"] = trials
         deadline = time.time() + 900
@@ -373,6 +374,10 @@ def cmd_selfcheck(args):
 
 
 def cmd_run(args):
+    if not args.smoke and analyze.CRITERIA.get("status") != "confirmed":
+        sys.exit("criteria.json has status %r: a measured run needs the operator's confirmed criteria "
+                 "(set \"status\": \"confirmed\" and commit). Use --smoke for a trial run."
+                 % analyze.CRITERIA.get("status"))
     if args.harness == "agy":
         if not AGY_CONSENT.exists():
             sys.exit("Antigravity runs change your user configuration; run `pull.py consent-agy` first.")
@@ -455,6 +460,8 @@ def _print_checklist(run_dir):
 
 
 def cmd_supervise(args):
+    # a terminated supervisor must still run its cleanup (stub, Antigravity server entry)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     Supervisor(args.run_dir).run()
     return 0
 
@@ -491,8 +498,15 @@ def cmd_stop(args):
     deadline = time.time() + 20
     while time.time() < deadline and alive(meta.get("supervisor_pid")):
         time.sleep(1)
+    forced = alive(meta.get("supervisor_pid"))
     kill_group(meta.get("supervisor_pid"))
     kill_group(meta.get("server_pid"))
+    if forced and meta.get("harness") == "agy":
+        time.sleep(3)
+        if alive(meta.get("supervisor_pid")):      # its own cleanup did not run
+            kill_group(meta.get("supervisor_pid"), signal.SIGKILL)
+        print("agy mcp remove:", hx.agy_unregister())
+        AGY_LOCK.unlink(missing_ok=True)
     print(f"stopped {run_dir.name}")
     return 0
 

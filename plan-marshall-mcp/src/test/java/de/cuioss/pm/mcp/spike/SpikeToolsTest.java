@@ -110,6 +110,12 @@ class SpikeToolsTest {
                 })
                 .thenAssertResults();
         client.when()
+                .toolsCall(SpikeTools.PULL_SUBMIT, Map.of("task_id", "t1", "decision", 7), response -> {
+                    assertTrue(response.isError());
+                    assertEquals("missing_argument", body(response).getString("reason"));
+                })
+                .thenAssertResults();
+        client.when()
                 .toolsCall(SpikeTools.PULL_SUBMIT, Map.of("task_id", "t1", "decision", "a", "rationale", "r"),
                         response -> assertTrue(body(response).getBoolean("accepted")))
                 .thenAssertResults();

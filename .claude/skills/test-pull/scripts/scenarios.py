@@ -45,11 +45,11 @@ CACHE_GAP_SECONDS = 330
 
 
 def tasks():
-    return json.loads((FIXTURES / "tasks.json").read_text())["tasks"]
+    return json.loads((FIXTURES / "tasks.json").read_text(encoding="utf-8"))["tasks"]
 
 
 def injections():
-    return json.loads((FIXTURES / "injections.json").read_text())
+    return json.loads((FIXTURES / "injections.json").read_text(encoding="utf-8"))
 
 
 def task_step(task, task_id=None, delay=0, writer=False):

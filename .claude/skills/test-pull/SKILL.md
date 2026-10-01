@@ -32,7 +32,7 @@ All commands run from the repository root. `P` below stands for
 |---|---|
 | `setup` | Build the runner jar with the canonical Maven command of `CLAUDE.md` and the arguments `package -pl plan-marshall-mcp -am -DskipTests`, then `P setup`. Report harness versions and whether the Antigravity consent exists. |
 | `selfcheck` | `P selfcheck` and `P selfcheck --silent` (each holds one call for 3600 s, with and without progress frames; `--seconds N` for a short check). Both must report `ok: true`; otherwise V1 results are not attributable to the harness. |
-| `smoke <harness>` | `P run vN <harness> headless --smoke` for every N (cells: `--cell all`), then `P report --smoke`. Shakes out the adapters; smoke runs are never recorded as results. |
+| `smoke <harness>` | `P run vN <harness> headless --smoke` for every N (cells: `--cell all`; for `agy` one command per cell and per V8 variant, each after the previous run ended), then `P report --smoke`. Shakes out the adapters; smoke runs are never recorded as results. |
 | `status [run]` | `P status [run]`. |
 | `stop <run>` | `P stop <run>`. |
 | `report [vN]` | `P report [vN]` prints AsciiDoc rows; `--json` prints the raw metrics. Copy rows into `doc/discussions/control-direction-measurements.adoc` only for measured (non-smoke) runs. |
@@ -40,11 +40,14 @@ All commands run from the repository root. `P` below stands for
 
 ## Rules
 
-1. **Criteria first.** A measured run needs `criteria.json` with `"status": "confirmed"`, committed. While the
-   status is `proposed`, run smoke only and ask the operator to confirm or change the criteria.
+1. **Criteria first.** A measured run needs `criteria.json` with `"status": "confirmed"`, committed; `P run`
+   refuses a run without `--smoke` while the status is `proposed`. Ask the operator to confirm or change
+   the criteria; never set the status yourself.
 2. **Antigravity changes user configuration.** `agy` has no per-call MCP configuration; a run executes
    `agy mcp add pullstub <url>` and removes the entry when it ends. Show the operator `P consent-agy` and run
-   `P consent-agy --yes` only after they agree. Antigravity runs are sequential.
+   `P consent-agy --yes` only after they agree. Antigravity runs are sequential: `P run … agy …` takes one
+   cell or variant per command (`--cell all` and the V8 default of all variants are refused), and the next
+   starts when the previous run has ended.
 3. **Never repeat a run until it passes.** A run that fails for a tooling reason (stub did not start, harness
    not logged in) is repeated and the repeat is noted. A run that fails its criterion is recorded as failed
    with its failure mode.
