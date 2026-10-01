@@ -22,9 +22,9 @@ def main(argv):
         if len(argv) < 6:
             print(__doc__)
             return 2
-        line = f'* *Adjusted by {argv[4]}*: {argv[5]}\n'
+        line = f'* *Adjusted by {argv[4]}*: {" ".join(argv[5:])}\n'
     else:
-        line = f'* *Decision*: Operator {datetime.date.today().isoformat()}: {argv[3]}\n'
+        line = f'* *Decision*: Operator {datetime.date.today().isoformat()}: {" ".join(argv[3:])}\n'
     text = open(path, encoding='utf-8').read()
     marker = f'[#{item}]\n'
     start = text.find(marker)

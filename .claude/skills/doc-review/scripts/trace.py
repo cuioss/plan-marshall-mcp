@@ -148,9 +148,9 @@ for p in ['roadmap.adoc']:
         if rid in reqs and reqs[rid][1] != t:
             print('TITLE MISMATCH roadmap', rid, repr(t), '!=', repr(reqs[rid][1]))
 
-# index table in Specification.adoc
+# index table in Specification.adoc (absent once the last specification is implemented and removed)
 idx = {}
-for m in re.finditer(r'\|link:specification/([a-z-]+\.adoc)\[[^\]]+\]\n\|`[A-Z ]+`\n\|(.*?)\n', files['Specification.adoc']):
+for m in re.finditer(r'\|link:specification/([a-z-]+\.adoc)\[[^\]]+\]\n\|`[A-Z ]+`\n\|(.*?)\n', files.get('Specification.adoc', '')):
     idx[m.group(1)] = set(re.findall(r'#(PM-[A-Z]+-\d+)\[', m.group(2)))
 print('\n== Spec traceability vs Specification.adoc index')
 for s in sorted(spec2req):
@@ -190,8 +190,8 @@ for p, txt in files.items():
         if len(set(nums)) != len(nums): print('DUP WATCH', p)
         if sorted(nums) != list(range(1, len(nums)+1)): print('GAPS WATCH', p, sorted(set(range(1, max(nums)+1)) - set(nums)))
 print('\n== Watch counts')
-counts_idx = dict(re.findall(r'\|link:implementation-watch/([a-z-]+\.adoc)\[[^\]]+\]\n\|`[A-Z]+`\n\|(\d+)', files['ImplementationWatch.adoc']))
-counts_spec = dict(re.findall(r'link:implementation-watch/([a-z-]+\.adoc)\[[^\]]+\] \((\d+) items?\)', files['Specification.adoc']))
+counts_idx = dict(re.findall(r'\|link:implementation-watch/([a-z-]+\.adoc)\[[^\]]+\]\n\|`[A-Z]+`\n\|(\d+)', files.get('ImplementationWatch.adoc', '')))
+counts_spec = dict(re.findall(r'link:implementation-watch/([a-z-]+\.adoc)\[[^\]]+\] \((\d+) items?\)', files.get('Specification.adoc', '')))
 for w, ids in sorted(watch.items()):
     print(w, len(ids), 'IW-index', counts_idx.get(w), 'Spec-index', counts_spec.get(w))
 
