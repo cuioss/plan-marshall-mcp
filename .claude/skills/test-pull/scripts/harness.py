@@ -138,7 +138,9 @@ def interactive(harness, ws, url, raised, pointer, worker, transport="stdio"):
         (ws / ".claude").mkdir(exist_ok=True)
         (ws / ".claude" / "settings.json").write_text(json.dumps(hook, indent=2))
         prefix = f"MCP_TOOL_TIMEOUT={RAISED_MS} CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT={RAISED_MS} " if raised else ""
-        return f"cd '{ws}' && {prefix}claude"
+        allowed = ",".join(f"mcp__{SERVER}__{tool}" for tool in TOOLS)
+        # without the allowlist every call of the loop would stop at a permission prompt
+        return f"cd '{ws}' && {prefix}claude --allowedTools '{allowed}'"
     if harness == "opencode":
         config = _opencode_config(url, raised, worker, run_dir, transport)
         (ws / "opencode.json").write_text(json.dumps(config, indent=2))
