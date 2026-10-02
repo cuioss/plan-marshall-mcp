@@ -95,6 +95,10 @@ class Relay:
                     self.emit(event)
                     if is_request and event.get("id") == request_id and "method" not in event:
                         break
+                else:
+                    # the stub's stream ended without the answer: the host must not wait for it
+                    self.log("stream_ended", id=request_id)
+                    self.error(request_id, "the stub closed the stream before it answered")
             else:
                 body = response.read()
                 if body.strip():
