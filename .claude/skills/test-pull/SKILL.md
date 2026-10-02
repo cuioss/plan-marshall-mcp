@@ -21,6 +21,7 @@ Throwaway tooling for `doc/roadmap.adoc` Milestone 0, Part A. It is removed toge
 - **Scenarios and prompts**: `scripts/scenarios.py`. **Harness adapters**: `scripts/harness.py`.
   **Metrics and verdicts**: `scripts/analyze.py`. **Decision fixtures**: `fixtures/`.
 - **Pass criteria**: `criteria.json`, set before the measured runs.
+- **Workspaces**: every harness process runs in a directory of its own outside the repository (system temp directory, `pull-spike-ws/<run>`). Inside the repository a harness loads the project instructions and shares the project's persistent memory across sessions. The MCP server is configured under the product's name `plan-marshall`; Claude Code jobs get `ENABLE_TOOL_SEARCH=false` so that the tools are callable without a tool search.
 - **Run data**: `.plan/temp/pull-spike/runs/<run>/` (gitignored): `meta.json`, `scenario.json`, `events.jsonl`,
   `harness-<worker>.jsonl` (every output line stamped on arrival), `result.json`, `checklist.txt`.
 
@@ -45,7 +46,7 @@ All commands run from the repository root. `P` below stands for
    refuses a run without `--smoke` while the status is `proposed`. Ask the operator to confirm or change
    the criteria; never set the status yourself.
 2. **Antigravity changes user configuration.** `agy` has no per-call MCP configuration; a run executes
-   `agy mcp add pullstub <url>` and removes the entry when it ends. Show the operator `P consent-agy` and run
+   `agy mcp add plan-marshall -- <relay command>` and removes the entry when it ends. Show the operator `P consent-agy` and run
    `P consent-agy --yes` only after they agree. Antigravity runs are sequential: `P run … agy …` takes one
    cell or variant per command (`--cell all` and the V8 default of all variants are refused), and the next
    starts when the previous run has ended.
