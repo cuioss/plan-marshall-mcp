@@ -91,11 +91,10 @@ def _opencode_config(url, raised, worker, run_dir, transport, extra_tools=()):
     return config
 
 
-def headless(harness, ws, url, prompt, model, worker, transport="stdio", raised=False, resume=None,
+def headless(harness, ws, run_dir, url, prompt, model, worker, transport="stdio", raised=False, resume=None,
              extra_tools=()):
-    """Returns (argv, env) for one headless run in the workspace directory `ws` of a run directory."""
+    """Returns (argv, env) for one headless run in the workspace `ws`; logs go to `run_dir`."""
     ws = pathlib.Path(ws)
-    run_dir = ws.parent
     if harness == "claude":
         config = ws / f"mcp-headless-{worker}.json"
         config.write_text(json.dumps({"mcpServers": {SERVER: _claude_server(url, worker, run_dir, transport)}}))
@@ -126,10 +125,9 @@ def headless(harness, ws, url, prompt, model, worker, transport="stdio", raised=
     raise ValueError(f"unknown harness {harness}")
 
 
-def interactive(harness, ws, url, raised, pointer, worker, transport="stdio"):
+def interactive(harness, ws, run_dir, url, raised, pointer, worker, transport="stdio"):
     """Writes the workspace configuration for a TUI session and returns the launch command line."""
     ws = pathlib.Path(ws)
-    run_dir = ws.parent
     if harness == "claude":
         (ws / ".mcp.json").write_text(json.dumps(
             {"mcpServers": {SERVER: _claude_server(url, worker, run_dir, transport)}}, indent=2))

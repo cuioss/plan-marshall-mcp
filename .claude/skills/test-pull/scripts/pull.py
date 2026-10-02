@@ -26,6 +26,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -157,7 +158,10 @@ class Supervisor:
         self.run_dir = pathlib.Path(run_dir)
         self.meta = read_json(self.run_dir / "meta.json")
         self.plan = self.meta["plan"]
-        self.ws = self.run_dir / "ws"
+        # The workspace lies outside the repository: a harness started inside it loads the project's
+        # instructions (CLAUDE.md) and shares the project's memory across sessions, which leaked a value
+        # from one run into later ones.
+        self.ws = pathlib.Path(tempfile.gettempdir()) / "pull-spike-ws" / self.run_dir.name
         self.url = None
         self.result = {"workers": []}
         self.count = 0
@@ -184,7 +188,8 @@ class Supervisor:
         # agy has one global server entry, so its relay cannot carry a worker id per process
         worker = hx.AGY_WORKER if self.meta["harness"] == "agy" and transport != "http" else tag
         prompt = scenarios.prompt(prompt, worker, transport)
-        argv, env = hx.headless(self.meta["harness"], self.ws, self.url, prompt, self.meta["model"], worker,
+        argv, env = hx.headless(self.meta["harness"], self.ws, self.run_dir, self.url, prompt,
+                                self.meta["model"], worker,
                                 transport=transport, raised=self.plan.get("raised", False), resume=resume,
                                 extra_tools=extra_tools)
         if self.count == 1:
@@ -304,7 +309,7 @@ class Supervisor:
             self.result["workers"].append(worker.summary())
 
     def run(self):
-        self.ws.mkdir(exist_ok=True)
+        self.ws.mkdir(parents=True, exist_ok=True)
         server, self.url = start_server(self.run_dir, self.meta["scenario"])
         self.meta.update(url=self.url, server_pid=server.pid, supervisor_pid=os.getpid(), started_ms=now_ms())
         agy = self.meta["harness"] == "agy"
@@ -314,7 +319,8 @@ class Supervisor:
                 self.meta["agy_register"] = hx.agy_register(self.url, self.run_dir, self.meta["transport"])
             if self.meta["mode"] == "interactive":
                 self.meta["launch"] = hx.interactive(
-                    self.meta["harness"], self.ws, self.url, self.plan.get("raised", False), scenarios.POINTER,
+                    self.meta["harness"], self.ws, self.run_dir, self.url, self.plan.get("raised", False),
+                    scenarios.POINTER,
                     hx.AGY_WORKER if agy else scenarios.TUI_WORKER, self.meta["transport"])
                 write_json(self.run_dir / "meta.json", self.meta)
                 self.interactive()
@@ -436,7 +442,7 @@ def _start_run(args, cell, variant):
     run_dir.mkdir(parents=True)
     meta = {"v": args.v, "harness": args.harness, "mode": args.mode, "cell": cell, "variant": variant,
             "fresh": args.fresh, "smoke": args.smoke, "model": args.model or hx.DEFAULT_MODEL[args.harness],
-            "transport": args.transport, "custom": custom,
+            "transport": args.transport, "custom": custom, "isolated": True,
             "harness_version": hx.version(args.harness), "scenario": scenario, "plan": plan,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     write_json(run_dir / "meta.json", meta)
