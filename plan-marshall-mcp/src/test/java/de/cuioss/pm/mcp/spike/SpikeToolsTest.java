@@ -117,7 +117,10 @@ class SpikeToolsTest {
                 .thenAssertResults();
         client.when()
                 .toolsCall(SpikeTools.PULL_SUBMIT, Map.of("task_id", "t1", "decision", "a", "rationale", "r"),
-                        response -> assertTrue(body(response).getBoolean("accepted")))
+                        response -> {
+                            assertTrue(body(response).getBoolean("accepted"));
+                            assertEquals("call pull_wait", body(response).getString("next"));
+                        })
                 .thenAssertResults();
         client.when()
                 .toolsList(page -> assertNotNull(page.findByName(SpikeTools.PULL_ESCALATE)))

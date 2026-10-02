@@ -17,7 +17,7 @@ Whether warm workers are needed, or fresh jobs are cheap enough.
 
 ## Scenario
 
-One minimal decision per fresh process, 10 processes per cell. Cold cells wait 330 s before every process so the provider's prompt cache has expired; `representative` cells append 30 KB of reference text to the prompt.
+One minimal decision per fresh process, 10 processes per cell. Cold cells wait 330 s before every process so that a provider cache with a lifetime of five minutes has expired (Claude Code writes its cache entries with a lifetime of one hour: use `--gap 3700 --reps 3` there, and run nothing else on that model meanwhile); `representative` cells append 30 KB of reference text to the prompt.
 
 ## Cells
 

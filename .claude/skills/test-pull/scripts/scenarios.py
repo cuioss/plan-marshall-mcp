@@ -73,7 +73,7 @@ DONE = {"kind": "done"}
 
 
 def build(v, opts):
-    """opts: cell, smoke, cycles, wait, reps, rounds, variant, fresh."""
+    """opts: cell, smoke, cycles, wait, reps, rounds, gap, variant, fresh."""
     return BUILDERS[v](opts)
 
 
@@ -145,7 +145,8 @@ def v5(opts):
     cold = opts["cell"].startswith("cold")
     task = tasks()[0]
     steps = [task_step(task, f"c{i}") for i in range(count)]
-    plan = {"kind": "fresh", "count": count, "gap_s": 0 if opts["smoke"] or not cold else CACHE_GAP_SECONDS,
+    plan = {"kind": "fresh", "count": count,
+            "gap_s": 0 if opts["smoke"] or not cold else opts.get("gap") or CACHE_GAP_SECONDS,
             "representative": opts["cell"].endswith("representative")}
     return {"steps": steps + [DONE]}, plan
 

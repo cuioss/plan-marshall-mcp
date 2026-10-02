@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
 import signal
 import socket
 import subprocess
@@ -80,13 +81,17 @@ def start_server(run_dir, scenario):
     if not JAR.exists():
         sys.exit(f"runner jar missing: {JAR}\nbuild it with: {BUILD}")
     write_json(run_dir / "scenario.json", scenario)
+    # every run uses a snapshot of the build, so a rebuild never pulls the jar from under a running stub
+    snapshot = BASE / "app" / str(int(JAR.stat().st_mtime))
+    if not snapshot.exists():
+        shutil.copytree(JAR.parent, snapshot)
     port, management = free_port(), free_port()
     argv = ["java", f"-Dpm.spike.scenario={run_dir / 'scenario.json'}", f"-Dpm.spike.run-dir={run_dir}",
             f"-Dquarkus.http.port={port}", f"-Dquarkus.management.port={management}",
             "-Dquarkus.http.host=127.0.0.1",
             # the server must never end a held call itself: both limits default to 30 minutes
             "-Dquarkus.http.idle-timeout=6H", "-Dquarkus.mcp.server.connection-idle-timeout=6H",
-            "-jar", str(JAR)]
+            "-jar", str(snapshot / JAR.name)]
     log = open(run_dir / "server.log", "ab")
     process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT, start_new_session=True)
     deadline = time.time() + 60
@@ -416,10 +421,11 @@ def cmd_run(args):
 
 def _start_run(args, cell, variant):
     opts = {"cell": cell or "", "smoke": args.smoke, "cycles": args.cycles, "wait": args.wait, "reps": args.reps,
+            "gap": args.gap,
             "rounds": args.rounds, "variant": variant, "fresh": args.fresh}
     scenario, plan = scenarios.build(args.v, opts)
     # a run with its own cycle count, wait, repetitions or rounds is recorded, never judged by the criterion
-    custom = any(value is not None for value in (args.cycles, args.wait, args.reps, args.rounds))
+    custom = any(value is not None for value in (args.cycles, args.wait, args.reps, args.rounds, args.gap))
     if args.mode == "interactive":
         plan = {**plan, "kind": "interactive", "deadline_s": max(plan["deadline_s"], 3600) + 1800}
     parts = [args.v, args.harness, args.mode[0], cell, variant, "fresh" if args.fresh else None,
@@ -570,7 +576,7 @@ def main(argv):
     run.add_argument("--variant")
     run.add_argument("--transport", choices=["stdio", "http"], default="stdio",
                      help="stdio: through relay.py, as hosts will see pm-mcp serve (default); http: directly")
-    for name in ("cycles", "wait", "reps", "rounds"):
+    for name in ("cycles", "wait", "reps", "rounds", "gap"):
         run.add_argument(f"--{name}", type=int)
     run.set_defaults(func=cmd_run)
     supervise = sub.add_parser("_supervise")
