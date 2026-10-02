@@ -134,6 +134,188 @@ Interactive session, Antigravity 1.2.14, 2026-10-02 (runs `v1-agy-i-default-nopr
 
 Not yet measured for V1: the interactive sessions of Claude Code and OpenCode.
 
+=== V2: reliability of the wait loop
+
+_Running on Claude Code and OpenCode._
+
+Antigravity (`gemini-3.8-flash-medium`, run `v2-agy-h-1002-094931`): stopped by the operator after 55 cycles and 32 minutes, because the run consumed about 8,300 fresh input tokens per cycle and the quota of the 5-hour window was nearly used up. No failure up to that point (no stop, no foreign tool call, no aborted call; median gap between answer and next call 3.8 s). Not judged against the criterion.
+
+=== V3: task loop in one warm session
+
+Headless, one warm session, 2026-10-02. Filler of 8 KB after every task; the answer to a submit carried no hint to the next call.
+
+[cols="2,1,1,2,4", options="header"]
+|===
+|Harness |Tasks decided |Correct |Context at the end |How the session ended
+
+|Claude Code (`claude-haiku-4-5`), `v3-claude-h-1002-094138`
+|55 of 144
+|100 %
+|141k tokens
+|After an accepted submit the model answered `DONE` instead of calling `pull_wait`. No compaction. 166 turns in 5.6 minutes, 1.78 USD.
+
+|OpenCode (`space-bunny-free`), `v3-opencode-h-1002-094139`
+|127 of 144
+|100 %
+|297k tokens
+|After a `wait_again` answer the model ended its turn without a call. No compaction. 382 turns in 28 minutes.
+|===
+
+* Decision quality did not degrade in a warm session: every decision was correct on both harnesses up to the end.
+* The loop itself broke as the context grew, before any compaction: at about 141k tokens with Haiku, at about 297k with the OpenCode model. A warm worker has to be recycled well before that point; the pull loop does not survive an unbounded context.
+* Open: the same run on Claude Code with the next larger model, the fresh-session baseline, and a run in which the submit answer names the next call (as the wait answers do).
+
+=== V4: lifetime of a headless session
+
+Headless, 2026-10-02. Alive for two hours: see V2.
+
+[cols="2,2,2,2,3", options="header"]
+|===
+|Harness |`SIGTERM` during a held call |`SIGTERM` at a task delivery |Resume by session id |What the relay saw at `SIGTERM`
+
+|Claude Code
+|exit 143 after 0.4 s, no orphans
+|exit 143 after 0.7 s, no orphans
+|nonce recalled, 3.1 s
+|a signal to the relay
+
+|OpenCode
+|ended by the signal at once, no orphans
+|ended by the signal at once, no orphans
+|nonce recalled, 6.9 s
+|the end of `stdin`
+
+|Antigravity
+|exit 1 after 0.5 s, no orphans
+|exit 1 after 0.9 s, no orphans
+|nonce recalled, 7.7 s
+|the end of `stdin`, then a signal
+|===
+
+All cells pass. No harness emitted a final usage record after `SIGTERM`, and none sent a further tool call. A warm worker and a resumed session are technically possible on all three; a job that is terminated reports no usage.
+
+=== V5: cost of a cold start
+
+Headless, fresh process per minimal decision, ten jobs per cell, provider cache warm, 2026-10-02. Medians.
+
+[cols="2,2,1,1,1,2", options="header"]
+|===
+|Harness |Prompt |Wall time |To first contact |To submit |Priced units
+
+|Claude Code (`claude-haiku-4-5`)
+|minimal
+|12.1 s
+|0.6 s
+|10.5 s
+|18,650 (0.02 USD)
+
+|Claude Code
+|plus 30 KB reference text
+|13.6 s
+|0.7 s
+|11.9 s
+|22,716 (0.02 USD); one of ten jobs did not submit
+
+|OpenCode (`space-bunny-free`)
+|minimal
+|11.6 s
+|1.7 s
+|8.9 s
+|4,376
+
+|OpenCode
+|plus 30 KB reference text
+|14.5 s
+|1.7 s
+|10.4 s
+|6,087
+
+|Antigravity (`gemini-3.8-flash-medium`)
+|minimal
+|16.8 s
+|0.5 s
+|12.9 s
+|unmeasured (no cache-creation figure)
+
+|Antigravity
+|plus 30 KB reference text
+|21.0 s
+|0.5 s
+|16.1 s
+|unmeasured
+|===
+
+* Against the criterion (median wall time at most 15 s, priced units at most three times a warm task): Claude Code and OpenCode pass with a warm cache (about 2.0 and 1.5 times the warm task of V7); Antigravity fails on wall time.
+* Process start and MCP connection take 0.5 to 1.7 s; almost all of a fresh job's time is the model's.
+* Not yet measured: the cells with a cold provider cache (they need a harness without parallel runs).
+
+=== V7: usage per task
+
+Headless, ten tasks in one session, 2026-10-02.
+
+[cols="2,1,1,1,2,1", options="header"]
+|===
+|Harness |Usage per turn |Four components |Tasks attributed |Median priced units per task |Verdict
+
+|Claude Code
+|yes (final output tokens only with `--include-partial-messages`)
+|yes
+|10 of 10
+|9,564; sums reconcile with the run total (error 0.0)
+|pass
+
+|OpenCode
+|yes
+|yes
+|10 of 10
+|2,927; the harness reports no run total
+|pass
+
+|Antigravity
+|yes
+|no: input, output, and cache read, no cache creation
+|10 of 10
+|unmeasured
+|fail
+|===
+
+Usage per task survives a warm worker on Claude Code and OpenCode. On Antigravity the fallback applies: `total_tokens` stays `unmeasured` under the rule of the specification.
+
+=== V8: carry-over between tasks
+
+_First of three repetitions; the fresh-session control is running._ Headless, one warm session per variant: three clean tasks, the task with injected text, eight clean tasks.
+
+On Claude Code (`claude-haiku-4-5`) and OpenCode (`space-bunny-free`), all five variants (canary token, forced decision, foreign tool, stop the loop, wrong task id): no carry-over into the eight clean tasks, all eight decided correctly, and the injected task itself decided correctly (`fix`).
+
+=== V9: binding under load
+
+Headless, two workers on one queue, ten kills, 2026-10-02.
+
+[cols="2,1,1,1,1,1,1", options="header"]
+|===
+|Harness |Killed tasks delivered again exactly once |Duplicate submits |Calls of the added tool |Answer to the probe task |Writers at once |Verdict
+
+|Claude Code
+|10 of 10
+|0
+|0
+|`not_available`
+|1
+|pass
+
+|OpenCode
+|10 of 10
+|0
+|0
+|`not_available`
+|1
+|pass
+|===
+
+* Every redelivery happened by lease expiry. Neither harness lets the server see that a worker is gone, so the lease is the only recovery signal, and its length is the delay before a killed task is taken up again.
+* A tool that the server registered in mid-run and announced with `tools/list_changed` was not callable under an allowlist of explicit tool names.
+* Antigravity cannot run this verification: its one server entry is global, so two workers cannot be told apart.
+
 [#observations]
 == Observations from building the tooling
 
@@ -153,5 +335,6 @@ These come from short trial runs (seconds to two minutes; Claude Code 2.1.287, O
 
 == Not yet measured
 
-* V1 in the interactive session; V2 to V10.
+* V1 in the interactive sessions of Claude Code and OpenCode; V2 on Claude Code and OpenCode (running); V3 follow-ups; V5 with a cold cache; V6; V8 repetitions and control; V10.
+* On Antigravity, left open by the operator's decision (quota): V2 in full length, V3, V5 with a cold cache, V6, V8.
 * The blocking times through the real relay `pm-mcp serve` (Part B).
