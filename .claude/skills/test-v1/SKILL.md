@@ -48,7 +48,7 @@ Interactive: one TUI session per cell. Start it with the printed command, paste 
 
 ## Reading the report
 
-`limit` is the measured abort time or `>= 3600 s`; `sign` names what revealed it. Compare the `-prog` and `-noprog` cells of one configuration for the progress question. The values hold for Streamable HTTP only.
+`limit` is the measured abort time or `>= 3600 s`; `sign` names what revealed it. Compare the `-prog` and `-noprog` cells of one configuration for the progress question. The values hold for the transport of the run (`transport` in the row; stdio through the relay unless `--transport http` was given).
 
 Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

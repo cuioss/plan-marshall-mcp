@@ -13,15 +13,29 @@ TOOLS = ["pull_wait", "pull_submit", "pull_info"]
 HARNESSES = ["claude", "opencode", "agy"]
 DEFAULT_MODEL = {
     "claude": "claude-haiku-4-5",
-    "opencode": "opencode/claude-haiku-4-5",
+    "opencode": "opencode/space-bunny-free",
     "agy": "gemini-3.8-flash-medium",
 }
 RAISED_MS = "7200000"
+# The model a run is repeated with when the small model fails its criterion.
+FALLBACK_MODEL = {
+    "claude": "claude-sonnet-5-5",
+    "opencode": "opencode/claude-sonnet-5-5",
+    "agy": "gemini-3.1-pro-low",
+}
 RAISED = {
-    "claude": "env MCP_TOOL_TIMEOUT and CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT = 7200000",
+    "claude": "env MCP_TOOL_TIMEOUT (and CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT over http) = 7200000",
     "opencode": "config mcp.pullstub.timeout and experimental.mcp_timeout = 7200000",
     "agy": "no knob known",
 }
+RELAY = str(pathlib.Path(__file__).resolve().parent / "relay.py")
+AGY_WORKER = "agy"
+
+
+def relay_argv(url, worker, run_dir):
+    """The stdio server command a host starts: the stand-in for `pm-mcp serve`."""
+    return ["python3", RELAY, "--url", url, "--worker", worker,
+            "--log", str(pathlib.Path(run_dir) / f"relay-{worker}.jsonl")]
 
 # Session markers of a calling host. A harness started from another host's shell must not inherit them.
 _SCRUB_EXACT = {"CLAUDECODE", "AI_AGENT", "OPENCODE", "OPENCODE_PID", "MCP_TOOL_TIMEOUT", "MCP_TIMEOUT"}
@@ -49,8 +63,17 @@ def version(harness):
         return f"unavailable ({error})"
 
 
-def _opencode_config(url, raised, extra_tools=()):
+def _claude_server(url, worker, run_dir, transport):
+    if transport == "http":
+        return {"type": "http", "url": url}
+    command = relay_argv(url, worker, run_dir)
+    return {"type": "stdio", "command": command[0], "args": command[1:]}
+
+
+def _opencode_config(url, raised, worker, run_dir, transport, extra_tools=()):
     server = {"type": "remote", "url": url, "enabled": True}
+    if transport != "http":
+        server = {"type": "local", "command": relay_argv(url, worker, run_dir), "enabled": True}
     # explicit names: a wildcard would admit a tool the server adds mid-session
     tools = {"*": False, **{f"{SERVER}_{tool}": True for tool in [*TOOLS, *extra_tools]}}
     config = {
@@ -68,12 +91,14 @@ def _opencode_config(url, raised, extra_tools=()):
     return config
 
 
-def headless(harness, ws, url, prompt, model, raised=False, resume=None, extra_tools=()):
-    """Returns (argv, env) for one headless run in the workspace directory `ws`."""
+def headless(harness, ws, url, prompt, model, worker, transport="stdio", raised=False, resume=None,
+             extra_tools=()):
+    """Returns (argv, env) for one headless run in the workspace directory `ws` of a run directory."""
     ws = pathlib.Path(ws)
+    run_dir = ws.parent
     if harness == "claude":
-        config = ws / "mcp-headless.json"
-        config.write_text(json.dumps({"mcpServers": {SERVER: {"type": "http", "url": url}}}))
+        config = ws / f"mcp-headless-{worker}.json"
+        config.write_text(json.dumps({"mcpServers": {SERVER: _claude_server(url, worker, run_dir, transport)}}))
         allowed = ",".join(f"mcp__{SERVER}__{tool}" for tool in [*TOOLS, *extra_tools])
         argv = ["claude", "-p", prompt, "--mcp-config", str(config), "--strict-mcp-config",
                 "--allowedTools", allowed, "--output-format", "stream-json", "--verbose",
@@ -88,21 +113,26 @@ def headless(harness, ws, url, prompt, model, raised=False, resume=None, extra_t
         if resume:
             argv += ["-s", resume]
         argv.append(prompt)
-        return argv, clean_env({"OPENCODE_CONFIG_CONTENT": json.dumps(_opencode_config(url, raised, extra_tools))})
+        return argv, clean_env({"OPENCODE_CONFIG_CONTENT": json.dumps(
+            _opencode_config(url, raised, worker, run_dir, transport, extra_tools))})
     if harness == "agy":
+        # --sandbox: the permission bypass is needed for MCP calls in print mode, but a model that loses its
+        # MCP server must not roam the machine with shell commands
         argv = ["agy", "-p", prompt, "--output-format", "stream-json", "--dangerously-skip-permissions",
-                "--model", model]
+                "--sandbox", "--model", model]
         if resume:
             argv += ["--conversation", resume]
         return argv, clean_env()
     raise ValueError(f"unknown harness {harness}")
 
 
-def interactive(harness, ws, url, raised, pointer):
+def interactive(harness, ws, url, raised, pointer, worker, transport="stdio"):
     """Writes the workspace configuration for a TUI session and returns the launch command line."""
     ws = pathlib.Path(ws)
+    run_dir = ws.parent
     if harness == "claude":
-        (ws / ".mcp.json").write_text(json.dumps({"mcpServers": {SERVER: {"type": "http", "url": url}}}, indent=2))
+        (ws / ".mcp.json").write_text(json.dumps(
+            {"mcpServers": {SERVER: _claude_server(url, worker, run_dir, transport)}}, indent=2))
         (ws / "pointer.txt").write_text(pointer)
         hook = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": f"cat '{ws / 'pointer.txt'}'"}]}]}}
         (ws / ".claude").mkdir(exist_ok=True)
@@ -110,7 +140,7 @@ def interactive(harness, ws, url, raised, pointer):
         prefix = f"MCP_TOOL_TIMEOUT={RAISED_MS} CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT={RAISED_MS} " if raised else ""
         return f"cd '{ws}' && {prefix}claude"
     if harness == "opencode":
-        config = _opencode_config(url, raised)
+        config = _opencode_config(url, raised, worker, run_dir, transport)
         (ws / "opencode.json").write_text(json.dumps(config, indent=2))
         return f"cd '{ws}' && opencode --agent pull-worker"
     if harness == "agy":
@@ -118,9 +148,11 @@ def interactive(harness, ws, url, raised, pointer):
     raise ValueError(f"unknown harness {harness}")
 
 
-def agy_register(url):
+def agy_register(url, run_dir, transport="stdio"):
+    """One global server entry: every agy process of a run shares the worker id `agy`."""
     subprocess.run(["agy", "mcp", "remove", SERVER], capture_output=True, text=True, timeout=60, env=clean_env())
-    done = subprocess.run(["agy", "mcp", "add", SERVER, url], capture_output=True, text=True, timeout=60,
+    target = [url] if transport == "http" else ["--", *relay_argv(url, AGY_WORKER, run_dir)]
+    done = subprocess.run(["agy", "mcp", "add", SERVER, *target], capture_output=True, text=True, timeout=60,
                           env=clean_env())
     return done.returncode, (done.stdout + done.stderr).strip()
 
@@ -159,7 +191,7 @@ def _usage(node):
     """Normalises one usage object to the four token components, or None when it is not one."""
     if "input_tokens" in node and "output_tokens" in node:
         return {"input": node.get("input_tokens") or 0, "output": node.get("output_tokens") or 0,
-                "cache_read": node.get("cache_read_input_tokens"),
+                "cache_read": node.get("cache_read_input_tokens", node.get("cache_read_tokens")),
                 "cache_creation": node.get("cache_creation_input_tokens")}
     if isinstance(node.get("tokens"), dict) and "input" in node["tokens"]:
         tokens = node["tokens"]
@@ -226,8 +258,12 @@ def call_returns(harness, records):
             content = (data.get("message") or {}).get("content")
             if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
                 stamps.append(record["t_ms"])
-        elif harness != "claude" and "tool" in str(data.get("type", "")).lower():
+        elif harness == "opencode" and "tool" in str(data.get("type", "")).lower():
             stamps.append(record["t_ms"])
+        elif harness == "agy":
+            step = data.get("step_update") or {}
+            if step.get("step_type") == "tool" and step.get("state") not in (None, "ACTIVE"):
+                stamps.append(record["t_ms"])
     return stamps
 
 

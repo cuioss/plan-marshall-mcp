@@ -11,8 +11,7 @@ import uuid
 FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures"
 
 LOOP_PROMPT = (
-    "You are a worker connected to the MCP server `pullstub`. Your worker id is `{worker}`; pass it as "
-    "the argument `worker` in every pull_wait and pull_submit call. Call the tool pull_wait now. "
+    "You are a worker connected to the MCP server `pullstub`. {worker_clause}Call the tool pull_wait now. "
     "The call blocks and returns JSON with a `status`. "
     "If status is `wait_again`, call pull_wait again immediately. "
     "If status is `task`, decide it from the task's own content only, call pull_submit with its task_id, "
@@ -24,8 +23,7 @@ LOOP_PROMPT = (
 )
 
 ONE_TASK_PROMPT = (
-    "You are a worker connected to the MCP server `pullstub`. Your worker id is `{worker}`; pass it as "
-    "the argument `worker` in every call. Call the tool pull_wait once. "
+    "You are a worker connected to the MCP server `pullstub`. {worker_clause}Call the tool pull_wait once. "
     "It returns a task. Decide it from the task's own content only and call pull_submit with its task_id, "
     "a decision that is exactly one of the task's options, and a one-sentence rationale. "
     "Then reply with the single word DONE and stop. Call no other tool."
@@ -35,11 +33,18 @@ RESUME_PROMPT = "Reply with only the nonce that the first task of this session c
 
 POINTER = (
     "scope_type: plan\nscope_id: pull-spike\nphase: execute\n"
-    "next call: pull_wait(worker=\"tui\") on the MCP server pullstub, then follow the `next` field of "
-    "every answer\n"
+    "next call: pull_wait() on the MCP server pullstub, then follow the `next` field of every answer\n"
 )
 
 TUI_WORKER = "tui"
+WORKER_CLAUSE = ("Your worker id is `{worker}`; pass it as the argument `worker` in every pull_wait and "
+                 "pull_submit call. ")
+
+
+def prompt(template, worker, transport):
+    """Over stdio the relay carries the worker id, as `pm-mcp serve` will; over http the model passes it."""
+    clause = WORKER_CLAUSE.replace("{worker}", worker) if transport == "http" else ""
+    return template.replace("{worker_clause}", clause)
 V1_CAP_SECONDS = 3600
 CACHE_GAP_SECONDS = 330
 

@@ -8,7 +8,7 @@ Usage:
                                                   with progress frames or, with --silent, without any
   pull.py run <v1..v10> <claude|opencode|agy> <headless|interactive>
               [--cell NAME|all] [--model M] [--smoke] [--cycles N] [--wait S] [--reps N] [--rounds N]
-              [--variant ID|all] [--fresh]
+              [--variant ID|all] [--fresh] [--transport stdio|http]
   pull.py status [RUN]                            progress of one run, or the list of runs
   pull.py stop <RUN>                              stop the server and the harness of a run
   pull.py report [v1..v10] [--run RUN]            metrics and verdicts as AsciiDoc table rows
@@ -175,9 +175,13 @@ class Supervisor:
         """Starts one headless harness process; its worker id is its tag, `w001`, `w002`, ..."""
         self.count += 1
         tag = f"w{self.count:03d}"
-        prompt = prompt.replace("{worker}", tag)
-        argv, env = hx.headless(self.meta["harness"], self.ws, self.url, prompt, self.meta["model"],
-                                raised=self.plan.get("raised", False), resume=resume, extra_tools=extra_tools)
+        transport = self.meta["transport"]
+        # agy has one global server entry, so its relay cannot carry a worker id per process
+        worker = hx.AGY_WORKER if self.meta["harness"] == "agy" and transport != "http" else tag
+        prompt = scenarios.prompt(prompt, worker, transport)
+        argv, env = hx.headless(self.meta["harness"], self.ws, self.url, prompt, self.meta["model"], worker,
+                                transport=transport, raised=self.plan.get("raised", False), resume=resume,
+                                extra_tools=extra_tools)
         if self.count == 1:
             self.meta["command"] = [part if part != prompt else "<prompt>" for part in argv]
             self.meta["prompt"] = prompt
@@ -302,10 +306,11 @@ class Supervisor:
         try:
             if agy:
                 AGY_LOCK.write_text(str(os.getpid()))
-                self.meta["agy_register"] = hx.agy_register(self.url)
+                self.meta["agy_register"] = hx.agy_register(self.url, self.run_dir, self.meta["transport"])
             if self.meta["mode"] == "interactive":
-                self.meta["launch"] = hx.interactive(self.meta["harness"], self.ws, self.url,
-                                                     self.plan.get("raised", False), scenarios.POINTER)
+                self.meta["launch"] = hx.interactive(
+                    self.meta["harness"], self.ws, self.url, self.plan.get("raised", False), scenarios.POINTER,
+                    hx.AGY_WORKER if agy else scenarios.TUI_WORKER, self.meta["transport"])
                 write_json(self.run_dir / "meta.json", self.meta)
                 self.interactive()
             else:
@@ -416,11 +421,13 @@ def _start_run(args, cell, variant):
     if args.mode == "interactive":
         plan = {**plan, "kind": "interactive", "deadline_s": max(plan["deadline_s"], 3600) + 1800}
     parts = [args.v, args.harness, args.mode[0], cell, variant, "fresh" if args.fresh else None,
+             "http" if args.transport == "http" else None, None if args.model is None else "alt",
              "smoke" if args.smoke else None, time.strftime("%m%d-%H%M%S")]
     run_dir = RUNS / "-".join(part for part in parts if part)
     run_dir.mkdir(parents=True)
     meta = {"v": args.v, "harness": args.harness, "mode": args.mode, "cell": cell, "variant": variant,
             "fresh": args.fresh, "smoke": args.smoke, "model": args.model or hx.DEFAULT_MODEL[args.harness],
+            "transport": args.transport,
             "harness_version": hx.version(args.harness), "scenario": scenario, "plan": plan,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     write_json(run_dir / "meta.json", meta)
@@ -442,7 +449,8 @@ def _print_checklist(run_dir):
     lines = [f"Operator checklist for {run_dir.name}",
              f"1. In a new terminal: {meta['launch']}",
              f"2. Approve the MCP server `{hx.SERVER}` if the harness asks, and confirm it lists pull_wait.",
-             "3. Paste this prompt:", "", scenarios.LOOP_PROMPT.replace("{worker}", scenarios.TUI_WORKER), ""]
+             "3. Paste this prompt:", "",
+             scenarios.prompt(scenarios.LOOP_PROMPT, scenarios.TUI_WORKER, meta["transport"]), ""]
     if meta["v"] == "v10" and not meta["smoke"]:
         lines += ["4. Near cycle 60 (`pull.py status`): type /clear. Note whether the loop resumes by itself;",
                   "   if not, type the single word `continue` and note whether the first call is pull_wait.",
@@ -557,6 +565,8 @@ def main(argv):
     run.add_argument("--smoke", action="store_true")
     run.add_argument("--fresh", action="store_true")
     run.add_argument("--variant")
+    run.add_argument("--transport", choices=["stdio", "http"], default="stdio",
+                     help="stdio: through relay.py, as hosts will see pm-mcp serve (default); http: directly")
     for name in ("cycles", "wait", "reps", "rounds"):
         run.add_argument(f"--{name}", type=int)
     run.set_defaults(func=cmd_run)

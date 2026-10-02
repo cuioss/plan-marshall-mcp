@@ -50,6 +50,18 @@ def load_harness(run_dir):
             for path in sorted(pathlib.Path(run_dir).glob("harness-*.jsonl"))}
 
 
+def load_relay(run_dir):
+    """Host-side record of the stdio relays of a run, in time order."""
+    events = []
+    for path in sorted(pathlib.Path(run_dir).glob("relay-*.jsonl")):
+        for line in _lines(path):
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+    return sorted(events, key=lambda e: e["t_ms"])
+
+
 def _of(events, name, **match):
     return [e for e in events if e["event"] == name and all(e.get(k) == v for k, v in match.items())]
 
@@ -206,6 +218,11 @@ def v1(run_dir, meta, events, outputs, result):
     cancelled = [e["t_ms"] for e in _of(events, "rx", method="notifications/cancelled") if e["t_ms"] >= first["t_ms"]]
     if cancelled:
         signs["cancel notification"] = cancelled[0]
+    relay = [e for e in load_relay(run_dir) if e["t_ms"] >= first["t_ms"]]
+    for name, label in (("stdin_closed", "host closed the relay's stdin"), ("signal", "host signalled the relay")):
+        stamps = [e["t_ms"] for e in relay if e["event"] == name]
+        if stamps:
+            signs[label] = stamps[0]
     failed = [e["t_ms"] for e in _of(events, "progress_failed")]
     if failed:
         signs["progress frame not writable"] = failed[0]
@@ -218,7 +235,7 @@ def v1(run_dir, meta, events, outputs, result):
     for worker in result.get("workers", []):
         if worker.get("ended_ms"):
             signs["harness exited"] = worker["ended_ms"]
-    metrics = {"progress_token_sent": first.get("progress_token"),
+    metrics = {"transport": meta.get("transport", "http"), "progress_token_sent": first.get("progress_token"),
                "progress_frames": len(_of(events, "progress", call=first["call"])),
                "raised_knobs": hx.RAISED[meta["harness"]] if meta["plan"].get("raised") else "defaults"}
     if not signs and first_end is None:
@@ -288,6 +305,8 @@ def v4(run_dir, meta, events, outputs, result):
                "orphans": worker.get("orphans"),
                "calls_after_sigterm": len([e for e in _of(events, "wait_start")
                                            if e["t_ms"] >= worker.get("sigterm_ms", 0)]),
+               "relay_saw": [e["event"] for e in load_relay(run_dir)
+                             if e["event"] in ("stdin_closed", "signal") and e["t_ms"] >= worker.get("sigterm_ms", 0)],
                "result_event_emitted": any(hx.total(meta["harness"], r) for r in outputs.values())}
     if metrics["orphans"] is None:
         return metrics, "incomplete"

@@ -17,6 +17,7 @@ Throwaway tooling for `doc/roadmap.adoc` Milestone 0, Part A. It is removed toge
   Tools `pull_wait` (blocks, answers `wait_again`, `task` or `done`), `pull_submit`, `pull_info` (distractor),
   `pull_escalate` (appears mid-run for the widening test). Every observation goes to `events.jsonl`.
 - **Driver**: `scripts/pull.py` (stdlib Python). One stub process and one detached supervisor per run.
+- **Relay**: `scripts/relay.py`, the stdio server a host starts; forwards to the stub and logs the host side.
 - **Scenarios and prompts**: `scripts/scenarios.py`. **Harness adapters**: `scripts/harness.py`.
   **Metrics and verdicts**: `scripts/analyze.py`. **Decision fixtures**: `fixtures/`.
 - **Pass criteria**: `criteria.json`, set before the measured runs.
@@ -53,11 +54,17 @@ All commands run from the repository root. `P` below stands for
    with its failure mode.
 4. **Long runs are detached.** `P run` returns at once; follow with `P status <run>`. Do not hold a shell open
    for a two-hour run.
-5. **Transport limit.** Every run measures MCP over Streamable HTTP. Hosts will later see stdio from
-   `pm-mcp serve`; state this beside every V1 value.
-6. **Worker identity.** Every prompt gives the model a worker id that it passes as the argument `worker`.
-   Claude Code calls without a session (each request on a transient connection), so the connection cannot
-   identify the caller; a call without the argument falls back to the connection id.
+5. **Transport.** A host reaches the stub as it will reach the product: over stdio, through
+   `scripts/relay.py`, the stand-in for `pm-mcp serve`, which forwards to the stub over Streamable HTTP.
+   `--transport http` connects the host to the stub directly; use it only to compare, and record the
+   transport with the value.
+6. **Worker identity.** The relay sets the argument `worker` of every `pull_*` call to its worker id
+   (`w001`, …; `tui` in an interactive session; `agy` for Antigravity, whose server entry is global), so the
+   model never passes it. The relay log `relay-<worker>.jsonl` is the host-side record: requests,
+   cancellations, the end of stdin, signals. Over `--transport http` the prompt tells the model its id.
+8. **Models.** Headless defaults: `claude-haiku-4-5`, `opencode/space-bunny-free`, `gemini-3.8-flash-medium`.
+   When a run with the small model fails its criterion, record the failure and run the verification once
+   more with the model of `FALLBACK_MODEL` in `scripts/harness.py` (`--model`); both rows are recorded.
 7. **Interactive runs need the operator.** `P run … interactive` prints a checklist (also stored as
    `checklist.txt`): the directory, the launch command, the prompt to paste, and what to do at which cycle.
    Relay it verbatim and collect what the operator saw on screen; the stub cannot see the screen.
