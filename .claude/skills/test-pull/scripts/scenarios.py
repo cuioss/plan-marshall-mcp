@@ -88,7 +88,8 @@ def v2(opts):
     cycles = 4 if opts["smoke"] else opts["cycles"] or 240
     seconds = 5 if opts["smoke"] else opts["wait"] or 30
     scenario = {"wait_seconds": seconds, "steps": [wait(cycles), DONE]}
-    return scenario, {"kind": "loop", "deadline_s": cycles * seconds * 2 + 600}
+    # room for a slow model: up to a minute per turn on top of the wait
+    return scenario, {"kind": "loop", "deadline_s": cycles * (seconds + 60) + 1800}
 
 
 def v10(opts):

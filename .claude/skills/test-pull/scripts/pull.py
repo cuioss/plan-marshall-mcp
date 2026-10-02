@@ -358,7 +358,7 @@ def cmd_consent_agy(args):
 
 
 def cmd_selfcheck(args):
-    run_dir = RUNS / f"selfcheck-{time.strftime('%m%d-%H%M%S')}"
+    run_dir = RUNS / f"selfcheck-{'silent' if args.silent else 'progress'}-{time.strftime('%m%d-%H%M%S')}"
     run_dir.mkdir(parents=True)
     scenario = {"wait_seconds": args.seconds, "progress_seconds": 0 if args.silent else 5,
                 "steps": [scenarios.wait(1), scenarios.DONE]}
