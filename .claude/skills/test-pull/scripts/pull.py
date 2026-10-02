@@ -442,7 +442,7 @@ def _start_run(args, cell, variant):
     run_dir.mkdir(parents=True)
     meta = {"v": args.v, "harness": args.harness, "mode": args.mode, "cell": cell, "variant": variant,
             "fresh": args.fresh, "smoke": args.smoke, "model": args.model or hx.DEFAULT_MODEL[args.harness],
-            "transport": args.transport, "custom": custom, "isolated": True,
+            "transport": args.transport, "custom": custom, "isolated": True, "server_name": hx.SERVER,
             "harness_version": hx.version(args.harness), "scenario": scenario, "plan": plan,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     write_json(run_dir / "meta.json", meta)

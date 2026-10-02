@@ -492,7 +492,8 @@ def report(run_dir, meta):
     cell = " ".join(str(part) for part in (meta.get("cell"), meta.get("variant"), "fresh" if meta.get("fresh") else None,
                                             "smoke" if meta.get("smoke") else None,
                                             "shortened" if meta.get("custom") else None,
-                                            None if meta.get("isolated") else "in-repo") if part)
+                                            None if meta.get("isolated") else "in-repo",
+                                            None if meta.get("server_name") else "named-pullstub") if part)
     return {"run": pathlib.Path(run_dir).name, "v": meta["v"], "harness": meta["harness"], "mode": meta["mode"],
             "cell": cell, "model": meta["model"], "harness_version": meta.get("harness_version"),
             "client_info": client, "metrics": metrics, "verdict": verdict, "finished": bool(result)}

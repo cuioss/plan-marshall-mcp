@@ -8,7 +8,9 @@ import os
 import pathlib
 import subprocess
 
-SERVER = "pullstub"
+# The name hosts will configure for the product. A name that says "stub" invites the model to conclude
+# that nothing will ever arrive ("pullstub appears to be a stub that never yields work").
+SERVER = "plan-marshall"
 TOOLS = ["pull_wait", "pull_submit", "pull_info"]
 HARNESSES = ["claude", "opencode", "agy"]
 DEFAULT_MODEL = {
@@ -25,7 +27,7 @@ FALLBACK_MODEL = {
 }
 RAISED = {
     "claude": "env MCP_TOOL_TIMEOUT (and CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT over http) = 7200000",
-    "opencode": "config mcp.pullstub.timeout and experimental.mcp_timeout = 7200000",
+    "opencode": "config mcp.<server>.timeout and experimental.mcp_timeout = 7200000",
     "agy": "no knob known",
 }
 RELAY = str(pathlib.Path(__file__).resolve().parent / "relay.py")
@@ -106,6 +108,9 @@ def headless(harness, ws, run_dir, url, prompt, model, worker, transport="stdio"
         if resume:
             argv += ["--resume", resume]
         extra = {"MCP_TOOL_TIMEOUT": RAISED_MS, "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": RAISED_MS} if raised else {}
+        # Without this the MCP tools are deferred behind ToolSearch; some fresh Haiku jobs then never made
+        # the call ("I don't have a direct mechanism to invoke the tool").
+        extra["ENABLE_TOOL_SEARCH"] = "false"
         return argv, clean_env(extra)
     if harness == "opencode":
         argv = ["opencode", "run", "--format", "json", "--agent", "pull-worker", "-m", model, "--dir", str(ws)]
