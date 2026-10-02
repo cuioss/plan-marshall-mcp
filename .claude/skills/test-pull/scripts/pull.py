@@ -418,16 +418,19 @@ def _start_run(args, cell, variant):
     opts = {"cell": cell or "", "smoke": args.smoke, "cycles": args.cycles, "wait": args.wait, "reps": args.reps,
             "rounds": args.rounds, "variant": variant, "fresh": args.fresh}
     scenario, plan = scenarios.build(args.v, opts)
+    # a run with its own cycle count, wait, repetitions or rounds is recorded, never judged by the criterion
+    custom = any(value is not None for value in (args.cycles, args.wait, args.reps, args.rounds))
     if args.mode == "interactive":
         plan = {**plan, "kind": "interactive", "deadline_s": max(plan["deadline_s"], 3600) + 1800}
     parts = [args.v, args.harness, args.mode[0], cell, variant, "fresh" if args.fresh else None,
              "http" if args.transport == "http" else None, None if args.model is None else "alt",
+             "custom" if custom else None,
              "smoke" if args.smoke else None, time.strftime("%m%d-%H%M%S")]
     run_dir = RUNS / "-".join(part for part in parts if part)
     run_dir.mkdir(parents=True)
     meta = {"v": args.v, "harness": args.harness, "mode": args.mode, "cell": cell, "variant": variant,
             "fresh": args.fresh, "smoke": args.smoke, "model": args.model or hx.DEFAULT_MODEL[args.harness],
-            "transport": args.transport,
+            "transport": args.transport, "custom": custom,
             "harness_version": hx.version(args.harness), "scenario": scenario, "plan": plan,
             "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     write_json(run_dir / "meta.json", meta)

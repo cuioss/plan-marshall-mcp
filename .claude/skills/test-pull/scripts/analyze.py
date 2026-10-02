@@ -479,9 +479,19 @@ def report(run_dir, meta):
     except (OSError, ValueError):
         result = {}
     metrics, verdict = ANALYSES[meta["v"]](run_dir, meta, events, outputs, result)
+    if (pathlib.Path(run_dir) / "stop").exists() and meta["mode"] == "headless" and verdict == "fail" \
+            and str(metrics.get("failure_mode", "")).startswith("stops ("):
+        # ended by `pull.py stop`, not by the harness: nothing to judge beyond the cycles reached
+        metrics["failure_mode"] = None
+        metrics["note"] = "stopped by the operator before the end"
+        verdict = "stopped"
+    if meta.get("custom") and verdict in ("pass", "fail") and meta["v"] in ("v2", "v5", "v9", "v10"):
+        metrics["note"] = "shortened run, not judged by the criterion"
+        verdict = "recorded"
     client = next((e.get("client_info") for e in _of(events, "rx", method="initialize")), None)
     cell = " ".join(str(part) for part in (meta.get("cell"), meta.get("variant"), "fresh" if meta.get("fresh") else None,
-                                            "smoke" if meta.get("smoke") else None) if part)
+                                            "smoke" if meta.get("smoke") else None,
+                                            "shortened" if meta.get("custom") else None) if part)
     return {"run": pathlib.Path(run_dir).name, "v": meta["v"], "harness": meta["harness"], "mode": meta["mode"],
             "cell": cell, "model": meta["model"], "harness_version": meta.get("harness_version"),
             "client_info": client, "metrics": metrics, "verdict": verdict, "finished": bool(result)}

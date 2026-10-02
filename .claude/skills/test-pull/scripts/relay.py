@@ -79,7 +79,13 @@ class Relay:
             response = connection.getresponse()
             if message.get("method") == "initialize" and response.getheader("Mcp-Session-Id"):
                 self.session = response.getheader("Mcp-Session-Id")
-            if "text/event-stream" in (response.getheader("Content-Type") or ""):
+            if not is_request:
+                # A notification never gets an answer on stdio, whatever the HTTP transport returns for it.
+                body = response.read()
+                if response.status >= 400:
+                    self.log("notification_refused", method=message.get("method"), status=response.status,
+                             body=body.decode("utf-8", "replace")[:300])
+            elif "text/event-stream" in (response.getheader("Content-Type") or ""):
                 for raw in response:
                     line = raw.decode("utf-8").rstrip("\r\n")
                     if not line.startswith("data:"):
