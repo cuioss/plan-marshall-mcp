@@ -353,7 +353,8 @@ def total(harness, records):
 def context_tokens(harness, record):
     """The context size one output record reports (input plus both cache components), or None."""
     data = record.get("json")
-    if not isinstance(data, dict) or data.get("type") in ("result", "stream_event"):
+    # a closing result record carries the totals of the run (Claude Code `type`, Antigravity `event`)
+    if not isinstance(data, dict) or data.get("type") in ("result", "stream_event") or data.get("event") == "result":
         return None
     nodes = [(data.get("message") or {}).get("usage") or {}] if harness == "claude" else _walk(data)
     for node in nodes:
