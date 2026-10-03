@@ -19,9 +19,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 
+import de.cuioss.pm.mcp.spike.SpikeScenario.Ack;
 import de.cuioss.pm.mcp.spike.SpikeScenario.Kind;
+import de.cuioss.pm.mcp.spike.SpikeScenario.Offer;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -91,5 +94,47 @@ class SpikeScenarioTest {
         assertNull(scenario.steps().getFirst().taskId());
         var missing = directory.resolve("missing.json");
         assertThrows(IOException.class, () -> SpikeScenario.load(missing));
+    }
+
+    @Test
+    @DisplayName("leaves the supervised protocol off unless the scenario switches it on")
+    void shouldDefaultProtocol() {
+        var scenario = SpikeScenario.parse(new JsonObject("{\"steps\":[{\"kind\":\"task\",\"id\":\"t1\"}]}"));
+
+        var protocol = scenario.protocol();
+        assertFalse(protocol.supervised());
+        assertEquals(Ack.NONE, protocol.ack());
+        assertEquals(30_000, protocol.ackDeadlineMillis());
+        assertFalse(protocol.links());
+        assertFalse(protocol.consult());
+        assertFalse(protocol.control());
+        assertNull(protocol.skillsDir());
+        assertEquals(Offer.ANY, scenario.steps().getFirst().offer());
+    }
+
+    @Test
+    @DisplayName("reads the switches of the supervised protocol and the offer of a task")
+    void shouldReadProtocol() {
+        var scenario = SpikeScenario.parse(new JsonObject("""
+                {"supervised": true, "ack": "implicit", "ack_deadline_seconds": 2.5, "links": true,
+                 "consult": true, "control": true, "skills_dir": "skills", "steps": [
+                  {"kind": "task", "id": "t1", "role": "worker", "release_at_seconds": 4, "offer_to": "tui",
+                   "fallback_after_seconds": 1.5, "skills": ["skill://pm/core/SKILL.md"]}]}
+                """));
+
+        var protocol = scenario.protocol();
+        assertTrue(protocol.supervised());
+        assertEquals(Ack.IMPLICIT, protocol.ack());
+        assertEquals(2_500, protocol.ackDeadlineMillis());
+        assertTrue(protocol.links());
+        assertTrue(protocol.consult());
+        assertTrue(protocol.control());
+        assertEquals("skills", protocol.skillsDir());
+        var offer = scenario.steps().getFirst().offer();
+        assertEquals("worker", offer.role());
+        assertEquals(4_000, offer.releaseAtMillis());
+        assertEquals("tui", offer.offerTo());
+        assertEquals(1_500, offer.fallbackAfterMillis());
+        assertEquals(List.of("skill://pm/core/SKILL.md"), offer.skills());
     }
 }
