@@ -22,9 +22,9 @@ RAISED_MS = "7200000"
 # The model a run is repeated with when the small model fails its criterion.
 FALLBACK_MODEL = {
     "claude": "claude-sonnet-5-5",
-    # Unusable for this account (2026-10-03): the paid models of OpenCode Zen answer "Model access is
-    # disabled", big-pickle refuses headless runs ("free tier can only be used from within OpenCode").
-    "opencode": "opencode/claude-sonnet-5-5",
+    # Named by the operator on 2026-10-03: the paid models of OpenCode Zen answer "Model access is
+    # disabled" for this account, and big-pickle refuses headless runs.
+    "opencode": "opencode/muse-spark-1.3-contributor-free",
     "agy": "gemini-3.1-pro-low",
 }
 RAISED = {
