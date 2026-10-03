@@ -1,0 +1,104 @@
+= Harness as Worker: Skills
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Overview] · xref:analysis.adoc[Analysis] · xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · xref:record.adoc[Run Record] · xref:findings.adoc[Findings] · xref:conclusion.adoc[Conclusion] · xref:architecture.adoc[Architecture] · xref:task-protocol.adoc[Task Protocol] · xref:roles.adoc[Roles] · *Skills* · xref:evaluation.adoc[Evaluation]
+
+NOTE: *Status: proposal (2026-10-03)*. How the client logic reaches every worker deterministically, in the structures of the MCP Skills Extension, with a shim for what the harnesses do not support yet. Not verified; xref:evaluation.adoc#e13[E13] plans the verification.
+
+A core feature of plan-marshall is that a model gets exactly the skills its work needs, deterministically chosen and reliably loaded: the execution context loads the persona and the listed skills in order, and a skill that cannot be loaded fails the dispatch. The requirements carry this into `PM-MCP` (xref:../../requirements/03-skills.adoc[Skill Generation & Delivery], `PM-SKILL-1` to `PM-SKILL-4`): static vocabulary skills per project with deterministic digests, delivered through MCP tools and resources, dynamic state only in representations, and a model job's skills in-band in its server-composed prompt (decision Z7-6).
+
+The harness as worker adds three things that the requirements do not cover yet: warm workers that serve many tasks with different skill needs, a task protocol whose client logic every worker must know, and an interactive session that may take a task. This document states how the skills reach all of them.
+
+== All client logic is a skill
+
+Everything a worker must know to act, other than the facts of the task, is a skill. Nothing of it lives in prompt text written for one occasion or in the harness's own instruction files (which a worker does not load, xref:findings.adoc#isolation[Findings, Instructions and isolation]).
+
+[cols="2,3,4", options="header"]
+|===
+|Skill |URI |Content
+
+|Core conduct
+|`skill://pm/core/SKILL.md`
+|The rules for every model: follow the offered links, never act outside them, deliverables only through submit links.
+
+|Task protocol
+|`skill://pm/worker/task-protocol/SKILL.md`
+|The client logic of the xref:task-protocol.adoc[Task Protocol]: what a wait, an offer, "wait again", and "end" mean; acknowledging; working along the links; submitting; consulting another role.
+
+|Role skills
+|`skill://pm/role/<role>/SKILL.md`
+|The contract of a role: what it decides and by which criteria (planning agent, project triage, code triage, outline, planning, coding, each review), and what its result means.
+
+|State skills
+|`skill://pm/<phase>/...`
+|The guidance of a workflow state, as specified today.
+
+|Domain skills
+|`skill://pm/domain/<domain>/SKILL.md`
+|The standards of a technology active in the project.
+|===
+
+The rules of `PM-SKILL-1` apply unchanged: skills are static vocabulary, never commands, paths, or per-plan content. A contract in a skill names link relations and their meaning; the concrete links, facts, and result schemas of a task arrive in its representation.
+
+[#structure]
+== One structure: the MCP Skills Extension
+
+The server publishes its catalogue in the structures of the MCP Skills Extension (`io.modelcontextprotocol/skills`, SEP-2640; analysis in xref:../../discussions/mcp-skills-extension.adoc[MCP Skills Extension]):
+
+* every skill is a `SKILL.md` with its supporting files, each an MCP resource under `skill://pm/…`;
+* every skill has a manifest: its `SKILL.md` URI, its frontmatter, and every file with its SHA-256 digest and size;
+* the server declares the extension and answers `skills/list`, `skills/get`, and `resources/read`.
+
+The tools of `PM-SKILL-3` serve the same manifests, URIs, and digests: `pm_skills` mirrors `skills/list`, `pm_skill` and `pm_skill_file` mirror `resources/read` of a `SKILL.md` and of a supporting file. The tool channel is a mirror of the extension, not a second format, so nothing changes in the catalogue when a host starts to speak the extension.
+
+The rules of the extension hold from the start, whether a host enforces them or not: no `dynamic` skills, a digest for every file, one origin, and no skill that instructs code execution on the host.
+
+[#delivery]
+== Deterministic delivery
+
+image::../../resources/harness-as-worker-skill-delivery.svg[The skill catalogue of pm-mcpd reaches fresh jobs in their prompt, warm workers in their offers, and the interactive session through the skill tools and the shim; once a host supports the Skills Extension it reaches it through the host's own skill path, align=center]
+
+For every task the server computes the required skill set: core conduct, task protocol, the role's skill, the state's skills, and the domain skills of the project, each identified by URI and digest. How the set reaches the model depends on the recipient:
+
+[cols="2,4,4", options="header"]
+|===
+|Recipient |Today |When the host supports the extension
+
+|Fresh job
+|In-band in the server-composed prompt file, as decided (Z7-6); above the size bound, a section index with `skill://` URIs to fetch through `pm_skill`.
+|Unchanged: the prompt is the server's.
+
+|Warm worker
+|Core conduct, task protocol, and role skill in-band in the launch prompt. Each offer carries in-band the required skills that this worker generation has not yet received, and names the others by URI and digest.
+|The offer names the skills by URI and digest; the host loads and activates them through its own skill path and verifies the digests.
+
+|Interactive session
+|The shim skill of the client bundle, and `pm_skill` for every skill a representation names; an offer to the session carries its skills in-band like an offer to a warm worker.
+|The host lists and activates the catalogue itself; the shim is removed from the bundle.
+|===
+
+The server keeps a delivery record per worker generation: which skill, which digest, when. A new generation starts with an empty record, so a successor receives everything again; nothing depends on what a predecessor knew.
+
+[#enforcement]
+== What the server enforces
+
+* *Delivery, not request.* A required skill reaches the model in the answer that carries the task, which the model has to read to get the task at all. The server does not wait for the model to fetch a skill, and it does not trust an acknowledgement that repeats digests: repeating proves nothing.
+* *No task without its skills.* The server never offers a task whose required skills it cannot deliver within the size bound of the offer; a role whose skills exceed the bound gets them in its launch prompt instead, or the task goes to a fresh job.
+* *Re-delivery when the context may have lost them.* A skill is delivered again after a budget recycle (new generation), after a compaction the harness reports (Claude Code marks one in its output), and whenever a skill's digest changed (new release or project configuration).
+* *Results against the contract.* What the server receives is checked against the link and schema the contract names, whatever the model made of the skill.
+* *What the server cannot enforce*: that the model applies a skill. That is a matter of measurement (xref:evaluation.adoc#e7[E7], xref:evaluation.adoc#e13[E13]), not of protocol.
+
+[#shim]
+== The shim
+
+None of the three harnesses activates skills that an MCP server serves (xref:../../discussions/skills-host-support.adoc[Skills Host Support]). The missing host capability is replaced by one small skill that is removed again when a host provides it.
+
+* *What it is*: a host-native skill in each client bundle (in the host's own skill format and directory), and the same paragraph in every server-composed prompt file. It states the convention and nothing else: skills of `plan-marshall` arrive in-band in answers or are named by a `skill://pm/` URI; a named skill is binding and is read through `pm_skill`, sections through their anchors; a skill is never reconstructed from memory; a skill of the same name from elsewhere does not replace it.
+* *What it is not*: it never decides which skills to load. The server decides; the shim only makes the model treat what it receives as skills.
+* *How it is removed*: per host and per connection. When a host implements the extension, it declares the extension's client capability when it connects; the server then switches that connection to host activation (offers name skills by URI only), and the client profile records the verified support, so the next client bundle no longer installs the shim. A machine with several hosts can run hosts with and without support side by side.
+
+== Bootstrapping
+
+The task protocol cannot teach itself through the task protocol. A headless worker therefore receives the core conduct and the task-protocol skill in its launch prompt, before its first wait. The interactive session receives the task-protocol skill in the first offer it takes, and the shim tells it how to read it.
