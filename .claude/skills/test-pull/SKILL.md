@@ -1,6 +1,6 @@
 ---
 name: test-pull
-description: Shared driver of the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A (control direction). Builds and checks the stub, starts and stops runs against Claude Code, OpenCode and Antigravity, reports progress, and turns run data into result rows for doc/discussions/control-direction-measurements.adoc. Use for setup, selfcheck, smoke, status, stop, report and cleanup; the single verifications are the skills test-v1 to test-v10.
+description: Shared driver of the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A (control direction). Builds and checks the stub, starts and stops runs against Claude Code, OpenCode and Antigravity, reports progress, and turns run data into result rows for doc/concepts/harness-as-worker/record.adoc. Use for setup, selfcheck, smoke, status, stop, report and cleanup; the single verifications are the skills test-v1 to test-v10.
 user-invocable: true
 argument-hint: "setup | selfcheck | smoke <harness> | status [run] | stop <run> | report [vN] | cleanup"
 allowed-tools: Bash, Read, Edit, Write
@@ -37,7 +37,7 @@ All commands run from the repository root. `P` below stands for
 | `smoke <harness>` | `P run vN <harness> headless --smoke` for every N (cells: `--cell all`; for `agy` one command per cell and per V8 variant, each after the previous run ended), then `P report --smoke`. Shakes out the adapters; smoke runs are never recorded as results. |
 | `status [run]` | `P status [run]`. |
 | `stop <run>` | `P stop <run>`. |
-| `report [vN]` | `P report [vN]` prints AsciiDoc rows; `--json` prints the raw metrics. Copy rows into `doc/discussions/control-direction-measurements.adoc` only for measured (non-smoke) runs. |
+| `report [vN]` | `P report [vN]` prints AsciiDoc rows; `--json` prints the raw metrics. Copy rows into `doc/concepts/harness-as-worker/record.adoc` only for measured (non-smoke) runs. |
 | `cleanup` | `P cleanup` stops every run and removes the Antigravity server entry. |
 
 ## Rules

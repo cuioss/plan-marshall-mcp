@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v6 — idle cost of a warm session
 
-Definition: `doc/discussions/control-direction.adoc#v6`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v6`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -43,5 +43,5 @@ None.
 
 `idle_cost`: median priced units per idle cycle by context size and by wait length. Needs per-turn usage (V7); without it the result is `incomplete`.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v1 — blocking time of one MCP tool call
 
-Definition: `doc/discussions/control-direction.adoc#v1`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v1`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -50,5 +50,5 @@ Interactive: one TUI session per cell. Start it with the printed command, paste 
 
 `limit` is the measured abort time or `>= 3600 s`; `sign` names what revealed it. Compare the `-prog` and `-noprog` cells of one configuration for the progress question. The values hold for the transport of the run (`transport` in the row; stdio through the relay unless `--transport http` was given).
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

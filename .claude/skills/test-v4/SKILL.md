@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v4 — lifetime of a headless session
 
-Definition: `doc/discussions/control-direction.adoc#v4`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v4`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -49,5 +49,5 @@ None.
 
 `exit_after_s`, `exit_code`, `orphans`, `calls_after_sigterm` (tool calls the dying harness still sent; each one consumes a step of the queue), `result_event_emitted` (whether usage survives a `SIGTERM`), `nonce_recalled`, `resume_wall_s`.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

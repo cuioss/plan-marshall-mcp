@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v10 — the interactive session as puller
 
-Definition: `doc/discussions/control-direction.adoc#v10`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v10`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -43,5 +43,5 @@ Start the TUI with the printed command and paste the prompt. Near cycle 60 type 
 
 `cycles`, `sessions` and `sessionless_requests` (a new session after `/clear`), `max_gap_s` (the pause at `/clear` and at each compaction), `failure_mode`. The operator's notes are part of the result.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

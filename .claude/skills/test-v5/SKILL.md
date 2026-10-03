@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v5 — cost of a cold start
 
-Definition: `doc/discussions/control-direction.adoc#v5`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v5`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -49,5 +49,5 @@ None.
 
 `p50_wall_s`, `p50_to_first_contact_s` (process start and MCP connection), `p50_to_submit_s`, `p50_priced_units`, and the cache columns, which show whether a cell really was cold.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

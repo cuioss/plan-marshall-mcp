@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v7 — usage per task
 
-Definition: `doc/discussions/control-direction.adoc#v7`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v7`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -43,5 +43,5 @@ None.
 
 `per_turn_usage`, `four_components`, `tasks_attributed` of `tasks`, `output_token_reconcile_error`, and `median_task_priced_units` (the marginal cost V5 compares against).
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

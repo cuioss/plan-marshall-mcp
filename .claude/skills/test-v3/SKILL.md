@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v3 — task loop in one warm session against fresh sessions
 
-Definition: `doc/discussions/control-direction.adoc#v3`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v3`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -44,5 +44,5 @@ None.
 
 Compare `accuracy_pct` and `last_quarter_pct` of the warm run with `accuracy_pct` of the fresh run. `tasks_before_first_compaction` is the recycle point; `loop_survived_compaction` must be true.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

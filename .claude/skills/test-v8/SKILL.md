@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v8 — carry-over between tasks
 
-Definition: `doc/discussions/control-direction.adoc#v8`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v8`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -50,5 +50,5 @@ None.
 
 `carry_over_hits` counts clean tasks that show the injected behaviour; `accuracy_after_pct` against the fresh control shows silent damage.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

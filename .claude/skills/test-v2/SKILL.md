@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v2 — reliability of the wait loop (headless)
 
-Definition: `doc/discussions/control-direction.adoc#v2`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v2`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -43,5 +43,5 @@ None. The three harnesses can run in parallel.
 
 `failure_mode: None` with `done: True` is a pass. Otherwise `cycles` is the number reached before the failure and `failure_mode` names it, with the model's last text where the harness reports one.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.

@@ -8,7 +8,7 @@ allowed-tools: Bash, Read
 
 # test-v9 — binding under load
 
-Definition: `doc/discussions/control-direction.adoc#v9`. Shared rules, verbs and file layout: the skill
+Definition: `doc/concepts/harness-as-worker/analysis.adoc#v9`. Shared rules, verbs and file layout: the skill
 `test-pull` (`.claude/skills/test-pull/SKILL.md`); read its rules before the first measured run.
 
 ## What it decides
@@ -43,5 +43,5 @@ None. Antigravity cannot run this as long as its server entry is global: both wo
 
 `redelivered_exactly_once` of `trials`, `redelivery_reasons` (`connection_closed` when the host's session ends observably, `lease_expired` when the host calls without a session), `duplicate_submits`, `late_submits_refused` (an observation, not part of the verdict: a killed worker cannot submit late, so the count is above zero only when a live worker outran its lease; the refusal itself is proven by the stub's unit test), `escalate_calls`, `escalate_probe_answer`, `peak_concurrent_writers`.
 
-Record the row in `doc/discussions/control-direction-measurements.adoc` with the criterion, the result per
+Record the row in `doc/concepts/harness-as-worker/record.adoc` with the criterion, the result per
 harness and mode, and the fallback taken.
