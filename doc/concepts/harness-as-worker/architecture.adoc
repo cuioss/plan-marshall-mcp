@@ -1,0 +1,108 @@
+= Harness as Worker: Architecture
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · xref:conclusion.adoc[Conclusion] · *Architecture* · xref:task-protocol.adoc[Task Protocol] · xref:roles.adoc[Roles] · xref:evaluation.adoc[Evaluation]
+
+NOTE: *Status: proposal (2026-10-03)*. The architecture that follows from the measurements of Milestone 0, Part A and the operator's target picture. It becomes part of the requirements and specifications only through the decision gate of xref:../../discussions/control-direction.adoc#gate[Control Direction] and the follow-up plan that applies it. Parts that are not yet verified are marked; xref:evaluation.adoc[Evaluation] plans their verification.
+
+`PM-MCP` drives plans and epics. Harness processes are its workers: the server starts them, offers them tasks, watches them, and replaces them. The model in a harness contributes judgment and work and never decides what happens next. This document gives the parts and how they fit together; xref:task-protocol.adoc[Task Protocol] specifies the exchange between server and worker, xref:roles.adoc[Roles] the kinds of workers.
+
+== Parts
+
+[cols="2,5", options="header"]
+|===
+|Part |Responsibility
+
+|Workflow engine (`pm-mcpd`)
+|Owns state and transitions of plans and epics. Every step that needs a model becomes a task with a role; every other step is server logic. The task protocol is a reusable sub-workflow of the workflow DSL, so that every transition of a worker is deterministic.
+
+|Task queue
+|Holds the open tasks per project and role, leases each offered task to exactly one worker generation, and releases the lease when the task is submitted or its holder replaced.
+
+|Supervisor
+|Starts, watches, recycles, and replaces workers per role and project (xref:task-protocol.adoc#supervision[Task Protocol, Supervision]): process exit, silence, a missing acknowledgement, an idle period, and the token budget end a worker. Respects the model slots.
+
+|Job launcher (`pm-exec`)
+|Starts a harness process in its confinement, in a working directory outside the project tree, with the job token and generation in the relay's environment, and with the harness's project instructions and persistent memory switched off.
+
+|Relay (`pm-mcp serve --job`)
+|The worker's only connection to the server. Carries identity and generation (the model never passes them), adds the per-request headers of a sessionless host, never answers a notification, and reports a lost daemon to the host at once.
+
+|Client profile
+|Per harness: launch template, bounded wait, whether progress resets the host's timeout, usage pointers, writable paths (Claude Code 240 s with progress resetting; OpenCode progress required; Antigravity 150 s, progress without effect).
+
+|Workers
+|Headless harness processes of a role: _warm_ (supervised, kept while there is work) or _fresh_ (one task, then end). See xref:roles.adoc[Roles].
+
+|Interactive session
+|Entry and viewer: turns the user's words into a plan, answers questions, watches. May take a task when it is attentive; never needed for a plan to proceed.
+|===
+
+== How the parts work together
+
+----
+ operator ──► interactive session ──┐ (entry, questions, viewing; optional task taker)
+                                    │
+                                    ▼
+ ┌──────────────────────── pm-mcpd ────────────────────────┐
+ │ workflow engine ──► task queue ◄── leases, generations  │
+ │        │                ▲                               │
+ │        ▼                │ offer / submit                │
+ │   supervisor ──► pm-exec │                              │
+ └────────│──────────│─────│───────────────────────────────┘
+          │ start,   │     │
+          │ recycle  ▼     │
+          │      harness process (worker)
+          │        └─ relay (pm-mcp serve --job) ─ stdio ─► MCP
+          └─ watches exit, silence, acknowledgement, idle time, token budget
+----
+
+. The workflow engine reaches a step that needs a model and puts a task for its role into the queue.
+. The supervisor makes sure a worker of that role exists: an idle warm worker, a fresh job, or the interactive session for tasks offered to it first.
+. The worker's pending wait call is answered with the task; the worker acknowledges, works along the links of the task's representation, and submits a structured result through the offered link.
+. The server validates the result, releases the lease, and continues the workflow; the worker waits again or is told to end.
+. If the worker is lost on the way, the supervisor ends it, the lease is released, and the task goes to a successor exactly once.
+. A worker that needs another model's judgment submits a consultation instead of a result; the server runs it as a task of another role and answers through the worker's next wait (xref:task-protocol.adoc#consultation[Task Protocol, Consultation]).
+
+== Principles
+
+* *The server knows, the model follows.* What to do next, who does it, and whether a worker is still alive are server facts. The model sees one task and its links.
+* *Nothing depends on the transport.* The server learns nothing from a dropped connection (Part A, V9); liveness comes from the process, the acknowledgement, and the worker's calls.
+* *Nothing depends on the model's persistence.* Workers are recycled before they give up or their context grows too large (V2, V3); every task carries what its state needs, so a successor starts empty.
+* *Nothing depends on the interactive session.* It is offered work only with a headless fallback (V10).
+* *Identity lives in the relay.* A model invented a worker id in Part A; the relay overrode it.
+* *A fresh job is the default.* About 9 s and 0.02 USD per small decision (V5); warm workers are an optimisation for roles with frequent small decisions.
+* *Untrusted text is screened before it reaches a worker.* The form of the screener is open (xref:roles.adoc#untrusted-content[Roles, Untrusted content]).
+
+== Verification status
+
+[cols="3,2", options="header"]
+|===
+|Part of the architecture |Status
+
+|Headless workers pulling tasks; exactly-once redelivery; lifecycle; usage per task; no carry-over of injected text
+|measured (xref:measurements.adoc[Measurements])
+
+|Acknowledgement, detection, replacement, generation fencing, immediate lease release
+|to verify (xref:evaluation.adoc#e1[E1], xref:evaluation.adoc#e2[E2])
+
+|Idle and budget recycling
+|to verify (xref:evaluation.adoc#e3[E3])
+
+|Session first with headless fallback
+|to verify (xref:evaluation.adoc#e4[E4])
+
+|Consultation through the server
+|to verify (xref:evaluation.adoc#e5[E5])
+
+|Several concurrent Antigravity workers behind one server entry
+|to verify (xref:evaluation.adoc#e6[E6])
+
+|Quality of the roles on real cases; typed roles across harnesses; screener form
+|to verify (xref:evaluation.adoc#e7[E7], xref:evaluation.adoc#e8[E8], xref:evaluation.adoc#e9[E9])
+
+|Writer workers in confinement; the real relay `pm-mcp serve`
+|Milestone 0, Part B
+|===

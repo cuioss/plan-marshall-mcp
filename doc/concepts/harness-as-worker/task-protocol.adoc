@@ -1,0 +1,140 @@
+= Harness as Worker: Task Protocol
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · xref:conclusion.adoc[Conclusion] · xref:architecture.adoc[Architecture] · *Task Protocol* · xref:roles.adoc[Roles] · xref:evaluation.adoc[Evaluation]
+
+NOTE: *Status: proposal (2026-10-03)*. The loop of wait, task, and submit is measured; the acknowledgement, the supervision, and the consultation are not yet (xref:evaluation.adoc[Evaluation], Stage 1).
+
+The exchange between the server and a worker. Every worker complies with it, whether the server spawned it or it is the interactive session that started the plan. The protocol is a reusable sub-workflow of the workflow DSL: every transition is server logic, and the model only follows the links it is offered.
+
+== Steps
+
+. *Wait*: the worker holds a wait call open. The call is bounded below the host's limit by the client profile; where the host needs it, the server sends progress frames during the wait.
+. *Offer*: the server answers the wait with a task. The task is leased to the worker's current generation. (MCP gives the server no way to make a harness act; the offer is always the answer to a pending call.)
+. *Acknowledge*: the worker confirms the task, explicitly or by its first call that follows the task's link (which variant is the default is decided by xref:evaluation.adoc#e1[E1]). The acknowledgement tells the server that the worker is alive and has the task.
+. *Execute*: the worker does the task by following the links of the task's representation. During long work its calls serve as heartbeats.
+. *Submit*: the worker submits a structured result through the offered link. The server checks it against the lease and the generation and refuses a submit of a replaced generation.
+. *Wait or end*: the server answers the next wait with the next task, with "wait again", or with "end".
+
+== States of the sub-workflow
+
+[cols="2,4,3", options="header"]
+|===
+|State |Meaning |Leaves to
+
+|`waiting`
+|the worker holds a wait call; no task leased to it
+|`offered` (task available), `ended` (idle timeout, budget, shutdown), `lost` (silence, exit)
+
+|`offered`
+|a task is leased to the worker's generation; no acknowledgement yet
+|`acknowledged`, `lost` (deadline passed, exit)
+
+|`acknowledged`
+|the worker confirmed the task
+|`executing` (first call along the task's links), `lost`
+
+|`executing`
+|the worker works along the links; its calls are heartbeats
+|`submitted`, `consulting`, `lost` (silence, exit)
+
+|`consulting`
+|the worker asked another role and waits for the answer
+|`executing` (answer delivered), `lost`
+
+|`submitted`
+|the result is accepted; the lease is released
+|`waiting`, `ended`
+
+|`lost`
+|the server has ended the worker; its lease is released at once
+|terminal for the worker; the task returns to the queue for a successor
+
+|`ended`
+|the worker ended on the server's instruction
+|terminal
+|===
+
+[#supervision]
+== Supervision
+
+The server ends a worker, and starts a successor when there is work:
+
+[cols="2,3,3", options="header"]
+|===
+|Trigger |Rule |Basis in Part A
+
+|Process exit
+|the harness process ends without the server's instruction
+|the strongest signal: both measured failure modes (giving up when idle, stopping at a large context) ended the headless process
+
+|Silence
+|no open wait call and no call for longer than the bounded wait plus a grace
+|headless gaps between calls 1 to 4 s median, up to 33 s; OpenCode provider stalls of about 310 s, so the grace is set per profile above that
+
+|Missing acknowledgement
+|no acknowledgement within the deadline after an offer
+|to be calibrated by xref:evaluation.adoc#e1[E1]; the deadline must tolerate provider stalls
+
+|Idle period
+|a few wake-ups without a task (about 15 minutes)
+|OpenCode gave up after 17 and 68 minutes of empty waits; an idle wake-up costs about a tenth of the context (V6)
+
+|Token budget
+|the context, taken from the per-turn usage, approaches the budget of the role and model
+|Haiku stopped pulling at 135k to 150k tokens; the budget lies well below 100k
+
+|Untrusted text (optional)
+|after a task that carried untrusted text
+|not required by V8, which found no carry-over between tasks
+|===
+
+Ending a worker: `SIGTERM`, which ended every harness within a second without orphans (V4), then `SIGKILL`. A terminated worker reports no usage; its usage is recorded as unmeasured.
+
+== Fencing and leases
+
+* Every worker has a generation, issued by the supervisor with the job token and carried by the relay.
+* A task is leased to one generation. A call or submit of another generation for that task is refused (the `not_bound` refusal measured in V9).
+* When the server replaces a worker, it releases the lease at once instead of waiting for its expiry, and offers the task to the successor exactly once.
+* The successor starts with an empty context. Nothing is handed over, because every task carries what its state needs. Resuming the predecessor's session is possible (V4) but brings back the context that recycling removes.
+
+[#consultation]
+== Consultation
+
+A worker that needs another model's judgment asks through the server, never directly:
+
+. In `executing`, the worker follows a consultation link and submits the question.
+. The server creates a task for the consulted role and runs it like any other task (warm worker or fresh job).
+. The asker waits in `consulting` within its bounded wait, with progress frames where the host needs them.
+. The answer arrives as the answer to the asker's next wait; the asker continues and refers to the consultation in its final submit.
+
+The flow is deterministic and stays within the single-level leaf constraint: a worker never starts another model itself.
+
+== Parameters per host
+
+[cols="2,2,2,2", options="header"]
+|===
+|Parameter |Claude Code |OpenCode |Antigravity
+
+|Bounded wait
+|240 s
+|240 s with progress frames (60 s without)
+|150 s
+
+|Progress resets the host's timeout
+|yes
+|yes
+|no
+
+|Host sends `notifications/cancelled` when it gives up
+|no
+|yes
+|yes
+
+|Session use
+|without a session (protocol `2026-07-28`)
+|with a session
+|without a session
+|===

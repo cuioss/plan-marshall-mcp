@@ -3,7 +3,7 @@
 :toclevels: 2
 :nofooter:
 
-xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · *Conclusion* · xref:evaluation.adoc[Evaluation]
+xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · *Conclusion* · xref:architecture.adoc[Architecture] · xref:task-protocol.adoc[Task Protocol] · xref:roles.adoc[Roles] · xref:evaluation.adoc[Evaluation]
 
 The conclusion of roadmap Milestone 0, Part A (control direction and the pull mechanism, 2026-10-01 to 2026-10-03). The decision gate of xref:../../discussions/control-direction.adoc#gate[Control Direction] is the operator's; this document states what the measurements establish, what they rule out, and the design that follows from them.
 
@@ -64,74 +64,14 @@ The server can be the driver. A headless harness process that the server starts 
 |one global server entry (no separable workers), a 180 s limit, no cache-creation usage, 17 s per fresh decision
 |===
 
-== The design that follows
+== Consequences
 
-=== Task protocol
+The measurements lead to one architecture: the server supervises its workers, a worker follows one task protocol, and the work is divided into typed roles, warm where frequent small decisions pay for it and fresh otherwise. It is described in xref:architecture.adoc[Architecture], xref:task-protocol.adoc[Task Protocol], and xref:roles.adoc[Roles]. The measured requirements that do not depend on the direction:
 
-A worker, whether spawned by the server or the session that started the plan, complies with one protocol, modelled as a reusable sub-workflow so that every transition is deterministic server logic:
-
-. *Wait*: the worker holds a wait call open, bounded below the host's limit by the client profile (240 s on Claude Code, progress frames on OpenCode, 150 s on Antigravity).
-. *Offer*: the server answers the wait with a task, bound to the worker's generation.
-. *Acknowledge*: the worker acknowledges, explicitly or by its first call that follows the task's link. No acknowledgement within the deadline means the worker is lost: the server ends it and offers the task to a successor. The deadline must tolerate provider stalls (OpenCode stalled for about 310 s).
-. *Execute*: the worker does the task by following the links of the task's representation; its calls serve as heartbeats during long work.
-. *Submit*: a structured result through the offered link, checked against the generation and the lease; a submit of a replaced generation is refused.
-. *Wait or end*: the server answers the next wait with the next task, with "wait again", or with "end".
-
-=== Supervision
-
-The server ends a worker and, when there is work, starts a successor:
-
-* when its process exits (the strongest signal; both measured failure modes ended that way headless);
-* when it neither holds a wait nor calls within the bounded wait plus a grace;
-* when it does not acknowledge an offered task in time;
-* after an idle period of a few wake-ups (about 15 minutes), before it gives up on its own, and because idling costs about a tenth of the context per wake-up;
-* when its context approaches the token budget (well below 100k tokens for Haiku), from the per-turn usage;
-* optionally after a task that carried untrusted text (not required by V8).
-
-A lease is released at once when the server replaces its holder; the successor starts with an empty context, because every task carries what its state needs.
-
-[#target-picture]
-=== Target picture of the roles (operator, 2026-10-03)
-
-The operator's picture of the model work per project, with what the measurements say about each part.
-
-*Warm models per project*, supervised as above:
-
-[cols="2,3,3", options="header"]
-|===
-|Role |Scope |Assessment
-
-|Project triage, the main agent
-|dynamic re-planning; smaller questions and decision points; triage of build and CI results that cannot be mapped directly; when a plan was started from an interactive session, that session can take this part
-|The mechanism is measured (V2, V3, V9) for closed decisions; open-ended re-planning and triage of real build and CI output are not (xref:evaluation.adoc#e7[E7]). The role is idle much of the time, so it needs the idle recycle (xref:evaluation.adoc#e3[E3]). The interactive session can take part only with a headless fallback (V10, xref:evaluation.adoc#e4[E4]).
-
-|Code triage
-|code, PR, and Sonar findings
-|As project triage: mechanism measured, quality on real findings not (xref:evaluation.adoc#e7[E7]).
-
-|Untrusted content verification
-|first a server-side cleanup (the deterministic level-1 validation), then a contained model that analyses the content for harmful instructions
-|Open point. The specification has the screener as a fresh, zero-tool, fail-closed job. A warm screener must keep at least the wait and submit tools; V8 found no carry-over between tasks, but injected text did act on the task that carried it. xref:evaluation.adoc#e9[E9] compares the warm contained form with the fresh zero-tool form before one is chosen.
-|===
-
-*New or opportunistic model starts*, each a fresh job:
-
-* *Outline* and *planning*.
-* *Coding*, as the execution context of a task (a writer job; writer jobs belong to Part B).
-* *Reviews*: security, simplify, and the pre-submission self-review, the latter split into two review agents: (a) does the code implement the requirement correctly and completely, (b) is the implementation itself correct and compliant with the rules. Their quality is part of xref:evaluation.adoc#e7[E7].
-
-*Typed and configurable*: every model process has a type (class, tool set) and is configured by effort level or, better, per project or machine with its own harness and model, for example OpenCode for planning and the main thread, Claude Code for coding, Antigravity for reviews (xref:evaluation.adoc#e8[E8]). The measurements rank the hosts: Claude Code fits well as a job harness; OpenCode with `space-bunny-free` gave up in idle loops, other models are unmeasured; Antigravity has the weakest profile (180 s limit, no cache-creation usage, one global server entry, xref:evaluation.adoc#e6[E6]).
-
-*A model asks a model through the workflow*: the consultation is modelled as a workflow step, so that it is always deterministic and stays within the single-level leaf constraint (xref:evaluation.adoc#e5[E5]).
-
-*The task protocol is a sub-workflow*: wait, offer, acknowledge, execute along the links, submit, wait or end, as a reusable sub-workflow of the workflow DSL, so that the supervision is server logic and the model only follows links.
-
-=== Requirements on the job runtime and the relay
-
-* Every worker runs in a directory outside the project tree or with the harness's project instructions and persistent memory switched off, with its MCP tools loaded directly (`ENABLE_TOOL_SEARCH=false` on Claude Code).
-* The relay carries identity and generation, adds the per-request headers of a sessionless host, never answers a notification, and reports a lost daemon at once.
-* Client profiles: `bounded_wait_seconds` 240 / progress required / 150, and `progress_resets_timeout` true / true / false for Claude Code / OpenCode / Antigravity.
-* A terminated job reports no usage; the runtime records its usage as unmeasured.
+* every worker runs outside the project tree, without the harness's project instructions and persistent memory, and with its tools loaded directly;
+* the relay carries identity and generation, adds the per-request headers of a sessionless host, never answers a notification, and reports a lost daemon at once;
+* client profiles: `bounded_wait_seconds` 240, progress required, 150, and `progress_resets_timeout` true, true, false for Claude Code, OpenCode, Antigravity;
+* a terminated job reports no usage.
 
 == For the decision gate
 
