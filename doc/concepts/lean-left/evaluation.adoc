@@ -1,0 +1,147 @@
+= Lean Left: Evaluation of the Open Issues
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:shift-left.adoc[Shift Left] · xref:measurements.adoc[Measurements] · xref:conclusion.adoc[Conclusion] · *Evaluation*
+
+NOTE: *Status: planned (2026-10-03)*. Nothing here is measured yet.
+
+The plan to verify what Milestone 0, Part A left open (xref:conclusion.adoc[Conclusion]): the supervision of workers that the shift left depends on, and the parts of the target picture that the measurements did not reach. Each item states a requirement on the verification, its method, the pass criterion and the fallback; criteria are confirmed by the operator before the first measured run, as in Part A.
+
+== Ground rules
+
+* *Final setup only*: every run uses the setup of the final series of Part A: worker directories outside the repository, the server under the product's name `plan-marshall`, tools loaded directly (`ENABLE_TOOL_SEARCH=false` on Claude Code), the `stdio` relay, and no more parallel runs than the model slots would allow, so that machine load does not move the figures.
+* *Tooling*: the stub `de.cuioss.pm.mcp.spike` and the skills `test-pull` and `test-v1` to `test-v10` are extended; every item gets a skill `test-eN`. The supervision logic of the job runtime lives in the driver for the spike; in the product it belongs to the server.
+* *Record*: results go into xref:measurements.adoc[Measurements] and, with every run, into xref:../../discussions/control-direction-measurements.adoc[Control Direction Measurements]; xref:conclusion.adoc[Conclusion] is updated where a result changes it.
+* *Harnesses and models*: Claude Code with `claude-haiku-4-5`, OpenCode with `space-bunny-free`, Antigravity with `gemini-3.8-flash-medium`, unless an item names others. A verification that the small model fails is repeated once with the next larger model; both results are recorded.
+
+== Stages
+
+[cols="1,3,2", options="header"]
+|===
+|Stage |Items |When
+
+|1, before the decision gate
+|<<e1>>, <<e2>>, <<e3>>, <<e4>>, <<e5>>, <<e6>>
+|On the existing stub; hours of work each. Decides whether supervised warm workers and consultation through the server are buildable.
+
+|2, after the direction is decided
+|<<e7>>, <<e8>>, <<e9>>
+|Needs real fixtures from plan-marshall plan states and the role configuration of the decided direction.
+
+|3, optional
+|<<e10>>, <<e11>>, <<e12>>
+|Confirmations whose outcome the supervision protocol is designed to make irrelevant.
+|===
+
+Out of scope here, because the roadmap places them in Part B or later: writer jobs in confinement (coding with one writer per plan), the real relay `pm-mcp serve` with the relay requirements of xref:measurements.adoc#setup-lessons[Measurements, What the setup taught], and the headless spikes of the client profiles.
+
+== Stage 1: the supervision protocol
+
+[#e1]
+=== E1 Task protocol with acknowledgement
+
+*Requirement*: A worker must confirm every offered task, and the server must be able to tell a live worker from a lost one by the confirmation alone.
+
+* *Method*: the stub offers tasks through the wait answer and expects an acknowledgement, in two variants: an explicit acknowledge call, and the first call that follows the task's link counted as acknowledgement. 200 tasks per harness and variant. Measured: latency from offer to acknowledgement (median, p99, maximum), tasks without acknowledgement, the extra cost of the explicit call per task (time and priced units).
+* *Pass*: no task left without acknowledgement by a live worker; an acknowledgement deadline can be set above the p99.9 latency including provider stalls; the cheaper variant is recorded as the protocol's default.
+* *Fallback*: if no deadline separates live from lost workers, liveness rests on process exit and silence alone (<<e2>>), and the acknowledgement becomes informational.
+
+[#e2]
+=== E2 Detection, replacement, and fencing
+
+*Requirement*: The server must detect a lost worker by process exit, silence, or a missing acknowledgement, end it, start a successor, and give the successor the lost worker's task exactly once; a submit of a replaced generation must be refused.
+
+* *Method*: fault injection against two workers on one queue: `SIGKILL` between offer and acknowledgement and between acknowledgement and submit; `SIGSTOP` (a stall) shorter and longer than the silence deadline, then `SIGCONT`; the model ending its turn without submitting; the relay killed under a held call. Ten trials per fault and harness. The generation travels in the relay's environment, as the job token will.
+* *Pass*: every task submitted exactly once; every lost worker detected within its deadline; the lease released at once on replacement, not by expiry; every submit of a replaced generation refused, including the resumed worker after `SIGCONT`; no stalled-but-alive worker replaced before its deadline.
+* *Fallback*: if immediate release is unsafe, release by lease expiry (the behaviour measured in V9).
+
+[#e3]
+=== E3 Idle and budget recycling
+
+*Requirement*: The server must end a worker before it gives up on its own, both after an idle period and when its context approaches the token budget, and must serve the next task without a delay beyond one fresh start.
+
+* *Method*: a four-hour run per harness with sparse work: one task every 10 to 40 minutes at random. Variant A without recycling (the reference, expected to reproduce the give-up of V2), variant B with an idle timeout of a few wake-ups and a token budget taken from the per-turn usage. A second scenario fills the context with large tasks until the budget triggers.
+* *Pass (variant B)*: no worker stops on its own; no task waits longer than the bounded wait plus one fresh start (about 10 s); the budget recycle fires before the loop breaks (for Haiku below 100k tokens). Recorded: the cost of variant B against keeping a worker warm (V6) and against fresh jobs only (V5).
+* *Fallback*: fresh jobs only for the roles concerned.
+
+[#e4]
+=== E4 Session first, headless fallback
+
+*Requirement*: A task may be offered first to the interactive session that started the plan; when the session does not acknowledge in time, a headless worker must take the task, and the plan must never wait on the session.
+
+* *Method*: an interactive session on each of Claude Code and OpenCode runs the protocol beside a headless standby worker for an hour; tasks arrive every few minutes. The operator works with the session normally in between (questions, `/clear`, a compaction). Measured: share of tasks taken by the session, delay of tasks the session missed, duplicate work.
+* *Pass*: every task done exactly once; no task delayed beyond the acknowledgement deadline plus one fresh start; the operator's input never queued behind a pull for longer than one bounded wait.
+* *Fallback*: tasks go to headless workers only; the session is entry and viewer.
+* *Operator*: needed for the whole hour, at the points the checklist names.
+
+[#e5]
+=== E5 Consultation through the server
+
+*Requirement*: A worker that needs another model's judgment must ask through the server: it submits a consultation, the server runs it as a job, and the answer arrives through the asker's next wait, deterministically and within the single-level leaf constraint.
+
+* *Method*: tasks whose result requires a second opinion (for example a triage decision that must be confirmed by a reviewer role). The asker submits a consultation link instead of a result; the stub runs a fresh consultant job; the asker waits within the bounded wait (with progress frames where the host needs them) and receives the answer. 50 consultations per harness, with consultants on the same and on another harness.
+* *Pass*: every consultation answered exactly once and delivered to the right asker; no asker leaves its loop while waiting; latency within the asker's bounded wait or covered by progress; the asker's final submit refers to the consultation.
+* *Fallback*: the workflow models the consultation as two sequential tasks, and the asker does not wait.
+
+[#e6]
+=== E6 Antigravity as a concurrent job host
+
+*Requirement*: Several Antigravity jobs must be able to run at the same time behind the one global server entry, each bound to its own identity.
+
+* *Method*: the relay takes identity and generation from its environment instead of its arguments; two and four concurrent `agy` jobs run the V9 scenario with waits of 150 s.
+* *Pass*: every task bound to the right job; exactly-once redelivery after kills as in V9; no wait reaches the 180 s limit.
+* *Fallback*: Antigravity runs one job at a time, or no model jobs (as decided for v1).
+
+== Stage 2: the target picture
+
+[#e7]
+=== E7 Quality of open-ended decisions
+
+*Requirement*: The roles that the target picture assigns to models must decide real, open-ended cases at a quality the operator accepts, warm and fresh.
+
+* *Method*: fixtures taken from plan-marshall plan states, each with a reference decision by the operator: re-planning after a failed task, triage of build and CI failures that do not map to a known cause, triage of PR comments and Sonar findings, and the two review questions separately (does the code implement the requirement correctly and completely; is the code itself correct and compliant). Every fixture warm and fresh, per harness and model of the role configuration.
+* *Pass*: agreement with the reference decisions at or above the level the operator sets before the run; warm within 5 points of fresh; the split review finds at least what one combined review finds.
+* *Fallback*: per role, a larger model or effort level; a role that fails at every level stays with the operator.
+
+[#e8]
+=== E8 Typed roles across harnesses
+
+*Requirement*: Every worker role must run on the harness and model its configuration names (per project or machine), with its class, tool set, and effort level, and its usage must be accounted in one place.
+
+* *Method*: a plan-like sequence with every role of the target picture: the main thread and planning on OpenCode, coding on Claude Code, reviews on Antigravity (or the configuration the direction decides). Then the configuration is changed per project and the sequence repeated.
+* *Pass*: each role ran where configured, with its tool set and nothing else; usage of all roles in one account; a configuration change took effect without code changes.
+* *Fallback*: one harness for all roles of a project.
+
+[#e9]
+=== E9 Screener effectiveness
+
+*Requirement*: The fresh zero-tool screener must catch injected instructions before a task reaches a worker, since V8 showed injected text acting on the task that carries it.
+
+* *Method*: the screener as specified (server-fixed prompt, no tools, isolated directory, one turn) against the five injection variants of V8, further variants written for the evaluation, and clean real samples (PR comments, Sonar messages).
+* *Pass*: every injection variant flagged `suspicious`; false positives on clean samples at or below the rate the operator sets before the run.
+* *Fallback*: tighter deterministic validation at level 1; a stronger screener model.
+
+== Stage 3: optional confirmations
+
+[#e10]
+=== E10 The interactive session in the final setup
+
+*Requirement*: V10 must be confirmed in the final setup (directory outside the repository, product server name), because both interactive sessions of Part A ran in the first setup.
+
+* *Method and pass*: as V10. Only needed if <<e4>> does not already give the answer.
+
+[#e11]
+=== E11 Other models as pullers on OpenCode
+
+*Requirement*: Whether OpenCode with a model other than `space-bunny-free` holds the pull loop.
+
+* *Method and pass*: V2 with one or two further models available to the operator. Only needed if <<e3>> fails, since idle recycling is meant to remove the give-up.
+
+[#e12]
+=== E12 Automatic compaction in a warm worker
+
+*Requirement*: Whether a headless warm worker keeps its loop through an automatic compaction.
+
+* *Method and pass*: a warm worker filled past its harness's compaction threshold with recycling switched off; the loop must continue. Only needed if the token budget of <<e3>> cannot be kept below the compaction point.
