@@ -10,7 +10,8 @@
  */
 /**
  * Throwaway stub for the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A
- * ({@code doc/concepts/harness-as-worker/analysis.adoc}): a blocking wait tool, scripted tasks and an event log.
+ * ({@code doc/concepts/harness-as-worker/analysis.adoc}) and the evaluation that follows
+ * ({@code doc/concepts/harness-as-worker/evaluation.adoc}): a blocking wait tool, scripted tasks and an event log.
  * <p>
  * The tools are registered only when {@code pm.spike.scenario} is configured. The package is removed when
  * Milestone 1 creates the target module structure.

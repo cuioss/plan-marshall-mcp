@@ -1,6 +1,6 @@
 ---
 name: test-pull
-description: Shared driver of the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A (control direction). Builds and checks the stub, starts and stops runs against Claude Code, OpenCode and Antigravity, reports progress, and turns run data into result rows for doc/concepts/harness-as-worker/record.adoc. Use for setup, selfcheck, smoke, status, stop, report and cleanup; the single verifications are the skills test-v1 to test-v10.
+description: Shared driver of the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A (control direction). Builds and checks the stub, starts and stops runs against Claude Code, OpenCode and Antigravity, reports progress, and turns run data into result rows for doc/concepts/harness-as-worker/record.adoc. Use for setup, selfcheck, smoke, run, status, stop, report and cleanup; kept as the base of the next evaluation (doc/concepts/harness-as-worker/evaluation.adoc).
 user-invocable: true
 argument-hint: "setup | selfcheck | smoke <harness> | status [run] | stop <run> | report [vN] | cleanup"
 allowed-tools: Bash, Read, Edit, Write
@@ -8,8 +8,11 @@ allowed-tools: Bash, Read, Edit, Write
 
 # test-pull — driver of the pull-mechanism verifications
 
-Throwaway tooling for `doc/roadmap.adoc` Milestone 0, Part A. It is removed together with the package
-`de.cuioss.pm.mcp.spike` when Milestone 1 restructures the modules.
+Throwaway tooling for `doc/roadmap.adoc` Milestone 0, Part A, kept with the package `de.cuioss.pm.mcp.spike` as
+the base of the evaluation in `doc/concepts/harness-as-worker/evaluation.adoc`; both are removed when Milestone 1
+restructures the modules. The per-verification skills `test-v1` to `test-v10` were removed on 2026-10-03 after
+V1 to V10 were recorded: what each verification measures and how to read it is in
+`doc/concepts/harness-as-worker/analysis.adoc` and `measurements.adoc`; runs start with `P run vN …`.
 
 ## Parts
 

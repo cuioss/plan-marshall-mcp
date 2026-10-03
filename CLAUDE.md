@@ -17,9 +17,9 @@ is built (the target is native binaries on the host: the always-on daemon `pm-mc
 the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
 
 Roadmap Milestone 0, Part A (verifications V1 to V10 of the concept `doc/concepts/harness-as-worker/`) runs on
-throwaway tooling: the stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`) and the
-project skills `test-pull` and `test-v1` to `test-v10`; the concept holds analysis, method, run record, result,
-architecture, and evaluation plan. The tooling is removed with Milestone 1.
+throwaway tooling, kept for the evaluation that follows: the stub package `de.cuioss.pm.mcp.spike` (active only
+with `pm.spike.scenario`) and the project skill `test-pull`; the concept `doc/concepts/harness-as-worker/` holds
+analysis, method, run record, result, architecture, and evaluation plan. The tooling is removed with Milestone 1.
 
 ## Modules
 
