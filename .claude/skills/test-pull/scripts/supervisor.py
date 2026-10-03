@@ -207,7 +207,8 @@ class JobRuntime:
             self.end(slot, "silence", silent_ms=silent_ms)
         elif between_tasks and self.plan.get("idle_wakeups") and idle >= self.plan["idle_wakeups"]:
             self.end(slot, "idle", wakeups=idle)
-        elif between_tasks and self.plan.get("token_budget") and slot.context >= self.plan["token_budget"]:
+        elif (between_tasks and self.plan.get("token_budget") and slot.context >= self.plan["token_budget"]
+              and slot.submits > 0):      # a budget below the context of a fresh worker must not recycle forever
             self.end(slot, "budget", budget=self.plan["token_budget"])
         elif between_tasks and self.plan.get("recycle_every") and slot.submits >= self.plan["recycle_every"]:
             self.end(slot, "recycle", submits=slot.submits)
