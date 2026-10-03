@@ -488,15 +488,32 @@ def _quantile(values, q):
     return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
 
 
-def _exactly_once(events):
-    """Tasks by their number of accepted submits; a task still leased when the run ended is left out."""
+def _open_at_end(result, events, run_dir=None):
+    """Tasks the stub still held when the run ended: leased, or given back and waiting for a successor.
+
+    `state_final` is read after every worker ended. Older runs have only the last snapshot before the close
+    (`state_at_end`); a task offered after the close began counts as held there.
+    """
+    state = result.get("state_final") or result.get("state_at_end") or {}
+    held = {lease["task_id"] for lease in state.get("leases", [])}
+    held |= {entry["task_id"] for entry in state.get("waiting", []) if entry.get("reason") != "new"}
+    if "state_final" not in result and run_dir is not None:
+        closing = [r["t_ms"] for r in load_runtime(run_dir) if r["event"] == "detect"
+                   and r["reason"] in ("shutdown", "ended")]
+        if closing:
+            start = min(closing) - 21000          # the close waits up to 20 s for workers to leave
+            held |= {e["task_id"] for e in _of(events, "offer") if e["t_ms"] >= start}
+    return held
+
+
+def _exactly_once(events, result=None, run_dir=None):
+    """Tasks by their number of accepted submits; a task the stub still held when the run ended is left out."""
     offered = {e["task_id"] for e in _of(events, "offer")}
     counts = {task_id: 0 for task_id in offered}
     for event in _of(events, "submit"):
         counts[event["task_id"]] = counts.get(event["task_id"], 0) + 1
-    last_offer = {e["task_id"]: e["t_ms"] for e in _of(events, "offer")}
-    end = events[-1]["t_ms"] if events else 0
-    open_at_end = [t for t, n in counts.items() if n == 0 and end - last_offer.get(t, 0) < 60000]
+    held = _open_at_end(result or {}, events, run_dir)
+    open_at_end = [t for t, n in counts.items() if n == 0 and t in held]
     return {"offered": len(offered), "submitted_once": len([n for n in counts.values() if n == 1]),
             "duplicates": len([n for n in counts.values() if n > 1]),
             "never_submitted": len([t for t, n in counts.items() if n == 0 and t not in open_at_end]),
@@ -546,7 +563,7 @@ def e1(run_dir, meta, events, outputs, result):
     if not offers:
         return {"note": "no task was offered"}, "incomplete"
     latencies = [e["latency_ms"] / 1000 for e in acks]
-    once = _exactly_once(events)
+    once = _exactly_once(events, result, run_dir)
     unacked_submits = len([e for e in _of(events, "submit") if e.get("acked") is False])
     missed = len(_of(events, "ack_missed"))
     runtime = load_runtime(run_dir)
@@ -608,7 +625,7 @@ def e2(run_dir, meta, events, outputs, result):
             slow_release += (fenced["t_ms"] - sent["t_ms"]) / 1000 > crit["max_release_s"]
         again = [e for e in _of(events, "offer", task_id=trial.get("task_id")) if e["t_ms"] > detect["t_ms"]]
         by_expiry += bool(again) and again[0]["reason"] not in ("fenced", "superseded", "ack_missed")
-    once = _exactly_once(events)
+    once = _exactly_once(events, result, run_dir)
     tasks = [t for t in trials if t.get("task_id")]
     metrics = {"fault": fault, "trials": len(trials),
                "trial_tasks_submitted": len([t for t in tasks if "submitted_ms" in t]), "trial_tasks": len(tasks),
@@ -636,7 +653,7 @@ def e3(run_dir, meta, events, outputs, result):
         reasons[record["reason"]] = reasons.get(record["reason"], 0) + 1
     waits = _offer_latency(events)
     budget = [r["context_tokens"] for r in detects if r["reason"] == "budget"]
-    once = _exactly_once(events)
+    once = _exactly_once(events, result, run_dir)
     planned = len([s for s in meta["scenario"]["steps"] if s["kind"] == "task"])
     self_stops = reasons.get("exit", 0) + reasons.get("silence", 0)
     metrics = {"cell": meta["cell"], "tasks_planned": planned, "tasks_submitted": len(_of(events, "submit")),
@@ -665,7 +682,7 @@ def e4(run_dir, meta, events, outputs, result):
     submits = _of(events, "submit")
     if not submits:
         return {"note": "no task was submitted"}, "incomplete"
-    once = _exactly_once(events)
+    once = _exactly_once(events, result, run_dir)
     waits = _offer_latency(events)
     due = {e["task_id"]: e["t_ms"] for e in _of(events, "release_due")}
     accepted = {}

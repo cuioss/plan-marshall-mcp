@@ -365,6 +365,8 @@ class Supervisor:
             time.sleep(0.2)
         self.result["state_at_end"] = runtime.state
         self.result["workers"] = runtime.close()
+        # after every worker ended: what the stub still holds is open, nothing else
+        self.result["state_final"] = runtime.control.state()
 
     def control(self, runtime, control):
         """A scheduled driver action of E13: a synthetic compaction, or a new digest of a skill."""
