@@ -1,0 +1,121 @@
+= Lean Left: Core Measurements
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:shift-left.adoc[Shift Left] · *Measurements* · xref:conclusion.adoc[Conclusion]
+
+The core figures behind the shift-left direction, measured on 2026-10-01 and 2026-10-02 in roadmap Milestone 0, Part A (verifications V1 to V10 of xref:../../discussions/control-direction.adoc#verification[Control Direction]). The complete record with every run, the pass criteria set before the runs, and the fallbacks is xref:../../discussions/control-direction-measurements.adoc[Control Direction Measurements]; this document keeps what a design decision needs.
+
+== How it was measured
+
+* *Stub*: a throwaway MCP server (`de.cuioss.pm.mcp.spike`) with a blocking wait tool, a submit tool, a distractor tool, scripted tasks, leases, and model slots. Every observation comes from its event log and from the arrival time of the harness's output lines, never from what a model says about itself.
+* *Transport*: the host reaches the stub as it will reach the product, over `stdio`, through a stand-in for `pm-mcp serve` that forwards to the stub over Streamable HTTP and logs the host side.
+* *Harnesses and models*: Claude Code 2.1.287 with `claude-haiku-4-5` (Sonnet for one comparison), OpenCode 1.18.34 with `space-bunny-free`, Antigravity 1.2.14 with `gemini-3.8-flash-medium`. Headless runs unless stated.
+* *Isolation*: the final series ran every worker in a directory outside the repository, with the server under the product's name `plan-marshall`, and with Claude Code's tools loaded directly. The first series did not; what that changed is listed in <<setup-lessons>>.
+* *Tasks*: closed-answer decisions modelled on a running plan (remediation, review triage, scope, build classification, commit type, quality gate).
+
+== Transport limits (V1)
+
+[cols="2,2,2,3", options="header"]
+|===
+|Host |Silent call ends after |With a progress frame every 5 s |Consequence for the client profile
+
+|Claude Code
+|1800 s of silence (an idle limit, not a call duration)
+|held as long as frames arrive
+|`bounded_wait_seconds` 240 holds; `progress_resets_timeout: true`
+
+|OpenCode
+|60 s (`MCP error -32001`)
+|held for at least 3600 s
+|progress frames or a raised timeout are required; `progress_resets_timeout: true`
+
+|Antigravity
+|180 s (`context deadline exceeded`)
+|180 s; progress has no effect
+|`bounded_wait_seconds` 150; `progress_resets_timeout: false`
+|===
+
+Interactive sessions showed the same limits. Claude Code and Antigravity call without a session (protocol `2026-07-28`); OpenCode opens one. OpenCode and Antigravity send `notifications/cancelled` when they give a call up; Claude Code does not.
+
+== The pull loop
+
+[cols="3,2,2,2", options="header"]
+|===
+|Measurement |Claude Code |OpenCode |Antigravity
+
+|V2: 240 waits of 30 s, headless
+|240 of 240 in three runs of three
+|240, 33, 102: gave up twice ("the server has no queued tasks")
+|240 of 240 in one run
+
+|V9: two workers, ten kills per run
+|killed task delivered again exactly once, 30 of 30; no duplicate submit; a tool added in mid-run not callable
+|the same, 30 of 30
+|not possible: one global server entry
+
+|V10: interactive session as puller
+|paused itself for up to 30 minutes ("to preserve token budget"); input queued while looping
+|stopped after 58 cycles and asked the operator
+|not measured
+|===
+
+The server learns nothing from the transport: a client that drops a held call is not noticed, and every redelivery in V9 happened by lease expiry.
+
+== Decisions: warm session against fresh job
+
+[cols="3,2,2,2", options="header"]
+|===
+|Measurement |Claude Code (Haiku) |OpenCode |Antigravity
+
+|V3: correct decisions, warm and fresh
+|100 % and 100 %
+|100 % and 100 %
+|100 % (warm, 72 tasks)
+
+|V3: where the warm loop broke
+|at 135k to 150k tokens of context, four runs of four (Sonnet: held to 787k)
+|held to 336k in three runs of four
+|held over 72 tasks
+
+|V5: fresh job for one decision, warm provider cache (median)
+|8.8 s, 17,525 priced units, 0.02 USD
+|11.3 s, 2,361 priced units
+|16.8 s
+
+|V5: the same with a cold provider cache
+|21.0 s, 0.06 USD
+|13.5 s
+|21.6 s
+
+|V7: marginal cost of one task in a warm session
+|12,786 priced units
+|1,865 priced units
+|unmeasured
+
+|V6: one idle wake-up of a warm session
+|about a tenth of the context (3,756 at 35k, 10,922 at 105k), per wake-up not per second
+|the same order
+|about 4,000 fresh input tokens plus the context; cache does not outlive longer waits
+|===
+
+The Sonnet warm session that held 144 tasks cost 39.04 USD (about 0.27 USD per decision).
+
+== Lifecycle, usage, and injected text
+
+* *V4*: on all three harnesses a headless session ends within a second of `SIGTERM` without orphaned processes, and a stored session can be resumed (3 to 13 s). A terminated session reports no usage.
+* *V7*: Claude Code and OpenCode report usage per turn with all four token components, so a task in a warm session gets its own figures. Antigravity reports no cache-creation figure; its `total_tokens` stays unmeasured.
+* *V8*: injected instructions in one task never reached a later task: 25 warm runs each on Claude Code and OpenCode, 15 on Antigravity, five variants. In three runs the injected text changed the decision of the task that carried it.
+
+[#setup-lessons]
+== What the setup taught
+
+Found while measuring; each changed the tooling and names a requirement for the product.
+
+* *A harness started inside a repository is not isolated.* Claude Code loaded the project instructions and shared the project's persistent memory across sessions; a value one session saved appeared in later, unrelated sessions. A model job needs a working directory outside the project tree, or project instructions and memory switched off.
+* *A server name that says "stub" invites giving up*; the OpenCode model cited it. It gave up under the product's name as well, so the name was not the cause, but it was a reason the model used.
+* *Deferred tools lose fresh jobs.* With Claude Code's tool search active, 6 of 72 fresh Haiku jobs never made the call. With `ENABLE_TOOL_SEARCH=false` all 72 did, at the price of about 11k more tokens of context per session.
+* *The relay carries identity, not the model.* A model invented a worker id from a remembered value; the relay overrode it.
+* *A relay must add the per-request headers of a sessionless host* (`Mcp-Method`, `Mcp-Name`), *must never answer a notification* (Antigravity ends a server that does), and *must report a lost daemon* to the host at once (Claude Code otherwise waits out its 30 minutes).
+* *Machine load moves the figures*: with 19 runs started together, fresh jobs took twice as long.

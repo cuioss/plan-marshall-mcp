@@ -1,0 +1,117 @@
+= Lean Left: Conclusion
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:shift-left.adoc[Shift Left] · xref:measurements.adoc[Measurements] · *Conclusion*
+
+The conclusion of roadmap Milestone 0, Part A (control direction and the pull mechanism, 2026-10-01 to 2026-10-03). The decision gate of xref:../../discussions/control-direction.adoc#gate[Control Direction] is the operator's; this document states what the measurements establish, what they rule out, and the design that follows from them.
+
+== The answer in one paragraph
+
+The server can be the driver. A headless harness process that the server starts holds a pull loop for hours, survives being killed without losing or duplicating its task, keeps injected text from travelling, and reports its usage per task; one small decision costs about 9 s and 0.02 USD as a fresh job. What breaks is the model's willingness to keep pulling: when nothing arrives for a long time, when its context grows large, or when it runs inside an interactive session. Neither the transport nor the model reports that it happened. The server therefore has to supervise its workers, and the interactive session cannot be a driver. With supervision the shift left works in principle; the parts of it that were not measured are not covered here.
+
+== Established
+
+[cols="1,4", options="header"]
+|===
+|Finding |Evidence
+
+|A headless worker holds the pull loop
+|V2: 240 cycles over two hours, Claude Code three runs of three, Antigravity one of one
+
+|Recovery is exact
+|V9: 30 of 30 killed tasks delivered again exactly once on Claude Code and on OpenCode; no duplicate submit; the late submit of a replaced worker refused
+
+|Lifecycle is controllable
+|V4: every harness ends within a second of `SIGTERM` without orphans; stored sessions resume
+
+|Decisions are as good warm as fresh
+|V3: every decision correct in both forms, on all harnesses
+
+|A fresh job is cheap
+|V5: 8.8 s and 0.02 USD on Claude Code with a warm provider cache, 11.3 s on OpenCode; about twice the cost with a cold cache
+
+|Usage is attributable per task
+|V7: Claude Code and OpenCode, all four token components per turn
+
+|Injected text does not travel
+|V8: 65 warm runs, five variants, no effect on later tasks
+|===
+
+== Ruled out or limited
+
+[cols="1,4", options="header"]
+|===
+|Finding |Evidence
+
+|The interactive session is not a driver
+|V10: Claude Code paused itself for up to 30 minutes and queued the operator's input while looping; OpenCode stopped after 58 cycles and asked the operator
+
+|A worker left idle gives up
+|V2: OpenCode with `space-bunny-free` stopped after 33 and 102 empty cycles ("nothing to decide")
+
+|A warm context has a ceiling
+|V3: Haiku stopped pulling at 135k to 150k tokens in four runs of four; Sonnet held to 787k at 0.27 USD per decision
+
+|The server learns nothing from the transport
+|V9 and the setup: a dropped call is not noticed; every redelivery came from lease expiry
+
+|Hosts differ in their limits
+|V1: Claude Code 30 minutes of silence, OpenCode 60 s without progress, Antigravity 180 s that progress cannot extend
+
+|Antigravity is the weakest worker host
+|one global server entry (no separable workers), a 180 s limit, no cache-creation usage, 17 s per fresh decision
+|===
+
+== The design that follows
+
+=== Task protocol
+
+A worker, whether spawned by the server or the session that started the plan, complies with one protocol, modelled as a reusable sub-workflow so that every transition is deterministic server logic:
+
+. *Wait*: the worker holds a wait call open, bounded below the host's limit by the client profile (240 s on Claude Code, progress frames on OpenCode, 150 s on Antigravity).
+. *Offer*: the server answers the wait with a task, bound to the worker's generation.
+. *Acknowledge*: the worker acknowledges, explicitly or by its first call that follows the task's link. No acknowledgement within the deadline means the worker is lost: the server ends it and offers the task to a successor. The deadline must tolerate provider stalls (OpenCode stalled for about 310 s).
+. *Execute*: the worker does the task by following the links of the task's representation; its calls serve as heartbeats during long work.
+. *Submit*: a structured result through the offered link, checked against the generation and the lease; a submit of a replaced generation is refused.
+. *Wait or end*: the server answers the next wait with the next task, with "wait again", or with "end".
+
+=== Supervision
+
+The server ends a worker and, when there is work, starts a successor:
+
+* when its process exits (the strongest signal; both measured failure modes ended that way headless);
+* when it neither holds a wait nor calls within the bounded wait plus a grace;
+* when it does not acknowledge an offered task in time;
+* after an idle period of a few wake-ups (about 15 minutes), before it gives up on its own, and because idling costs about a tenth of the context per wake-up;
+* when its context approaches the token budget (well below 100k tokens for Haiku), from the per-turn usage;
+* optionally after a task that carried untrusted text (not required by V8).
+
+A lease is released at once when the server replaces its holder; the successor starts with an empty context, because every task carries what its state needs.
+
+=== Placement of the work
+
+* *Warm while busy, fresh otherwise*: roles with frequent small decisions (project triage, code triage) keep a supervised warm worker while there is work; outline, planning, coding, and reviews run as fresh jobs.
+* *Untrusted text stays with a fresh zero-tool screener*: a pulling worker needs at least the wait and submit tools, and V8 showed injected text acting on the task that carries it; the specified screener (fresh, zero-tool, fail-closed) remains the right form.
+* *The interactive session takes part when attentive*: a task may be offered to it first; without acknowledgement a headless worker takes it.
+* *Consultation goes through the server*: a model that needs another model submits a consultation as a task; the answer arrives through its next wait.
+* *Workers are typed and configurable*: class, tool set, effort level, and per project or machine the harness and model of each role.
+
+=== Requirements on the job runtime and the relay
+
+* Every worker runs in a directory outside the project tree or with the harness's project instructions and persistent memory switched off, with its MCP tools loaded directly (`ENABLE_TOOL_SEARCH=false` on Claude Code).
+* The relay carries identity and generation, adds the per-request headers of a sessionless host, never answers a notification, and reports a lost daemon at once.
+* Client profiles: `bounded_wait_seconds` 240 / progress required / 150, and `progress_resets_timeout` true / true / false for Claude Code / OpenCode / Antigravity.
+* A terminated job reports no usage; the runtime records its usage as unmeasured.
+
+== For the decision gate
+
+Read against the four decisions of the gate:
+
+. *Direction*: the evidence supports the server driving the interior of plans and epics through supervised headless workers (option 2 of xref:../../discussions/control-direction.adoc#options[Control Direction]), with the interactive session as entry and viewer. It speaks against any design that depends on the interactive session to keep pulling.
+. *Form of small decisions*: fresh jobs by default; supervised warm workers for roles with frequent small decisions; resuming a stored session is possible but brings back the context that recycling removes.
+. *Deterministic server logic*: every model decision costs 9 to 20 s whatever its form, which is the price of leaving a decision with a single bound action to a model.
+. *Watching a running plan*: the interactive session can watch, and a long call does not block it, but it cannot be relied on to react promptly; the web application and `pm-operator status` are the dependable views.
+
+The supervision protocol, consultation through the server, the session-first offer, Antigravity as a concurrent job host, and the quality of open-ended decisions are not measured yet; their verification is still to be planned.
