@@ -27,6 +27,7 @@ import harness as hx
 import mcpclient
 
 TERM_GRACE_S = 10
+MAX_FAILED_STARTS = 5
 
 
 def now_ms():
@@ -133,6 +134,8 @@ class JobRuntime:
         self.processes = []
         self.zombies = []
         self.submits = 0
+        self.failed_starts = 0
+        self.aborted = None
         self.state = {}
         self.state_at = 0
         self.lock = threading.Lock()
@@ -200,6 +203,13 @@ class JobRuntime:
         idle = self.state.get("idle", {}).get(slot.worker, 0)
         between_tasks = not self.holds(slot)
         if slot.proc.process.poll() is not None:
+            # an exit before any call of the worker is a start failure (login, quota, harness), not a loss
+            if not slot.ended and slot.last_ms <= slot.proc.started_ms:
+                self.failed_starts += 1
+                if self.failed_starts >= MAX_FAILED_STARTS:
+                    self.aborted = f"{self.failed_starts} workers in a row exited before their first call"
+            else:
+                self.failed_starts = 0
             self.end(slot, "ended" if slot.ended else "exit", exit_code=slot.proc.process.returncode)
         elif slot.ack_missed:
             self.end(slot, "ack_missed")
@@ -236,6 +246,7 @@ class JobRuntime:
         slot.proc = self.spawn(slot, prompt or slot.prompt)
         slot.output = Tail(self.run_dir / f"harness-{slot.proc.tag}.jsonl")
         slot.state = "live"
+        slot.last_ms = slot.proc.started_ms
         self.processes.append({"tag": slot.proc.tag, "worker": slot.worker, "generation": slot.generation,
                                "role": slot.role, "harness": slot.harness, "model": slot.model,
                                "pid": slot.proc.process.pid, "started_ms": slot.proc.started_ms})

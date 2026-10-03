@@ -355,6 +355,9 @@ class Supervisor:
                 break
             if runtime.state.get("finished"):
                 break
+            if runtime.aborted:
+                self.result["error"] = "tooling: " + runtime.aborted
+                break
             if not self.plan.get("respawn", True) and runtime.slots and all(
                     slot.state == "empty" and slot.generation > 0 for slot in runtime.slots):
                 self.result["note"] = "every worker ended and none is replaced (no recycling)"

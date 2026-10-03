@@ -823,6 +823,9 @@ def report(run_dir, meta):
     except (OSError, ValueError):
         result = {}
     metrics, verdict = ANALYSES[meta["v"]](run_dir, meta, events, outputs, result)
+    if str(result.get("error", "")).startswith("tooling"):
+        metrics["note"] = result["error"]
+        verdict = "tooling"
     if (pathlib.Path(run_dir) / "stop").exists() and meta["mode"] == "headless" and verdict == "fail" \
             and str(metrics.get("failure_mode", "")).startswith("stops ("):
         # ended by `pull.py stop`, not by the harness: nothing to judge beyond the cycles reached
