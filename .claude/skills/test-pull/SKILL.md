@@ -1,8 +1,8 @@
 ---
 name: test-pull
-description: Shared driver of the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A (control direction). Builds and checks the stub, starts and stops runs against Claude Code, OpenCode and Antigravity, reports progress, and turns run data into result rows for doc/concepts/harness-as-worker/record.adoc. Use for setup, selfcheck, smoke, run, status, stop, report and cleanup; kept as the base of the next evaluation (doc/concepts/harness-as-worker/evaluation.adoc).
+description: Shared driver of the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A (control direction) and of the evaluation E1 to E13 (doc/concepts/harness-as-worker/evaluation.adoc). Builds and checks the stub, starts and stops runs against Claude Code, OpenCode and Antigravity, supervises workers (detection, fencing, recycling, fault injection), reports progress, and turns run data into result rows for doc/concepts/harness-as-worker/record.adoc. Use for setup, selfcheck, smoke, run, status, stop, report and cleanup.
 user-invocable: true
-argument-hint: "setup | selfcheck | smoke <harness> | status [run] | stop <run> | report [vN] | cleanup"
+argument-hint: "setup | selfcheck | smoke <harness> | status [run] | stop <run> | report [vN|eN] | cleanup"
 allowed-tools: Bash, Read, Edit, Write
 ---
 
@@ -72,6 +72,49 @@ All commands run from the repository root. `P` below stands for
 7. **Interactive runs need the operator.** `P run … interactive` prints a checklist (also stored as
    `checklist.txt`): the directory, the launch command, the prompt to paste, and what to do at which cycle.
    Relay it verbatim and collect what the operator saw on screen; the stub cannot see the screen.
+
+## Evaluation E1 to E13
+
+The items of `doc/concepts/harness-as-worker/evaluation.adoc` are scenarios of this driver: `P run eN <harness>
+headless --cell <cell>`, one cell per command (a run takes both model slots).
+
+| Item | Cells | Plan kind |
+|---|---|---|
+| `e1` acknowledgement | `explicit`, `implicit` | `supervised`: warm pool of two, budget recycle |
+| `e2` detection, replacement, fencing | `kill-offer`, `kill-exec`, `stop-short`, `stop-long`, `turn-end`, `relay-kill` | `faults`: one injected fault per trial |
+| `e3` idle and budget recycling | `A-norecycle`, `B-recycle`, `budget-fill` | `supervised` |
+| `e4` session first | `session-first` (mode `interactive`) | `session_first`: the operator's session beside a headless standby |
+| `e5` consultation | `same`, `cross` | `consult`: an asker and a consultant pool, the consultant on the same or the next harness |
+| `e6` Antigravity concurrent (harness `agy` only) | `agy2`, `agy4` | `agy_concurrent`: kill trials, identity from the environment |
+| `e13` skill delivery | `warm-offer`, `warm-recycle`, `warm-compaction`, `fresh-prompt`, `control`, `uri-switch`, `interactive` (mode `interactive`) | `supervised`, `fresh_skills`, `uri_switch`, `skills_interactive` |
+
+- **Stub switches** (scenario keys, all off for V1 to V10): `supervised` (held waits, generation and role per
+  call, fencing), `ack` (`none`, `explicit` with `pull_ack`, `implicit` with `pull_task`),
+  `ack_deadline_seconds`, `links`, `consult` (`pull_consult`), `skills_dir` (`pm_skills`, `pm_skill`,
+  `pm_skill_file`, resources `skill://pm/…`), `control` (driver tools `spike_state`, `spike_fence`,
+  `spike_compacted`, `spike_skill_update`); per task `role`, `release_at_seconds`, `offer_to`,
+  `fallback_after_seconds`, `skills`.
+- **Job runtime**: `scripts/supervisor.py`, the supervision the product puts into the server. A slot per
+  worker, a generation per process (`harness-<worker>g<generation>.jsonl`). It ends a worker on process exit,
+  a missed acknowledgement, silence, idle wake-ups, the token budget or a fixed number of submits: SIGTERM,
+  SIGKILL after 10 s, `spike_fence`, a successor when the stub shows work. Its record is `supervisor.jsonl`.
+- **Relay**: carries `worker`, `generation` and `role` (arguments, or the environment `PM_SPIKE_WORKER`,
+  `PM_SPIKE_GENERATION`, `PM_SPIKE_ROLE` when started without `--worker`), hides the `spike_*` tools, and
+  answers `skills/list` and `skills/get` from `pm_skills` and `pm_skill`.
+- **Prompts are skills**: a worker's launch prompt is the shim paragraph plus the fixture skills
+  `fixtures/skills/core` and `fixtures/skills/worker/task-protocol` (`scenarios.protocol_prompt`); the shim
+  skill `pm-shim` is installed into the worker directory in each harness's own skill directory.
+- **Supervision values**: `fixtures/supervision.json` per harness (bounded wait, progress, ack variant and
+  deadline, silence grace, idle wake-ups, token budget). E1 sets the ack values, E2 the silence grace; write
+  the measured values there before the items that depend on them.
+- **Criteria per stage**: `criteria.json` carries `stage1`, `stage2`, `stage3`; `P run eN` refuses a measured
+  run while its stage is `proposed`. Only the operator confirms a stage.
+- **Parallelism**: at most two harness processes with a model at a time, so one evaluation run at a time.
+  `e6` is the stated exception with four Antigravity jobs.
+- **Smoke**: `P run eN <harness> headless --cell <cell> --smoke` for every cell (the interactive cells need
+  the operator and print a checklist), then `P report eN --smoke`.
+- **Order**: E2 and E1 first (they calibrate the supervision values), then E3, E6, E5, E13, and E4 at a time
+  the operator names.
 
 ## Order of the measured runs
 

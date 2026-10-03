@@ -468,7 +468,351 @@ def v9(run_dir, meta, events, outputs, result):
     return metrics, "pass" if ok else "fail"
 
 
-ANALYSES = {"v1": v1, "v2": v2, "v3": v3, "v4": v4, "v5": v5, "v6": v6, "v7": v7, "v8": v8, "v9": v9, "v10": v2}
+# --- evaluation E1 to E13 -----------------------------------------------------------------------------
+
+def load_runtime(run_dir):
+    """The record of the job runtime (supervisor.jsonl)."""
+    records = []
+    for line in _lines(pathlib.Path(run_dir) / "supervisor.jsonl"):
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    return records
+
+
+def _quantile(values, q):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+
+def _exactly_once(events):
+    """Tasks by their number of accepted submits; a task still leased when the run ended is left out."""
+    offered = {e["task_id"] for e in _of(events, "offer")}
+    counts = {task_id: 0 for task_id in offered}
+    for event in _of(events, "submit"):
+        counts[event["task_id"]] = counts.get(event["task_id"], 0) + 1
+    last_offer = {e["task_id"]: e["t_ms"] for e in _of(events, "offer")}
+    end = events[-1]["t_ms"] if events else 0
+    open_at_end = [t for t, n in counts.items() if n == 0 and end - last_offer.get(t, 0) < 60000]
+    return {"offered": len(offered), "submitted_once": len([n for n in counts.values() if n == 1]),
+            "duplicates": len([n for n in counts.values() if n > 1]),
+            "never_submitted": len([t for t, n in counts.items() if n == 0 and t not in open_at_end]),
+            "open_at_end": len(open_at_end)}
+
+
+def _stale_accepted(events):
+    """Accepted submits of a generation that was fenced before the submit."""
+    fenced, count = {}, 0
+    for event in events:
+        if event["event"] == "fenced":
+            fenced[event["connection"]] = max(fenced.get(event["connection"], -1), event.get("generation", -1))
+        elif event["event"] == "submit" and event.get("generation", 0) <= fenced.get(event["connection"], -1):
+            count += 1
+    return count
+
+
+def _offer_latency(events):
+    """Seconds from a task becoming due (or returning to the queue) to the offer that led to its submit."""
+    due = {e["task_id"]: e["t_ms"] for e in _of(events, "release_due")}
+    waits = {}
+    for event in events:
+        if event["event"] == "offer" and event["task_id"] in due:
+            waits.setdefault(event["task_id"], (event["t_ms"] - due[event["task_id"]]) / 1000)
+    return waits
+
+
+def _usage_total(meta, outputs, workers):
+    """Priced units and cost over all processes of a run; a killed process reports no total."""
+    units, cost, unmeasured = 0, 0.0, 0
+    for worker in workers:
+        records = outputs.get(worker["tag"], [])
+        summed = _sum_units(hx.turns(worker.get("harness", meta["harness"]), records))
+        total = hx.total(worker.get("harness", meta["harness"]), records) or {}
+        if summed is None:
+            unmeasured += 1
+        else:
+            units += summed
+        cost += total.get("cost_usd") or 0
+    return {"priced_units": units, "cost_usd_reported": round(cost, 3), "processes": len(workers),
+            "processes_without_usage": unmeasured}
+
+
+def e1(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e1"]
+    offers, acks = _of(events, "offer"), _of(events, "ack")
+    if not offers:
+        return {"note": "no task was offered"}, "incomplete"
+    latencies = [e["latency_ms"] / 1000 for e in acks]
+    once = _exactly_once(events)
+    unacked_submits = len([e for e in _of(events, "submit") if e.get("acked") is False])
+    missed = len(_of(events, "ack_missed"))
+    runtime = load_runtime(run_dir)
+    lost = len([r for r in runtime if r["event"] == "detect" and r["reason"] in ("exit", "silence", "ack_missed")])
+    turns = [turn for tag, records in outputs.items() for turn in hx.turns(meta["harness"], records)]
+    usage = [row for row in _task_usage([dict(e, event="delivery") if e["event"] == "offer" else e for e in events],
+                                        sorted(turns, key=lambda t: t["t_ms"])) if row["priced_units"]]
+    longest = max(latencies) if latencies else None
+    p999 = _quantile(latencies, 0.999)
+    metrics = {"variant": meta["cell"], "offers": len(offers), "acks": len(acks),
+               "ack_p50_s": round(statistics.median(latencies), 2) if latencies else None,
+               "ack_p99_s": _quantile(latencies, 0.99), "ack_p999_s": p999, "ack_max_s": longest,
+               "submits_without_ack": unacked_submits, "ack_missed": missed, "workers_lost": lost,
+               "deadline_proposed_s": None if p999 is None else round(max(p999 * crit["deadline_factor"], longest)
+                                                                      + crit["deadline_margin_s"], 1),
+               "median_task_priced_units": statistics.median([r["priced_units"] for r in usage]) if usage else None,
+               "median_task_wall_s": statistics.median([r["wall_s"] for r in usage]) if usage else None,
+               **once, **_usage_total(meta, outputs, result.get("workers", []))}
+    if meta.get("smoke"):
+        return metrics, "recorded"
+    ok = (unacked_submits + missed <= crit["max_tasks_without_ack"] and once["duplicates"] == 0
+          and once["never_submitted"] == 0)
+    return metrics, "pass" if ok else "fail"
+
+
+def e2(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e2"]
+    trials = result.get("trials") or []
+    if not trials:
+        return {"note": "no fault was injected"}, "incomplete"
+    runtime = load_runtime(run_dir)
+    silence_s = meta["scenario"]["wait_seconds"] + meta["plan"]["silence_grace_s"]
+    deadline_s = {"exit": 0, "silence": silence_s, "ack_missed": meta["scenario"]["ack_deadline_seconds"]}
+    fault = meta["plan"]["fault"]
+    late, early, slow_release, by_expiry, detected = 0, 0, 0, 0, []
+    for trial in trials:
+        mine = [r for r in runtime if r.get("worker") == trial["worker"] and r.get("generation") == trial["generation"]
+                and r["t_ms"] >= trial["injected_ms"] - 500]
+        detect = next((r for r in mine if r["event"] == "detect" and r["reason"] in deadline_s), None)
+        sent = next((r for r in mine if r["event"] == "fence_sent"), None)
+        fenced = next((e for e in _of(events, "fenced", connection=trial["worker"])
+                       if e.get("generation") == trial["generation"]), None)
+        if fault == "stop-short":
+            early += detect is not None and detect["t_ms"] <= trial.get("submitted_ms", trial["settled_ms"])
+            continue
+        if detect is None:
+            late += "recovered_ms" not in trial      # the host restarted its relay and the worker went on
+            continue
+        # the deadline of a signal runs from the last sign of life, a process exit is seen at once
+        base = detect["last_event_ms"] if detect["reason"] in ("silence", "ack_missed") else trial["injected_ms"]
+        after = (detect["t_ms"] - base) / 1000
+        trial.update(detected_by=detect["reason"], detected_after_s=round(after, 1))
+        detected.append(detect["reason"])
+        if fault in ("kill-offer", "kill-exec") or detect["reason"] != "exit":
+            late += after > deadline_s[detect["reason"]] + crit["detection_margin_s"]
+        if detect["reason"] == "silence":
+            early += after < deadline_s["silence"]
+        if sent and fenced:
+            slow_release += (fenced["t_ms"] - sent["t_ms"]) / 1000 > crit["max_release_s"]
+        again = [e for e in _of(events, "offer", task_id=trial.get("task_id")) if e["t_ms"] > detect["t_ms"]]
+        by_expiry += bool(again) and again[0]["reason"] not in ("fenced", "superseded", "ack_missed")
+    once = _exactly_once(events)
+    tasks = [t for t in trials if t.get("task_id")]
+    metrics = {"fault": fault, "trials": len(trials),
+               "trial_tasks_submitted": len([t for t in tasks if "submitted_ms" in t]), "trial_tasks": len(tasks),
+               "detected_by": sorted(set(detected)), "detected_late_or_never": late, "replaced_early": early,
+               "max_detected_after_s": max([t["detected_after_s"] for t in trials if "detected_after_s" in t],
+                                           default=None),
+               "recovered_without_replacement": len([t for t in trials if "recovered_ms" in t]),
+               "release_slower_than_limit": slow_release, "released_by_expiry": by_expiry,
+               "stale_submits_refused": len([e for e in _of(events, "stale_refused") if e.get("call") == "submit"]),
+               "stale_submits_accepted": _stale_accepted(events), **once}
+    if meta.get("smoke"):
+        return metrics, "recorded"
+    ok = (once["duplicates"] == 0 and once["never_submitted"] == 0 and late == 0 and early == 0
+          and slow_release == 0 and by_expiry == 0 and metrics["stale_submits_accepted"] == 0
+          and metrics["trial_tasks_submitted"] == metrics["trial_tasks"])
+    return metrics, "pass" if ok else "fail"
+
+
+def e3(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e3"]
+    runtime = load_runtime(run_dir)
+    detects = [r for r in runtime if r["event"] == "detect"]
+    reasons = {}
+    for record in detects:
+        reasons[record["reason"]] = reasons.get(record["reason"], 0) + 1
+    waits = _offer_latency(events)
+    budget = [r["context_tokens"] for r in detects if r["reason"] == "budget"]
+    once = _exactly_once(events)
+    planned = len([s for s in meta["scenario"]["steps"] if s["kind"] == "task"])
+    self_stops = reasons.get("exit", 0) + reasons.get("silence", 0)
+    metrics = {"cell": meta["cell"], "tasks_planned": planned, "tasks_submitted": len(_of(events, "submit")),
+               "self_stops": self_stops, "ended_by_runtime": {k: v for k, v in reasons.items()
+                                                              if k in ("idle", "budget", "recycle")},
+               "generations": len([r for r in runtime if r["event"] == "spawn"]),
+               "max_task_wait_s": round(max(waits.values()), 1) if waits else None,
+               "median_task_wait_s": round(statistics.median(waits.values()), 1) if waits else None,
+               "budget_recycles_at_tokens": budget, "duplicates": once["duplicates"],
+               **_usage_total(meta, outputs, result.get("workers", []))}
+    if result.get("note"):
+        metrics["note"] = result["note"]
+    if meta.get("smoke") or meta["cell"] == "A-norecycle":
+        return metrics, "recorded"          # variant A is the reference without recycling
+    limit = meta["scenario"]["wait_seconds"] + crit["task_wait_margin_s"]
+    ok = self_stops == 0 and metrics["tasks_submitted"] == planned and once["duplicates"] == 0
+    if meta["cell"] == "budget-fill":
+        ok = ok and bool(budget) and max(budget) <= crit["max_budget_recycle_tokens"]
+    else:
+        ok = ok and waits and max(waits.values()) <= limit
+    return metrics, "pass" if ok else "fail"
+
+
+def e4(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e4"]
+    submits = _of(events, "submit")
+    if not submits:
+        return {"note": "no task was submitted"}, "incomplete"
+    once = _exactly_once(events)
+    waits = _offer_latency(events)
+    due = {e["task_id"]: e["t_ms"] for e in _of(events, "release_due")}
+    accepted = {}
+    for offer in _of(events, "offer"):
+        accepted[offer["task_id"]] = offer          # the last offer is the one that was submitted
+    by_session = [e for e in submits if e["connection"] == "tui"]
+    missed = {t: (o["t_ms"] - due[t]) / 1000 for t, o in accepted.items() if o["connection"] != "tui" and t in due}
+    held = [e.get("held_ms", 0) / 1000 for e in _of(events, "wait_end", connection="tui")]
+    metrics = {"tasks": len(submits), "taken_by_session": len(by_session),
+               "session_share_pct": _pct([e["connection"] == "tui" for e in submits]),
+               "ack_missed_by_session": len(_of(events, "ack_missed", connection="tui")),
+               "max_delay_of_missed_task_s": round(max(missed.values()), 1) if missed else 0,
+               "max_first_offer_wait_s": round(max(waits.values()), 1) if waits else None,
+               "longest_session_wait_call_s": round(max(held), 1) if held else None,
+               "operator_input_max_queued_s": result.get("operator", {}).get("input_max_queued_s",
+                                                                             "to be noted by the operator"),
+               **once}
+    if meta.get("smoke"):
+        return metrics, "recorded"
+    limit = meta["scenario"]["ack_deadline_seconds"] + crit["delay_margin_s"]
+    queued = metrics["operator_input_max_queued_s"]
+    if not isinstance(queued, (int, float)):
+        return metrics, "incomplete"
+    ok = (once["duplicates"] == 0 and once["never_submitted"] == 0 and metrics["max_delay_of_missed_task_s"] <= limit
+          and queued <= meta["scenario"]["wait_seconds"])
+    return metrics, "pass" if ok else "fail"
+
+
+def e5(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e5"]
+    opened = _of(events, "consult_open")
+    if not opened:
+        return {"note": "no consultation was opened"}, "incomplete"
+    answers, delivered = _of(events, "consult_answer"), _of(events, "consult_delivered")
+    per_id = {}
+    for event in answers:
+        per_id[event["consultation_id"]] = per_id.get(event["consultation_id"], 0) + 1
+    askers = {e["consultation_id"]: e["connection"] for e in opened}
+    right = [e for e in delivered if askers.get(e["consultation_id"]) == e["connection"]]
+    latency = []
+    for event in delivered:
+        start = next((o["t_ms"] for o in opened if o["consultation_id"] == event["consultation_id"]), None)
+        if start:
+            latency.append((event["t_ms"] - start) / 1000)
+    final = [e for e in _of(events, "submit") if not e["task_id"].startswith("c-")]
+    referenced = [e for e in final if e.get("consultation_ref") == "ok"]
+    runtime = load_runtime(run_dir)
+    asker_lost = len([r for r in runtime if r["event"] == "detect" and str(r.get("worker", "")).startswith("w")
+                      and r["reason"] in ("exit", "silence", "ack_missed")])
+    planned = len([s for s in meta["scenario"]["steps"] if s["kind"] == "task"])
+    metrics = {"consultant": next((s.get("harness", meta["harness"]) for s in meta["plan"]["slots"]
+                                   if s["role"] == "consultant"), None),
+               "tasks": planned, "consultations": len(opened),
+               "answered_exactly_once": len([n for n in per_id.values() if n == 1]),
+               "delivered_to_asker": len(right), "askers_lost": asker_lost,
+               "final_submits": len(final), "final_submits_referencing": len(referenced),
+               "submits_without_consultation": len([e for e in final if e.get("consultation_ref") is None]),
+               "latency_p50_s": round(statistics.median(latency), 1) if latency else None,
+               "latency_max_s": round(max(latency), 1) if latency else None,
+               "progress_frames": len(_of(events, "progress")),
+               **_usage_total(meta, outputs, result.get("workers", []))}
+    if meta.get("smoke"):
+        return metrics, "recorded"
+    ok = (len(opened) == planned and metrics["answered_exactly_once"] == planned and len(right) == planned
+          and asker_lost <= crit["max_askers_lost"] and len(referenced) == len(final) == planned)
+    return metrics, "pass" if ok else "fail"
+
+
+def e6(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e6"]
+    metrics, verdict = e2(run_dir, meta, events, outputs, result)
+    relay = load_relay(run_dir)
+    identities = [e for e in relay if e["event"] == "identity"]
+    binding = {}
+    for event in events:
+        if event["event"] == "offer":
+            binding[event["task_id"]] = (event["connection"], event.get("generation"))
+    wrong = len([e for e in _of(events, "submit") if binding.get(e["task_id"]) != (e["connection"], e.get("generation"))])
+    held = [e.get("held_ms", 0) / 1000 for e in _of(events, "wait_end")]
+    metrics.update(jobs=meta["cell"], relays_started=len(identities),
+                   identity_from_environment=len([e for e in identities if e.get("source") == "environment"]),
+                   workers_seen=sorted({e["connection"] for e in _of(events, "wait_start")}),
+                   submits_bound_to_other_job=wrong,
+                   longest_wait_s=round(max(held), 1) if held else None,
+                   waits_at_bounded_length=len([h for h in held if h >= meta["scenario"]["wait_seconds"] - 1]),
+                   aborted_waits=len([e for e in _of(events, "wait_end") if e.get("outcome") in ("cancelled", "aborted")]))
+    if verdict in ("recorded", "incomplete"):
+        return metrics, verdict
+    ok = (verdict == "pass" and wrong == 0 and metrics["identity_from_environment"] == metrics["relays_started"] > 0
+          and (metrics["longest_wait_s"] or 0) < crit["wait_limit_s"] and metrics["aborted_waits"] == 0)
+    return metrics, "pass" if ok else "fail"
+
+
+def e13(run_dir, meta, events, outputs, result):
+    crit = CRITERIA["e13"]
+    if meta["cell"] == "uri-switch":
+        seen = result.get("uri_switch")
+        if not seen:
+            return {"note": "the test clients did not run"}, "incomplete"
+        declaring, plain = seen["declaring"]["skills"], seen["plain"]["skills"]
+        metrics = {"declaring_client_inband": len([s for s in declaring if s["inband"]]),
+                   "declaring_client_named": len(declaring),
+                   "plain_client_inband": len([s for s in plain if s["inband"]]),
+                   "resources_read": seen["declaring"]["resources_read_ok"], **seen["relay"]}
+        ok = (declaring and plain and metrics["declaring_client_inband"] == 0
+              and metrics["plain_client_inband"] == len(plain) and metrics["resources_read"]
+              and seen["relay"]["skills_list"] > 0 and seen["relay"]["skills_get_ok"]
+              and seen["relay"]["spike_tools_listed"] == 0 and seen["relay"]["spike_call_refused"])
+        return metrics, "pass" if ok else "fail"
+    import scenarios
+    data = json.loads((scenarios.FIXTURES / "skill-tasks.json").read_text(encoding="utf-8"))
+    table = {task["id"]: task for task in data["tasks"]}
+    decisions = _decisions(events)
+    if not decisions:
+        return {"note": "no submitted task"}, "incomplete"
+    rule = [d["decision"] == table[t]["expected"] for t, d in decisions.items() if t in table]
+    # common practice types a dependency bump as chore or build; which of the two varies by reader
+    common = [d["decision"] in ("chore", "build", "ci") for t, d in decisions.items() if t in table]
+    runtime = load_runtime(run_dir)
+    # every moment at which a worker's context may have lost the skill
+    resets = [(r["t_ms"], r["worker"], "generation") for r in runtime if r["event"] == "spawn"]
+    resets += [(e["t_ms"], e["connection"], "compaction") for e in _of(events, "compacted")]
+    resets += [(e["t_ms"], None, "digest") for e in _of(events, "skill_updated")]
+    offers = [e for e in _of(events, "offer") if e.get("skills")]
+    redelivered, expected = {}, {}
+    for stamp, worker, kind in resets:
+        following = next((o for o in offers if o["t_ms"] >= stamp and worker in (None, o["connection"])), None)
+        if following is None:
+            continue
+        expected[kind] = expected.get(kind, 0) + 1
+        redelivered[kind] = redelivered.get(kind, 0) + (following.get("skills_delivered", 0) > 0)
+    metrics = {"cell": meta["cell"], "tasks": len(rule), "rule_rate_pct": _pct(rule),
+               "common_practice_pct": _pct(common), "offers_with_skills": len(offers),
+               "skill_deliveries": len(_of(events, "skill_delivered")),
+               "resets": expected, "redelivered_after_reset": redelivered,
+               "skill_missing": len(_of(events, "skill_missing")),
+               "skill_reads": len([e for e in _of(events, "skill_read") if e.get("found")]),
+               "generations": len([r for r in runtime if r["event"] == "spawn"]),
+               **_usage_total(meta, outputs, result.get("workers", []))}
+    if meta.get("smoke") or meta["cell"] == "control":
+        return metrics, "recorded"          # the control is the reference; render() compares against it
+    ok = (metrics["rule_rate_pct"] >= crit["min_rule_rate_pct"] and metrics["skill_missing"] == 0
+          and redelivered == expected)
+    return metrics, "pass" if ok else "fail"
+
+
+ANALYSES = {"e1": e1, "e2": e2, "e3": e3, "e4": e4, "e5": e5, "e6": e6, "e13": e13, "v1": v1, "v2": v2, "v3": v3, "v4": v4, "v5": v5, "v6": v6, "v7": v7, "v8": v8, "v9": v9, "v10": v2}
 
 
 def report(run_dir, meta):
@@ -504,9 +848,10 @@ def render(rows, as_json=False):
         return json.dumps(rows, indent=2)
     if not rows:
         return "no runs"
-    out = [f"// criteria: {CRITERIA['status']}", '[cols="1,2,2,3,6,1", options="header"]', "|===",
+    stages = ", ".join(f"{key}: {value}" for key, value in CRITERIA.items() if key.startswith("stage"))
+    out = [f"// criteria: {CRITERIA['status']}; {stages}", '[cols="1,2,2,3,6,1", options="header"]', "|===",
            "|V |Harness |Mode |Cell |Result |Verdict"]
-    for row in sorted(rows, key=lambda r: (int(r["v"][1:]), r["harness"], r["mode"], r["cell"])):
+    for row in sorted(rows, key=lambda r: (r["v"][0], int(r["v"][1:]), r["harness"], r["mode"], r["cell"])):
         result = "; ".join(f"{key}: {value}" for key, value in row["metrics"].items())
         if not row["finished"]:
             result += " (run not finished)"

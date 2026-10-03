@@ -1,7 +1,9 @@
-"""Minimal MCP client over Streamable HTTP (stdlib only), used by `pull.py selfcheck`.
+"""Minimal MCP client over Streamable HTTP (stdlib only).
 
-It proves that the stub itself holds a blocking tool call for the full measurement cap, so that an
-abort seen in V1 is the harness's and not the server's.
+`pull.py selfcheck` uses it to prove that the stub itself holds a blocking tool call for the full
+measurement cap, so that an abort seen in V1 is the harness's and not the server's. The job runtime
+(`supervisor.py`) uses it for the driver's tools, and the E13 cell `uri-switch` as the test client that
+declares the MCP Skills Extension.
 """
 import http.client
 import json
@@ -54,10 +56,10 @@ class McpClient:
         finally:
             connection.close()
 
-    def initialize(self):
+    def initialize(self, name="pull-selfcheck", capabilities=None):
         result, _ = self.request("initialize", {
-            "protocolVersion": PROTOCOL, "capabilities": {},
-            "clientInfo": {"name": "pull-selfcheck", "version": "0"}})
+            "protocolVersion": PROTOCOL, "capabilities": capabilities or {},
+            "clientInfo": {"name": name, "version": "0"}})
         self.notify("notifications/initialized")
         return result
 
