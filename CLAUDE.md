@@ -19,7 +19,8 @@ the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specifi
 Roadmap Milestone 0, Part A (verifications V1 to V10 of `doc/discussions/control-direction.adoc`) runs on
 throwaway tooling: the stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`) and the
 project skills `test-pull` and `test-v1` to `test-v10`; results go to
-`doc/discussions/control-direction-measurements.adoc`. Both are removed with Milestone 1.
+`doc/discussions/control-direction-measurements.adoc`; the result and the resulting architecture are the concept
+`doc/concepts/harness-as-worker/`. The tooling is removed with Milestone 1.
 
 ## Modules
 
