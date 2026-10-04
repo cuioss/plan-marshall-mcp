@@ -40,24 +40,24 @@ The self-remedy of a failure class is a sub-workflow unit per class (`scope subw
 
 |`remediation.merge-conflict`
 |`remediation-merge`
-|none (`decide` takes the only action `fix`)
+|`triage-merge`
 |`finalize.remediate-sync-conflict`, `finalize.remediate-merge-conflict`
 
 |`remediation.qgate-findings`
 |`remediation-qgate`
-|none (`decide` takes the only action `fix`)
+|`qgate`
 |`refine.remediate-qgate`, `outline.remediate-qgate`, `plan.remediate-qgate`
 
 |`remediation.spend`
 |`remediation-spend`
-|none (no `decide`)
+|– (no action set, no `decide`)
 |`finalize.remediate-spend`
 |===
 
 *Contract*: Parameters `retry_budget`, `fix_budget`, `waiver_wait_seconds`, and `actions` (the subset of `retry`, `fix`, `loop_back` the call admits; the plan instance's composition rules may narrow it, for example `actions=[retry]` for a `land` plan), bounded by the compiled hard caps (link:../timeouts/01-job-budgets-and-waits.adoc#retry-budget[retry], link:../timeouts/01-job-budgets-and-waits.adoc#fix-budget[fix], link:../timeouts/01-job-budgets-and-waits.adoc#waiver-wait[waiver wait]); the plan instance carries the effective ceilings with their source. Budgets are counted per plan and class, persisted, and never reset (link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]). The terminals are the reachable subset of `resolved`, `waived`, `exhausted`, `fix_requested`: `waived` only where the class has a waivable gate, `fix_requested` only where the fix runs in the caller. A unit has no step-out terminal; its call sites still route `stepped_out`, which keeps the exit contract of every sub-workflow uniform. The gather state records the evidence as failure envelopes behind untrusted resources (link:../store-schemas/14-plan-instance-waivers-questions.adoc#evidence-directory[Store Schemas Specification, Evidence Directory]); a unit that ingests externally authored text (review comments and bot findings, analysis-provider messages) builds one `batch-v1` batch of the firing's new items after level-1 validation and screens its uncached items in one screener task per batch part, and an item the screener flags `suspicious`, or whose verdict is missing, is withheld: only its structured fields are delivered, it stays pending, and the unit ends through its budget and fallback unless a `met` waiver covers it (the hand-back report lists withheld items). A nested `git.commit_and_push` that returns `stepped_out`, or `done` without a commit, returns to `budget-check`; a server step-out of cause `condition` never reaches the unit, because it unwinds every frame to the plan's fallback. No primitive writes a waiver: the waived path exists only as the `waived` terminal, produced by the gather state (`waiver.lookup`) or the waiver wait.
 
 [#remediation-decide]
-*Deciding the remedy*: `decide` (`auto remediation.offer-actions`) computes the admissible remedies: each action the call binds whose budget is left (`loop_back` only `in_worktree`), and `request_waiver` while `waiver_wait_seconds > 0`, the failing gate is waivable, and no request is pending. One admissible remedy is taken without a task (`retry` -> `rerun`, an in-branch `fix` -> `apply-fix`, a `fix` that runs in the caller and `loop_back` -> `fix-requested`), each charged by the primitive that takes it; several -> `choose`. `choose` (`job llm remediation-decision role <triage role>`, the facts carrying the evidence the decision rests on) offers one closing submit per admissible remedy, each defined once in `facts.options`: `retry` (`reason: enum[flaky|infra|timeout]`, refused with `retry_not_applicable` when the same fingerprints already failed after a retry with the same reason), `fix` (`summary: text[1..500]`), `loop_back` (`remediation_summary: text[1..2000]`), `request_waiver` (rel `escalate`, `rationale: text[1..2000]`); `fix` and `loop_back` are refused with `fix_unchanged` when the worktree or the artifact is unchanged since the previous attempt. A task of the unit that closes `lost` (its re-offers spent, or its role undefined, unqualified, or unavailable) enters `conservative`, which takes the bound `retry` once per unit instance and otherwise `exhausted` (`PM-WORK-6`).
+*Deciding the remedy*: `decide` (`auto remediation.offer-actions`) computes the admissible remedies: each action the call binds whose budget is left (`loop_back` only `in_worktree`), and `request_waiver` while `waiver_wait_seconds > 0`, the failing gate is waivable, and no request is pending. One admissible remedy is taken without a task (`retry` -> `rerun`, an in-branch `fix` -> `apply-fix`, a `fix` that runs in the caller and `loop_back` -> `fix-requested`), each charged by the primitive that takes it; several -> `choose`. The admissible set follows only from the call's bindings and the budgets left, so no unit hard-wires whether a task decides (link:../workflow-dsl/08-remediation-units.adoc#remediation-invariants[Workflow DSL Specification, `INV-REM-7`]); with the shipped bindings the server takes `fix` in `remediation-merge` and `remediation-qgate`. `choose` (`job llm remediation-decision role <triage role>`, the facts carrying the evidence the decision rests on) offers one closing submit per admissible remedy, each defined once in `facts.options`: `retry` (`reason: enum[flaky|infra|timeout]`, refused with `retry_not_applicable` when the same fingerprints already failed after a retry with the same reason), `fix` (`summary: text[1..500]`), `loop_back` (`remediation_summary: text[1..2000]`), `request_waiver` (rel `escalate`, `rationale: text[1..2000]`); `fix` and `loop_back` are refused with `fix_unchanged` when the worktree or the artifact is unchanged since the previous attempt. A task of the unit that closes `lost` (its re-offers spent, or its role undefined, unqualified, or unavailable) enters `conservative`, which takes the bound `retry` once per unit instance and otherwise `exhausted` (`PM-WORK-6`).
 
 [#state-catalogue-remediation-generic]
 === Generic Remediation States
@@ -119,7 +119,7 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |[[state-remediation.resolved]]`remediation-<class>.resolved`
 |inherit
 |`terminal`
-|The unit's gather, await, or continue state (class passed).
+|The unit's gather, await, or continue state, or the `rerun` of `remediation-merge` (class passed).
 |Declared `terminal resolved success`.
 |The caller's `resolved` transition.
 |link:../hypermedia-format/03-composite-wait-and-encoder.adoc#policy-unit-returns[Hypermedia Format Specification, Policy Unit Returns]
@@ -156,14 +156,14 @@ A generic state `remediation-<class>.x` stands for one concrete state per unit i
 |`budget-check`, `resolved`, `exhausted` |x |x |x |x |x |x |x
 |`waiver-wait` |x |x |x |- |- |x |x
 |`screen` |- |x |x |- |- |- |-
-|`conservative` |x |x |x |x |x |- |-
+|`conservative` |x |x |x |x |x |x |-
 |`apply-fix` |x |x |x |- |x |- |-
 |`commit-fix` |x |x |x |- |- |- |-
 |`waived` |x |x |x |- |- |x |x
 |`fix-requested` |x |- |x |x |- |x |-
 |===
 
-Every unit with `decide` declares it per unit (its outcome routing differs); every unit whose bound actions can leave several remedies declares `choose` and `rerun`: `remediation-ci`, `remediation-analysis`, `remediation-review`, `remediation-build`.
+Every unit with an action set declares `decide` and `choose` per unit (their outcome routing differs), and `rerun` where `retry` is in its action set: all units but `remediation-spend`, which has no action set; `rerun` in all of them but `remediation-qgate`. The units `remediation.merge-conflict`, `remediation.qgate-findings`, and `remediation.spend` are listed in link:11-remediation-units-merge-qgate-spend.adoc[Remediation Units: Merge Conflict, Q-Gate Findings & Spend].
 
 [#state-catalogue-remediation-ci]
 === `remediation.ci-failure`
@@ -363,80 +363,4 @@ Every unit with `decide` declares it per unit (its outcome routing differs); eve
 |The re-run build job the preceding primitive enqueued.
 |`succeeded` -> `remediation-build.resolved`; `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate` -> `remediation-build.gather`.
 |link:../job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime Specification, Gate Honesty Verification]
-|===
-
-[#state-catalogue-remediation-merge]
-=== `remediation.merge-conflict`
-
-The unit binds only `fix`, so `decide` always takes it without a task and the unit has no `choose`; a merge conflict is not waivable.
-
-[cols="2,1,1,2,3,2,2"]
-|===
-|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
-
-|[[state-remediation-merge.gather]]`remediation-merge.gather`
-|inherit
-|`auto`
-|`call` (start state); `remediation-merge.continue` (`conflict`).
-|`remediation.gather-conflict-evidence`: the conflicted paths and hunks with the base commits that touched them; for a moved remote branch the observed `remote_sha` and the foreign commits. The rebase stays in progress in the worktree.
-|`failures` -> `remediation-merge.budget-check`.
-|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path]
-
-|[[state-remediation-merge.decide]]`remediation-merge.decide`
-|inherit
-|`auto`
-|`remediation-merge.budget-check` (`budget_left`).
-|`auto remediation.offer-actions` (<<remediation-decide>>): the only remedy is `fix`.
-|`fix` -> `remediation-merge.apply-fix` (the generic `apply-fix` with skill `pm/git/sync-recovery`).
-|link:../workflow-dsl/08-remediation-units.adoc#unit-template[Workflow DSL Specification, Unit Template]
-
-|[[state-remediation-merge.continue]]`remediation-merge.continue`
-|inherit
-|`auto`
-|`remediation-merge.apply-fix` (`fixed`).
-|`auto remediation.continue-integration`: continues the rebase with the resolved files, or rebases onto the observed remote head; never a forced push over foreign commits.
-|`rebased` -> `remediation-merge.resolved`; `conflict` -> `remediation-merge.gather`.
-|link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#merge-path[Phase Workflows Specification, Merge Path]
-|===
-
-[#state-catalogue-remediation-qgate]
-=== `remediation.qgate-findings`
-
-[cols="2,1,1,2,3,2,2"]
-|===
-|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
-
-|[[state-remediation-qgate.gather]]`remediation-qgate.gather`
-|inherit
-|`auto`
-|`call` (start state).
-|`remediation.gather-qgate-evidence`: the calling phase's blocking Q-Gate findings (including a filed derivation failure).
-|`failures` -> `remediation-qgate.budget-check`; `none` -> `remediation-qgate.resolved`; `all_waived` (`qgate_findings:<phase>`; the findings dispositioned accepted by waiver) -> `remediation-qgate.waived`.
-|link:../phase-workflows/03-q-gate-and-execute.adoc#_q_gate_validation_loop[Phase Workflows Specification, Q-Gate Validation Loop]
-
-|[[state-remediation-qgate.decide]]`remediation-qgate.decide`
-|inherit
-|`auto`
-|`remediation-qgate.budget-check` (`budget_left`).
-|`auto remediation.offer-actions`: the unit binds only `fix`, so the server always takes `fix` without a task; the findings in `facts.qgate_findings` go to the caller's rework (a new authoring task, or `plan.revise-tasks`), where an unchanged artifact is refused `fix_unchanged` at its re-submission. A waiver request is filed only by `budget-check` (`exhausted_wait`).
-|`fix` -> `remediation-qgate.fix-requested`.
-|link:../phase-workflows/03-q-gate-and-execute.adoc#_q_gate_validation_loop[Phase Workflows Specification, Q-Gate Validation Loop]
-|===
-
-[#state-catalogue-remediation-spend]
-=== `remediation.spend`
-
-A degenerate unit: no `retry`, no `fix`, and no `decide`. The spend ceiling is not raisable: only a `met` waiver of the gate `spend` lets the plan pass, and `merge.gate-entry` is the single point that reads it; the unit's waiver wait, when bound, only waits for that waiver.
-
-[cols="2,1,1,2,3,2,2"]
-|===
-|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
-
-|[[state-remediation-spend.gather]]`remediation-spend.gather`
-|inherit
-|`auto`
-|`call` (start state).
-|`remediation.gather-spend-report`: cumulative finalize spend (`finalize.spend-ratio`) against the `spend` ceiling; it performs no waiver lookup.
-|`within_ceiling` -> `remediation-spend.resolved`; `over` -> `remediation-spend.budget-check` (whose `exhausted_wait` enters the waiver wait only while `waiver_wait_seconds > 0`).
-|link:../model-work/09-completion-usage-and-spend.adoc#spend-accounting-budget-anchors[Model Work Specification, Spend Accounting]
 |===
