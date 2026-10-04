@@ -34,11 +34,11 @@ Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#out
 link:../specification/store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas § Job Record] (Write order at job end)
 Hazard:: Settling a job in an arbitrary order lets a crash leave a released build slot with an unsettled record, or a
 ledger row that stamps a build whose job record never recorded its fate.
-Guard:: Crash injection after each step of the fixed order (job record fate, for a model job its metrics row,
-change-ledger row, timing observation, slot release): after restart every store is consistent, and the only losses
-are a model job's missing metrics row (`record-metrics` reports it as the divergence `row_absent_from_metrics`,
-never as `0`; the job record carries no usage), a missing ledger row (the next freshness check re-runs the build), or a missing timing sample; no step is
-re-derived and no marker file exists.
+Guard:: Crash injection after each step of the fixed order (job record fate with a worker's fence, for a worker the
+metrics rows of its tasks not yet written, change-ledger row, timing observation, slot release): after restart every
+store is consistent, and the only losses are a task's missing metrics row (`record-metrics` reports it as the
+divergence `row_absent_from_metrics`, never as `0`; the job record carries no usage), a missing ledger row (the next
+freshness check re-runs the build), or a missing timing sample; no step is re-derived and no marker file exists.
 Source:: design review.
 
 == Subprocess Lifecycle & Process-Group Isolation
@@ -95,10 +95,12 @@ link:../specification/timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Bu
 link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4]
 Hazard:: A wait budget passed as an iteration count expired in seconds and reported a bot "absent" while it was
 running; a wait at its ceiling could not tell waiting from re-polling finished work; wait cost was invisible.
-Guard:: Wait jobs use monotonic wall-clock deadlines (test with fast pollers); an exhausted poll is `unproven`, not
-absent; a bounded wait returning `running` reports whether the job state changed during the window; a wait on an
-already-settled job returns immediately; time deferred by a provider rate limit is attributed `provider_rate_limit`,
-never counted as a timeout. The wait population below is the baseline for bounded-wait metrics.
+Guard:: Engine waits use monotonic wall-clock deadlines (test with fast pollers); an exhausted poll is `unproven`,
+not absent; the only calls a model holds open are a worker's `pm_wait` and a running `pm_build`: a `pm_wait` returns
+an offer, `wait_again`, or `end` within its host's bounded window and never fails with a transport timeout, a
+`pm_build` returning the running build reports whether the job state changed during the window, and a `pm_build`
+on an already-settled job returns at once; time deferred by a provider rate limit is attributed
+`provider_rate_limit`, never counted as a timeout. The wait population below is the baseline for wait metrics.
 Fixture:: 600 s budget burned in seconds ("CodeRabbit absent" while running); a script cost rollup of 2,051 calls, 14,423,580 ms, dominated by the three wait notations
 build_server 27.4%, ci 27.3%, ci_complete_precondition 23.1% (77.8% together). Wait attribution by reason:
 deliberate (an operator ruling to wait out a CodeRabbit quota window) vs poll miss (8 `ci_complete_precondition`
@@ -112,7 +114,7 @@ and D2.
 Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
 link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2]
 Hazard:: Re-attaching to a build wait returned a previous job's verdict.
-Guard:: Every wait and `pm_build` result carries the job id, and the job record binds it to the `worktree_sha` it was
+Guard:: Every `pm_build` result carries the job id, and the job record binds it to the `worktree_sha` it was
 computed for (recorded, never returned: hypermedia-format Model-Facing Minimality); a test re-attaches after a
 runtime restart and after a second job for the same command started.
 Source:: plan-marshall truthful-signals PLAN-TRUTH-150 D1.
@@ -179,7 +181,7 @@ file under `<PM_MCP_BASE>/credentials/`, and an entry of the per-project machine
 permission error; positive control: the same job reads a binary under `<PM_MCP_HOME>`, a sibling of `<PM_MCP_BASE>`
 in its parent directory, and a sibling of each directory on the path from `/` (read set built by sibling
 enumeration); control: an entry created on that path after job start is not readable by the job, which is the
-accepted limitation, and an entry created elsewhere stays readable; the one exception: a model job (kind `llm`)
+accepted limitation, and an entry created elsewhere stays readable; the one exception: a worker (kind `llm`)
 reads its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` and fails to read that of another job and
 every other entry of `<PM_MCP_BASE>`.
 Source:: design review.
@@ -194,10 +196,10 @@ one project rewrite another project's sources or the runtime's own stores and en
 Guard:: On Linux with Landlock, a job fixture of project A writes into the enrolled root of project B and into
 `<PM_MCP_BASE>` (an enrolment file and a machine-store file), and each write fails with a permission error; positive
 control: the same job writes into its own project root, one of its worktrees, `.marshall/local/temp/`, a declared
-toolchain cache, and `/tmp`, and each write succeeds; for a model job (kind `llm`) additionally the harness sub-paths
+toolchain cache, and `/tmp`, and each write succeeds; for a worker (kind `llm`) additionally the harness sub-paths
 its client profile declares (`headless.writable_paths`: login or credential file, caches, session directory)
-succeed, while its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (which it can only read), a settings
-or hook file of its harness, the home of another harness, and the rest of `<PM_MCP_BASE>` fail.
+succeed, while its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (which it can only read), a settings,
+command, or skill file of its harness, the home of another harness, and the rest of `<PM_MCP_BASE>` fail.
 Source:: design review.
 
 [#PM-WATCH-JOB-28]
@@ -206,14 +208,14 @@ Source:: design review.
 Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime § Linux Filesystem Confinement] (Write set, Read set),
 link:../specification/runtime-model/01-processes-and-transport.adoc#_singleton_discovery[Runtime Model § Singleton & Discovery] (Socket, Path length)
 Hazard:: A prompt file, result schema, socket, or token kept in the system temporary directory lies in every job's
-write set: a job of any project replaces the next model job's prompt or schema, or plants a socket the clients
+write set: a job of any project replaces the next worker's prompt or schema, or plants a socket the clients
 connect to, and a socket fallback under the temporary directory puts the listener itself there.
 Guard:: On Linux with Landlock: the set of paths the runtime reads back or trusts for a launch (prompt file, rendered
 result schema, MCP configuration, the screener's `cwd/`, socket, token, runtime record) is disjoint from the write set
-of every job kind; a model job reads its own `<PM_MCP_BASE>/run/jobs/<job_id>/`, fails to write it, and fails to read
+of every job kind; a worker reads its own `<PM_MCP_BASE>/run/jobs/<job_id>/`, fails to write it, and fails to read
 or write that of another job; a `PM_MCP_BASE` long enough to push `run/runtime.sock` over the platform `sun_path`
 limit refuses the start and creates no file or directory in the system temporary directory; positive control: a
-default-length base binds the socket and a model job starts from its job-private directory.
+default-length base binds the socket and a worker starts from its job-private directory.
 Source:: design review.
 
 == Native Build Output Parsers
@@ -294,7 +296,7 @@ link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
 Hazard:: Timeouts were read as failures.
 Guard:: Matched tests: a failing build stays `failed`; a timeout over a build that would pass yields no verdict; an
 unlearned budget is recorded as `budget_derivation: floor_default` in the job record (never rendered) and its timeout
-offers `retry` with the escalated budget instead of failing the gate.
+is retried by the server with the escalated budget instead of failing the gate.
 Fixture:: job `dbbc60f9` (an integration test that normally takes 1250–1800 s timed out at 300 s before any test ran and was resubmitted as `abe890bd`);
 plugin-doctor real-tree test over 300 s under `module-tests`, green under `verify` (one test red in one runner and
 green in another, invisibly); a 30 s budget against a verb measured at 24–57 s.
@@ -310,7 +312,8 @@ Hazard:: A module test timed out on a worktree full of build residue; blending t
 re-tiered every later run of the command.
 Guard:: Scenario test: a timed-out run leaves `L` unchanged and sets a one-shot escalation budget that the next
 finished run clears; a run started over residue above the threshold is stored `poisoned` and not blended while clean
-observations exist; the job facts show `observations`, `poisoned`, `escalated`.
+observations exist; the build timings store records `observations`, `poisoned`, and `escalation_seconds`, and
+`pm-operator status` shows them, while no representation or job fact carries them.
 Fixture:: module-tests timed out at 873 s on 52,704 residue files (450 MB), green in 529 s after cleanup;
 quality-gate 968 s and module-tests 1473 s re-tiered against 360 s and 501 s earlier; 9 orchestrator yields.
 Source:: plan-marshall defect truthful-signals PLAN-TRUTH-150.
@@ -401,3 +404,16 @@ point, lone surrogate, or ANSI escape survives; images, raw HTML, and links outs
 neutralized with one reported change each; a rule-table hit is recorded as a finding and never blocks on its own; the
 number of passes is bounded.
 Source:: design review.
+
+[#PM-WATCH-JOB-29]
+=== PM-WATCH-JOB-29: Bot boilerplate is removed before the screener sees a comment
+
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#ingestion-validator[Job Runtime § Ingestion Validator],
+link:../Requirements.adoc#PM-SEC-1[PM-SEC-1]
+Hazard:: The screener flagged 23 to 27 % of real review comments as suspicious because their collapsed sections, HTML
+comments, and the disclosure footers of the review bots (instructions addressed to an AI agent) reached it; every
+false flag withholds a real finding from triage.
+Guard:: Corpus test over recorded comments of every registered review bot: after level 1 no `<details>` block, HTML
+comment, or footer of the compiled per-bot pattern table remains, and each removal is one reported change; matched
+control: an injected instruction in the visible body of a comment survives level 1 and is flagged by the screener.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).

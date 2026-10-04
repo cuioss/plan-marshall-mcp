@@ -10,9 +10,9 @@ link:../ImplementationWatch.adoc[Implementation Watch] » Runtime Model
 == Overview
 
 Watch items for the link:../specification/runtime-model.adoc[Runtime & Interaction Model Specification]: start-up
-liveness, the runtime token and the offline verbs, stall and idle-gap detection on active plans, and test isolation
-from machine-wide state. The sections
-mirror the specification. Item format and lifecycle: link:../ImplementationWatch.adoc[Implementation Watch].
+liveness, the runtime token and the offline verbs, drain, the relay rules, stall and idle-gap detection on active
+plans, and test isolation from machine-wide state. The sections mirror the specification. Item format and
+lifecycle: link:../ImplementationWatch.adoc[Implementation Watch].
 
 == Runtime
 
@@ -45,29 +45,35 @@ token gets `401`, re-reads the file exactly once, and succeeds, and a second `40
 Source:: design review.
 
 [#PM-WATCH-RUN-5]
-=== PM-WATCH-RUN-5: Without a runtime, the four runtime-free verbs start nothing and write nothing
+=== PM-WATCH-RUN-5: Without a runtime, the three runtime-free verbs start nothing and write nothing
 
 Anchor:: link:../specification/runtime-model/01-processes-and-transport.adoc#local-api[Runtime Model § Local API] (Availability),
 link:../specification/cli-and-security/01-cli-and-installer.adoc#cli-daemon-access[CLI & Security § Runtime Access & On-Demand Start],
 link:../Requirements.adoc#PM-ARCH-7[PM-ARCH-7]
-Hazard:: A status query, a session-start hook, a client status check, or a drain that silently brings up the runtime
-or writes a file breaks the single-writer rule and turns a read-only check into a state change the host drives.
-Guard:: With no runtime running, `pm-operator status`, `pm-mcp hook session-start`, `pm-operator client status`, and
-`pm-operator drain` each run against a `PM_MCP_BASE` whose tree is hashed before and after: no runtime process is started,
+Hazard:: A status query, a client status check, or a drain that silently brings up the runtime or writes a file
+breaks the single-writer rule and turns a read-only check into a state change.
+Guard:: With no runtime running, `pm-operator status`, `pm-operator client status`, and `pm-operator drain` each run
+against a `PM_MCP_BASE` whose tree is hashed before and after: no runtime process is started,
 no socket exists afterwards, and the tree is byte-identical (contents, names, and modes), and each verb opens only
 files of the closed read-only list of `pm-api`; matched control: any other verb of either binary starts the runtime on
 demand.
 Source:: design review.
 
 [#PM-WATCH-RUN-6]
-=== PM-WATCH-RUN-6: Drain releases build slots only
+=== PM-WATCH-RUN-6: Drain releases slots and task leases, never provider leases
 
 Anchor:: link:../specification/runtime-model/02-startup-recovery-drain.adoc#_drain_stop_upgrade[Runtime Model § Drain, Stop & Upgrade]
 Hazard:: A drain that releases merge-queue or review-bot leases lets another plan take a merge slot or a rate window
-while the drained plan's merge or review round is still in flight on the provider.
-Guard:: Drain with a running build, a held merge-queue lease, and a held review-bot lease: the build is settled
-`killed` and its slot released, both leases are still recorded after exit, and the next start adopts or releases them
-by the recovery evidence rules exactly as after a crash.
+while the drained plan's merge or review round is still in flight on the provider; a drain that leaves a worker's
+generation unfenced lets its late submit land after the restart, and one that counts its tasks as lost spends their
+re-offer budget on an operator action.
+Guard:: Drain with a running build, a busy writer worker, an idle warm worker, a held merge-queue lease, and a held
+review-bot lease: the waits of idle workers are answered `end`; after the drain timeout the build and the remaining
+worker are settled `killed`, the worker's generation is fenced and its job token revoked, its task lease released,
+and the build and model slots released; both provider leases are still recorded after exit, and the next start
+adopts or releases them by the recovery evidence rules exactly as after a crash; after the next start the released
+task is offered again exactly once without counting a re-offer, and a late call of the fenced generation is refused
+`generation_fenced`.
 Source:: design review.
 
 [#PM-WATCH-RUN-7]
@@ -83,16 +89,16 @@ authenticated round trip succeeds or the runtime start timeout expires.
 Source:: design review.
 
 [#PM-WATCH-RUN-8]
-=== PM-WATCH-RUN-8: An operator-mode question is listed as stalled, never timed out
+=== PM-WATCH-RUN-8: An operator-mode question is listed as waiting, never as stalled or timed out
 
 Anchor:: link:../specification/runtime-model/04-sessions-and-workers.adoc#stalled-plans[Runtime Model § Stalled Plans],
 link:../Requirements.adoc#PM-WF-12[PM-WF-12]
 Hazard:: A plan waiting on a question in mode `operator` (the only unbounded wait) is invisible, or is treated as a
 bounded wait and expires.
-Guard:: Aged fixture: a plan resting on a mode-`operator` question beyond the stalled threshold is reported
-`stalled` by `pm-operator status` and the event stream with the question named, produces one `plan_stalled` record per
-episode, and the question never expires; matched control: a mode-`auto` question with a running deadline is not
-listed.
+Guard:: Aged fixture: a plan resting on a mode-`operator` question beyond the stalled threshold is listed by
+`pm-operator status`, the web app, and the event stream as waiting for an answer with the question named, never as
+`stalled`, produces no `plan_stalled` record, and the question never expires; matched control: the same plan without
+an open question and without progress beyond the threshold is reported `stalled` with cause `no_progress`.
 Source:: design review.
 
 [#PM-WATCH-RUN-9]
@@ -112,7 +118,37 @@ enabled: after the exit no process listens on `web.port`, `web` in `machine-conf
 next start opens the listener again; matched control: with the port free the same start opens it.
 Source:: design review.
 
-== Logical Plan Sessions
+== Relay
+
+[#PM-WATCH-RUN-10]
+=== PM-WATCH-RUN-10: A host cancel of an answered request cancels nothing
+
+Anchor:: link:../specification/runtime-model/03-relay.adoc#relay-rules[Runtime Model § Relay Rules] (rule 4),
+link:../Requirements.adoc#PM-ARCH-3[PM-ARCH-3]
+Hazard:: OpenCode sends `notifications/cancelled` for every request it has already received an answer for;
+treated as the cancel of pending work, each such notification cancels the wait or the job that the answer started.
+Guard:: Relay and runtime fixtures: a cancellation whose `requestId` the relay has already answered is dropped and
+never forwarded; the runtime ignores a cancellation of a request it has answered; a cancellation of a pending
+`pm_wait` ends only that call without consuming or leasing a task; no cancellation ends a job; matched control: a
+cancellation of a pending `pm_build` wait ends that wait and leaves the build running.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).
+
+[#PM-WATCH-RUN-11]
+=== PM-WATCH-RUN-11: Identity arguments never appear in a tool schema
+
+Anchor:: link:../specification/runtime-model/03-relay.adoc#relay-rules[Runtime Model § Relay Rules] (rule 5),
+link:../Requirements.adoc#PM-ARCH-3[PM-ARCH-3]
+Hazard:: With the worker identity, generation, and role visible as tool arguments, the OpenCode model filled them
+with invented values and kept them in its compaction summary; after a compaction an interactive model passed an
+invented worker id remembered from another session.
+Guard:: A `tools/list` through the relay, for a session and a worker relay of every client, contains no property of
+the identity set (`generation_id`, `role`, `worker`, `job_token`) in any `inputSchema`; a `tools/call` carrying such an
+argument reaches the runtime without it; the runtime's own tool schemas declare none, and identity, role, and
+generation are taken only from the relay's headers; matched control: a call whose header identity differs from an
+invented argument is bound to the header identity.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).
+
+== Server-Driven Scopes
 
 [#PM-WATCH-RUN-2]
 === PM-WATCH-RUN-2: Stalls and idle gaps on an active plan are derived
@@ -121,11 +157,13 @@ Anchor:: link:../specification/runtime-model/04-sessions-and-workers.adoc#stalle
 link:../Requirements.adoc#PM-ARCH-7[PM-ARCH-7], link:../Requirements.adoc#PM-SEC-6[PM-SEC-6]
 Hazard:: A stalled plan left no record; an agent that announced continuation and then ended its turn halted the plan
 unnoticed.
-Guard:: `pm-operator status`, the web app, and the epic view derive `stalled` for non-terminal scopes without pending
-condition or awaited event whose last transition or model call is older than the compiled stalled threshold (600 s),
-and the runtime records one `plan_stalled` audit record per episode with the idle span; metrics derive idle gaps
-between consecutive calls on a plan that is neither blocked nor waiting, from the audit log; nothing of it reaches a
-model-facing representation; test with an aged fixture and a blocked control that is not reported.
+Guard:: `pm-operator status`, the web app, and the epic view derive `stalled` (cause `no_progress`) for non-terminal
+scopes without pending condition or awaited event (no running job, no task queued or leased within its budget, no
+open external wait, waiver wait, or question record) whose last transition or task progress is older than the
+compiled stalled threshold, and the runtime records one `plan_stalled` audit record per episode with the idle span;
+a role the supervisor cannot serve stalls nothing, because its tasks close `role_unavailable`; metrics derive idle
+gaps from the audit log; nothing of it reaches a model-facing representation; test with an aged fixture, a blocked
+control, and a control with a leased task, neither of which is reported.
 Fixture:: a 17-min gap 13:45:20 → 14:02:28; 12h54m idle vs 2h8m worked; a deferred stall nothing recorded
 (D-087-g).
 Source:: plan-marshall defect post-run-quality PLAN-PRQ-04 D0; truthful-signals (quality-aspect) PLAN-217 D3.
