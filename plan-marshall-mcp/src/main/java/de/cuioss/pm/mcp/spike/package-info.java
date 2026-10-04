@@ -9,9 +9,8 @@
  * repository or at https://github.com/cuioss/plan-marshall-mcp/blob/main/LICENSE.md
  */
 /**
- * Throwaway stub for the pull-mechanism verifications V1 to V10 of roadmap Milestone 0, Part A
- * ({@code doc/concepts/harness-as-worker/analysis.adoc}) and the evaluation that follows
- * ({@code doc/concepts/harness-as-worker/evaluation.adoc}): a blocking wait tool, scripted tasks and an event log.
+ * Throwaway stub for the harness-as-worker measurements V1 to V10 and E1 to E13 of roadmap Milestone 0, Part A
+ * ({@code doc/specification/evaluation.adoc}): a blocking wait tool, scripted tasks and an event log.
  * <p>
  * The tools are registered only when {@code pm.spike.scenario} is configured. The package is removed when
  * Milestone 1 creates the target module structure.
