@@ -126,7 +126,7 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |`auto`
 |`setup.configure-finalize`; `setup.merge-queue` (every resolution).
 |Re-entrant: reads the answer of a resolved merge-queue record first (`skip` ends the probe), otherwise the derived network fact `merge_queue_enforced` (with the queue's check-response timeout) for the base branch; raises the question record when the queue is not enforced and the project is eligible.
-|`not_needed` (enforced, or not eligible) -> `setup.probe-enrichment`; `skipped` (answer `skip`, also on expiry) -> `setup.probe-enrichment`; `needs_answer` (no answer yet, or `recheck` and still not enforced) -> `setup.merge-queue`.
+|`not_needed` (enforced, or not eligible) -> `setup.probe-qualification`; `skipped` (answer `skip`, also on expiry) -> `setup.probe-qualification`; `needs_answer` (no answer yet, or `recheck` and still not enforced) -> `setup.merge-queue`.
 |link:../domain-extensions/04-setup-state-machine.adoc#setup-merge-queue[Domain Extensions Specification, Merge-Queue Probe]
 
 |[[state-setup.merge-queue]]`setup.merge-queue`
@@ -148,9 +148,9 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |[[state-setup.needs-repair]]`setup.needs-repair`
 |`workspace`
 |`link`
-|`setup.check-operator-files` (`malformed`, `role_undefined`), `setup.reconcile-config` (`invalid`, `format_refused`), `setup.verify-credentials` (a missing credential or failing check), `setup.discover-modules` (every fate but `succeeded`).
+|`setup.check-operator-files` (`malformed`, `role_undefined`), `setup.reconcile-config` (`invalid`, `format_refused`), `setup.verify-credentials` (a missing credential or failing check), `setup.discover-modules` (every fate but `succeeded`), `setup.qualify-roles` (`cancelled`), `setup.enrich-architecture` (`unenriched`, `lost`).
 |`facts`: the failed state, the file, the finding, and for an operator repair the command (`pm-operator config --project <project_id>`, `pm-operator credentials`). `retry` (rel `next`); `rewrite_config:<file>` (rel `fix`), offered for a team JSON file refused by format: writes the server-rendered rewrite at the current format (valid keys carried over, dropped keys named, shown as a diff). The operator file is never rewritten by a link.
-|`retry` returns the failed state as its outcome: `retry_operator_files` -> `setup.check-operator-files`, `retry_reconcile` -> `setup.reconcile-config`, `retry_credentials` -> `setup.verify-credentials`, `retry_discovery` -> `setup.discover-modules`; `rewrite_config` -> `setup.reconcile-config`.
+|`retry` returns the failed state as its outcome: `retry_operator_files` -> `setup.check-operator-files`, `retry_reconcile` -> `setup.reconcile-config`, `retry_credentials` -> `setup.verify-credentials`, `retry_discovery` -> `setup.discover-modules`, `retry_qualification` -> `setup.probe-qualification`, `retry_enrichment` -> `setup.probe-enrichment`; `rewrite_config` -> `setup.reconcile-config`.
 |link:../domain-extensions/04-setup-state-machine.adoc#setup-needs-repair[Domain Extensions Specification, Setup Repair]
 
 |[[state-setup.probe-build-map]]`setup.probe-build-map`
@@ -174,7 +174,7 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |`auto`
 |`setup.probe-build-map` (`in_sync`), `setup.reseed-build-map`, `setup.seed-build-map` (`reconcile`).
 |Finds the project workflow units whose `derived_from` default revision is older than the binary's default revision.
-|`current` -> `setup.probe-enrichment`; `changed` -> `setup.offer-new-steps`.
+|`current` -> `setup.probe-qualification`; `changed` -> `setup.offer-new-steps`.
 |link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Configuration Validation & Upgrades Before 1.0]
 
 |[[state-setup.offer-new-steps]]`setup.offer-new-steps`
@@ -182,13 +182,29 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |`awaiting_user`
 |`setup.probe-new-steps` (`changed`).
 |One question record per changed unit, carrying the three-way diff (hunks between the two default revisions, applied to the project unit): `adopt` applies the hunks and advances `derived_from`, `decline` advances `derived_from` only; on expiry nothing changes, so the offer repeats on the next reconcile run. A declined change is never re-offered, and a step the team removed is never restored.
-|Every question closed -> `setup.probe-enrichment`.
+|Every question closed -> `setup.probe-qualification`.
 |link:../domain-extensions/06-configuration.adoc#config-upgrades[Domain Extensions Specification, Configuration Validation & Upgrades Before 1.0 (Upgrade Path)]
+
+|[[state-setup.probe-qualification]]`setup.probe-qualification`
+|`workspace`
+|`auto`
+|`setup.probe-merge-queue` (`not_needed`, `skipped`) (first run); `setup.probe-new-steps` (`current`), `setup.offer-new-steps` (reconcile run); `setup.needs-repair` (`retry`).
+|Computes the roles to grade: every role of the effective set without a valid qualification record for its configuration on the enrolled harness major.minor (on the first run every role, since shipped records are bound to the release's harness versions), minus `qualification.skip_roles` of `local-config.json`; enqueues their grading (`enqueuesJob()`).
+|`current` (nothing to grade) -> `setup.probe-enrichment`; `grade` -> `setup.qualify-roles`.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-qualification[Domain Extensions Specification, Role Qualification at Install]
+
+|[[state-setup.qualify-roles]]`setup.qualify-roles`
+|`workspace`
+|`composite_job`
+|`setup.probe-qualification` (`grade`).
+|Runs the grading of `pm-operator roles qualify` for each listed role in turn (link:../model-work/01-roles-and-configuration.adoc#grading[Model Work Specification, Grading]); its worker and judge jobs run through the model slots and are recorded in the workspace metrics. `facts`: each role with its item count and grading state. A role not yet graded takes the conservative fallback wherever its tasks arise.
+|`graded` (every listed role graded, qualified or not) -> `setup.probe-enrichment`; `incomplete` (a role's grading could not finish: its start-failure guard holds, or its items stayed lost) -> `setup.probe-enrichment`; `cancelled` -> `setup.needs-repair`.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-qualification[Domain Extensions Specification, Role Qualification at Install]
 
 |[[state-setup.probe-enrichment]]`setup.probe-enrichment`
 |`workspace`
 |`auto`
-|`setup.probe-merge-queue` (`not_needed`, `skipped`) (first run); `setup.probe-new-steps` (`current`), `setup.offer-new-steps` (reconcile run).
+|`setup.probe-qualification` (`current`), `setup.qualify-roles` (`graded`, `incomplete`).
 |Computes the modules to enrich (first run: every module without a `responsibility`; reconcile run: the modules in `changed[]` of `pm://architecture/drift`, never one in `indeterminate[]`).
 |`nothing_to_enrich` -> `setup.commit-changes`; `enrich` -> `setup.enrich-architecture`.
 |link:../domain-extensions/04-setup-state-machine.adoc#setup-probe-states[Domain Extensions Specification, Probe States]
@@ -198,13 +214,13 @@ Declared in `project-setup.pmwf` (`scope workspace`), hosted by the project's wo
 |`job`
 |`setup.probe-enrichment` (`enrich`).
 |`job llm enrich-module role enrich each setup.enrichment-modules`: a fan-out over the server-computed list of the modules to enrich (link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States]), one task per module, served within the role's count and the model slots, each with its own entity `enrich-<module_id>` submitting `submit:enrich-<module_id>` (`responsibility`, `purpose`, `key_packages`, reasoning fields). The state completes when every entity has its submission: the return evaluation reports `all_enriched` once every module of the set has a `responsibility`.
-|`all_enriched` -> `setup.commit-changes`; `unenriched` (a module's task ended `infeasible` or closed `lost` after its re-offers: the module stays without `responsibility` and is named in `facts`) -> `setup.commit-changes`; `lost` (the role undefined, unqualified, or without a startable worker) -> `setup.commit-changes` (every module named unenriched). The re-offers cover only the unfinished modules (xref:01-conventions-generic-conditions.adoc#condition-job_incomplete[Condition job incomplete]).
+|`all_enriched` -> `setup.commit-changes`; `unenriched` (a module's task ended `infeasible` or closed `lost` after its re-offers; the modules are named in `facts`) -> `setup.needs-repair`; `lost` (the role undefined, unqualified, or without a startable worker) -> `setup.needs-repair` (every module named unenriched): setup completes only with every discovered module enriched (`PM-EXT-3`). The re-offers cover only the unfinished modules (xref:01-conventions-generic-conditions.adoc#condition-job_incomplete[Condition job incomplete]).
 |link:../domain-extensions/04-setup-state-machine.adoc#_architecture_enrichment_judgment_links_project_setup_state_machine[Domain Extensions Specification, Enrichment Parameters]
 
 |[[state-setup.commit-changes]]`setup.commit-changes`
 |`workspace`
 |`link`
-|`setup.probe-enrichment` (`nothing_to_enrich`), `setup.enrich-architecture` (`all_enriched`, `unenriched`); `setup.land-changes` (`stepped_out`).
+|`setup.probe-enrichment` (`nothing_to_enrich`), `setup.enrich-architecture` (`all_enriched`); `setup.land-changes` (`stepped_out`).
 |`land` (rel `next`, `noop`), `leave` (rel `alt`, `noop`): whether to land the setup changes. `facts`: the changed paths of the setup staging set. After a stepped-out `setup.land-changes` the configuration stays dirty and this state is its resolution: `start.setup-required` names it, and `land` commits again.
 |`land` -> `setup.land-changes`; `leave` -> `setup.completed` (the changes stay uncommitted in the primary checkout).
 |link:../domain-extensions/04-setup-state-machine.adoc#_steward_wizard_step_mapping[Domain Extensions Specification, Step 16]

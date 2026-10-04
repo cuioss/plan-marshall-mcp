@@ -12,7 +12,7 @@ link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Wo
 == Task Protocol
 _See Requirements link:../../Requirements.adoc#PM-WORK-2[PM-WORK-2: Task Protocol], link:../../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_state, pm_do)], link:../../Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
 
-A worker gets its work as tasks through one protocol: it waits, is offered a task, acknowledges it, executes it along the task's links, and submits a result. Every transition is server logic; the model only follows the links it is offered. Headless workers (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]) and an interactive session that takes a task (<<session-worker>>) follow the same protocol.
+A worker gets its work as tasks through one protocol: it waits, is offered a task, acknowledges it, executes it along the task's links, and submits a result. Every transition is server logic; the model only follows the links it is offered. Headless workers (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]) and an interactive session that takes a task (<<session-worker>>) follow the same protocol. A `zero_tool` worker (the screener) has no MCP connection and takes no part in it: its task is leased to it at spawn and closed from its exit (xref:07-untrusted-text-screening.adoc#screener[Screener]; xref:03-supervision-and-recycling.adoc#detection[Detection]).
 
 image::../../resources/harness-as-worker-task-exchange.svg[One task from offer to submit between workflow engine, task queue, and worker, including the wait-again answer and the acknowledgement, align=center]
 
@@ -59,7 +59,7 @@ A `pm_wait` of a generation that holds an unacknowledged offer shows that the of
 [#execute-submit]
 === Execute & Submit
 
-The worker executes the task only along the links of the task's entity representation (`pm_state` and `pm_do` on its entity, and the tools of its role). Every call is a heartbeat; an open call (a held `pm_build` included) is never silence. The worker delivers its result only through a submit link of the entity. Every call on a task entity is checked, in this order:
+The worker executes the task only along the links of the task's entity representation (`pm_state` and `pm_do` on its entity, and the tools of its role). It addresses the task by the scope and the `entity` its offer names: the scope entity the task works on (for example `envelope-3`), for a consultation task its `consultation_id`; the `queue_task_id` identifies the delivery and is no argument of its own (link:../identifiers/01-general-rules-and-registry.adoc#id-entity-id[Identifier Registry, `entity`]). Every call is a heartbeat; an open call (a held `pm_build` included) is never silence. The worker delivers its result only through a submit link of the entity. Every call on a task entity is checked, in this order:
 
 . *Generation*: a call of a fenced generation is refused `generation_fenced` (<<fencing>>).
 . *Lease*: a call on an entity not leased to the caller's generation is refused `job_scope_mismatch`; a call after the worker's job ended is refused `job_ended`.
@@ -68,7 +68,7 @@ The worker executes the task only along the links of the task's entity represent
 
 The error codes are defined in the link:../mcp-tools/04-errors-and-testing.adoc[MCP Tools Specification, Errors]. The first valid submit of the required submission closes the attempt in the transaction that validated it and releases the lease; every later submit of the task is refused because its link is not offered after the close. The task is done exactly once.
 
-A warm worker whose `pm_wait` arrives while it holds an acknowledged task that is not consulting has ended its turn without the required submission: the attempt ends, and the task is offered to it again as a new attempt within the re-offer budget (<<re-offer>>).
+A worker whose `pm_wait` arrives while it holds an acknowledged task that is not consulting has ended its turn without the required submission: the attempt ends, and the task is offered to the same generation again as a new attempt within the re-offer budget (<<re-offer>>). This holds for a warm and a fresh worker alike: a fresh worker receives its own task again, never another one, and is answered `end` only after its task closed; when the budget is spent the task closes `lost` and the next `pm_wait` is answered `end`.
 
 [#task-outcomes]
 === Closed Task Outcomes
@@ -90,7 +90,7 @@ A task ends only in one of four closed outcomes, recorded on the queue task with
 |The worker reported the task infeasible through the entity's infeasible link, with its evidence; the creating state takes its infeasible route.
 
 |`lost`
-|The worker was ended while holding the task, or no attempt delivered a result: the re-offers are spent (reason `attempts_spent`), or the task closed without an attempt (reason `role_undefined`, `role_unqualified`, or `role_unavailable`, xref:01-roles-and-configuration.adoc#model-caller[The Model Caller]), or the task was withdrawn because its state or scope ended while it was open (reason `withdrawn`). The creating state takes its conservative fallback (xref:01-roles-and-configuration.adoc#conservative-fallback[Conservative Fallback]).
+|The worker was ended while holding the task, or no attempt delivered a result: the re-offers are spent (reason `attempts_spent`), or the task closed without an attempt (reason `role_undefined`, `role_unqualified`, or `role_unavailable`, xref:01-roles-and-configuration.adoc#model-caller[The Model Caller]), or the task was withdrawn because its state or scope ended while it was open (reason `withdrawn`). The creating state takes its conservative fallback (xref:01-roles-and-configuration.adoc#conservative-fallback[Conservative Fallback]). In a fan-out state (`each`) a task that closes `lost` with `attempts_spent` only marks its entity as missing for the state's return evaluation; the state settles `lost` only for a cause of the role (`role_undefined`, `role_unqualified`, `role_unavailable`), which applies to every task of the state (link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States], item 6).
 |===
 
 A worker never ends or hands back a plan, and no link of a task entity ends a scope; `step_out` exists only in the sub-workflows the entry session drives (link:../hypermedia-format/01-representation-and-link-forms.adoc[Hypermedia Format Specification]). The model state evaluates the outcome together with the persisted entity records (xref:09-completion-usage-and-spend.adoc#job-completion[Task Completion & Return Evaluation]).
@@ -99,7 +99,7 @@ A worker never ends or hands back a plan, and no link of a task entity ends a sc
 === Re-Offer within the Self-Remedy Budget
 _Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-32[PM-WATCH-DISP-32]_
 
-An attempt that ends without a result (its worker lost while holding the task, a fresh worker that exited without the required submission, a warm worker that waited again while holding it) makes the server offer the task again, as a new attempt, within the compiled self-remedy budget of the state (link:../timeouts/01-job-budgets-and-waits.adoc#task-reoffer-budget[Timeouts & Budgets Specification, Task Re-Offer Budget]). The server re-offers on its own and records the re-offers as the `job_incomplete` condition of the state, whose compiled budget they spend (xref:09-completion-usage-and-spend.adoc#job-completion[Task Completion & the `job_incomplete` Condition]); no model follows a link for it. When the budget is spent, the task closes `lost` with `attempts_spent`. An attempt ended by a runtime restart, a drain, a start failure of a fresh worker (xref:03-supervision-and-recycling.adoc#start-failure-guard[Start-Failure Guard]), or the withdrawal of an unacknowledged session offer (<<session-worker>>) does not count against the budget. The queue task records the number of attempts and the generation and end of every attempt.
+An attempt that ends without a result (its worker lost while holding the task, a fresh worker that exited without the required submission, a worker that waited again while holding it) makes the server offer the task again, as a new attempt, within the compiled self-remedy budget of the state (link:../timeouts/01-job-budgets-and-waits.adoc#task-reoffer-budget[Timeouts & Budgets Specification, Task Re-Offer Budget]). The server re-offers on its own and records the re-offers as the `job_incomplete` condition of the state, whose compiled budget they spend (xref:09-completion-usage-and-spend.adoc#job-completion[Task Completion & the `job_incomplete` Condition]); no model follows a link for it. When the budget is spent, the task closes `lost` with `attempts_spent`. An attempt ended by a runtime restart, a drain, a start failure of a fresh worker (xref:03-supervision-and-recycling.adoc#start-failure-guard[Start-Failure Guard]), or the withdrawal of an unacknowledged session offer (<<session-worker>>) does not count against the budget. The queue task records the number of attempts and the generation and end of every attempt.
 
 [#leases-fencing]
 == Leases, Generations & Fencing
@@ -193,7 +193,7 @@ _Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-
 
 The entry session of a scope may take tasks of that scope while it is attentive; a plan never waits on it. A task is offered to the session first only when all of these hold:
 
-* the task's role sets `session_first` and its class is `read_only` or `zero_tool` (a session never takes a `writer` task, because it runs outside the job confinement);
+* the task's role sets `session_first`, which only a `read_only` role may (xref:01-roles-and-configuration.adoc#role-validation[Validation]; a session never takes a `writer` task, because it runs outside the job confinement, and never a `zero_tool` task, which has no protocol);
 * the session's host has `worker.session_tasks` set in its client profile (link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Worker Block]);
 * the session entered the task's scope and holds a pending `pm_wait`.
 

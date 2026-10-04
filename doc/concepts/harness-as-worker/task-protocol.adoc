@@ -7,7 +7,7 @@ xref:../../Concepts.adoc[Concepts] » xref:README.adoc[Harness as Worker] » Tas
 
 xref:README.adoc[Overview] · xref:journey.adoc[Journey] · xref:architecture.adoc[Architecture] · *Task Protocol* · xref:roles.adoc[Roles] · xref:skills.adoc[Skills]
 
-The exchange between the server and a worker. Every worker follows it, whether the server started it or it is the interactive session that started the plan. The protocol is a reusable sub-workflow of the workflow DSL: every transition is server logic, and the model only follows the links it is offered. The states, parameters, and rules are specified in link:../../specification/model-work.adoc[Model Work]; the values per host in link:../../specification/client-profiles.adoc[Client Profiles].
+The exchange between the server and a worker. Every worker follows it, whether the server started it or it is the interactive session that started the plan. The one exception is the screener of untrusted text: it has no tools and no connection to the server, so its task ends with its process, by a valid verdict or without one (xref:roles.adoc#untrusted-content[Roles, Untrusted content]). The protocol is a reusable sub-workflow of the workflow DSL: every transition is server logic, and the model only follows the links it is offered. The states, parameters, and rules are specified in link:../../specification/model-work.adoc[Model Work]; the values per host in link:../../specification/client-profiles.adoc[Client Profiles].
 
 == Steps
 
@@ -29,15 +29,13 @@ A worker is _waiting_ while it holds a wait call, _offered_ once a task is lease
 [#supervision]
 == Supervision
 
-Neither the transport nor the model reports that a worker is lost or about to give up. The server therefore watches each worker itself and ends it on any of these signals:
+Neither the transport nor the model reports that a worker is lost or about to give up. The server therefore watches each worker itself and tells two cases apart.
 
-* *Process exit*: the harness process ends without the server's instruction.
-* *Silence*: no open wait call and no other call for longer than the bounded wait plus a grace.
-* *Missing acknowledgement*: no acknowledgement within the host's deadline after an offer.
-* *Idle period*: a few wake-ups without a task; a long-idle worker tends to give up, and every wake-up costs.
-* *Token budget*: the context, read from the per-turn usage, approaches the role's budget; a warm loop breaks as its context grows.
+A worker is *lost* when it stops doing its part: its process exits without the server's instruction, it does not acknowledge an offer in time, or it falls silent, with no open wait call and no other call for longer than its host allows. The server ends it, and its task goes to a successor.
 
-Ending a worker is `SIGTERM`, then `SIGKILL`, then the fence. A worker that exits before its first call has not been lost but failed to start; after a few such starts the server stops replacing it and tells the operator.
+A warm worker is *recycled* before it fails: after a run of wake-ups without a task, because a long-idle worker tends to give up and every wake-up costs, or when its context approaches the role's token budget, because a warm loop breaks as its context grows. A recycle is no loss: the server answers the worker's next wait with "end", never in the middle of a task.
+
+A worker that exits before its first call has not been lost but failed to start, typically because its harness cannot start at all. Replacing it would start workers without end, so after a few such starts the server starts no more workers of that role on that harness, tells the operator, and lets the role's tasks take their fallback (<<task-end>>). The detection rules are specified in link:../../specification/model-work/03-supervision-and-recycling.adoc[Model Work Specification, Supervision & Recycling].
 
 == Fencing and leases
 
@@ -48,10 +46,17 @@ image::../../resources/harness-as-worker-worker-replacement.svg[A stalled worker
 * When the server replaces a worker, it releases the lease at once and offers the task to the successor exactly once.
 * The successor starts with an empty context. Nothing is handed over, because every task carries what its state needs.
 
+[#task-end]
+== How a task ends
+
+A task ends in one of four outcomes. It is _submitted_ when the worker delivered its result through the offered link. It is _asked_ when the worker needs an answer it cannot find: the question becomes a record the server serves, and the work continues in a new task with the answer in its facts. It is _infeasible_ when the worker shows with evidence that the task cannot be done as given, which the creating state answers by its infeasible route. It is _lost_ when no worker delivers.
+
+A lost attempt is not yet a lost task: the server offers the task again, to a successor, within a small budget of re-offers. Only when that budget is spent, or when no qualified worker of the role can be started at all, does the task end lost, and the state that created it takes its declared conservative fallback. No outcome asks the operator mid-plan.
+
 [#consultation]
 == Consultation
 
-A worker that needs another model's judgment asks through the server, never directly, and only where the workflow provides for it: a state declares the consultations it offers by role name (for example `consult role triage`), and the server looks up that role's configuration like any other.
+A worker that needs another model's judgment asks through the server, never directly, and only where the workflow provides for it: a state declares the consultations it offers by role name (for example `consult role triage-review`), and the server looks up that role's configuration like any other.
 
 . While executing, the worker follows one of the consultation links its state offers and submits the question.
 . The server creates a task for the named role and runs it like any other task.
@@ -64,4 +69,4 @@ The flow is deterministic and stays within the single-level leaf constraint: a w
 
 == The interactive session as a worker
 
-The session that started a plan may take a task when it is attentive, beside a headless worker that takes the task when the session does not acknowledge in time. The plan never waits on the session. Each start of a session gives it a new generation, which fences an earlier loop of the same session that may still be running.
+The session that started a plan may take a task when it is attentive, beside a headless worker that takes the task when the session does not acknowledge in time. It takes only tasks that change nothing, of a `read_only` role whose configuration offers its tasks to a session first, and only on a host whose session can take tasks at all; a writer's task never goes to a session, because the session runs outside the confinement. The plan never waits on the session. Each start of a session gives it a new generation, which fences an earlier loop of the same session that may still be running.
