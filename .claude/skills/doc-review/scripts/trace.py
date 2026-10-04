@@ -257,5 +257,5 @@ print('WATCH ITEMS NOT REFERENCED FROM REQ/SPEC', sorted(allwatch - refd_outside
 # referenced reqs undefined
 allreqrefs = set()
 for p, txt in files.items():
-    allreqrefs |= set(re.findall(r'\bPM-(?:ARCH|WF|SKILL|TOOL|SVC|EXEC|CRED|SEC|TECH|DIST|MIG|TEST|CLIENT|IMPL|EXT)-\d+\b', txt))
+    allreqrefs |= set(re.findall(r'\bPM-(?:ARCH|WF|SKILL|TOOL|SVC|EXEC|CRED|SEC|TECH|DIST|MIG|TEST|CLIENT|IMPL|EXT|WORK)-\d+\b', txt))
 print('UNDEFINED REQ IDS REFERENCED', sorted(allreqrefs - set(reqs)))

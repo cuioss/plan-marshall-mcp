@@ -1,0 +1,83 @@
+== Model Work: Roles, Tasks & Workers (PM-WORK)
+
+[#PM-WORK-1]
+=== PM-WORK-1: Roles as Configuration
+
+Every piece of model work is done by a worker of a role, and a role is a configuration artifact, never code: the server knows no fixed role, and one abstract model caller acts on whatever the artifact says.
+
+* The system must define every role by exactly one artifact (a JSON document with a closed schema and `format_version`) holding its description, its class (`writer`, `read_only`, or `zero_tool`) and its exact tool set (PM-MCP tools and harness tools by exact name), the harness, model, and effort it runs on, its form (`warm`: a supervised worker that takes task after task; `fresh`: one worker per task), how many of its workers run at once, its skills (the role skill being its contract, `PM-SKILL-4`), the roles it may consult (`PM-WORK-4`), its recycling rules (idle wake-ups, token budget, tasks per generation, `PM-WORK-3`), and whether its tasks may be offered to an interactive session first (`PM-WORK-5`).
+* The roles that exist must be exactly the artifacts present in the effective role set: the shipped default set compiled into the release, overridden by the operator's machine set (`<PM_MCP_BASE>/roles/`) and the operator's per-project set (`<PM_MCP_BASE>/projects/<project_id>/roles/`), each artifact replacing the artifact of the same name in a lower set as a whole. Role artifacts are operator files (`PM-EXT-6`): the system must never read a role, a harness, or a model pin from git-tracked configuration.
+* The system must let workflow units name roles freely by name (the role-name grammar of the identifier registry) and must refuse to compose a plan instance or an epic workflow that names a role the effective set does not define, with `role_undefined` naming the role and the state, at composition, never when the state is reached (`PM-IMPL-5`).
+* The system must validate every artifact on load against its schema and against the client profile of its harness (`PM-CLIENT-2`): a harness that is not eligible as a worker host, lacks a capability the role's class needs, or does not accept a restricted tool set with the named model makes the artifact invalid, reported to the operator with the reason; an invalid artifact counts as undefined.
+* The system must run every model step of a workflow through a single model caller that reads the artifact of the role the state names and acts on it (a task for a warm worker of the role, or a fresh worker for the task), so that changing, adding, or moving a role to another harness is an edit of the role set and never a code change.
+* The shipped default set must define every role the default workflow units name, run every role `fresh` except where a qualification record shows the warm form within its allowed gap (`PM-WORK-6`), and ship with the qualification records of its configurations.
+
+See the link:specification/dispatch-and-effort.adoc[Model Jobs & Effort Specification] for implementation details. The measurements behind its values are recorded in the link:specification/evaluation.adoc[Evaluation Reference].
+
+[#PM-WORK-2]
+=== PM-WORK-2: Task Protocol
+
+A worker gets its work as tasks through one protocol: it waits, is offered a task, acknowledges it, executes it along the task's links, and submits a result. Every transition of the protocol is server logic; the model only follows the links it is offered.
+
+* The system must turn every model step into a persisted task of the role the state names, queued per project and role, and must serve it to a worker of that role through the task protocol, a reusable sub-workflow of the workflow DSL compiled into the binary (`PM-IMPL-5`).
+* A worker must receive tasks only as the answer to its pending wait call (`pm_wait`, `PM-TOOL-1`), which the server holds for at most the bounded wait of the worker's host with progress frames where the host needs them (`PM-IMPL-4`), and answers with a task, with "wait again", or with "end".
+* An offer must lease the task to the worker's current generation and carry the skills the task requires that this generation has not yet received (`PM-SKILL-4`); a leased task must never be offered to a second concurrent wait of the same generation.
+* The worker must acknowledge an offered task within the acknowledgement deadline of its host (`PM-CLIENT-2`), where a host's profile marks the acknowledgement informational, silence alone decides (`PM-WORK-3`).
+* The worker must execute the task only along the links of the task's entity representation, and must deliver its result only through a submit link of that entity; the server must validate every submit against the link's closed schema (a submit that misses a required reference is refused with a reason the worker can act on), against the lease, and against the generation, and must refuse every call of a fenced generation with `generation_fenced`.
+* A task must end only in one of its closed outcomes, recorded on the task: `submitted`, `asked` (a question record, `PM-WF-12`), `infeasible` (with its evidence), or `lost` (the worker was ended while holding it); a worker never ends or hands back a plan.
+* When a worker is replaced, the server must release its lease at once and offer the task to the successor exactly once; the successor starts with an empty context, and nothing is handed over, because every task carries what its state needs.
+* A task that ends without its required submission must be offered again within the compiled self-remedy budget of its state, after which the state takes its conservative fallback (`PM-WORK-6`); the task count, the attempts, and the generation of every attempt are recorded.
+
+See the link:specification/dispatch-and-effort.adoc[Model Jobs & Effort Specification] and the link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details. The measurements behind its values are recorded in the link:specification/evaluation.adoc[Evaluation Reference].
+
+[#PM-WORK-3]
+=== PM-WORK-3: Supervision & Recycling
+
+Neither the transport nor the model reports that a worker is lost or about to give up; the server must detect it itself, end the worker, and replace it, and must recycle workers before they give up or their context grows too large.
+
+* The system must run a supervisor per project and role that keeps a worker available for every queued task within the role's count and the machine's model slots (`PM-WF-14`), starting fresh workers per task and warm workers while the role has work.
+* The supervisor must end a worker on any of these signals: its process exits without the server's instruction; no acknowledgement within its host's deadline after an offer (where the acknowledgement is not informational); silence, no open wait call and no other call for longer than the bounded wait plus the host's silence grace.
+* The supervisor must recycle a warm worker after the idle wake-ups of its role without a task and when its context, taken from the harness's per-turn usage, reaches the token budget of its role; a generation serves at least one task before the budget can recycle it.
+* Ending a worker must be `SIGTERM`, then `SIGKILL` after the termination grace, then the fence: its job token is revoked, its generation fenced, and its lease released at once (`PM-WORK-2`); a successor is started when work remains. A terminated worker's usage is recorded as `unmeasured`.
+* The supervisor must treat a worker that exits before its first call as a start failure, not as a lost worker; after a compiled number of consecutive start failures of a role on a harness it must stop starting workers there, report the harness's own error text (for example an account usage limit) to the operator in `pm-operator status`, the web app, and the audit log, and let the role's waiting tasks take their conservative fallback (`PM-WORK-6`).
+* The per-host values (bounded wait, progress, acknowledgement deadline and whether it is informational, silence grace, idle wake-ups) must come from the client profile of the worker's harness (`PM-CLIENT-2`); the token budget and the recycling rules from the role's artifact.
+
+See the link:specification/dispatch-and-effort.adoc[Model Jobs & Effort Specification], the link:specification/job-runtime.adoc[Job Runtime Specification], and the link:specification/client-profiles.adoc[Client Profiles Specification] for implementation details. The measurements behind its values are recorded in the link:specification/evaluation.adoc[Evaluation Reference].
+
+[#PM-WORK-4]
+=== PM-WORK-4: Consultation through the Server
+
+A worker that needs another model's judgment must ask through the server, so that the flow stays deterministic, accounted, and within the single-level leaf constraint.
+
+* The system must offer a worker a consultation link only for the roles its role artifact names as consultable; following it submits a question and moves the asking task to the state `consulting`.
+* The server must run a consultation as a task of the consulted role like any other task, and must deliver the answer as the answer to the asker's next wait, exactly once and only to the asking generation; a consultation of a fenced asker is answered to the successor's task facts instead.
+* The asker must wait within its bounded wait with progress frames where its host needs them; its final submit must refer to the consultation, and a submit that omits the reference is refused.
+* A consulted task must offer no consultation link of its own (consultation depth one), and no worker may start a model itself (`PM-WF-5`).
+* The usage of a consultation must be accounted to the consulted role's task and linked to the asking task.
+
+See the link:specification/dispatch-and-effort.adoc[Model Jobs & Effort Specification] for implementation details. The measurements behind its values are recorded in the link:specification/evaluation.adoc[Evaluation Reference].
+
+[#PM-WORK-5]
+=== PM-WORK-5: Interactive Session as Optional Worker
+
+The interactive session that entered a scope may take tasks while it is attentive, but a plan must never wait on it.
+
+* The system must offer a task to an interactive session first only when the task's role permits it, the role's class is `read_only` or `zero_tool` (a session never takes a writer task, because it runs outside the job confinement), the session's host is marked eligible for session tasks in its client profile, and the session holds a wait call; otherwise, and when the session does not acknowledge within its host's deadline, the task goes to a headless worker of the role.
+* The system must give every start of an interactive session (each `pm-mcp enter`, and each new host session the relay reports) a new generation that fences every earlier generation of the same session identity at once, so that an earlier loop still running in the host is refused (`generation_fenced`).
+* The system must treat a session as gone for task offers after its host reports a clear or a compaction, until it calls `pm_wait` again; the relay passes on such host markers where the host provides them (`PM-SEC-4`), and the shim covers a clear the host does not report (`PM-SKILL-4`).
+* A session must take tasks through the same protocol, links, validation, and fencing as a headless worker (`PM-WORK-2`); its tasks carry the session's identity, and its usage is recorded as `unmeasured` unless its host reports usage per turn.
+
+See the link:specification/dispatch-and-effort.adoc[Model Jobs & Effort Specification] and the link:specification/runtime-model.adoc[Runtime & Interaction Model Specification] for implementation details. The measurements behind its values are recorded in the link:specification/evaluation.adoc[Evaluation Reference].
+
+[#PM-WORK-6]
+=== PM-WORK-6: Role Qualification
+
+A role must run only on a configuration whose judgment has been shown to meet the operator's level; until one does, its tasks take a conservative server fallback, never a question to the operator.
+
+* The system must run a role only on a configuration (harness, model, effort, form, skill digests) that has a valid qualification record: the role's topics of the model verification corpus answered at or above the operator's agreement level, and, for the warm form, within the operator's allowed gap to the fresh form of the same configuration.
+* The operator must be able to grade a role's configuration through the operator CLI (`pm-operator roles qualify <role>`), which runs the role's corpus topics as model jobs of that configuration, warm and fresh, and records per item the answer, the agreement level, the warm-fresh gap, the cost, and the time; the record is bound to the configuration's digest and the corpus revision.
+* The system must invalidate a qualification record when the model, effort, a skill digest, the corpus revision, or the harness version of its configuration changes, and report the role as unqualified to the operator until it is graded again.
+* While a role is unqualified, the system must route its tasks to the conservative fallback of their state: the server takes the state's single `retry` once where the state offers one, and otherwise, or after it, the remediation policy's `exhausted` outcome or the state's declared fallback; the task is recorded with the reason `role_unqualified`, and no task is routed to the operator.
+* The release must ship the model verification corpus and the qualification records of its default role set (`PM-WORK-1`), and the build must validate every corpus item against its schema.
+
+See the link:specification/dispatch-and-effort.adoc[Model Jobs & Effort Specification], the link:specification/evaluation.adoc[Evaluation Reference] (role grading method and measured results), and the link:specification/workflow-dsl.adoc[Workflow DSL Specification] for implementation details.
