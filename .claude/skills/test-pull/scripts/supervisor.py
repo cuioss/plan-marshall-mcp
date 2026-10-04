@@ -150,7 +150,9 @@ class JobRuntime:
     def add(self, role, harness, model, prompt, eager, count=1, effort=None, worker=None):
         for _ in range(count):
             index = len([slot for slot in self.slots if slot.role == role]) + 1
-            self.slots.append(Slot(worker or f"{role[0]}{index}", role, harness, model, prompt, eager, effort))
+            # Stage 1 ids (w1, c1) for its two roles; configured roles carry their name, so ids never clash
+            default = f"{role[0]}{index}" if role in ("worker", "consultant") else f"{role}-{index}"
+            self.slots.append(Slot(worker or default, role, harness, model, prompt, eager, effort))
 
     def slot(self, worker, generation=None):
         for slot in self.slots:
