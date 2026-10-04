@@ -13,7 +13,7 @@ _See Requirement link:../../Requirements.adoc#PM-WF-8[PM-WF-8: Asynchronous Job 
 
 _See Requirement link:../../Requirements.adoc#PM-WF-9[PM-WF-9: Composite Wait States & Short-Circuit Failure Handling]_
 
-During Phase 6 (`finalize`), CI verification, the configured code analysis providers (Sonar, CodeQL, and others behind the code-analysis contract of `pm-core`), and automated PR review bots run concurrently after branch push. Rather than forcing the model to poll separate jobs sequentially, the workflow engine exposes the composite wait state `finalize.concurrent-wait`, the one joint observation of the three classes.
+During Phase 6 (`finalize`), CI verification, the configured code analysis providers (Sonar, CodeQL, and others behind the code-analysis contract of `pm-core`), and automated PR review bots run concurrently after branch push. The workflow engine observes them as the composite wait state `finalize.concurrent-wait`, the one joint observation of the three classes, and advances the plan on its completion as one engine event; no model polls or cancels it.
 
 === `finalize.concurrent-wait` Representation
 
@@ -30,14 +30,11 @@ facts:
   bots[1]{bot_kind,roster_class,state,refusal_mode,completion_check,at_head}:
     coderabbit,required,in_progress,none,pending,false
   ci_status: running
-  continuation_policy: stop_on_issue_only
   pr_number: 184
-links[2]{rel,link,form,free}:
-  wait,"wait:finalize.concurrent-wait",wait,""
-  abort,"cancel:finalize.concurrent-wait",noop,""
+links[0]{rel,link,form,free}:
 ----
 
-Both links are the implicit links of the `composite_job` state (link:../workflow-dsl/02-units-jobs-decisions.adoc#implicit-job-links[Workflow DSL Specification]); they are never declared in DSL source. The constituent job identifiers (the CI job, the analysis jobs, and the review-bot job), the per-provider analysis results, the branch, and the elapsed wait time are recorded in the scope's `mcp/status.json` and the job records and shown by `pm-operator status`; they are never rendered, because both links address the composite, not a constituent job (xref:01-representation-and-link-forms.adoc#model-facing-minimality[Model facing minimality]).
+The representation is a view (xref:01-representation-and-link-forms.adoc#representation-kinds[Representation Kinds]): it shows the progress of the composite and offers no link. The constituent job identifiers (the CI job, the analysis jobs, and the review-bot job), the per-provider analysis results, the branch, and the elapsed wait time are recorded in the scope's `mcp/status.json` and the job records and shown by `pm-operator status` and the web app; they are never rendered (xref:01-representation-and-link-forms.adoc#model-facing-minimality[Model facing minimality]).
 
 === Closed Status Enumerations in `finalize.concurrent-wait`
 _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-26[PM-WATCH-PHASE-26]_
@@ -103,7 +100,7 @@ A required bot that ends `unproven` is a review-evidence failure: the composite 
 === Deterministic Evaluation & Immediate Short-Circuit Matrix
 _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-27[PM-WATCH-PHASE-27], link:../../implementation-watch/hypermedia-format.adoc#PM-WATCH-HYP-8[PM-WATCH-HYP-8]_
 
-When the model follows `wait:finalize.concurrent-wait`, the daemon monitors the underlying jobs (the CI run, the analysis providers, and the review-bot wait) concurrently and unblocks according to the following transition rules. Rows are evaluated top to bottom and the first matching row wins; together they cover every combination of constituent job fates, `ci_status`, `analysis_status`, and `bot_status`. The composite outcome column names the `finalize.watch-ci-and-bots` outcome declared in the `finalize.pmwf` excerpt (link:../workflow-dsl.adoc[Workflow DSL Specification]); _(keep waiting)_ means the composite job has not settled. Every failing class is handed to its remediation policy unit, one unit at a time in the fixed order CI -> analysis -> review findings, because a code fix for an earlier class invalidates the later observations anyway; the composite outcome of a later class is never evaluated while an earlier class fails.
+While the composite job runs, the daemon monitors the underlying jobs (the CI run, the analysis providers, and the review-bot wait) concurrently and settles the composite according to the following transition rules. Rows are evaluated top to bottom and the first matching row wins; together they cover every combination of constituent job fates, `ci_status`, `analysis_status`, and `bot_status`. The composite outcome column names the `finalize.watch-ci-and-bots` outcome declared in the `finalize.pmwf` excerpt (link:../workflow-dsl.adoc[Workflow DSL Specification]); _(keep waiting)_ means the composite job has not settled. Every failing class is handed to its remediation policy unit, one unit at a time in the fixed order CI -> analysis -> review findings, because a code fix for an earlier class invalidates the later observations anyway; the composite outcome of a later class is never evaluated while an earlier class fails.
 
 [cols="1,1,1,1,2,3"]
 |===
@@ -114,14 +111,14 @@ When the model follows `wait:finalize.concurrent-wait`, the daemon monitors the 
 |_Any_
 |`watch_interrupted` / `cancelled`
 |`finalize.restart-watch`
-|A constituent job ended with a fate other than success (`killed`, for example on a runtime restart, `timed_out`, `indeterminate`, `refused`, `failed`): `watch_interrupted`, carrying `{constituent, fate}`. A followed `cancel:finalize.concurrent-wait` settles the composite job itself `cancelled`, routed to the same state. Every other constituent is cancelled, and the `auto` state `finalize.restart-watch` restarts the watch explicitly within the compiled restart budget (default 2 per wait-region firing); exhaustion enters `finalize.hand-back`.
+|A constituent job ended with a fate other than success (`killed`, for example on a runtime restart, `timed_out`, `indeterminate`, `refused`, `failed`): `watch_interrupted`, carrying `{constituent, fate}`. A cancellation of the composite job by the engine (a runtime drain) settles it `cancelled`, routed to the same state. Every other constituent is cancelled, and the `auto` state `finalize.restart-watch` restarts the watch explicitly within the compiled restart budget (default 2 per wait-region firing); exhaustion enters `finalize.hand-back`.
 
 |`failed`
 |_Any_
 |_Any_
 |`ci_failed`
 |`call remediation.ci-failure`
-|*Immediate Short-Circuit*: The daemon immediately unblocks `wait:finalize.concurrent-wait`, cancels the still-pending analysis and review-bot waits, and persists one CI failure finding (source `ci`) per failed check with its `failure_class` and `failure_kind` (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification], step `22`). The unit's gather job fetches the logs through the provider module, parses them with the domain `log_parser`, and fetches the base's CI result of the same checks in the same job: a red that the base shows with the same fingerprints is recorded as baseline-red and never reaches `decide`. Its `decide` state renders the failure envelopes (xref:01-representation-and-link-forms.adoc#remediation-evidence-facts[Remediation Evidence]).
+|*Immediate Short-Circuit*: The daemon immediately settles the composite job, cancels the still-pending analysis and review-bot waits, and persists one CI failure finding (source `ci`) per failed check with its `failure_class` and `failure_kind` (link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification], step `22`). The unit's gather job fetches the logs through the provider module, parses them with the domain `log_parser`, and fetches the base's CI result of the same checks in the same job: a red that the base shows with the same fingerprints is recorded as baseline-red and never reaches `decide`. Its decision task renders the failure envelopes (xref:01-representation-and-link-forms.adoc#remediation-evidence-facts[Remediation Evidence]).
 
 |`not_triggered`
 |_Any_
@@ -163,21 +160,21 @@ When the model follows `wait:finalize.concurrent-wait`, the daemon monitors the 
 |`completed` ($\ge 1$ open findings)
 |`findings_open`
 |`call remediation.review-findings`
-|Bot review findings were ingested into `findings.jsonl` and their texts passed the two-level guard as one batch of the firing. The unit's triage is one job of the firing over the findings not withheld by the screener, grouped by `(domain, rule_id)`, which submits one disposition per group with per-finding exceptions (`submit:triage-groups`; link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Unified Triage Hook]); its `decide` state then offers the remedy for the findings dispositioned `FIX` or still open, withheld ones included.
+|Bot review findings were ingested into `findings.jsonl` and their texts passed the two-level guard as one batch of the firing. The unit's triage is one task of the firing over the findings not withheld by the screener, grouped by `(domain, rule_id)`, which submits one disposition per group with per-finding exceptions (`submit:triage-groups`; link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Unified Triage Hook]); its `decide` state then offers the remedy for the findings dispositioned `FIX` or still open, withheld ones included.
 
 |`passed`
 |`passed` / `not_run`
 |`refused_awaitable`
 |`bot_refused_awaitable`
 |`finalize.review-window-wait`
-|CI and analysis passed, but the review bot's rate window is closed. The job state `finalize.review-window-wait` waits for the registered window (its implicit `wait:` link) and then re-triggers the unproven bots automatically; a trigger is never posted inside the closed window, because a trigger extends it.
+|CI and analysis passed, but the review bot's rate window is closed. The job state `finalize.review-window-wait` waits for the registered window and then re-triggers the unproven bots automatically; a trigger is never posted inside the closed window, because a trigger extends it.
 
 |`passed`
 |`passed` / `not_run`
 |`refused_structural`
 |`bot_refused_structural`
 |`call remediation.review-findings`
-|The diff exceeds the bot's structural cap; the refusal is filed as a finding, which the unit's triage job dispositions like any finding of the firing (`FIX` splits, `ACCEPT` accepts, `SUPPRESS` disables the bot for this pull request). It never waits.
+|The diff exceeds the bot's structural cap; the refusal is filed as a finding, which the unit's triage task dispositions like any finding of the firing (`FIX` splits, `ACCEPT` accepts, `SUPPRESS` disables the bot for this pull request). It never waits.
 
 |`passed`
 |`passed` / `not_run`
@@ -198,7 +195,7 @@ When the model follows `wait:finalize.concurrent-wait`, the daemon monitors the 
 |`pending` / `running`
 |_(keep waiting)_
 |`finalize.concurrent-wait`
-|CI and analysis are green and the review bot has not finished; the daemon keeps waiting on the bot. When the wait bound expires, returns updated `finalize.concurrent-wait` with fresh `wait:` / `cancel:` links.
+|CI and analysis are green and the review bot has not finished; the daemon keeps waiting on the bot, and the view shows the updated statuses.
 
 |`running`
 |_Any_
@@ -212,7 +209,7 @@ When the model follows `wait:finalize.concurrent-wait`, the daemon monitors the 
 |_Any other_
 |_(keep waiting)_
 |`finalize.concurrent-wait`
-|Wait bound (bounded or progress window, link:../timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Budgets Specification]) expired while CI is still running; returns updated `finalize.concurrent-wait` with fresh `wait:` / `cancel:` links. Settled analysis and bot statuses are retained in `facts` until CI settles.
+|CI is still running; the daemon keeps waiting on it at the observation cadence (link:../timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Budgets Specification]), and the view shows the updated statuses. Settled analysis and bot statuses are retained in `facts` until CI settles.
 |===
 
 [#policy-unit-returns]

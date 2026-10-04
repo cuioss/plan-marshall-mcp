@@ -1,0 +1,357 @@
+= Model Work Specification: Envelope Tasks, Questions & Deadlines
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Work Specification] » Envelope Tasks, Questions & Deadlines
+
+== Task Envelope Bin-Packing & Sequential Task Yield
+_See Requirements link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Model Work as Role Tasks & Single-Level Leaf Constraint], link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Task Envelopes, Model Slots & Usage per Task]_
+
+During Phase 4 (`plan`), the workflow engine does not create a task of model work per plan task. Instead, it sizes each plan task, packs compatible plan tasks into budget-bounded envelopes (`envelope-1`, `envelope-2`, ...), and Phase 5 queues one *envelope task* per envelope: one task of the writer role the execute state names (`implement` in the default units), served by a worker of that role (xref:04-worker-launch.adoc#model-job-launch[Worker Launch]).
+
+[#cost-sizing]
+=== Cost Sizing (`derive-cost-size`), Envelope Budget & Minimum Task Work
+
+The cost model (size rubric, size-to-token table, and Next-Fit packing under the budget) is `plan-marshall`'s (`manage-tasks/scripts/_tasks_cost.py`, `manage-tasks/scripts/_tasks_envelope.py`, the defaults in `manage-config/scripts/_config_defaults.py`, and `extension-api/standards/dispatch-granularity.md` § 1.2), verified at commit `88fcfc9ef`; re-verify against the latest `plan-marshall` version before implementing. `plan-marshall`'s packer packs on the budget alone; envelope sharing by module and role (item 5) and the below-minimum merge (item 6) are deliberate changes. It predicts the token consumption of a task's work (generation, reasoning, and in-context skill loads), not wall-clock time; the build count is deliberately not a signal, because a build is token-cheap whatever its duration. The dominant cost of an envelope task is the per-plan-task work, not the envelope's re-establishment overhead, so bundling tasks amortises only that minor share.
+
+1. *Size Rubric*: For every plan task $t$, `TaskCostEstimator` (the `derive-cost-size` function) computes a deterministic weighted score from four signals of the task record (link:../store-schemas/06-task-references-manifest.adoc#_task_record_schema_taskstask_nnn_json[Store Schemas Specification, Task Record]):
++
+$$\text{score}(t) = 10 \cdot N_{\text{steps}}(t) + W_{\text{profile}}(t) + 3 \cdot N_{\text{skills}}(t) + 4 \cdot N_{\text{files}}(t)$$
++
+where $N_{\text{steps}}(t)$ is the number of the task's `steps` (the dominant term), $N_{\text{skills}}(t)$ the number of its `skills[]`, $N_{\text{files}}(t)$ the number of its distinct `target_files`, and $W_{\text{profile}}(t)$ the weight of its `profile`: `implementation` `12`, `module_testing` `12`, `verification` `4`, and the default weight `8` for every other member of the task profile enum (`integration_testing`, `documentation`), as `plan-marshall` weights a profile it does not list. There is no per-profile base cost.
+2. *Six Sizes*: The score maps to `cost_size` through monotone bands, so raising any signal never lowers the size:
++
+[cols="1,2,2"]
+|===
+|`cost_size` |Score band |Default `predicted_cost_tokens`
+
+|`XS` |$\text{score} < 30$ |`5K`
+|`S` |$30 \le \text{score} < 60$ |`25K`
+|`M` |$60 \le \text{score} < 150$ |`60K`
+|`L` |$150 \le \text{score} < 300$ |`130K`
+|`XL` |$300 \le \text{score} < 700$ |`260K`
+|`XXL` |$\text{score} \ge 700$ |`520K`
+|===
+3. *Size-to-Token Table*: `predicted_cost_tokens(t)` is defined as the value of the task's `cost_size` in the size-to-token table; it is a table lookup, never a per-task computation. The table is derived, never configured: its compiled defaults are the column above, and a hand-set table could only be less accurate than the calibration (*deliberate change vs. `plan-marshall`*: its `plan.phase-5-execute.cost_size_token_table` does not exist). The table's values are labelled `uncalibrated` until the server recalibrates them from a measured `metrics.json` population (link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]: per envelope task the summed `predicted_cost_tokens` beside the measured token components); a recalibrated table carries `basis: calibrated` with its population count and is kept as the derived fact `cost_calibration` of the project's `derived-facts.json` (link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-fact-kinds-discovery-calibration[Store Schemas Specification, Derived fact kinds]), and every figure derived from a table (`predicted_cost_tokens`, the Phase 4 budget projection) carries the basis of the table it used.
+4. *Envelope Budget*: Envelopes are packed Next-Fit under a per-envelope budget derived from the context budget of the client profile of the harness that the envelope role's artifact names (`headless.context_budget_tokens`, link:../client-profiles.adoc[Client Profiles Specification]; xref:01-roles-and-configuration.adoc[Roles & Configuration]; compiled fallback `400K`, `plan-marshall`'s `per_envelope_budget_tokens` default), because it depends on the model's context window, a property of the operator's role configuration; the operator may override it per project (`envelope_budget_tokens` in `local-config.json`, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]); a team file never sets it. The budget is a plan-time packing bound over summed `predicted_cost_tokens`, never a runtime comparand: a worker cannot measure its own context use mid-turn, and a worker that runs short of context leaves through `yield:envelope-M` (link:../phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows Specification, Task Envelope Execution]). A task whose predicted cost alone exceeds the budget (an `XXL` task under the defaults) is placed alone in its envelope.
+5. *Envelope Sharing*: Plan tasks share an envelope only when they target the same module and the execute unit names the same role for them; the execution profile is not a sharing criterion, so a deliverable's `implementation` and `module_testing` tasks share one envelope. *Deliberate change vs. `plan-marshall`*: its packer (`_tasks_envelope.py`) closes an envelope only on the budget and has no module or role compatibility, so one envelope could mix modules and roles under a single configuration.
+6. *Minimum Task Work (10K)*: `10K` tokens is the minimum judgement work that justifies an envelope task of its own (`plan-marshall`'s `dispatch-granularity.md` § 1.2), not an envelope ceiling. An envelope whose summed `predicted_cost_tokens` stays below `10K` (for example a lone `XS` task) is merged by the server into its adjacent envelope of the same module and role, the preceding one first; without such a neighbour it stays alone, and the plan representation lists it in the fact `below_minimum_task`. Every such merge produces an envelope over the budget: Next-Fit closes an envelope only on an incompatible task or on the budget, so two adjacent compatible envelopes were split by the budget alone, and a merge only enlarges envelopes. The minimum task work therefore takes precedence over the budget by design. *Deliberate change vs. `plan-marshall`*: its packer has no below-minimum merge; an envelope below `10K` is dispatched alone.
+
+The rubric prices a byte when it enters a context and ignores how long it stays resident. Isolating work in a separate envelope is justified only when re-creating the envelope's starting context (created bytes bill 1.25) costs less than the residency it removes (read bytes bill 0.1 per remaining turn); this condition is evaluated per split, never assumed. The server supplies both inputs: `record-metrics` publishes per envelope the `predicted_cost_tokens` beside the measured token components, and per envelope split (`yield:envelope-M`) the re-creation and residency terms, or `not_derivable` when a component is unmeasured.
+
+=== Deterministic Envelope Packing Algorithm (`EnvelopePacker`)
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-1[PM-WATCH-DISP-1]_
+
+Given the ordered sequence of plan tasks $T = [t_1, t_2, \dots, t_n]$ produced during Phase 4 (`plan`), each stamped with its `predicted_cost_tokens` (<<cost-sizing>>), `EnvelopePacker` runs automatically in-process upon `plan.describe-tasks` submission to partition $T$ into an ordered list of envelopes, each a contiguous slice of $T$, so topological dependency order is preserved. The packer never re-derives a task's cost; it only sums the stamped values:
+
+[source,java]
+----
+package de.cuioss.pm.workflow.envelope;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+
+public final class EnvelopePacker {
+
+    /** Minimum predicted work that justifies an envelope task of its own (dispatch-granularity § 1.2). */
+    public static final long MIN_JOB_TOKENS = 10_000;
+
+    public enum CostSize { XS, S, M, L, XL, XXL }
+
+    public record PlannedTaskSummary(
+            String taskId,
+            String moduleId,
+            String role,
+            Set<String> skillUris,
+            CostSize costSize,
+            long predictedCostTokens,
+            List<String> dependsOnTaskIds
+    ) {}
+
+    public record PackedEnvelope(
+            String envelopeId,
+            String moduleId,
+            String role,
+            List<String> taskIds,
+            List<String> unionSkillUris,
+            long totalPredictedCostTokens
+    ) {}
+
+    /**
+     * @param orderedTasks         topological order over depends_on, ties broken by task_id
+     * @param envelopeBudgetTokens the configured per-envelope budget (default 400K)
+     */
+    public List<PackedEnvelope> packEnvelopes(List<PlannedTaskSummary> orderedTasks, long envelopeBudgetTokens) {
+        List<List<PlannedTaskSummary>> groups = new ArrayList<>();
+        List<PlannedTaskSummary> current = new ArrayList<>();
+        long currentTotal = 0;
+
+        // Next-Fit in task order: close the open envelope when the next task is
+        // incompatible or would push it past the budget; a task over budget sits alone.
+        for (PlannedTaskSummary task : orderedTasks) {
+            boolean fits = !current.isEmpty()
+                    && canShareEnvelope(current.getFirst(), task)
+                    && currentTotal + task.predictedCostTokens() <= envelopeBudgetTokens;
+            if (!fits && !current.isEmpty()) {
+                groups.add(current);
+                current = new ArrayList<>();
+                currentTotal = 0;
+            }
+            current.add(task);
+            currentTotal += task.predictedCostTokens();
+        }
+        if (!current.isEmpty()) {
+            groups.add(current);
+        }
+
+        mergeBelowMinimum(groups);
+
+        List<PackedEnvelope> envelopes = new ArrayList<>();
+        for (List<PlannedTaskSummary> group : groups) {
+            envelopes.add(sealEnvelope(envelopes.size() + 1, group));
+        }
+        return List.copyOf(envelopes);
+    }
+
+    private boolean canShareEnvelope(PlannedTaskSummary first, PlannedTaskSummary candidate) {
+        // Same module and same role; the execution profile is not a criterion
+        return first.moduleId().equals(candidate.moduleId())
+                && first.role().equals(candidate.role());
+    }
+
+    private void mergeBelowMinimum(List<List<PlannedTaskSummary>> groups) {
+        // An envelope below the minimum task work joins its adjacent compatible
+        // envelope (preceding first); adjacent compatible envelopes were split only by
+        // the budget, so every merge yields an over-budget envelope. Contiguity is kept.
+        for (int i = 0; i < groups.size(); i++) {
+            List<PlannedTaskSummary> small = groups.get(i);
+            if (total(small) >= MIN_JOB_TOKENS) {
+                continue;
+            }
+            int target = -1;
+            if (i > 0 && canShareEnvelope(groups.get(i - 1).getFirst(), small.getFirst())) {
+                target = i - 1;
+            } else if (i + 1 < groups.size() && canShareEnvelope(groups.get(i + 1).getFirst(), small.getFirst())) {
+                target = i + 1;
+            }
+            if (target < 0) {
+                continue; // stays alone; reported in the fact below_minimum_task
+            }
+            if (target < i) {
+                groups.get(target).addAll(small);
+            } else {
+                groups.get(target).addAll(0, small);
+            }
+            groups.remove(i);
+            i--;
+        }
+    }
+
+    private static long total(List<PlannedTaskSummary> group) {
+        return group.stream().mapToLong(PlannedTaskSummary::predictedCostTokens).sum();
+    }
+
+    private PackedEnvelope sealEnvelope(int index, List<PlannedTaskSummary> group) {
+        PlannedTaskSummary head = group.getFirst();
+        List<String> taskIds = group.stream().map(PlannedTaskSummary::taskId).toList();
+        List<String> skills = group.stream()
+                .flatMap(t -> t.skillUris().stream())
+                .distinct()
+                .sorted()
+                .toList();
+        return new PackedEnvelope("envelope-" + index, head.moduleId(), head.role(), taskIds, skills, total(group));
+    }
+}
+----
+
+*Dependency Order*: The ordered input $T$ is the topological order of the task graph persisted in each task's `depends_on` (link:../store-schemas/06-task-references-manifest.adoc#_task_record_schema_taskstask_nnn_json[Store Schemas Specification, Task Record]; Kahn's algorithm, ties broken by `task_id`), and `PlannedTaskSummary.dependsOnTaskIds` is that field, so no envelope places a task before one of its dependencies. The same field governs execution: a plan task is yielded only when every plan task in its `depends_on` is `completed`, and an envelope task is queued only when its first plan task is yieldable (link:../phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows Specification, Task Envelope Execution]); a plan task whose dependency ended `infeasible` or `removed` is never yielded.
+
+=== Sequential Task Yield Within an Envelope
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-1[PM-WATCH-DISP-1]_
+
+When Phase 5 queues the envelope task of an envelope (`entity = "envelope-N"`), a worker of the envelope role serves it, bound by its job token to the task entities leased to its generation (xref:04-worker-launch.adoc#job-token[Job Token, Generation & Connection Binding]). Its launch prompt or offer carries the envelope's skills and contract but never the plan task bodies; the server yields the plan tasks one at a time as hypermedia state representations of the entity:
+
+[source,text]
+----
+Workflow engine (pm-mcpd)                          Worker l-01 (role implement, fresh)
+──────────┬──────────────                          ───────────────┬───────────────────
+          │ execute.envelope-ready:                               │
+          │ queue task qt-01 (envelope-1), lease to l-01,         │
+          │ start l-01 with its contract envelope ───────────────►│ harness CLI started
+          │◄──────────────────────────────────────────────────────│ pm_state(entity="envelope-1")
+          │ [records connected_at] offer: link ack                 │
+          │──────────────────────────────────────────────────────►│
+          │◄──────────────────────────────────────────────────────│ pm_do(entity="envelope-1", link="ack")
+          │ TASK-1 state + submit:TASK-1                           │
+          │──────────────────────────────────────────────────────►│
+          │◄──────────────────────────────────────────────────────│ pm_do(…, link="submit:TASK-1", args={…})
+          │ [persists TASK-1] TASK-2 state + submit:TASK-2         │
+          │──────────────────────────────────────────────────────►│
+          │◄──────────────────────────────────────────────────────│ pm_do(…, link="submit:TASK-2", args={…})
+          │ [persists TASK-2, seals envelope-1]                    │
+          │ envelope.completed (links[0]), task qt-01 submitted ──►│
+          │◄──────────────────────────────────────────────────────│ job-result; exit
+          │ fate and usage parsed; return evaluation on records    │
+          │ next envelope task or verification                     │
+----
+
+The diagram abbreviates identifiers: `l-01` stands for a full `job_id` such as `l-3f9a2c417e0d8b65`, `qt-01` for a full `queue_task_id`, and `TASK-1` for `TASK-001` (link:../identifiers/01-general-rules-and-registry.adoc#id-job-id[`job_id`], link:../identifiers/01-general-rules-and-registry.adoc#id-task-id[`task_id`]). A warm worker of the role receives the same entity as the answer to its `pm_wait`; the exchange after the acknowledgement is identical (xref:02-task-protocol.adoc[Task Protocol]).
+
+1. *Initial Yield*: After the acknowledgement the server returns the state representation for the first uncompleted plan task $t_1$ (`state: "envelope.task.active"`, `facts.task_id: "TASK-001"`). The representation offers four exits from a plan task: `submit:TASK-001` (complete the plan task), `ask:TASK-001` (a task question, <<task-questions>>), `yield:envelope-N` (give back the envelope's remaining plan tasks, for example when the context runs short), and `infeasible:TASK-001` (the plan task is impossible as specified, with evidence); link:../phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows Specification, Task Envelope Execution] defines what the server does on each. A change to files beyond the plan task's declared footprint inside the plan's worktree needs no link and no question: the server records it as an unplanned change with its provenance and lists it in the pull-request body and the landing record; only a boundary breach (outside the worktree, the main checkout, a protected path) is refused by the non-waivable guards.
+2. *Sequential Advancement on `submit`*: When the worker completes plan task $t_i$ and invokes `pm_do(plan_id="<plan_id>", entity="envelope-N", link="submit:TASK-i", args={...})`, the engine atomically persists $t_i$'s result in the plan store and advances the envelope cursor to $t_{i+1}$. If $i < k$ and $t_i$ is not a chain tail, the `pm_do` call immediately returns the representation for $t_{i+1}$.
+3. *Terminal Envelope Completion*: When the final plan task $t_k$ in `envelope-N` is submitted, `pm_do` transitions the entity to the terminal state `envelope.completed` with an empty `links` table (`links[0]{rel,link,form,free}:`), and the envelope task ends `submitted`. A fresh worker then ends with its `job-result` (xref:09-completion-usage-and-spend.adoc#job-result-schema[Worker Result & Usage Parsing]), and the plan's return evaluation runs on the persisted records (xref:09-completion-usage-and-spend.adoc#return-evaluation[Return Evaluation]).
+4. [[envelope-early-end]]*Early End of an Envelope Task*: Four exits end the entity before $t_k$, each moving it to `envelope.completed` with its required records persisted and handing the remaining plan tasks to the next envelope task `envelope-(N+1)`. The `submit` of a chain-tail plan task (the last plan task of a deliverable) and `yield:envelope-N` end the task `submitted`, with the `yield_reason` the server records from the exit taken, from the closed enumeration `chain_tail | question | context` (the `yield` link has no free parameter): after a chain tail (`chain_tail`) the plan commits the deliverable and runs its module build before the next envelope task; after a yield (`context`) the next envelope task follows at once. `ask:TASK-i` ends the task `asked` (`yield_reason: question`): the remaining plan tasks, the asking plan task included, form `envelope-(N+1)`, queued once the question record is closed and carrying the answer in its facts. `infeasible:TASK-i` ends the task `infeasible` with its evidence, judged by `execute.infeasible-review`. No entity state waits on a question, so a waiting envelope never holds a worker or a model slot.
+5. *Serial Envelope Tasks*: At most one envelope task of a plan is served at a time, by the one-writer rule of the model slots (xref:04-worker-launch.adoc#model-slots[Model Slots & One Writer per Plan]), because the envelopes share one worktree, one chain-tail commit, and one module build. The plan state moves only when the envelope task ends, evaluated by `execute.evaluate-envelope-return` (xref:09-completion-usage-and-spend.adoc#return-evaluation[Return Evaluation]).
+
+[#decision-evidence]
+== Evidence in Facts
+_See Requirement link:../../Requirements.adoc#PM-WORK-2[PM-WORK-2: Task Protocol]_
+
+A model decides only from the evidence it is given: every model of the evaluation judged a case wrongly whose facts showed the claim to be judged but not the evidence that refutes it, and rightly once that evidence was added (link:../evaluation.adoc#limits[Evaluation Reference, Limits]). The server therefore composes the facts of every task and every question that asks for a judgment with the evidence the judgment rests on, not only the claim:
+
+* a review comment or a finding with the code it refers to at the commit it was made against, and the current code where it differs;
+* a build or CI failure with the log lines that name the failure, from the job's own output;
+* a decision a standing record already settles (an ADR, an accepted waiver, an earlier answer of the plan) with that record;
+* the definitions of the decision's options, as the representation carries them (link:../hypermedia-format/01-representation-and-link-forms.adoc[Hypermedia Format Specification, Representation & Link Forms]).
+
+Evidence too large for `facts` is named by its `pm://` resource URI with the anchor of the relevant part, which the worker reads within its tool set; a `zero_tool` worker receives it in-band. A fact primitive that cannot produce the evidence of a judgment (an unreadable log, a commit no longer reachable) states that in the facts (`evidence: unavailable` with the reason), and the role's skill directs the worker to the conservative option of the decision.
+
+[#question-records]
+== Question Records
+_See Requirement link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
+_Implementation watch: link:../../implementation-watch/mcp-tools.adoc#PM-WATCH-TOOL-14[PM-WATCH-TOOL-14]_
+
+Every content question of a scope (an init classifier's question, a refine or outline clarification, the optional outline review, a Phase 5 task question, a question a worker asks before one of its judgments, a team-configuration choice of the workspace setup) is a server-owned *question record*. A question is never an operator decision: overrides (waivers, `abort`, the integrity resolutions) use only the operator channel, and a waiver request is its own record, never a question record. A worker never prompts a human and never waits for an answer: asking ends its task `asked` (xref:02-task-protocol.adoc[Task Protocol]), so no worker and no model slot is held while a question is open. The server delivers the question, owns its deadline and its default, and survives every host session: a record lives in the scope's store.
+
+[#question-record-creation]
+=== Record, Store & Creation
+
+Question records are appended to `questions.jsonl` of the scope's store (plan, epic, or workspace; link:../store-schemas/14-plan-instance-waivers-questions.adoc[Store Schemas Specification, Plan Instance, Waivers & Questions]): the envelope below, `asked_at`, the engine-owned deadline, answer events `{branch_key, text?, channel, answered_at}` with `channel: web | session | elicitation | model | assumption`, and the closure `answered | assumed | cancelled`. They are created in three ways:
+
+1. *The `ask` link*: a task entity whose state declares it offers `ask` (`question:schema[question-envelope]`, link:../hypermedia-format/01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Hypermedia Format Specification, Question, Waiver-Request & Exit Links]); the worker asks before it takes a judgment, the task ends `asked`, and the engine enters the state's question state `<state>.asked`, which serves the record and, once the record closes (`answered` or `assumed`), queues a new task of the role with the answer in its facts.
+2. *A task's submission*: a refine or outline authoring task completes its draft on best judgment and carries its open questions in the `questions` list of its one `submit` (`questions:list<schema[question-envelope]>?`), each item becoming a record (class `clarification`); an envelope task's `ask:TASK-NNN` creates one record (class `task`) and ends the task (<<task-questions>>).
+3. *A server primitive*: init classifiers, the optional outline review, and the workspace setup choices that write team configuration raise records with server-owned options (`origin: server`, classes `init`, `review`, and `setup`). Setup choices that write operator configuration are never question records: they use the operator channel.
+
+[#question-envelope-schema]
+*Server-Owned Fields*: `question_id`, `class`, `origin`, and `source_entity` are assigned by the server when it persists a question, never by the model. `question_id` is the next value of a scope-wide counter of the plan, epic, or workspace (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), never reused; `origin` and `source_entity` (with `plan_task_id` for class `task`) are defined by the link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]. The model supplies a question without these four fields: the free schema of `ask` and `ask:TASK-NNN` and the item schema of the `questions` list are the `BatchedQuestionEnvelope` minus `question_id`, `class`, `origin`, and `source_entity` (that is `question_text`, `default_assumption`, and `options`, each option an object `{branch_key, label, description, recommended?}`), and a payload that carries a server-owned field is rejected with `invalid_link_args`. This model-supplied subset is registered as the named parameter schema `question-envelope` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]). It is the schema below with the four server-owned members removed from `properties` and `required`, closed with `additionalProperties: false`. A question of the classes `task` and `ask` states its default: exactly one option is `recommended`, else the payload is rejected with `invalid_link_args`.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/batched-question-envelope-v1.json",
+  "title": "BatchedQuestionEnvelope",
+  "type": "object",
+  "required": ["question_id", "class", "origin", "source_entity", "question_text", "options"],
+  "additionalProperties": false,
+  "properties": {
+    "question_id": { "type": "string", "pattern": "^Q-[0-9]{3,6}$", "description": "Server-owned: next value of the scope-wide question counter." },
+    "class": {
+      "type": "string",
+      "enum": ["init", "clarification", "review", "task", "setup", "ask"],
+      "description": "Server-owned: derived from the creating link or primitive."
+    },
+    "origin": {
+      "type": "string",
+      "enum": ["model", "server"],
+      "description": "Server-owned; defined by the Question Record (store-schemas/14)."
+    },
+    "source_entity": { "type": "string", "description": "Server-owned; defined by the Question Record (store-schemas/14)." },
+    "question_text": { "type": "string", "minLength": 10, "maxLength": 500 },
+    "default_assumption": {
+      "type": ["string", "null"],
+      "description": "Best-judgment assumption recorded when the question closes without an answer (questions.mode none, or the class fallback on expiry)."
+    },
+    "options": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["branch_key", "label", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "branch_key": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,31}$", "description": "Deterministic enum key bound to a state transition or parameter assignment." },
+          "label": { "type": "string", "minLength": 2, "maxLength": 80 },
+          "description": { "type": "string", "minLength": 5, "maxLength": 240 },
+          "recommended": { "type": "boolean", "default": false }
+        }
+      }
+    }
+  }
+}
+----
+
+[#question-delivery]
+=== Delivery, Mode & Server-Owned Deadlines
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-29[PM-WATCH-DISP-29]_
+
+*Delivery*: Every open record of a plan or an epic is delivered on two channels at once, and the first valid answer wins:
+
+* *Web app*: the dependable channel. The record appears in the scope's view of the web app, and the server notifies every paired device (link:../cli-and-security.adoc[CLI, Coordination & Security Specification], web access); the answer is recorded with `channel: web`.
+* *Entry session*: every session connection viewing the scope (`pm_state`) gets one answer link `answer:<question_id>` per open record on the scope's representation (rel `submit`, form `submit`, `answer:schema[question-answer]`), with the question and its options in the facts. The session relays the user's choice through the link; the answer is recorded with `channel: session`. A session that is not open misses nothing: the record stays open on the web app.
+
+MCP elicitation carries only the choices of the project setup and of the plan and epic bootstraps, which the entry session drives; a record of class `setup` is also elicited to the session that drives the setup and recorded with `channel: elicitation`. A content question of a plan or an epic is never elicited. Neither `pm-mcp` nor `pm-operator` has an answer command.
+
+*Mode*: How a record is answered is operator configuration in `local-config.json` (operator channel only, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), per project with optional overrides per class (`init`, `clarification`, `review`, `task`; `setup` and `ask` follow the project value):
+
+[cols="1,5"]
+|===
+|`questions.mode` |Effect
+
+|`auto` (default)
+|Delivered, bounded by `questions.wait_seconds` (shipped `1800`, link:../timeouts/01-job-budgets-and-waits.adoc#question-wait[Timeouts & Budgets Specification, Question Wait]); on expiry the class fallback below applies. With `wait_seconds: 0` the fallback applies at creation.
+
+|`operator`
+|Delivered without a deadline: the one operator-chosen exception to the bounded waits. The state is derived `awaiting_user`, and the scope is listed as waiting for an answer in `pm-operator status` and the web app, never as stalled (link:../runtime-model/04-sessions-and-workers.adoc#stalled-plans[Runtime & Interaction Model Specification, Stalled Plans]).
+
+|`model`
+|For a record a task asked, the server queues a task of the asking role whose entity is the record; its `submit` carries `branch_key` and a `confidence` (`0..100`). The server accepts the answer at or above the compiled refine confidence threshold (`95`) with `channel: model`; otherwise, and when the role is unqualified, the record is handled as in `auto`. A server-raised record has no asking role and is handled as in `none`.
+
+|`none`
+|No wait: the `recommended` option, else the `default_assumption`, is applied at once and recorded with `channel: assumption`.
+|===
+
+*Server-owned deadline*: The question wait is a server state of the derived kind `awaiting_user` (DSL `question <class>`, link:../workflow-dsl/02-units-jobs-decisions.adoc#question-states[Workflow DSL Specification, Question States]) with an engine-owned deadline processed by the job runtime's timer, which takes the fallback transition without a model call and without a session; its awaited events are `QUESTION_ANSWER` (any channel) and `TIME` (expiry).
+
+*Expiry Fallback per Class* (compiled), each recorded with `channel: assumption`:
+
+[cols="1,4"]
+|===
+|Class |On expiry
+
+|`init`
+|The classifier's server-computed `recommended` option, or the `returned` route where the classifier has no safe default.
+
+|`clarification`
+|The envelope's `default_assumption`, recorded as an assumption amendment.
+
+|`review`
+|The `returned` route (a review that was asked for and not given does not start execution).
+
+|`task`, `ask`
+|The question's stated default, its `recommended` option, validated against the options.
+
+|`setup`
+|The question state's declared fallback (link:../domain-extensions/04-setup-state-machine.adoc#setup-questions[Domain Extensions Specification, Setup choices by owner]).
+|===
+
+*Answers & Amendments*: An answer names `question_id`, `branch_key`, and an optional `text` (named parameter schema `question-answer`); web, session, elicitation, and model answers pass the same validation. An unknown `branch_key` is refused `invalid_link_args`, a second answer `already_answered`, an answer after the record closed `question_expired`. An answer creates an `amendments[]` entry (with its `question_id`) only when it changes the plan's intent; refine answers still go into `request.md`. The amendment `source` is `user` (an answer on the `web`, `session`, or `elicitation` channel), `model` (an answer in mode `model`), `assumption` (a fallback or `none`), or `refutation` (a refuted lesson premise, carried from the lesson source of the plan's bootstrap); answered questions and amendments are listed in the pull-request body, the landing record, and the retrospective.
+
+*Lifecycle Rules*: A plan scope has at most one question state at a time (phases are serial), and a waiver request arises only inside a remediation unit, which is never entered while a question state is current, so a question wait and a waiver wait never overlap. The `integrity_breach` pause holds a record's expiry until the pause ends. Operator `abort` and `delete-plan` close every open record `cancelled`.
+
+[#phase-question-states]
+=== Phase Question States (`refine.awaiting_answers`, `outline.awaiting_answers`)
+
+When the return evaluation of a refine or outline authoring task finds that the task's submission created open records, it enters the phase's question state (`refine.awaiting_answers` or `outline.awaiting_answers`), which serves the records per their mode and advances once every record is closed; at most one refine task is served again for the answers. A Q-Gate remediation pass of `refine.analyze` never opens a new question round: its questions and a below-threshold confidence are recorded as `low_confidence_manual_review`.
+
+[#task-questions]
+=== Task Questions (Phase 5)
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-28[PM-WATCH-DISP-28]_
+
+A task question is an ordinary question record of class `task`. The worker of an envelope task follows `ask:TASK-NNN` (`question:schema[question-envelope]`, with its `recommended` option as the stated default) on `envelope.task.active` when a plan task cannot proceed without an answer (for example a contradictory interface contract); the server persists the record naming the envelope and the plan task (link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]), and the envelope task ends `asked` (<<envelope-early-end>>). The plan's return evaluation yields `question_pending` and enters `execute.task-question` on the plan scope, which serves the record per the `task` class's mode; on expiry the stated default applies. In every case the server records the answer as an `amendments[]` entry and lists it in the pull-request body and the landing record. The remaining plan tasks, the asking plan task included, form the next envelope task `envelope-(N+1)`, queued with the answer in its facts. No further envelope task is queued while the record is open.

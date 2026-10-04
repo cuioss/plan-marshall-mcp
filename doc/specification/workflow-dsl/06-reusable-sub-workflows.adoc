@@ -11,15 +11,15 @@ link:../../Specification.adoc[Specification] » link:../workflow-dsl.adoc[Workfl
 == Reusable Compound Sub-Workflows & Call-Stack Execution (`PM-WF-16`)
 _See Requirement link:../../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
 
-Workflows are composed not only of atomic `do` / `auto` / `job` primitives, but also of reusable, config-aware *compound sub-workflows* (`scope subworkflow`). A compound sub-workflow encapsulates a multi-state sub-process (deterministic `auto` checks, configuration lookups, conditional interactive pauses, and recovery branches) and handles its internal cases locally with its own states and links, so that Phase 5 (`execute`), Phase 6 (`finalize`), the workspace setup, and the epic invoke the exact same state machine rather than duplicating states or collapsing interactive recovery into opaque Java code. Its exit contract towards the caller is small and control-only (xref:01-grammar.adoc#sub-workflow-exits[Sub-Workflow Exit Contract]). The shipped sub-workflows are `git.commit_and_push` (below), the remediation policy units (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]), and the compiled-only bootstrap source units and lesson maintenance unit, whose call sites (`start.source-<kind>`, `start-epic.source-issue`, `setup.maintain-lessons`) are documented in the link:../state-catalogue/09-bootstrap-and-lessons.adoc[State Catalogue, Bootstrap, Source Units & Lesson Maintenance].
+Workflows are composed not only of atomic `do` / `auto` / `job` primitives, but also of reusable, config-aware *compound sub-workflows* (`scope subworkflow`). A compound sub-workflow encapsulates a multi-state sub-process (deterministic `auto` checks, configuration lookups, task states for the judgments it needs, and recovery branches) and handles its internal cases locally with its own states, so that Phase 5 (`execute`), Phase 6 (`finalize`), the workspace setup, and the epic invoke the exact same state machine rather than duplicating states or collapsing recovery into opaque Java code. Its exit contract towards the caller is small and control-only (xref:01-grammar.adoc#sub-workflow-exits[Sub-Workflow Exit Contract]). The shipped sub-workflows are `git.commit_and_push` (below), the remediation policy units (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]), the task protocol unit `worker-task` (xref:02-units-jobs-decisions.adoc#worker-task-unit[Task Protocol Unit]), and the compiled-only bootstrap source units and lesson maintenance unit, the only sub-workflows with link states (xref:02-units-jobs-decisions.adoc#session-driven-units[Session-Driven Units]), whose call sites (`start.source-<kind>`, `start-epic.source-issue`, `setup.maintain-lessons`) are documented in the link:../state-catalogue/09-bootstrap-and-lessons.adoc[State Catalogue, Bootstrap, Source Units & Lesson Maintenance].
 
 === Call-Stack Execution & Persistence Semantics
 
 1. *Sub-Workflow Invocation (`call`)*: When the engine transitions into a `StateNode` whose behavior is `StateBehavior.SubWorkflowCall(subWorkflowId, paramBindings, transitions)`, it pushes a `CallFrame(callerWorkflowId, callerStateId, callerPhase, subWorkflowId, paramBindings, Instant.now().toString())` onto the `call_stack` array in `mcp/status.json` and sets `status.state` to the target sub-workflow's `startState` while preserving `status.phase = callerPhase` whenever a sub-workflow state declares `phase inherit` (the caller state's resolved phase value; xref:01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Formal EBNF Grammar for the Workflow DSL]). `callerWorkflowId` is the id of the caller's definition unit, `plan` for every state of the plan instance (xref:02-units-jobs-decisions.adoc#workflow-definition-units[Workflow Definition Units (Multi-File Workflows)]). `paramBindings` are the effective values the plan instance binds at the call site, whose provenance (template file, composition rule, or waiver) the instance header records (xref:09-plan-instance.adoc#plan-instance[Plan Instance]). Preserving `callerPhase` guarantees that phase-scoped guards (such as `in_worktree`), phase metric accounting (`metrics.json`), and terminal-title updates remain invariant regardless of which caller invoked the sub-workflow.
-2. *Interactive Pauses & Job Waits Inside a Sub-Workflow*: If execution inside the sub-workflow reaches an `AutoStep`, the engine executes it immediately in the same turn. If execution reaches an `InteractiveLinks` state (such as `git.artifact-review`, `git.compose-message`, `git.commit-fix`, or a remediation unit's `decide`) or a `JobStep`, the engine persists `mcp/status.json` (with the active `call_stack` and sub-workflow `state`) and returns that state's TOON representation to the caller. Subsequent `pm_do` or `pm_state` calls resolve against the active sub-workflow state at the top of `call_stack`, surviving context compactions and daemon restarts identically to top-level states.
+2. *Resting States Inside a Sub-Workflow*: If execution inside the sub-workflow reaches an `AutoStep`, the engine executes it immediately in the same transaction. If execution reaches a resting state (a task state such as `git.compose-message` or a remediation unit's `choose`, a `JobStep`, a question state, or in a session-driven sub-workflow an `InteractiveLinks` state), the engine persists `mcp/status.json` (with the active `call_stack` and sub-workflow `state`); the scope's view and a session-driven state's representation resolve against the active sub-workflow state at the top of `call_stack`, and the tasks it created carry their creating frame, surviving daemon restarts identically to top-level states.
 3. *Sub-Workflow Return (`terminal <outcome_id> <outcome_class>`)*: When a transition inside the sub-workflow lands on a `StateNode` whose `terminalOutcome` is present with the id `outcomeId`, the engine assembles the frame's result record (for `done`: the fields the unit's primitives contributed through `PrimitiveResult.updatedFacts`, validated against the unit's `result` schema), pops the top `CallFrame` from `call_stack`, selects the caller's transition for `outcomeId` (for an outcome routed twice, the one whose result guard holds), transitions `status.state` to its target in `callerWorkflowId`, and continues auto-chaining in the same atomic transaction.
-4. *Step-Out (`stepped_out`)*: The implicit `step_out (reason)` of a resting link state (xref:02-units-jobs-decisions.adoc#implicit-job-links[Implicit Links]) returns like a terminal with the outcome `stepped_out {by: model, cause: step_out, reason}`; a terminal of class `stepped_out` returns `{by: server, cause: <the outcome that entered it>}`. Exactly one frame unwinds; the caller routes the outcome once (Rule 6), and a caller that is itself a sub-workflow routes it to one of its own link states, where the model may step out further. A step-out consumes no budget and writes no waiver; the gap record of a fallback it leads to names `cause: stepped_out` with the reason.
-5. *Guided Step-In*: A `call` makes the sub-workflow's first resting state current, and the representation shows the call-path breadcrumb (the caller states of every frame). Each interactive state of a sub-workflow asks for exactly one piece of model judgment through one link naming its skill section (`skill` clause, Rule 6); it asks only for inputs the server cannot derive and never bundles unrelated inputs. This is a design rule for every sub-workflow, including the remediation units, whose `decide` state asks only for the remedy and leaves the triage of individual findings to a separate state.
+4. *Step-Out (`stepped_out`)*: A terminal of class `stepped_out` returns `{by: server, cause: <the outcome that entered it>}`; in a session-driven sub-workflow the implicit `step_out (reason)` of a resting link state (xref:02-units-jobs-decisions.adoc#implicit-job-links[Implicit Links]) returns like a terminal with the outcome `stepped_out {by: model, cause: step_out, reason}`. Exactly one frame unwinds; the caller routes the outcome once (Rule 6), and a caller that is itself a sub-workflow routes it to a state of its own that continues the unwinding. A step-out consumes no budget and writes no waiver; the gap record of a fallback it leads to names `cause: stepped_out` with the reason.
+5. *Guided Step-In*: A `call` makes the sub-workflow's first resting state current, and the view shows the call-path breadcrumb (the caller states of every frame). Each task state and each session-driven link state of a sub-workflow asks for exactly one piece of model judgment, naming its skill section (`skill` clause, Rule 6); it asks only for inputs the server cannot derive and never bundles unrelated inputs. This is a design rule for every sub-workflow, including the remediation units, whose decision task asks only for the remedy and leaves the triage of individual findings to a separate task.
 
 === Canonical Reusable Sub-Workflow: `git.commit_and_push` (`git-commit-and-push.pmwf`)
 
@@ -35,14 +35,14 @@ The sub-workflow header declares both parameters with `param` and its result rec
 
 |`message_mode`
 |`auto_deliverable` \| `step_or_fallback` \| `interactive` \| `none_assert_clean`
-|Controls commit message sourcing: `auto_deliverable` formats `feat(<module>): complete deliverable <N> - <title>` from the active deliverable (*a `PM-MCP` choice*: `plan-marshall`'s `phase-5-execute` Step 10a derives the commit message from the task title instead); `step_or_fallback` uses a step-supplied commit message or `chore(finalize): apply <step_id> changes`; `interactive` pauses in `git.compose-message` with diff analysis facts for model submission; `none_assert_clean` expects a clean working tree (used by `finalize.push-barrier`) and routes any unexpected dirty files through `git.compose-message` before pushing.
+|Controls commit message sourcing: `auto_deliverable` formats `feat(<module>): complete deliverable <N> - <title>` from the active deliverable (*a `PM-MCP` choice*: `plan-marshall`'s `phase-5-execute` Step 10a derives the commit message from the task title instead); `step_or_fallback` uses a step-supplied commit message or `chore(finalize): apply <step_id> changes`; `interactive` creates a task of the role `commit-message` in `git.compose-message` with diff analysis facts; `none_assert_clean` expects a clean working tree (used by `finalize.push-barrier`) and routes any unexpected dirty files through `git.compose-message` before pushing.
 
 |`push_mode`
 |`never` \| `if_push_remote` \| `always` \| `post_pr_conditional`
 |Controls push execution after commit (or on a clean tree): `never` stops after local commit; `if_push_remote` pushes when the project has a push remote (derived fact `push_remote`, link:../store-schemas/09-derived-facts-and-build-timings.adoc#derived-facts[Store Schemas Specification, Derived Facts Store]; a `stale` or `failed` fact is `indeterminate`, never "no remote", and raises `precondition_unmet` in `git.evaluate-push-policy`); `always` pushes unconditionally; `post_pr_conditional` pushes if and only if the order of the persisted `settle_trigger` is greater than `20` (after `create-pr`) and a push remote exists. `settle_trigger {step_id, order}` is written by the transition entering `finalize.settle-commit`: the step whose firing is open, or order `0` when the caller is not a step (`execute.exit-barrier`, `land.exit-barrier`, `finalize.adopt-pr`), so such a caller never pushes. No configuration key suppresses a push (`plan-marshall`'s `commit_and_push` does not exist).
 |===
 
-*Exit contract*: `done` with the result record `commit-result {commit?, pushed, clean, landed}`, where `commit` is the SHA of the commit this call made (absent when none), `pushed` means that the remote branch holds `HEAD` after the call (so a clean tree whose `HEAD` the remote already holds, the branch state `synced`, returns `{pushed: true, clean: true}` without a push), `clean` that the working tree was clean on entry, and `landed` that the plan's branch already landed (its pull request merged and the remote branch deleted, `remote_absent_landed`; then `pushed` is `false`); plus `stepped_out {by, cause, reason}`, returned by the model's `step_out` or by the server after an exhausted attempt cap of one of the unit's model loops (`cause: attempts_exhausted`), an exhausted `.gitignore` oracle retry (`cause: oracle_failed`), a rebase that could not start (`cause: rebase_failed`), or a remote branch state the unit cannot establish (`cause: push_state_unknown`). Callers branch on the result with result guards (`guard result.pushed`, `guard result.landed`); no caller routes a push-mode-specific outcome.
+*Exit contract*: `done` with the result record `commit-result {commit?, pushed, clean, landed}`, where `commit` is the SHA of the commit this call made (absent when none), `pushed` means that the remote branch holds `HEAD` after the call (so a clean tree whose `HEAD` the remote already holds, the branch state `synced`, returns `{pushed: true, clean: true}` without a push), `clean` that the working tree was clean on entry, and `landed` that the plan's branch already landed (its pull request merged and the remote branch deleted, `remote_absent_landed`; then `pushed` is `false`); plus `stepped_out {by: server, cause, reason}`, returned by the server after an exhausted attempt cap of one of the unit's loops (`cause: attempts_exhausted`), a task of the unit other than `commit-message` that closed `infeasible` or `lost` (`cause: infeasible` or `lost`), an exhausted `.gitignore` oracle retry (`cause: oracle_failed`), a rebase that could not start (`cause: rebase_failed`), or a remote branch state the unit cannot establish (`cause: push_state_unknown`). Callers branch on the result with result guards (`guard result.pushed`, `guard result.landed`); no caller routes a push-mode-specific outcome.
 
 ==== Declarative DSL Definition (`classpath:/workflows/git-commit-and-push.pmwf`)
 
@@ -80,11 +80,12 @@ state git.artifact-review
   phase inherit
   skill pm/git/artifact-cleanup
   facts git.artifact-candidates
-  link next confirm_cleanup [submit] (action: enum[delete_uncertain|keep_tracked], paths: list<text>?)
-    do git.apply-artifact-decision
-      resolved              -> git.resolve-message
-      prohibited_remaining  -> git.artifact-review
-      attempts_exhausted    -> git.stepped-out
+  job llm artifact-review role artifact-review  # submit: confirm_cleanup (action, paths?)
+    resolved                -> git.resolve-message
+    prohibited_remaining    -> git.artifact-review
+    attempts_exhausted      -> git.stepped-out
+    infeasible              -> git.stepped-out
+    lost                    -> git.stepped-out
 
 state git.resolve-message
   phase inherit
@@ -96,29 +97,32 @@ state git.compose-message
   phase inherit
   skill pm/git/commit-message
   facts git.diff-summary
-  link next commit [submit] (message: text[1..2000])
-    do git.validate-message
-      valid                 -> git.stage-and-commit
+  job llm commit-message role commit-message    # submit: commit (message)
+    valid                   -> git.stage-and-commit
+    infeasible              -> git.template-message
+    lost                    -> git.template-message
+
+state git.template-message
+  phase inherit
+  auto git.template-message                     # the caller step's template message from git.diff-summary
+    ready                   -> git.stage-and-commit
 
 state git.stage-and-commit
   phase inherit
   auto git.stage-and-commit
     committed               -> git.evaluate-push-policy
     nothing_to_commit       -> git.evaluate-push-policy
-    hook_failed             -> git.commit-fix
+    hook_failed             -> git.commit-fix       # attempt cap left
+    attempts_exhausted      -> git.stepped-out
 
 state git.commit-fix
   phase inherit
   skill pm/git/commit-recovery
   facts git.hook-failure
-  link retry retry [noop] ()
-    do git.retry-commit
-      ok                    -> git.evaluate-push-policy
-      hook_failed           -> git.commit-fix
-      attempts_exhausted    -> git.stepped-out
-  link fix recompose [submit] (message: text[1..2000])
-    do git.validate-message
-      valid                 -> git.stage-and-commit
+  job llm commit-fix role implement             # fixes the hook's findings; submit: fixed (message?)
+    fixed                   -> git.stage-and-commit # re-runs the footprint check and the commit
+    infeasible              -> git.stepped-out
+    lost                    -> git.stepped-out
 
 state git.evaluate-push-policy
   phase inherit
@@ -134,12 +138,10 @@ state git.verify-freshness
 
 state git.freshness-blocked
   phase inherit
-  skill pm/finalize/push-barrier
   facts git.freshness-status
-  link fix run_verification_build [noop] ()
-    do build.enqueue-verification
-      started               -> git.freshness-build-running
-      attempts_exhausted    -> git.stepped-out
+  auto build.enqueue-verification               # server: a verification build, capped per call
+    started                 -> git.freshness-build-running
+    attempts_exhausted      -> git.stepped-out
 
 state git.freshness-build-running
   phase inherit
@@ -181,24 +183,28 @@ state git.push-with-lease
 
 state git.sync-required
   phase inherit
-  skill pm/git/sync-recovery
   facts git.branch-divergence
-  link fix sync_rebase [noop] ()
-    do git.rebase-onto-upstream
-      rebased               -> git.verify-freshness
-      conflict              -> git.resolve-conflicts
-      rebase_failed         -> git.stepped-out
-      attempts_exhausted    -> git.stepped-out
+  auto git.rebase-onto-upstream                 # server: fetch and rebase, capped per call over push rejections
+    rebased                 -> git.verify-freshness
+    conflict                -> git.resolve-conflicts
+    rebase_failed           -> git.stepped-out
+    attempts_exhausted      -> git.stepped-out
 
 state git.resolve-conflicts
   phase inherit
   skill pm/git/sync-recovery
   facts git.rebase-conflict
-  link fix continue_rebase [noop] ()
-    do git.rebase-continue
-      rebased               -> git.verify-freshness
-      conflict              -> git.resolve-conflicts
-      attempts_exhausted    -> git.stepped-out
+  job llm conflict role implement               # resolves the conflicted files; submit: resolved (summary)
+    resolved                -> git.continue-rebase
+    infeasible              -> git.stepped-out  # the server aborts the rebase first
+    lost                    -> git.stepped-out
+
+state git.continue-rebase
+  phase inherit
+  auto git.rebase-continue                      # continues the rebase with the resolved files
+    rebased                 -> git.verify-freshness
+    conflict                -> git.resolve-conflicts    # attempt cap left
+    attempts_exhausted      -> git.stepped-out          # the server aborts the rebase first
 
 state git.done terminal done success
   phase inherit
@@ -207,9 +213,9 @@ state git.stepped-out terminal stepped_out stepped_out
   phase inherit
 ----
 
-NOTE: The sub-workflow has no operator escalation and no override state. The `.gitignore` oracle is retried by the server: `git.artifact-escalate` re-runs the detection a compiled number of times and then steps out (`cause: oracle_failed`); nothing is ever staged past an unclassified path. A stale or undecidable freshness verdict is never pushed: `git.freshness-blocked` offers only `run_verification_build` (and the implicit `step_out`). A repository hook failure is never bypassed: `git.commit-fix` offers `retry` and `recompose`, and `git.retry-commit` returns `attempts_exhausted` after `3` failed commit attempts on an identical staged change set (the staged tree id and the message; compiled constant, link:../timeouts.adoc[Timeouts & Budgets Specification]); the counter resets when the staged tree or the message changes (a fix, a hook that rewrote files, a `recompose`). Hooks run only in the CLI variant, so only that variant reaches `git.commit-fix`. `attempts_exhausted` enters `git.stepped-out`, and so does a rebase that could not start (the fetch or the rebase start failed: `rebase_failed`, server step-out with `cause: rebase_failed`); there is no escalation state for it. Every other model loop of the unit is capped as well, each by its own compiled attempt cap per call (link:../timeouts.adoc[Timeouts & Budgets Specification]): `confirm_cleanup` while prohibited paths remain, `run_verification_build` while the freshness verdict stays stale, `sync_rebase` (the loop `git.sync-required` -> push -> rejection), and `continue_rebase` while conflicts remain; the primitive of the capped link returns `attempts_exhausted` once the cap is reached, which enters `git.stepped-out`. A rebase conflict is model work: `git.resolve-conflicts` offers `continue_rebase` once the model has resolved the conflicted files in the checkout; a `step_out` from it or from `git.sync-required` lets the server abort the unfinished rebase and restore the pre-rebase branch before the frame unwinds. The only forced push is `git.push-with-lease`, entered automatically when the parity decision finds that a server rebase rewrote the plan's own, already pushed branch (Stage 6); every other force push is refused.
+NOTE: The sub-workflow has no operator escalation, no override state, and no link state: the server moves it, and a model acts in it only through the tasks of its four task states. The `.gitignore` oracle is retried by the server: `git.artifact-escalate` re-runs the detection a compiled number of times and then steps out (`cause: oracle_failed`); nothing is ever staged past an unclassified path. A stale or undecidable freshness verdict is never pushed: `git.freshness-blocked` runs a verification build by itself, capped per call. A repository hook failure is never bypassed: `git.commit-fix` is a task of the role `implement` (the plan's writer role), whose worker fixes what the hook reported in the checkout and submits `fixed`, optionally with a recomposed message, and `git.stage-and-commit` re-runs the footprint check and the commit; `git.stage-and-commit` returns `attempts_exhausted` after `3` failed commit attempts on an identical staged change set (the staged tree id and the message; compiled constant, link:../timeouts.adoc[Timeouts & Budgets Specification]); the counter resets when the staged tree or the message changes (a fix, a hook that rewrote files, a recomposed message). Hooks run only in the CLI variant, so only that variant reaches `git.commit-fix`. `attempts_exhausted` enters `git.stepped-out`, and so does a rebase that could not start (the fetch or the rebase start failed: `rebase_failed`, server step-out with `cause: rebase_failed`); there is no escalation state for it. Every other loop of the unit is capped as well, each by its own compiled attempt cap per call (link:../timeouts.adoc[Timeouts & Budgets Specification]): the artifact review while prohibited paths remain, the verification build while the freshness verdict stays stale, the rebase of `git.sync-required` (the loop `git.sync-required` -> push -> rejection), and the conflict resolution while `git.continue-rebase` meets conflicts; the primitive returns `attempts_exhausted` once the cap is reached, which enters `git.stepped-out`. A rebase conflict is model work: `git.resolve-conflicts` is a task of the role `implement`, whose worker resolves the conflicted files in the checkout and submits `resolved`, and the server continues the rebase in `git.continue-rebase`. A task of `artifact-review` or `implement` that closes `infeasible` or `lost` (its role unqualified or without a startable worker, or its re-offers spent) steps out of the unit (`cause: infeasible` or `lost`), the unit's conservative fallback; a task of `commit-message` that closes `infeasible` or `lost` takes the template message of the caller's step (`git.template-message`) instead. Before any step-out leaves an unfinished rebase, the server aborts it and restores the pre-rebase branch. The only forced push is `git.push-with-lease`, entered automatically when the parity decision finds that a server rebase rewrote the plan's own, already pushed branch (Stage 6); every other force push is refused.
 
-Every resting link state (`git.artifact-review`, `git.compose-message`, `git.commit-fix`, `git.freshness-blocked`, `git.sync-required`, `git.resolve-conflicts`) asks for one judgment through one link naming its skill section (`confirm_cleanup` with `pm/git/artifact-cleanup`, `commit` with `pm/git/commit-message`, `retry` or `recompose` with `pm/git/commit-recovery`, `run_verification_build` with `pm/finalize/push-barrier`, `sync_rebase` and `continue_rebase` with `pm/git/sync-recovery`), and offers the implicit `step_out`. `stepped_out` never ends the plan, the epic, or the workspace run by itself: the caller routes it (Rule 6, <<_call_site_reuse_matrix_across_workflows>>).
+Every task state (`git.artifact-review` of the role `artifact-review`, `git.compose-message` of the role `commit-message`, `git.commit-fix` and `git.resolve-conflicts` of the role `implement`) asks for one judgment through its task, naming its skill section (`pm/git/artifact-cleanup`, `pm/git/commit-message`, `pm/git/commit-recovery`, `pm/git/sync-recovery`). The unit is the same in a plan, an epic, and the workspace setup, so it routes every `infeasible` and `lost` explicitly (Rule 2). The states are catalogued in link:../state-catalogue/05-git-commit-and-push.adoc#state-catalogue-git[State Catalogue, Sub-Workflow `git.commit_and_push`]. `stepped_out` never ends the plan, the epic, or the workspace run by itself: the caller routes it (Rule 6, <<_call_site_reuse_matrix_across_workflows>>).
 
 ==== Six-Stage Execution Contract of `git.commit_and_push`
 _Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-6[PM-WATCH-DSL-6], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-7[PM-WATCH-DSL-7], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-10[PM-WATCH-DSL-10], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-9[PM-WATCH-STORE-9], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-73[PM-WATCH-PHASE-73], link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-74[PM-WATCH-PHASE-74], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-24[PM-WATCH-DSL-24], link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-25[PM-WATCH-DSL-25]_
@@ -227,7 +233,7 @@ _Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATC
 ** Transitions to `git.artifact-review` only for paths in the change set of this commit (porcelain entries: staged, unstaged, untracked) that match artifact patterns and are `uncertain`, or for prohibited secret files (`.env*`, `*.pem`, `*.key`, `credentials.json`) in that change set. Unchanged tracked files are never candidates; unchanged tracked files that match artifact patterns are recorded only as a count (`tracked_pattern_matches`) in the audit record, never rendered, since no link acts on them.
 * *Stage 3 — In-Memory Commit Message Resolution, Validation & Trailer Injection (`git.resolve-message` / `git.compose-message`)*:
 ** When `message_mode` is `auto_deliverable` or `step_or_fallback`, resolves the deterministic commit message in memory (e.g., `feat(<module>): complete deliverable <N> - <title>` or `chore(finalize): apply <step_id> changes`).
-** When `message_mode == interactive` (or `none_assert_clean` when unexpected dirty files were found), transitions to `git.compose-message`, populates `facts` via `git.diff-summary` (changed file count, module scope, priority-ordered suggested type `fix > feat > perf > refactor > docs > style > test > chore > ci`), and accepts `message: text[1..2000]` directly in `pm_do` `args`.
+** When `message_mode == interactive` (or `none_assert_clean` when unexpected dirty files were found), transitions to `git.compose-message`, whose task carries `facts` from `git.diff-summary` (changed file count, module scope, priority-ordered suggested type `fix > feat > perf > refactor > docs > style > test > chore > ci`) and whose submit carries `message: text[1..2000]` directly in `pm_do` `args`.
 ** Validates Conventional Commits format (`<type>[optional (<scope>)][!]: <subject>`) via `ConventionalCommitValidator` and deterministically appends the configured trailer `Co-Authored-By: {name} <{email}>`, resolved as in `plan-marshall` (`manage-run-config` `commit-trailer get`) from the operator's `commit_trailer{name,email}` in the machine-local `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, falling back to `machine-config.json` `project_defaults.commit_trailer` and then to the compiled default `plan-marshall <noreply@cuioss.de>` (link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]); the schema refuses an empty value or one containing an angle bracket or line break. No team file is ever consulted for the trailer.
 ** The trailer names the system that produced the commit; it is independent of the commit's author and committer (Stage 4), which are never taken from the message.
 ** The resolved trailer is the only authority: a `Co-Authored-By:` line in a model-supplied `message` is rejected (`invalid_link_args`, `detail` names the line), and the only trailer in the commit is the one the server appends. The commit's audit record carries `trailer_source: {name, email}`, each half `configured`, `default`, or `invalid_ignored` (a stored value that was treated as absent); it is provenance for the operator and is never rendered in `facts`.
@@ -240,15 +246,15 @@ _Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATC
 ** When invoked from a Phase 6 `mutates_source: true` step: re-stamps `head_at_completion = commit_sha` on `head_dependent: true` steps in `mcp/status.json`, and when the commit follows the latest successful build (any such step, not only steps at `order >= 10`, `pre-push-quality-gate.order`; for example `architecture-refresh` at `9` on re-entry; link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#_finalize_commit_instrumentation_freshness_reconcile_post_pr_re_push_pm_wf_16[Phase Workflows Specification, Finalize Commit Instrumentation] item 3), writes a `freshness_reconcile` record (`commit_sha`, `step_id`, `prior_build_worktree_sha` from the latest passing build row in `change-ledger.jsonl`) so the downstream push gate recognizes the finalize-internal commit without requiring a redundant full build when no source-affecting inputs changed.
 ** If `git commit` exits non-zero due to a repository pre-commit hook, returns `hook_failed -> git.commit-fix`.
 * *Stage 5 — Config-Driven Push Policy & Freshness Precondition (`git.evaluate-push-policy` -> `git.verify-freshness`)*:
-** Evaluates `push_mode` together with the derived fact `push_remote`; a `stale` or `failed` fact is never read as "no remote": the state raises the `precondition_unmet` condition (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays]) naming the fact, whose `retry` re-derives and re-evaluates it within the condition's self-remedy budget, after which the phase's fallback is taken. Otherwise: `push_mode == never` skips push (`skip_push -> git.done`); `push_mode == if_push_remote` requires push if and only if a push remote exists; `push_mode == post_pr_conditional` requires push if and only if a push remote exists and the persisted `settle_trigger` has `order > 20` (after `create-pr`), automating post-PR re-push for late source-mutating steps (`adr-propose`, in-branch fixes); `push_mode == always` requires push unconditionally.
-** Before any push, `git.pre-commit-verify-freshness` verifies `change-ledger.jsonl` freshness (`fresh` corroborated on both notation and scope dimensions against the current `worktree_sha`, computed by the git contract operation `git.worktree-sha`, one node for both variants that returns the digest and its `worktree_sha_version`, `exempt` when `build-decision == not_necessary`, or reconciled via `freshness_reconcile`). If `stale` or `undecidable`, transitions to `git.freshness-blocked`, which offers only `run_verification_build`; a stale tree is never pushed, and there is no override.
+** Evaluates `push_mode` together with the derived fact `push_remote`; a `stale` or `failed` fact is never read as "no remote": the state raises the `precondition_unmet` condition (xref:04-ast-node-model.adoc#condition-overlays[Condition Overlays]) naming the fact; the server re-derives and re-evaluates it within the condition's self-remedy budget, after which the phase's fallback is taken. Otherwise: `push_mode == never` skips push (`skip_push -> git.done`); `push_mode == if_push_remote` requires push if and only if a push remote exists; `push_mode == post_pr_conditional` requires push if and only if a push remote exists and the persisted `settle_trigger` has `order > 20` (after `create-pr`), automating post-PR re-push for late source-mutating steps (`adr-propose`, in-branch fixes); `push_mode == always` requires push unconditionally.
+** Before any push, `git.pre-commit-verify-freshness` verifies `change-ledger.jsonl` freshness (`fresh` corroborated on both notation and scope dimensions against the current `worktree_sha`, computed by the git contract operation `git.worktree-sha`, one node for both variants that returns the digest and its `worktree_sha_version`, `exempt` when `build-decision == not_necessary`, or reconciled via `freshness_reconcile`). If `stale` or `undecidable`, transitions to `git.freshness-blocked`, which runs a verification build of the server; a stale tree is never pushed, and there is no override.
 ** When no reconciliation record names the live `HEAD`, `git.freshness-status` reports `stale_reason: reconciliation_record_absent` together with the causes that absence admits (`admitted_causes` ⊆ `source_drift_unbuilt`, `no_successful_build`, `record_owed_not_emitted`, `commit_outside_reconcile_membership`). The refusal reports what it observed and never asserts a single inferred cause; the fail-closed halt is unchanged.
-** `git.freshness-blocked` renders, beside `stale_reason`, the evidence it would accept: the required build notation(s) and the scope (`whole_tree` or a module list); the current `worktree_sha` is recorded in the audit record, not rendered.
+** `git.freshness-blocked` records in its facts, beside `stale_reason`, the evidence it would accept, which the scope's view shows: the required build notation(s) and the scope (`whole_tree` or a module list); the current `worktree_sha` is recorded in the audit record, not rendered.
 * *Stage 6 — Branch Sync Parity Probe & Push Execution (`git.check-branch-parity` -> `git.execute-push`)*:
 ** `git.push-barrier-decision` first reads the persisted fact `branch_pushed_at` in `mcp/status.json`. When it is unset, the branch has never been pushed by this plan and the decision is `first_push` (`git -C <tree> push --set-upstream origin <branch>`) without consulting the probe. When it is set (re-entry), the decision follows `plan-marshall`'s push-barrier mapping (`workflow-integration-git/scripts/git-workflow.py`, `push_barrier_action`, verified at commit `1d4a1da37`; re-verify before implementing): it runs `git.branch-sync-state` and returns `refire` only for `ahead`, and `rewritten_by_rebase` (a *PM-MCP* addition) when the plan's recorded last push (`branch_pushed_at`) is no ancestor of `HEAD` because a server rebase (`sync-baseline` or the merge-path sync) rewrote the branch; `synced` returns `synced`, which ends the call with `done` (`pushed: true`, the remote branch holds `HEAD`); `remote_absent_landed` returns `landed`, which ends the call with `done` (`pushed: false`, `landed: true`); `remote_absent_unverified` and any unrecognised state return `push_state_unknown`, a server step-out (`cause: push_state_unknown`) that the caller routes to its fallback. A never-pushed branch and a squash-merged-and-deleted branch are indistinguishable locally, so `remote_absent_unverified` is resolved with provider evidence before it is classified: `ci.pr-find` by the head branch finding a merged pull request turns it into `remote_absent_landed` (`landed`, re-pushing would resurrect a landed branch); finding no pull request at all turns it into `never_pushed`, which pushes (`refire`); any other observation (an open or closed-unmerged pull request, or a provider that cannot be observed) keeps `remote_absent_unverified`, which never pushes and steps out. *Deliberate change vs. `plan-marshall`*: `plan-marshall` never pushes on `remote_absent_unverified`, consults no provider evidence, and reports every skipped state as pushed.
 ** `git.branch-sync-state` classifies the plan's recorded `branch_name` (`mcp/status.json`), never the ambient `HEAD` of the checkout, and fetches the remote ref before classifying. A classification made without a fetch in the same transaction is labelled unverified (as `remote_absent_unverified` already is) and is never used to claim that the branch is unpushed. *Deliberate change vs. `plan-marshall`*: its `branch-sync-state` is a read-only comparison against the local remote-tracking ref and never fetches.
 ** `git.execute-push` (and `git.push-with-lease`) sets `branch_pushed_at` (timestamp and pushed `HEAD`) in `mcp/status.json` on the first successful push and refreshes it on every later successful push, so it always names the last pushed commit. A push answered `up_to_date` pushed nothing and ends the call with `done` (`pushed: true`).
-** If `git push` is rejected as non-fast-forward (`rejected_non_ff{remote_sha}`), transitions to `git.sync-required`, which offers `sync_rebase`. `sync_rebase` rebases onto the fetched upstream; a conflict enters `git.resolve-conflicts` (model work, never an operator decision).
+** If `git push` is rejected as non-fast-forward (`rejected_non_ff{remote_sha}`), transitions to `git.sync-required`, where the server rebases onto the fetched upstream; a conflict enters `git.resolve-conflicts` (a task of the role `implement`, never an operator decision).
 ** *Explicit push lease*: The only forced push is `git.push-with-lease`, a server rule rather than a decision: it is entered automatically when the parity decision returns `rewritten_by_rebase`, pushes only the plan's own branch, and always names its lease explicitly as the expected remote SHA, in both variants: the `remote_sha` observed at the last rejection, else the SHA of the last recorded push (`branch_pushed_at`). The local remote-tracking ref is never the lease, because a fetch between observation and push moves it and turns the lease into a plain force. A `rejected_lease{remote_sha}` (the remote moved meanwhile) returns to `git.sync-required`; any other force push is refused. Before every retry of a rejected push, the remote branch is re-read (`ls-remote`) and the retry uses the re-read SHA. *Deliberate change vs. `plan-marshall`*: `plan-marshall` pushes `--force-with-lease` without an expected value, taking the lease from the tracking ref.
 
 ==== Call-Site Reuse Matrix Across Workflows
@@ -282,17 +288,17 @@ Every call site routes the exit contract `done` / `stepped_out` (Rule 6); a site
 |`remediation.ci-failure`, `remediation.review-findings`, `remediation.analysis` -> `<unit>.commit-fix`
 |`interactive`
 |`always`
-|The in-branch `fix` of a remediation unit inside the finalize wait region or at the pre-merge barrier, always after the pull request exists (the Settle-band call sites `finalize.remediate-security-audit` and `finalize.remediate-self-review` bind `actions=[retry,loop_back]` and never reach this state); `done` with `result.commit` -> the unit's await state for the new `HEAD` (the fix is charged); `done` without a commit and `stepped_out` -> the unit's `decide` (not charged, xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]).
+|The in-branch `fix` of a remediation unit inside the finalize wait region or at the pre-merge barrier, always after the pull request exists (the Settle-band call sites `finalize.remediate-security-audit` and `finalize.remediate-self-review` bind `actions=[retry,loop_back]` and never reach this state); `done` with `result.commit` -> the unit's await state for the new `HEAD`; `done` without a commit and `stepped_out` -> the unit's `budget-check` (the fix was charged when its task submitted it, xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]).
 
 |`epic.pmwf` -> `epic.commit-ledger`
 |`step_or_fallback`
 |`never`
-|Commits epic ledger updates in the shared epic worktree on the fixed epic branch, staging only `.marshall/orchestrator/**` paths. Never commits on the primary checkout; ledger changes reach the default branch only through the epic landing (link:../dispatch-and-effort/04-epic-coordination.adoc#epic-landing[Model Jobs & Effort Specification]); `stepped_out` returns to `epic.active` (the write stays uncommitted).
+|Commits epic ledger updates in the shared epic worktree on the fixed epic branch, staging only `.marshall/orchestrator/**` paths. Never commits on the primary checkout; ledger changes reach the default branch only through the epic landing (link:../model-work/08-epic-coordination.adoc#epic-landing[Model Work Specification]); `stepped_out` returns to `epic.active` (the write stays uncommitted).
 
 |`epic.pmwf` -> `epic.commit-decomposition`
 |`step_or_fallback`
 |`never`
-|Commits the decomposition writes of `epic.decompose` (a `workstream`, `spec_section`, or `stage` write, or the drafted decomposition of `epic.decompose-draft`) in the shared epic worktree on the fixed epic branch, staging only `.marshall/orchestrator/**`. `done` and `stepped_out` return to `epic.decompose` (after `stepped_out` the write stays uncommitted and is committed with the next ledger write).
+|Commits the decomposition writes of `epic.decompose` (its `workstream`, `spec_section`, and `stage` writes) in the shared epic worktree on the fixed epic branch, staging only `.marshall/orchestrator/**`. `done` and `stepped_out` continue at `epic.active` (after `stepped_out` the writes stay uncommitted and are committed with the next ledger write).
 
 |`project-setup.pmwf` -> `setup.land-changes`
 |`step_or_fallback`

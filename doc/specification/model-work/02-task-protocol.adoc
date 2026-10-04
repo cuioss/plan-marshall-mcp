@@ -1,0 +1,199 @@
+= Model Work Specification: Task Protocol
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Work] » Task Protocol
+
+[#task-protocol]
+== Task Protocol
+_See Requirements link:../../Requirements.adoc#PM-WORK-2[PM-WORK-2: Task Protocol], link:../../Requirements.adoc#PM-TOOL-1[PM-TOOL-1: Core Workflow Verb Set (pm_state, pm_do)], link:../../Requirements.adoc#PM-IMPL-4[PM-IMPL-4: Bounded Long-Poll & Progress-Reset Waiting Primitives]_
+
+A worker gets its work as tasks through one protocol: it waits, is offered a task, acknowledges it, executes it along the task's links, and submits a result. Every transition is server logic; the model only follows the links it is offered. Headless workers (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]) and an interactive session that takes a task (<<session-worker>>) follow the same protocol.
+
+image::../../resources/harness-as-worker-task-exchange.svg[One task from offer to submit between workflow engine, task queue, and worker, including the wait-again answer and the acknowledgement, align=center]
+
+[#queue-task]
+=== Queue Task
+
+A *queue task* is one unit of model work. Entering a model state (`job llm <entity_kind> role <role> [each <primitive>]`, link:../workflow-dsl/02-units-jobs-decisions.adoc#model-job-states[Workflow DSL Specification, Model Job States]) creates one queue task per entity, in the transaction that enters the state, and hands it to the model caller (xref:01-roles-and-configuration.adoc#model-caller[The Model Caller]). A consultation creates one for the consulted role (xref:05-consultation.adoc[Consultation]). A queue task is distinct from a plan task (`TASK-NNN`); a task envelope's queue task carries plan tasks (xref:06-envelopes-questions-deadlines.adoc[Task Envelopes]).
+
+The record `<PM_MCP_BASE>/projects/<project_id>/queue/<queue_task_id>.json` (identifier `qt-…`: link:../identifiers.adoc[Identifiers Specification]; schema: link:../store-schemas.adoc[Store Schemas Specification]) holds the scope and entity, the creating state, the role and the configuration digest (xref:01-roles-and-configuration.adoc#role-artifact[Role Artifact Schema]) the caller resolved, the kind (`work` or `consultation`), the status, the current lease, every attempt with its generation and its end, the closed outcome with its reason, and the references between an asking task and its consultations (xref:05-consultation.adoc[Consultation]). It is updated only in short transactions under the project's queue lock and claimed and released like every lease record (link:../store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas Specification, Transaction Locks & Leases]).
+
+The queue is ordered per project and role: consultation tasks first, then work tasks in creation order.
+
+[#pm-wait]
+=== `pm_wait`: The Worker's Only Wait
+
+`pm_wait()` takes no argument (schema: link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, Core Workflow Tools]). The caller's identity, role, and generation come from its connection: a worker's job token and generation, or a session's generation, set by the relay (link:../runtime-model.adoc[Runtime & Interaction Model Specification, Relay]). The server holds the call for at most the bounded wait of the caller's host (`connection.bounded_wait_seconds`) and sends progress frames during it where the host's `connection.progress_resets_timeout` is set (link:../timeouts/01-job-budgets-and-waits.adoc#bounded-wait[Timeouts & Budgets Specification, Bounded Wait]). It answers with exactly one of:
+
+* *`offer`*: the representation of a task entity leased to the caller's generation: an offer (<<offer>>), the same offer again, or the caller's current task carrying a consultation answer (xref:05-consultation.adoc[Consultation]).
+* *`wait_again`*: the window ended without a task for the caller.
+* *`end`*: the caller is to end: a recycle, the end of a fresh worker's task, an artifact change, or a drain (xref:03-supervision-and-recycling.adoc#ending[Ending a Worker]).
+
+A generation holds at most one pending `pm_wait`. A newer `pm_wait` of the same generation supersedes the pending one, which is answered `wait_again` at once and never with a task, so a leased task is never offered to a second concurrent wait of one generation. A host's cancellation of the call ends only that call (link:../timeouts/01-job-budgets-and-waits.adoc#host-cancellation[Timeouts & Budgets Specification, Host Cancellation]).
+
+[#offer]
+=== Offer
+
+The server answers a pending `pm_wait` with the first queued task of the caller's role that the caller may take:
+
+* the task's configuration digest (xref:01-roles-and-configuration.adoc#role-artifact[Role Artifact Schema]) equals the digest the caller's generation was started with;
+* the caller's generation holds no other lease;
+* a warm worker takes only tasks that run in the working directory it was started in (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]);
+* a `writer` task of a plan is offered only while no other `writer` task of the plan is leased (one writer per plan, xref:04-worker-launch.adoc[Worker Launch]).
+
+The offer leases the task to the caller's generation in the transaction that answers the wait and carries the task's entity representation (its facts and links, the link `ack` among them) and the skills the task requires, in-band those the generation has not received; which skills, the offer bound, and the fresh worker that takes a task above it are specified in xref:04-worker-launch.adoc#skill-delivery[Worker Launch, Skill Delivery Record & Re-Delivery]. A fresh worker is started for one task, which is leased to its generation at spawn: its launch prompt carries the offer, its first call is `pm_state` on the offered entity, and its acknowledgement deadline runs from that first call (xref:04-worker-launch.adoc[Worker Launch]).
+
+[#ack]
+=== Acknowledge
+
+The worker acknowledges an offer by following the link `ack` (rel `next`, form `noop`) of the offered entity through `pm_do`. The acknowledgement tells the server that the worker is alive and holds the task. It is due within `worker.ack_deadline_seconds` of the worker's host, counted from the offer, for a fresh worker from its first call (<<offer>>; link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Worker Block]). Where the host's `worker.ack_informational` is set, a missing acknowledgement ends no worker and silence alone decides (xref:03-supervision-and-recycling.adoc#detection[Detection]).
+
+A `pm_wait` of a generation that holds an unacknowledged offer shows that the offer's answer did not reach the worker; it is answered with the same offer under the same lease.
+
+[#execute-submit]
+=== Execute & Submit
+
+The worker executes the task only along the links of the task's entity representation (`pm_state` and `pm_do` on its entity, and the tools of its role). Every call is a heartbeat; an open call (a held `pm_build` included) is never silence. The worker delivers its result only through a submit link of the entity. Every call on a task entity is checked, in this order:
+
+. *Generation*: a call of a fenced generation is refused `generation_fenced` (<<fencing>>).
+. *Lease*: a call on an entity not leased to the caller's generation is refused `job_scope_mismatch`; a call after the worker's job ended is refused `job_ended`.
+. *Link*: the link must be offered in the entity's current state (`link_not_available` otherwise).
+. *Schema*: the arguments must match the link's closed schema. A submit that misses a required reference (the consultation reference of xref:05-consultation.adoc[Consultation] among them) is refused `invalid_link_args` with a reason the worker can act on; the task stays executing, and the worker may submit again.
+
+The error codes are defined in the link:../mcp-tools/04-errors-and-testing.adoc[MCP Tools Specification, Errors]. The first valid submit of the required submission closes the attempt in the transaction that validated it and releases the lease; every later submit of the task is refused because its link is not offered after the close. The task is done exactly once.
+
+A warm worker whose `pm_wait` arrives while it holds an acknowledged task that is not consulting has ended its turn without the required submission: the attempt ends, and the task is offered to it again as a new attempt within the re-offer budget (<<re-offer>>).
+
+[#task-outcomes]
+=== Closed Task Outcomes
+
+A task ends only in one of four closed outcomes, recorded on the queue task with its reason:
+
+[cols="1,4"]
+|===
+|Outcome |Meaning
+
+|`submitted`
+|The entity recorded its required submission.
+
+|`asked`
+|The worker followed the entity's `ask` link: a question record was created (xref:06-envelopes-questions-deadlines.adoc#question-records[Question Records]); the state that created the task serves the question, and the work continues in a new task with the answer in its facts.
+
+|`infeasible`
+|The worker reported the task infeasible through the entity's infeasible link, with its evidence; the creating state takes its infeasible route.
+
+|`lost`
+|The worker was ended while holding the task, or no attempt delivered a result: the re-offers are spent (reason `attempts_spent`), or the task closed without an attempt (reason `role_undefined`, `role_unqualified`, or `role_unavailable`, xref:01-roles-and-configuration.adoc#model-caller[The Model Caller]), or the task was withdrawn because its state or scope ended while it was open (reason `withdrawn`). The creating state takes its conservative fallback (xref:01-roles-and-configuration.adoc#conservative-fallback[Conservative Fallback]).
+|===
+
+A worker never ends or hands back a plan, and no link of a task entity ends a scope; `step_out` exists only in the sub-workflows the entry session drives (link:../hypermedia-format/01-representation-and-link-forms.adoc[Hypermedia Format Specification]). The model state evaluates the outcome together with the persisted entity records (xref:09-completion-usage-and-spend.adoc#job-completion[Task Completion & Return Evaluation]).
+
+[#re-offer]
+=== Re-Offer within the Self-Remedy Budget
+
+An attempt that ends without a result (its worker lost while holding the task, a fresh worker that exited without the required submission, a warm worker that waited again while holding it) makes the server offer the task again, as a new attempt, within the compiled self-remedy budget of the state (link:../timeouts/01-job-budgets-and-waits.adoc#task-reoffer-budget[Timeouts & Budgets Specification, Task Re-Offer Budget]). The server re-offers on its own and records the re-offers as the `job_incomplete` condition of the state, whose compiled budget they spend (xref:09-completion-usage-and-spend.adoc#job-completion[Task Completion & the `job_incomplete` Condition]); no model follows a link for it. When the budget is spent, the task closes `lost` with `attempts_spent`. An attempt ended by a runtime restart, a drain, a start failure of a fresh worker (xref:03-supervision-and-recycling.adoc#start-failure-guard[Start-Failure Guard]), or the withdrawal of an unacknowledged session offer (<<session-worker>>) does not count against the budget. The queue task records the number of attempts and the generation and end of every attempt.
+
+[#leases-fencing]
+== Leases, Generations & Fencing
+_See Requirements link:../../Requirements.adoc#PM-WORK-2[PM-WORK-2: Task Protocol], link:../../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Operator-Gated Network Exposure & Stream Hygiene], link:../../Requirements.adoc#PM-IMPL-7[PM-IMPL-7: Data Store Invariants, Footprint Reconciliation & Lock Ordering]_
+
+* *Generation*: A worker's `generation_id` is its `job_id`; a fresh worker has one generation, a warm worker's generation ends with its job, and a recycle starts a new worker and so a new generation. A session's generation is an `sg-` identifier (<<session-worker>>). The relay carries the generation; a model never passes it.
+* *Lease*: A task is leased to one generation at a time. The lease is released at the submit that closes the task or the attempt, at the fence of its generation, and at the withdrawal of an unacknowledged session offer. A released task whose budget remains is queued again at once.
+* *Delivery record*: The skills delivered to a generation are recorded per generation; a new generation starts with an empty record, so a successor receives every skill again (xref:04-worker-launch.adoc#skill-delivery[Skill Delivery Record & Re-Delivery]).
+
+[#fencing]
+=== Fencing
+
+A generation is fenced when the supervisor ends its worker (xref:03-supervision-and-recycling.adoc#ending[Ending a Worker]), when a new generation of the same session identity starts (<<session-worker>>), and, for every generation of a dead runtime instance, in the project's recovery. The fence is persisted in the transaction that releases the generation's lease, so no call of the fenced generation is accepted after its task is free. Every later call of a fenced generation is refused `generation_fenced`, before any other check; a worker's job token is revoked with the fence.
+
+image::../../resources/harness-as-worker-worker-replacement.svg[A stalled worker of generation 1 is replaced by generation 2, which receives the same task; the late submit of generation 1 is refused, align=center]
+
+[#redelivery]
+=== Exactly-Once Redelivery
+
+When a worker is replaced, its lease is released at the fence and its task is offered to a successor exactly once per attempt. The successor starts with an empty context; nothing is handed over from the predecessor, because the task's representation carries what its state needs: the facts of the state, the persisted partial progress of the entity (the completed plan tasks of an envelope, the persisted submits of a multi-submit entity), and the answers of its consultations. A late submit of the replaced generation is refused `generation_fenced`.
+
+After a runtime restart the project's recovery records every worker of the dead instance `killed`, fences its generation, releases its lease, and queues its task again, offered exactly once (link:../job-runtime/01-pipeline-and-subprocesses.adoc[Job Runtime Specification]).
+
+[#worker-states]
+== Worker States
+_See Requirement link:../../Requirements.adoc#PM-WORK-2[PM-WORK-2: Task Protocol]_
+
+image::../../resources/harness-as-worker-task-states.svg[Worker states: waiting, offered, acknowledged, executing, consulting, submitted, lost, and ended, with their transitions, align=center]
+
+The worker state is recorded in the worker's job record (link:../store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas Specification, Job Record]) and shown in `pm-operator status` and the web app.
+
+[cols="1,3,3"]
+|===
+|State |Meaning |Leaves to
+
+|`waiting`
+|Started, or between tasks; holds or will call `pm_wait`.
+|`offered` (an offer), `ended` (`end`), `lost` (a detection signal)
+
+|`offered`
+|A task is leased to its generation and not acknowledged.
+|`acknowledged` (`ack`), `lost` (missing acknowledgement where it is not informational, silence, exit)
+
+|`acknowledged`
+|The task is confirmed.
+|`executing` (the first call after `ack`), `lost`
+
+|`executing`
+|Works along the task's links.
+|`submitted` (the task closes), `consulting` (a consultation link), `lost`
+
+|`consulting`
+|Waits in `pm_wait` for a consultation's answer.
+|`executing` (the answer), `lost`
+
+|`submitted`
+|The task closed; the lease is released.
+|`waiting` (the next `pm_wait` of a warm worker), `ended` (a fresh worker, or `end`)
+
+|`lost`
+|Ended by the supervisor on a detection signal; its lease is released at once.
+|`ended`
+
+|`ended`
+|The process is gone and the generation fenced.
+|—
+|===
+
+[#worker-task-unit]
+== The `worker-task` Sub-Workflow
+_See Requirements link:../../Requirements.adoc#PM-WORK-2[PM-WORK-2: Task Protocol], link:../../Requirements.adoc#PM-IMPL-5[PM-IMPL-5: Declarative Workflow DSL & Automated Diagram Generation], link:../../Requirements.adoc#PM-WF-16[PM-WF-16: Reusable Compound Sub-Workflows & Config-Driven Git Commit/Push]_
+
+The protocol of one task is the compiled sub-workflow unit `worker-task`, which every model state calls once per entity; its DSL text is in the link:../workflow-dsl/02-units-jobs-decisions.adoc#worker-task-unit[Workflow DSL Specification, Task Protocol Unit], and its states are catalogued in the link:../state-catalogue/10-entity-units.adoc[State Catalogue, Entity Units]. Its parameters are the role, the entity, and the consultation roles the calling state declares. Its semantics:
+
+* *`queued`*: An `auto` state that runs the model caller. A task closed by the caller (`role_undefined`, `role_unqualified`, `role_unavailable`) leaves to the terminal `lost`; otherwise the unit leaves to `waiting`.
+* *`waiting`*: Waits for a `pm_wait` of a worker of the role; the offer leases the task and leaves to `offered`; a release (the role's workers stopped by the start-failure guard) returns to `queued`.
+* *`offered`*: Waits for the engine events of the lease: `ack` leaves to `executing`; the loss or withdrawal of the lease returns to `queued` as a re-offer.
+* *`executing`*: Runs the entity's own unit (link:../state-catalogue/10-entity-units.adoc[State Catalogue, Entity Units]), whose links are the task's links, together with the consultation links of the calling state. A consultation link leaves to `consulting`; the end of the entity unit leaves to the terminal of its outcome; the loss of the worker returns to `queued` as a re-offer.
+* *`consulting`*: Waits for the consultation's answer and returns to `executing`; the loss of the worker returns to `queued`, and the answer reaches the successor in the task's facts (xref:05-consultation.adoc[Consultation]).
+* *Terminals*: `submitted`, `asked`, `infeasible`, `lost` (<<task-outcomes>>). A re-offer beyond the budget leaves to `lost`.
+
+The terminal is the task's outcome, which the calling model state evaluates. The unit offers no `step_out` and no `abort`. Every transition of the unit is an engine event or an `auto` primitive; the only links a worker follows are `ack`, the entity's links, and the consultation links.
+
+[#session-worker]
+== The Session as Optional Worker
+_See Requirements link:../../Requirements.adoc#PM-WORK-5[PM-WORK-5: Interactive Session as Optional Worker], link:../../Requirements.adoc#PM-SKILL-4[PM-SKILL-4: Skill Delivery to Workers & State through Representations]_
+
+The entry session of a scope may take tasks of that scope while it is attentive; a plan never waits on it. A task is offered to the session first only when all of these hold:
+
+* the task's role sets `session_first` and its class is `read_only` or `zero_tool` (a session never takes a `writer` task, because it runs outside the job confinement);
+* the session's host has `worker.session_tasks` set in its client profile (link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Worker Block]);
+* the session entered the task's scope and holds a pending `pm_wait`.
+
+Otherwise the task goes to a headless worker of the role. An offer the session does not acknowledge within its host's acknowledgement deadline is withdrawn: its lease is released, and the task is offered to a headless worker of the role without counting a re-offer. A session's lease that silence ends is released the same way. `pm_wait` is in the session's tool set only while the session is eligible for tasks (link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, Core Workflow Tools]).
+
+* *Session generation*: Every `pm-mcp enter`, and every new host session the relay reports, gets a new session generation `sg-…`, issued by the runtime and carried by the relay. It fences every earlier generation of the same session identity at once, so an earlier loop that still runs in the host behind another relay is refused `generation_fenced`. A generation the relay issues has no scope until the session enters one; the `start.create-scope` commit of a bootstrap sets the committing generation's scope to the new scope (link:../store-schemas/16-task-queue.adoc#session-generation-record[Store Schemas Specification, Session Generation Record]).
+* *Clear and compaction*: After the relay reports a clear or a compaction of its host session, the session is gone for offers until it calls `pm_wait` again; an offer it holds unacknowledged is withdrawn, and its skills are delivered again with its next offer (xref:04-worker-launch.adoc#skill-delivery[Skill Delivery Record & Re-Delivery]); a clear the host does not report stays invisible, and the shim covers it.
+* *Same protocol*: A session takes a task through the same offer, acknowledgement, links, validation, leases, and fencing as a headless worker. Its task records carry the session's identity and generation; its usage is `unmeasured` unless its host reports usage per turn.
+
+Which hosts may take session tasks, and how their sessions behave while they loop, is recorded in the link:../client-profiles.adoc[Client Profiles Specification]; the measurements are in the link:../evaluation.adoc#limits[Evaluation Reference, Limits].

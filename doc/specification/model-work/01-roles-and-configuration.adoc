@@ -1,0 +1,253 @@
+= Model Work Specification: Roles & Configuration
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Work] » Roles & Configuration
+
+[#roles]
+== Roles as Configuration Artifacts
+_See Requirements link:../../Requirements.adoc#PM-WORK-1[PM-WORK-1: Roles as Configuration], link:../../Requirements.adoc#PM-WF-14[PM-WF-14: Task Envelopes, Model Slots & Usage per Task], link:../../Requirements.adoc#PM-EXT-6[PM-EXT-6: Configuration Split by Owner Class (Team, Operator, Server State)]_
+
+Every piece of model work is a task of a role (xref:02-task-protocol.adoc[Task Protocol]). A role is one JSON artifact; the server knows no fixed role. A workflow state names a role by its name, and the one model caller (<<model-caller>>) reads the artifact and acts on it. Changing, adding, or moving a role to another harness is an edit of a role set, never a code change.
+
+[#role-artifact]
+=== Role Artifact Schema
+
+A role artifact is the file `<name>.json` of a role set (<<role-sets>>). Its schema is closed; an unknown member makes the artifact invalid (<<role-validation>>).
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/role-artifact-v1.json",
+  "title": "RoleArtifact",
+  "type": "object",
+  "required": ["format_version", "name", "description", "class", "tools", "harness", "model", "effort", "form", "count", "skills", "session_first", "budget_floor_seconds"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": { "const": 1 },
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$", "description": "Role name (role name, identifiers.adoc); equals the file name without .json." },
+    "description": { "type": "string", "minLength": 1, "maxLength": 240 },
+    "class": { "type": "string", "enum": ["writer", "read_only", "zero_tool"] },
+    "tools": {
+      "type": "array", "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$" },
+      "description": "Exact tool names: PM-MCP tools and harness tools; never a pattern. Empty for zero_tool."
+    },
+    "harness": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$", "description": "client_id of the harness's client profile." },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Model identifier as the harness takes it." },
+    "effort": { "type": ["string", "null"], "description": "Effort value as the harness takes it; null: no effort flag." },
+    "form": { "type": "string", "enum": ["warm", "fresh"] },
+    "count": { "type": "integer", "minimum": 1, "maximum": 16, "description": "Workers of the role that run at once per project." },
+    "skills": {
+      "type": "array", "uniqueItems": true, "minItems": 1,
+      "items": { "type": "string", "pattern": "^skill://pm/[a-z0-9/_.-]+/SKILL\\.md$" },
+      "description": "The role's skills in delivery order; the first is the role skill, the role's contract."
+    },
+    "session_first": { "type": "boolean", "description": "Whether the role's tasks are offered to an interactive session first." },
+    "recycling": {
+      "type": "object",
+      "required": ["idle_wakeups", "token_budget", "tasks_per_generation"],
+      "additionalProperties": false,
+      "properties": {
+        "idle_wakeups": { "type": ["integer", "null"], "minimum": 1, "maximum": 100, "description": "null: the host's value." },
+        "token_budget": { "type": "integer", "minimum": 10000 },
+        "tasks_per_generation": { "type": ["integer", "null"], "minimum": 1, "description": "null: unbounded." }
+      },
+      "description": "Required for form warm, absent for form fresh."
+    },
+    "budget_floor_seconds": { "type": "integer", "minimum": 60, "maximum": 86400, "description": "Floor of the job budget learned for the role." }
+  }
+}
+----
+
+* *`class`* decides what the role may do: a `writer` changes the plan worktree and runs builds, a `read_only` role reads and submits, a `zero_tool` role has no tool and no PM-MCP connection. The class tool sets and the capabilities a class needs from its harness are specified in xref:04-worker-launch.adoc[Worker Launch]; `tools` names the exact subset the role gets. Every non-`zero_tool` role names `pm_wait`, `pm_state`, `pm_do`, `pm_skill`, and `pm_skill_file`.
+* *`form`*: a `fresh` role gets one worker per task, which ends after the task; a `warm` role gets supervised workers that take task after task and are recycled (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]). A `zero_tool` role is always `fresh`.
+* *`count`*: for `fresh`, the most fresh workers of the role that run at once in the project; for `warm`, the most warm workers the supervisor keeps. Both are bounded further by the machine's model slots and by one writer per plan (xref:04-worker-launch.adoc[Worker Launch]).
+* *`recycling`*: `idle_wakeups` lowers the host's value (`worker.idle_wakeups` of the client profile, link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Profile Schema]) and never raises it; `token_budget` and `tasks_per_generation` hold for the role alone.
+* *`budget_floor_seconds`*: the floor of the job budget that the runtime learns per role, at least the compiled minimum of the link:../timeouts/01-job-budgets-and-waits.adoc#model-job-budget[Timeouts & Budgets Specification, Worker Budget]; the shipped floors are in <<default-roles>>.
+
+The *configuration digest* of an artifact is the SHA-256 of its canonical JSON (RFC 8785) with `description` removed, together with the digests of its skills and the major.minor of the enrolled harness version (link:../store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]). It identifies the configuration a qualification record is bound to (<<qualification-records>>).
+
+[#role-sets]
+=== Role Sets & Precedence
+
+The roles that exist are exactly the artifacts of the effective role set of a project. Three sets contribute, from lowest to highest precedence:
+
+[cols="1,3,3"]
+|===
+|Set |Location |Owner
+
+|Shipped
+|`classpath:/roles/<name>.json`, compiled into the release; qualification records under `classpath:/roles/qualification/`
+|The release (<<default-roles>>)
+
+|Machine
+|`<PM_MCP_BASE>/roles/<name>.json`
+|The operator, for every project of the machine
+
+|Project
+|`<PM_MCP_BASE>/projects/<project_id>/roles/<name>.json`
+|The operator, for one project
+|===
+
+An artifact replaces the artifact of the same name in a lower set as a whole; members are never merged. The paths are listed in the link:../filesystem-layout.adoc[Filesystem Layout Specification]. Role sets are operator files (link:../domain-extensions/06-configuration.adoc[Domain Extensions Specification, Configuration]): the runtime never reads a role, a harness, or a model from git-tracked configuration, and no job can write a set (job confinement, link:../job-runtime/02-confinement-and-environment.adoc[Job Runtime Specification]).
+
+The runtime reads the effective set at every composition (<<role-composition>>) and at every task creation (<<model-caller>>), keyed by the configuration digest (<<role-artifact>>), so an edited artifact applies to the next task and the next worker generation. A running generation keeps the configuration it was started with; a warm worker whose artifact changed is recycled after its current task (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]).
+
+[#role-validation]
+=== Validation against Schema and Client Profile
+
+Every artifact is validated when it is read, first against its schema, then against the client profile of its `harness` (link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Profile Schema]). An invalid artifact counts as undefined; it does not fall back to an artifact of a lower set. The reason is reported to the operator in `pm-operator roles list` and `show` (<<operator-roles>>), in `pm-operator status`, and in the audit log.
+
+[cols="2,5"]
+|===
+|Reason |Rule
+
+|`schema_invalid`
+|The artifact fails its schema, its `name` differs from its file name, or `recycling` is missing for `warm` or present for `fresh`.
+
+|`harness_unknown`
+|No client profile has the `client_id` `harness`, or the harness is not enrolled on the machine.
+
+|`harness_not_eligible`
+|The profile's `worker.eligible` is `false`.
+
+|`harness_capability_missing`
+|The profile's `headless.capabilities` lack a capability the role's class needs.
+
+|`model_restricted`
+|No entry of `worker.restricted_models` matches `model` (exact name or a `*` glob): the model refuses a restricted tool set on that harness.
+
+|`effort_unsupported`
+|`effort` is below every value `headless.model_efforts` lists for the model.
+
+|`tool_not_permitted`
+|`tools` names a tool outside the tool set of the class, a harness tool that starts sub-agents or asks the user, or omits a PM-MCP tool every role of the class names; a `zero_tool` role names any tool.
+
+|`form_not_permitted`
+|A `zero_tool` role is `warm`.
+
+|`session_first_not_permitted`
+|A `writer` role sets `session_first`.
+
+|`skill_unresolved`
+|A skill does not resolve in the compiled skill catalogue, or the first skill is not a role skill (`skill://pm/role/…`).
+|===
+
+[#role-composition]
+=== Composition Check (`role_undefined`)
+
+A workflow unit names roles freely by name: in a model state (`job llm <entity_kind> role <role>`) and in a consultation clause (`consult role <role>`, xref:05-consultation.adoc[Consultation]); the grammar is the link:../workflow-dsl.adoc[Workflow DSL Specification]'s. When the runtime composes a plan instance, an epic workflow, or the project setup workflow of a project (link:../workflow-dsl/09-plan-instance.adoc[Workflow DSL Specification, Plan Instance]), it resolves every named role in the project's effective set. A role that is absent or invalid refuses the composition with `role_undefined`, naming the role, the state, and the validation reason where there is one (link:../mcp-tools/04-errors-and-testing.adoc[MCP Tools Specification, Errors]); the scope is not created, and no state is reached that names the role.
+
+A role that becomes undefined after composition (an artifact removed or invalidated by an edit) is found at task creation: the task closes without an attempt with the reason `role_undefined`, and its state takes the conservative fallback (<<conservative-fallback>>).
+
+[#model-caller]
+== The Model Caller
+_See Requirements link:../../Requirements.adoc#PM-WORK-1[PM-WORK-1: Roles as Configuration], link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Model Work as Role Tasks & Single-Level Leaf Constraint]_
+
+The runtime has exactly one model caller. Every model step of every workflow goes through it, and no other part of the runtime knows what a role is for. When a model state creates a task (xref:02-task-protocol.adoc#queue-task[Queue Task]), the caller acts in this order:
+
+. *Resolve*: It reads the effective artifact of the state's role. An absent or invalid artifact closes the task with `role_undefined` (<<role-composition>>).
+. *Qualify*: It looks up a valid qualification record for the artifact's configuration (<<qualification-records>>). Without one, the task closes with `role_unqualified` and the state takes its conservative fallback (<<conservative-fallback>>). When only the fresh form of a `warm` artifact qualifies, the caller runs the role `fresh` and records `form_downgraded` on the task.
+. *Available*: When the start-failure guard of the role on its harness holds (xref:03-supervision-and-recycling.adoc#start-failure-guard[Start-Failure Guard]), the task closes with `role_unavailable` and the state takes its conservative fallback.
+. *Queue*: It queues the task for the role with the artifact's configuration digest (<<role-artifact>>).
+. *Serve*: An interactive session takes the task first where the artifact sets `session_first` and the session qualifies (xref:02-task-protocol.adoc#session-worker[The Session as Optional Worker]); otherwise the supervisor serves it with a warm worker of the role or starts a fresh worker for it (xref:03-supervision-and-recycling.adoc[Supervision & Recycling]), launched by the launch contract (xref:04-worker-launch.adoc[Worker Launch]).
+
+[#role-model-effort]
+=== Model & Effort
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-12[PM-WATCH-DISP-12]_
+
+The harness, model, and effort of a worker come only from its role's artifact. There are no effort levels, no ladder, and no agent file installed per role or per level; how the launch fills the harness's model and effort slots and narrows an effort the harness does not accept is specified in xref:04-worker-launch.adoc#model-and-effort[Worker Launch, Model & Effort]. An effort below every value the harness accepts for the model makes the artifact invalid (`effort_unsupported`, <<role-validation>>). An artifact change applies to the next worker generation, without a client update and without a host restart.
+
+[#default-roles]
+=== Default Role Set
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-11[PM-WATCH-DISP-11]_
+
+The shipped set defines every role the default workflow units name. Every default role runs on the harness `claude`, `fresh`, with `count` `2` (`screener` and `enrich` `4`) and `session_first` `false`. The model tier is data of the shipped artifacts: `small` is `claude-haiku-4-5`, `medium` is `claude-sonnet-5-5`, `large` is the Opus model the release pins; the effort is the artifact's value. The column `Floor s` is the artifact's `budget_floor_seconds`. A role runs `warm` in the shipped set only where its qualification record shows the warm form within the allowed gap (<<qualification-records>>); the shipped set has no such role. The measurements behind the forms and tiers are in the link:../evaluation.adoc#results[Evaluation Reference, Results].
+
+[cols="2,1,1,1,5"]
+|===
+|Role |Class |Tier |Floor s |Work
+
+|`refine` |`read_only` |`large` |`900` |Refine authoring (`refine.analyze`): the request and its clarifications, delivered through submit links.
+|`outline` |`read_only` |`large` |`900` |Outline authoring (`outline.deep`, `outline.light`), delivered through submit links.
+|`classify` |`read_only` |`small` |`300` |The change type of a plan.
+|`plan` |`read_only` |`large` |`900` |Describing and revising plan tasks (Phase 4).
+|`qgate` |`read_only` |`medium` |`900` |Q-Gate validation of refine, outline, and plan.
+|`implement` |`writer` |`large` |`900` |Task envelopes (Phase 5), applying accepted simplify proposals, commit fixes, conflict resolution.
+|`replan` |`read_only` |`large` |`900` |The review of an infeasible plan task and re-planning of a running plan.
+|`review-security` |`read_only` |`medium` |`900` |Finalize security review.
+|`review-simplify` |`read_only` |`medium` |`900` |Finalize simplify review (proposals only).
+|`review-requirement` |`read_only` |`medium` |`900` |Self-review: does the change implement the requirement correctly and completely.
+|`review-code` |`read_only` |`medium` |`900` |Self-review: is the code itself correct and compliant.
+|`architecture` |`read_only` |`large` |`900` |Architecture judgment of a plan.
+|`pr-author` |`read_only` |`medium` |`300` |The pull-request body.
+|`adr-author` |`read_only` |`medium` |`300` |Architecture decision records, delivered through submit links; the server writes the record.
+|`artifact-review` |`read_only` |`medium` |`900` |Review of a plan's written artifacts.
+|`commit-message` |`read_only` |`small` |`300` |Commit messages of `git.commit_and_push`.
+|`triage-review` |`read_only` |`medium` |`900` |Review-bot and PR comment triage; the decision of `remediation-review`.
+|`triage-analysis` |`read_only` |`medium` |`900` |Static-analysis triage; the decision of `remediation-analysis`.
+|`triage-ci` |`read_only` |`medium` |`900` |The decision of `remediation-ci`.
+|`triage-build` |`read_only` |`medium` |`900` |The decision of `remediation-build`.
+|`screener` |`zero_tool` |`small` |`300` |The level-2 screener of untrusted text (xref:07-untrusted-text-screening.adoc[Untrusted Text Screening]).
+|`enrich` |`read_only` |`medium` |`900` |Architecture enrichment, one task per module (project setup).
+|`lessons` |`read_only` |`medium` |`300` |Lesson authoring after a plan and lesson review.
+|`decompose` |`read_only` |`large` |`900` |Epic decomposition (xref:08-epic-coordination.adoc[Epic Coordination]).
+|`reground` |`read_only` |`large` |`900` |Spec re-grounding of staged epic rows.
+|`coordinate` |`read_only` |`large` |`900` |Inbox messages, cross-epic transfers, mailbox sends, and the completion review of an epic.
+|`landing` |`read_only` |`large` |`900` |The landing analysis and reconciliation of an epic's landed plan.
+|===
+
+The shipped qualification records leave `triage-build`, `triage-ci`, and `replan` unqualified (link:../evaluation.adoc#limits[Evaluation Reference, Limits]): their tasks take the conservative fallback until the operator qualifies a configuration of them. `triage-analysis` qualifies `warm` only on the `medium` tier or above, never on `small`.
+
+[#qualification]
+== Role Qualification
+_See Requirement link:../../Requirements.adoc#PM-WORK-6[PM-WORK-6: Role Qualification]_
+
+A role runs only on a configuration whose judgment was shown to meet the operator's level against the model verification corpus `test/model/verification/` (link:../evaluation.adoc#corpus[Evaluation Reference, Verification Corpus]), which the release ships with its revision.
+
+[#qualification-records]
+=== Qualification Records
+
+A qualification record is `<set>/qualification/<role>.json` in the role set that holds the role's effective artifact; for a shipped artifact the operator's record is written to the machine set. Its schema and members are owned by the link:../store-schemas/16-task-queue.adoc#qualification-record[Store Schemas Specification, Role Qualification Record].
+
+* *Valid*: A record is valid for an artifact when its `configuration_digest` equals the artifact's configuration digest (<<role-artifact>>), its `corpus_revision` equals the shipped corpus revision, and `qualified_forms` contains `fresh`. `warm` is in `qualified_forms` only when the warm agreement meets the agreement level and the gap is at most the allowed gap.
+* *Invalidated*: A change of the model, the effort, a skill digest, the major or minor of the harness version the enrolment records, or the corpus revision changes the configuration digest or the revision, so the record does not match it; the role is reported unqualified in `pm-operator status`, `pm-operator roles list`, and the web app until it is graded again.
+* *Operator level*: The agreement level (percent of confirmed items answered right) and the allowed warm-fresh gap (percentage points) are operator configuration `qualification.agreement_level` / `qualification.allowed_gap` in `local-config.json` (defaults `80` / `5`, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]). A record graded below the current level counts as not qualified.
+
+[#qualification-topics]
+=== Corpus Topics of a Role
+
+The topics of a role are the corpus items whose `role` names the role, together with the generic worker items (`decision/*` and `skills/*`) for every role of the classes `writer` and `read_only`. Only items with `review.status: confirmed` count. A role without topics of its own is graded on the generic items alone.
+
+[#grading]
+=== Grading
+
+`pm-operator roles qualify <role>` (<<operator-roles>>) grades the configuration of the role's effective artifact:
+
+. Every item of the role's topics is offered as a task to workers of the configuration through the task protocol, once in the fresh form (one worker per item) and once in the warm form (one supervised worker taking the items in order; items its `contamination` notes name never share a worker). The workers run in an empty job-private working directory, so no project instruction reaches them; their tasks carry the item's `input.question`, `input.facts`, and `input.context` and offer one submit with the item's `input.choices` or `input.answer_schema`.
+. Each answer is scored by the item's `grading.method`; a rubric goes to a fresh `zero_tool` judge job with the corpus judge prompt.
+. The record is written with every item's answer, score, cost, and time. The grading jobs run under the model slots and are recorded in the workspace scope's metrics.
+
+[#conservative-fallback]
+=== Conservative Fallback
+
+A task closed with `role_unqualified`, `role_unavailable`, or `role_undefined`, and a task whose re-offers are spent (xref:02-task-protocol.adoc#re-offer[Re-Offer]), never reaches the operator. The server resolves the task's state itself, in this order:
+
+. When the call binds `retry` and its budget is left, the server takes `retry` once per unit instance (link:../state-catalogue/08-remediation-units.adoc#state-remediation.conservative[State Catalogue, Conservative Remediation]).
+. Otherwise the server takes the `exhausted` outcome of the remediation policy the state belongs to (link:../workflow-dsl/08-remediation-units.adoc[Workflow DSL Specification, Remediation Policy Units]) or, outside a remediation unit, the state's declared `lost` route (link:../workflow-dsl.adoc[Workflow DSL Specification]).
+
+The task records the reason; the gap the fallback records names it (link:../phase-workflows/01-planning-phases-1-2.adoc[Phase Workflows Specification, Gap Record]).
+
+[#operator-roles]
+== Operator Verbs: `pm-operator roles`
+_See Requirements link:../../Requirements.adoc#PM-WORK-6[PM-WORK-6: Role Qualification], link:../../Requirements.adoc#PM-SEC-3[PM-SEC-3: Operator Channel Isolation (Operator CLI & Paired Web Devices)]_
+
+The verbs `pm-operator roles list`, `show`, and `qualify` (with their output, confirmation, and `--yes`) are specified in link:../cli-and-security/02-credentials-and-operator.adoc#operator-roles[CLI, Coordination & Security Specification, Roles]; the command tree is in the link:../cli-and-security/01-cli-and-installer.adoc[CLI, Coordination & Security Specification]. `qualify` grades the effective configuration as <<grading>> describes; `list` and `show` report the validity of <<role-validation>> and the qualification state of <<qualification-records>>.
+
+There is no verb that edits a role: the operator edits the artifacts of the machine or project set.

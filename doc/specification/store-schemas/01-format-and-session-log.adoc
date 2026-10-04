@@ -20,9 +20,7 @@ _Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WAT
 3. *Single Writer Set*: Every writer of a `PM-MCP` store runs inside the one `PM-MCP` runtime and serializes through its own locks. Legacy `plan-marshall` never touches `.marshall/` or `<PM_MCP_BASE>`, and `PM-MCP` never writes `.plan/` or `~/.plan-marshall/` (`PM-MIG-2`), so no store is shared and no cross-runtime lock protocol exists.
 4. *Absent vs Unparseable*: Every store and document reader returns one of `absent`, `empty`, `parsed`, or `unreadable` (with the failing line or offset). An input that yields no parsable content is `unreadable`, never an empty record and never `absent`. Consumers handle `unreadable` explicitly: they fail closed or report `indeterminate`.
 5. *One Wire Shape per Instant*: Every persisted or exchanged instant is an RFC 3339 UTC string (`"format": "date-time"`, `Z` suffix); epoch numbers are never persisted. A process start instant is taken from the OS (`ProcessHandle.Info.startInstant()`) and stored in the same shape. Durations are integers whose field name carries the unit (`duration_ms`, `*_seconds`).
-6. *JSONL Append Discipline*: A JSONL store is appended to only under the lock of its store (the scope lock for plan, epic, and workspace stores; the audit lock for `audit.jsonl`; the mailbox leaf lock for a plan's `mcp/mailbox.jsonl`, xref:04-epic-and-change-ledger.adoc#epic-inbox-record[Epic Inbox & Plan Mailbox Records (`inbox.jsonl`, `mcp/mailbox.jsonl`)]), by one `write` on a descriptor opened with `O_APPEND` (`StandardOpenOption.APPEND`), followed by `fsync` (`FileChannel.force(true)`); every appended record ends with a newline. A last line without a trailing newline is a torn tail left by an interrupted append: the next writer, still under the store's lock and before appending, truncates the file to the end of the last complete line and appends an audit record `jsonl_tail_repaired` (`category: store`, `details{store, truncated_bytes, truncated_sha256}`). Lines before the last complete newline are never touched; a malformed complete line stays in place and is reported `unreadable` with its line number (item 4). In `audit.jsonl` a torn tail lies after the anchored head (`audit.head` is updated only after a complete append), so the repair never touches a chained record.
-+
-*Single exception*: The refresh of `last_seen_at` in the last row of a scope's `sessions.jsonl` (<<_scope_session_log_sessions_jsonl>>) is not an append: it replaces the file by a journaled replace (<<transaction-journal>>) under the scope lock, in which every earlier row stays byte-identical and only that one field of the last row changes. No other JSONL store is ever rewritten.
+6. *JSONL Append Discipline*: A JSONL store is appended to only under the lock of its store (the scope lock for plan, epic, and workspace stores; the audit lock for `audit.jsonl`; the mailbox leaf lock for a plan's `mcp/mailbox.jsonl`, xref:04-epic-and-change-ledger.adoc#epic-inbox-record[Epic Inbox & Plan Mailbox Records (`inbox.jsonl`, `mcp/mailbox.jsonl`)]), by one `write` on a descriptor opened with `O_APPEND` (`StandardOpenOption.APPEND`), followed by `fsync` (`FileChannel.force(true)`); every appended record ends with a newline. A last line without a trailing newline is a torn tail left by an interrupted append: the next writer, still under the store's lock and before appending, truncates the file to the end of the last complete line and appends an audit record `jsonl_tail_repaired` (`category: store`, `details{store, truncated_bytes, truncated_sha256}`). Lines before the last complete newline are never touched, and no JSONL store is ever rewritten; a malformed complete line stays in place and is reported `unreadable` with its line number (item 4). In `audit.jsonl` a torn tail lies after the anchored head (`audit.head` is updated only after a complete append), so the repair never touches a chained record.
 
 [#transaction-journal]
 === Transaction Journal (`mcp/transaction-journal.json`)
@@ -78,15 +76,15 @@ Every write to the server-owned stores of a plan, epic, or workspace scope runs 
 _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-1[PM-WATCH-STORE-1]_
 
 [[_scope_session_log_sessions_jsonl]]
-Every scope keeps a session log in the per-project machine store (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]), append-only apart from the `last_seen_at` refresh of its last row (the single exception to the JSONL append discipline, <<format-versioning>> item 6): `plans/<plan_id>/sessions.jsonl`, `epics/<epic_id>/sessions.jsonl`, or `workspace/sessions.jsonl` (the project's workspace scope, link:../filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]). Each row records one host session that entered or addressed the scope. The *current identity* of the scope is its last row: every scope-addressed MCP call resolves the client profile from it (`PM-ARCH-4`); the project is the store the log lives in, never a path recorded in a row.
+Every scope keeps an append-only session log in the per-project machine store (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]): `plans/<plan_id>/sessions.jsonl`, `epics/<epic_id>/sessions.jsonl`, or `workspace/sessions.jsonl` (the project's workspace scope, link:../filesystem-layout.adoc#workspace-home[Filesystem Layout Specification, Workspace Home]). Each row is the entry row of one `pm-mcp enter` on the scope. The log is history and audit data: no call resolves anything from it, a session's call is rendered from the client its relay declares, and a worker's call from its job record (`PM-ARCH-4`, `PM-CLIENT-3`).
 
-* *Appended by `pm-mcp enter`*: Every `pm-mcp enter` on an existing scope appends one row (link:../cli-and-security/01-cli-and-installer.adoc#_entry_identity_recording_pm_mcp_enter[CLI, Coordination & Security Specification, Entry Identity Recording]).
-* *Appended by the server*: When a scope-addressed call carries a `PM-MCP-Client-Session` header (link:../runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]) whose value differs from the `client_session_id` of the scope's last row, the server appends a row for that session in a short transaction under the scope lock, outside any snapshot read. Such a row keeps the declared `client` of the previous row (a declaration is only ever made by `pm-mcp enter`), takes `client_detected` from the connection's MCP `clientInfo.name`, and records `client_build: null` (the version probe runs only in `pm-mcp enter`).
-* *Job Connections Append Nothing*: A request authenticated by a job token (`PM-MCP-Job-Token`, sent by the job relay `pm-mcp serve --job` of a model job, link:../runtime-model.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]) never appends a row, never refreshes `last_seen_at`, and never triggers a client handover: it takes its client profile from its job record (xref:10-job-and-lesson-records.adoc#job-record[Job Record]), and its audit records carry the `job_id`.
-* *`last_seen_at`*: The server refreshes `last_seen_at` of the last row at most once per refresh interval per scope (link:../timeouts/02-runtime-leases-operator-web.adoc#session-last-seen-refresh[Timeouts & Budgets Specification, Session Row `last_seen_at` Refresh Interval]), by a journaled replace of the file in which every earlier row stays byte-identical; no other field of any row is ever changed, and no earlier row is ever touched.
+* *Appended only by `pm-mcp enter`*: Every `pm-mcp enter` on an existing scope appends one row (link:../cli-and-security/01-cli-and-installer.adoc#_entry_identity_recording_pm_mcp_enter[CLI, Coordination & Security Specification, Entry Identity Recording]). No other call, connection, or transition appends a row, and no row is ever changed.
+* *Session Generation*: The row records the session generation that the entry issued (`generation_id`, `sg-` form, link:../identifiers/01-general-rules-and-registry.adoc#id-generation-id[Identifier Registry, `generation_id`]). The generation itself is held in the session generation record of the task queue (xref:16-task-queue.adoc#session-generation-record[Session Generation Record]), which fences earlier generations; the row is its history.
+* *Worker Connections Append Nothing*: A request authenticated by a job token (`PM-MCP-Job-Token`, sent by the job relay `pm-mcp serve --job` of a worker) never appends a row: its identity is its job record (xref:10-job-and-lesson-records.adoc#job-record[Job Record]), and its audit records carry its `job_id`, `role`, and `generation_id`.
 * *Pending Entry Record*: When `pm-mcp enter … plan|epic` names no live scope, it writes a pending entry record `pending/<entry_id>.json` of the per-project machine store and prints the `entry_id` (<<pending-entry-record>>). The record is the state store of that entry's bootstrap (`bootstrap-plan` or `bootstrap-epic`, the entity `<entry_id>` hosted by the workspace scope). In the bootstrap's `start.create-scope` transaction the engine creates the scope from it: its `session` becomes the first row of the new scope's `sessions.jsonl`, and for a plan its `from_epic` is copied into `mcp/status.json` `origin.epic_id` (the single carrier of epic membership, xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store (`mcp/status.json`)]). The record is deleted in the transaction that enters a terminal of the bootstrap. A deleted `entry_id` no longer exists, so each pending record creates at most one scope.
-* *History in the Log*: The session history of a scope is the log itself. A row whose declared `client` differs from the previous row's additionally appends an `identity` audit record (`event: entry_handover`, `details` with the previous and the new `client` and `client_session_id`, xref:12-machine-stores.adoc#audit-log[Security & Transition Audit Log (`<PM_MCP_BASE>/logs/audit.jsonl`, `PM-SEC-6`)]).
-* *Integrity*: `sessions.jsonl` follows the JSONL append discipline (<<format-versioning>> item 6, including its single stated exception for the `last_seen_at` refresh) and is covered by the scope's digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]).
+* *Server-Started Plans*: A plan that the server starts for a launchable row of an epic (link:../model-work/08-epic-coordination.adoc[Model Work Specification, Epic Coordination]) runs the same plan bootstrap from a pending entry record that the server writes itself, with `session: null` and `from_epic` set; its `sessions.jsonl` starts empty and gains a row only when a session enters the plan.
+* *Identity Changes*: A row whose declared `client` differs from the previous row's additionally appends an `identity` audit record (`event: entry_client_changed`, `details` with the previous and the new `client` and `client_session_id`, xref:12-machine-stores.adoc#audit-log[Security & Transition Audit Log (`<PM_MCP_BASE>/logs/audit.jsonl`, `PM-SEC-6`)]); it changes nothing else.
+* *Integrity*: `sessions.jsonl` follows the JSONL append discipline (<<format-versioning>> item 6) and is covered by the scope's digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]).
 
 [source,json]
 ----
@@ -109,9 +107,8 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
     "bundle_version",
     "project_id",
     "entered_from",
-    "first_seen_at",
-    "last_seen_at",
-    "transcript_locator"
+    "generation_id",
+    "entered_at"
   ],
   "additionalProperties": false,
   "properties": {
@@ -119,7 +116,7 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
     "client_session_id": {
       "type": ["string", "null"],
       "pattern": "^[\\x21-\\x7E]{1,128}$",
-      "description": "Host session identifier (identifiers.adoc, client_session_id): read by pm-mcp enter from the Host Integration Table session ID variable, or taken from the PM-MCP-Client-Session header for a server-appended row; null when the host provides none."
+      "description": "Host session identifier (identifiers.adoc, client_session_id): read by pm-mcp enter from the Host Integration Table session ID variable; null when the host provides none."
     },
     "client": {
       "type": "string",
@@ -129,13 +126,13 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
     "client_detected": {
       "type": ["string", "null"],
       "enum": ["claude", "opencode", "antigravity", "codex", "neutral", null],
-      "description": "Client detected from the environment signature (pm-mcp enter) or the MCP clientInfo.name (server-appended row); null when nothing matched."
+      "description": "Client detected from the environment signature by pm-mcp enter; null when nothing matched."
     },
     "environment_match_tier": { "type": "string", "enum": ["MATCHED", "UNVERIFIED", "CONTRADICTED"] },
     "client_build": {
       "type": ["string", "null"],
       "minLength": 1,
-      "description": "Exact host build printed by the per-host version probe of the client profile (client-profiles.adoc, Host Integration Table, Identity Probes), run by pm-mcp enter; null when the host has no probe, the probe failed, or the row was appended by the server."
+      "description": "Exact host build printed by the per-host version probe of the client profile (client-profiles.adoc, Host Integration Table, Identity Probes), run by pm-mcp enter; null when the host has no probe or the probe failed."
     },
     "model_family": {
       "type": ["string", "null"],
@@ -145,8 +142,8 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
     "model_id": { "type": ["string", "null"], "minLength": 1, "description": "Exact model identifier where known." },
     "model_source": {
       "type": ["string", "null"],
-      "enum": ["host", "declared", null],
-      "description": "host: exposed by the host (Identity Probes); declared: pm-mcp enter --model; null: unknown."
+      "enum": ["host", null],
+      "description": "host: exposed by the host (Identity Probes); null: unknown."
     },
     "pm_mcp_version": { "type": "string", "minLength": 1, "description": "Release version of the runtime binary (pm-mcpd) that wrote the row (PM-DIST-1)." },
     "bundle_version": { "type": ["string", "null"], "minLength": 1, "description": "Installed client bundle version (state/install-records.json); null when no bundle is installed for the client." },
@@ -157,13 +154,8 @@ Every scope keeps a session log in the per-project machine store (link:../filesy
       "pattern": "^(_epics|[a-z0-9][a-z0-9-]{1,62}[a-z0-9])$",
       "description": "Required iff entered_from == worktree: the name <x> of the worktree .marshall/local/worktrees/<x> (a plan_id, or _epics for the shared epic worktree; filesystem-layout.adoc, Project Resolution Rule)."
     },
-    "first_seen_at": { "type": "string", "format": "date-time" },
-    "last_seen_at": { "type": "string", "format": "date-time", "description": "Refreshed at most once per refresh interval (timeouts.adoc#session-last-seen-refresh), last row only." },
-    "transcript_locator": {
-      "type": ["string", "null"],
-      "minLength": 1,
-      "description": "Location of the host transcript of this session, rendered from the Host Integration Table transcript locator; null when the host has none or the session id is unknown."
-    }
+    "generation_id": { "type": "string", "pattern": "^sg-[0-9a-f]{16}$", "description": "The session generation issued by this pm-mcp enter (identifiers.adoc, generation_id; Session Generation Record)." },
+    "entered_at": { "type": "string", "format": "date-time" }
   },
   "allOf": [
     {
@@ -187,9 +179,9 @@ _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WAT
 The pending entry record carries what the user named at `pm-mcp enter` and the state of the entry's bootstrap until a terminal of the bootstrap deletes it:
 
 * *Written under the workspace lock*: `pm-mcp enter` (through the runtime) creates the record, and every bootstrap transition replaces it, each as a journaled transaction of the workspace scope under `locks/workspace.lock` (<<transaction-journal>>); the record is covered by the workspace scope's digest sidecar (xref:13-leases-integrity-testing.adoc#store-digest-verification[Store Digest Verification Against Out-of-Band Edits]). A digest mismatch pauses only that bootstrap entity (`integrity_breach`, kind `store_tampered`), ended by `pm-operator accept-edit workspace pending/<entry_id>.json` or by the pending-record sweep; no other entry and no workspace workflow is affected.
-* *What the user named, unvalidated*: `kind`, `requested_id`, and `hint` are recorded as given; `start.resolve` and the source units validate them. `hint` is the user's own words, relayed by the host entry command; it is shown to the model as facts of the bootstrap and never parsed by the server into a source.
+* *What the user named, unvalidated*: `kind`, `requested_id`, and `hint` are recorded as given (for a server-started plan: `kind: plan`, the row's `plan_id` as `requested_id`, `hint: null`); `start.resolve` and the source units validate them. `hint` is the user's own words, relayed by the host entry command; it is shown to the entry session as facts of the bootstrap and never parsed by the server into a source.
 * *Bootstrap state*: `bootstrap` holds the entity's state position, its call frames (the called source unit), its condition overlay, the source record a source unit returned with `done`, the commit options chosen in `start.ready`, and the reason of the last refused re-check of the `start.create-scope` transaction. A source record keeps the fetched external text only in its level-1-cleaned form with its screen verdict (xref:15-screening-and-grants.adoc#screen-verdict-cache[Screen Verdict Cache]); a `suspicious` item is used only after the audited `accept` of its link state.
-* *Addressing*: The model addresses the entry as `pm_state` / `pm_do` with `plan_id: NO_PLAN` and `entity: <entry_id>`; a call naming a deleted or swept `entry_id` is `scope_not_found`. The pending-record sweep removes records older than the maximum age (link:../timeouts/02-runtime-leases-operator-web.adoc#pending-entry-max-age[Timeouts & Budgets Specification, Pending Entry Record Maximum Age]).
+* *Addressing*: The entry session addresses the entry as `pm_state` / `pm_do` with `plan_id: NO_PLAN` and `entity: <entry_id>`; a call naming a deleted or swept `entry_id` is `scope_not_found`. The pending-record sweep removes records older than the maximum age (link:../timeouts/02-runtime-leases-operator-web.adoc#pending-entry-max-age[Timeouts & Budgets Specification, Pending Entry Record Maximum Age]).
 
 [source,json]
 ----
@@ -209,11 +201,14 @@ The pending entry record carries what the user named at `pm-mcp enter` and the s
     "from_epic": {
       "type": ["string", "null"],
       "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$",
-      "description": "kind plan only: the parent epic when the entry command came from an epic emission (pm-mcp enter --from-epic); routes start.resolve to source-epic-row; the start.create-scope transaction copies it into mcp/status.json origin.epic_id."
+      "description": "kind plan only: the parent epic of a plan the server starts for a launchable epic row (never set by pm-mcp enter); routes start.resolve to source-epic-row; the start.create-scope transaction copies it into mcp/status.json origin.epic_id."
     },
     "created_at": { "type": "string", "format": "date-time" },
     "updated_at": { "type": "string", "format": "date-time" },
-    "session": { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/session-row.json" },
+    "session": {
+      "oneOf": [ { "$ref": "https://cuioss.de/plan-marshall-mcp/schemas/session-row.json" }, { "type": "null" } ],
+      "description": "The entry row of pm-mcp enter; null for a plan the server starts for an epic row."
+    },
     "bootstrap": {
       "type": "object",
       "required": ["state", "call_stack", "facts", "source", "options", "pending_condition", "last_refusal"],
@@ -268,7 +263,8 @@ The pending entry record carries what the user named at `pm-mcp enter` and the s
     }
   },
   "allOf": [
-    { "if": { "properties": { "kind": { "const": "epic" } } }, "then": { "properties": { "from_epic": { "const": null } } } }
+    { "if": { "properties": { "kind": { "const": "epic" } } }, "then": { "properties": { "from_epic": { "const": null } } } },
+    { "if": { "properties": { "session": { "const": null } } }, "then": { "properties": { "kind": { "const": "plan" }, "from_epic": { "type": "string" } } } }
   ]
 }
 ----
