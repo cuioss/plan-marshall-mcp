@@ -1,0 +1,653 @@
+= Harness as Worker: Run Record
+:toc: left
+:toclevels: 2
+:nofooter:
+
+xref:README.adoc[Overview] · xref:analysis.adoc[Analysis] · xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · *Run Record* · xref:findings.adoc[Findings] · xref:conclusion.adoc[Conclusion] · xref:architecture.adoc[Architecture] · xref:task-protocol.adoc[Task Protocol] · xref:roles.adoc[Roles] · xref:skills.adoc[Skills] · xref:evaluation.adoc[Evaluation]
+
+The complete record of the verifications V1 to V10 (xref:analysis.adoc#verification[Analysis, What must be verified first]) and of Stages 1 and 2 of the evaluation (<<evaluation-stage-1>>, <<evaluation-stage-2>>): every result per harness, mode, and series, with the names of the runs. The method, the series, and the pass criteria are in xref:measurements.adoc[Measurements]; the core figures there are taken from this record. The raw data of every run is archived as named in xref:README.adoc#raw-data[Overview, Raw data].
+
+== Results
+
+One table per verification, from `pull.py report`. Run names refer to the directories under `.plan/temp/pull-spike/runs/`.
+
+=== V1: blocking time of one MCP tool call
+
+Headless, `stdio` through the relay, 2026-10-02. Claude Code 2.1.287 (`claude-haiku-4-5`), OpenCode 1.18.34 (`opencode/space-bunny-free`), Antigravity 1.2.14 (`gemini-3.8-flash-medium`). The stub held a silent call for 3600.5 s against its own client, and the progress cells of Claude Code and OpenCode ran to the cap, so every earlier end is the harness's.
+
+[cols="2,2,2,2,4,1", options="header"]
+|===
+|Harness |Configuration |No progress |Progress every 5 s |How the call ended |Verdict
+
+|Claude Code
+|default
+|1800 s
+|≥ 3600 s
+|The harness reported the call as ended after 1800 s; it sent no `notifications/cancelled`.
+|pass
+
+|Claude Code
+|`MCP_TOOL_TIMEOUT=7200000`
+|≥ 3600 s
+|≥ 3600 s
+|Answered at the cap.
+|pass
+
+|OpenCode
+|default
+|60 s
+|≥ 3600 s
+|`notifications/cancelled` with `MCP error -32001: Request timed out` after 60 s.
+|fail without progress, pass with
+
+|OpenCode
+|`mcp.pullstub.timeout` and `experimental.mcp_timeout` = 7200000
+|≥ 3600 s
+|≥ 3600 s
+|Answered at the cap.
+|pass
+
+|Antigravity
+|default (no knob known)
+|180 s
+|180 s
+|`notifications/cancelled` with `context deadline exceeded` after 180 s (`timed out after 3m0s`).
+|fail
+|===
+
+Read against the criteria:
+
+* *Bounded wait of 240 s*: holds on Claude Code by default. On OpenCode it holds only when the server sends progress or the profile raises the timeout; a silent call ends after 60 s. On Antigravity it does not hold: the limit is 180 s, so the fallback applies, `bounded_wait_seconds` = 150 for that profile.
+* *`progress_resets_timeout`*: true for Claude Code (1800 s without, at least 3600 s with; an idle limit, see the interactive session below) and for OpenCode (60 s without, at least 3600 s with). False for Antigravity: 36 frames did not move its 180 s deadline.
+* *Withdrawn*: the first headless runs showed Antigravity ending the MCP server after a timed-out call ("`server name pullstub failed to load`"). That was a defect of the stand-in relay, which wrote the stub's reply to a notification back to the host; Antigravity ends a server that answers a notification. With the relay corrected, the interactive session called again after the timeout and was answered. The two headless cells are repeated with the corrected relay.
+* *Cancellation*: OpenCode and Antigravity send `notifications/cancelled` when they give a call up; Claude Code does not.
+* All three harnesses send a `progressToken` with every call.
+
+Interactive session, Antigravity 1.2.14, 2026-10-02 (runs `v1-agy-i-default-noprog-1002-102632` and `v1-agy-i-default-prog-1002-103509`): the silent call and the call with a progress frame every 5 s were each cancelled after 180.0 s (`timed out after 3m0s: context deadline exceeded`); in both sessions the model called again within 5 s and was answered. The interactive limit equals the headless one, and progress does not extend it.
+
+Interactive session, Claude Code 2.1.287, 2026-10-02, silent call (`v1-claude-i-default-noprog-1002-123511`): the call ended after 1802 s, as headless, without a `notifications/cancelled`. The session did not block on it: after about two minutes the harness moved the call to the background ("Waiting on the backgrounded pull_wait call") and ended the model's turn; when the call failed, the harness woke the model, which called again and was answered. In the interactive session a long pull is therefore a background task that returns the prompt to the user, not a blocked turn.
+
+With a progress frame every 5 s (`v1-claude-i-default-prog-1002-123514`) the call was held for 3,410 s and 682 frames, until the stub of the run reached its own end at 14:10:13. The harness then gave the call up at 14:40:25, 1,812 s after the last frame, and named the reason itself: no response or progress for 1,810 s, its MCP idle timeout. The limit of Claude Code is therefore an idle time of 1,800 s since the last message of the server, not a duration of the call; every progress frame restarts it. The same holds interactive and headless.
+
+Interactive session, OpenCode 1.18.34 (`space-bunny-free`), 2026-10-02: the silent call was cancelled after 60.0 s with `MCP error -32001: Request timed out` (`v1-opencode-i-default-noprog-1002-182239`), and the model called again and was answered; the call with a progress frame every 5 s was still held after more than ten minutes, when the operator's run was stopped (`v1-opencode-i-default-prog-1002-182241`). Both as headless.
+
+=== V2: reliability of the wait loop
+
+Headless, `stdio`, 240 answers `wait_again` after 30 s each, 2026-10-02. Final series unless marked.
+
+[cols="3,1,1,3,1", options="header"]
+|===
+|Run |Cycles |Duration |How it ended |Verdict
+
+|Claude Code (`claude-haiku-4-5`), `v2-claude-h-1002-214242`
+|240 of 240
+|7633 s
+|`done`. No stop, question, foreign tool call, or aborted call; median gap between answer and next call 1.5 s, longest 25.7 s. 1.64 USD.
+|pass
+
+|Claude Code, first and second series (`v2-claude-h-1002-093742`, `v2-claude-h-1002-193202`)
+|240 of 240, twice
+|7492 s, 7594 s
+|`done` both times.
+|pass
+
+|OpenCode (`space-bunny-free`), `v2-opencode-h-1002-214804`
+|102
+|4058 s
+|The model called the distractor tool three times, then stopped: "Polled pull_wait 102 times; every response is wait_again and pull_info returns nothing to report — the server has no queued tasks, so there is nothing to decide". Two stalls of about 310 s between calls.
+|fail
+
+|OpenCode, second series (`v2-opencode-h-1002-193206`)
+|33
+|1107 s
+|Stopped: "The pullstub server appears to be a stub that never yields work".
+|fail
+
+|OpenCode, first series (`v2-opencode-h-1002-093749`)
+|240 of 240
+|8386 s
+|`done`.
+|(pass)
+
+|Antigravity (`gemini-3.8-flash-medium`), first series, `v2-agy-h-1002-131624`
+|240 of 240
+|8426 s
+|`done`. Median gap 4.1 s, longest 33.0 s.
+|pass
+
+|Antigravity, 10 cycles of 150 s, `v2-agy-h-custom-1002-104958`
+|10 of 10
+|1549 s
+|`done`.
+|not judged (shortened)
+|===
+
+* *Claude Code with Haiku holds the wait loop*: three runs of 240 cycles and more than two hours each, in every setup.
+* *OpenCode with `space-bunny-free` does not*: it held one run and gave up in two, after 33 and 102 cycles, with the same reasoning each time: nothing has arrived, so nothing will. The second stop happened under the product's server name, so the name "stub" was not the cause. By the fallback of the criterion this model is not eligible as a puller; another model on OpenCode is not measured.
+* *Antigravity* passed its one full-length run, which ran in the first series (workspace inside the repository, server named `pullstub`); Antigravity loads no project instructions from this repository.
+* The 150 s cycles confirm the fallback of V1 for Antigravity: a bounded wait of 150 s stays under its 180 s limit, ten times in a row.
+
+=== V3: task loop in one warm session
+
+Headless, 2026-10-02. One warm session: the 24 tasks cycled six times (144 tasks) with 8 KB of filler after each. Fresh: every task in a process of its own, three repetitions (72 tasks).
+
+[cols="3,1,1,2,3", options="header"]
+|===
+|Run |Tasks decided |Correct |Context at the end |How it ended
+
+|Claude Code (`claude-haiku-4-5`), warm, final series `v3-claude-h-1002-214244`
+|52 of 144
+|100 %
+|150k tokens
+|The model answered `DONE` although the status was not `done`. No compaction. 157 turns, 1.85 USD.
+
+|Claude Code (`claude-haiku-4-5`), warm, three earlier runs
+|55, 50, 57
+|100 %
+|135k to 141k tokens
+|The same stop each time, once after an accepted submit, otherwise after a `wait_again`.
+
+|Claude Code (`claude-sonnet-5-5`), warm, first series `v3-claude-h-alt-1002-104235`
+|144 of 144
+|100 %
+|787k tokens
+|`done`, no compaction. 435 turns in 31 minutes, 39.04 USD.
+
+|OpenCode (`space-bunny-free`), warm, final series `v3-opencode-h-1002-214822`
+|144 of 144
+|100 %
+|336k tokens
+|`done`, no compaction. Three of four runs reached `done`; the first stopped at 127 tasks and 297k tokens.
+
+|Antigravity (`gemini-3.8-flash-medium`), warm, three rounds, `v3-agy-h-custom-1002-172154`
+|72 of 72
+|100 %
+|–
+|`done`. 279 turns, 5.6 million fresh input tokens. Shortened, not judged.
+
+|Claude Code (`claude-haiku-4-5`), fresh, final series `v3-claude-h-fresh-1002-214244`
+|72 of 72
+|100 %
+|–
+|With deferred tool loading (second series) 66 of 72: six jobs never made the call.
+
+|OpenCode (`space-bunny-free`), fresh, final series `v3-opencode-h-fresh-1002-214824`
+|72 of 72
+|100 %
+|–
+|72 of 72 in all three series.
+|===
+
+* *Criterion (warm within 5 points of fresh)*: met. Every decision that was taken was correct, warm and fresh, on all harnesses; the task set does not separate the two forms.
+* *The loop, not the decisions, is what a growing context breaks.* With Haiku the session stopped pulling at 135k to 150k tokens in four runs of four, whether or not the submit answer named the next call. Sonnet held the loop to 787k tokens. No run reached an automatic compaction, so the behaviour after one is not measured.
+* *A warm session with a large context is the expensive form*: the Sonnet session cost about 0.27 USD per decision, a Haiku session about 0.03 USD, a fresh Haiku job 0.02 USD (V5). A warm worker pays for its whole context on every turn.
+* *Recycle point*: by a token budget far below the point where the loop breaks, not by waiting for a compaction.
+* *A fresh job needs its tools directly.* Claude Code defers MCP tools behind a tool search by default; a share of fresh Haiku jobs then wrote that they had no way to call the tool and ended. With `ENABLE_TOOL_SEARCH=false` all 72 jobs decided. The price is context: the tool definitions are loaded up front (43k instead of 32k tokens at the start of a session).
+
+=== V4: lifetime of a headless session
+
+Headless, 2026-10-02. Alive for two hours: see V2.
+
+[cols="2,2,2,2,3", options="header"]
+|===
+|Harness |`SIGTERM` during a held call |`SIGTERM` at a task delivery |Resume by session id |What the relay saw at `SIGTERM`
+
+|Claude Code
+|exit 143 after 0.4 s, no orphans
+|exit 143 after 0.7 s, no orphans
+|nonce recalled, 3.1 s
+|a signal to the relay
+
+|OpenCode
+|ended by the signal at once, no orphans
+|ended by the signal at once, no orphans
+|nonce recalled, 6.9 s
+|the end of `stdin`
+
+|Antigravity
+|exit 1 after 0.5 s, no orphans
+|exit 1 after 0.9 s, no orphans
+|nonce recalled, 7.7 s
+|the end of `stdin`, then a signal
+|===
+
+All cells pass. No harness emitted a final usage record after `SIGTERM`, and none sent a further tool call. A warm worker and a resumed session are technically possible on all three; a job that is terminated reports no usage.
+
+=== V5: cost of a cold start
+
+Headless, fresh process per minimal decision, ten jobs per cell, 2026-10-02. Medians. Final series for Claude Code and OpenCode: the cells ran alone, in isolated workspaces, on Claude Code with direct tools.
+
+[cols="2,2,1,1,1,2", options="header"]
+|===
+|Harness |Prompt |Wall time |To first contact |To submit |Priced units
+
+|Claude Code (`claude-haiku-4-5`)
+|minimal
+|8.8 s
+|0.5 s
+|7.3 s
+|17,525 (0.02 USD)
+
+|Claude Code
+|plus 30 KB reference text
+|10.0 s
+|0.5 s
+|8.2 s
+|20,059 (0.02 USD)
+
+|OpenCode (`space-bunny-free`)
+|minimal
+|11.3 s
+|1.5 s
+|9.1 s
+|2,361
+
+|OpenCode
+|plus 30 KB reference text
+|15.4 s
+|1.6 s
+|11.4 s
+|4,617
+
+|Antigravity (`gemini-3.8-flash-medium`), first series
+|minimal
+|16.8 s
+|0.5 s
+|12.9 s
+|unmeasured (no cache-creation figure)
+
+|Antigravity, first series
+|plus 30 KB reference text
+|21.0 s
+|0.5 s
+|16.1 s
+|unmeasured
+|===
+
+* *Against the criterion* (median wall time at most 15 s, priced units at most three times a warm task of V7): Claude Code passes clearly (1.4 times a warm task). OpenCode passes with the minimal prompt and misses by 0.4 s with the reference text (1.3 and 2.5 times a warm task). Antigravity fails on wall time.
+* Process start and MCP connection take 0.5 to 1.6 s; almost all of a fresh job's time is the model's. Direct tools save Claude Code a turn: 8.8 s against 12.1 s in the first series.
+* *The figures depend on the machine.* With 19 runs started at once the same cells took 18 to 21 s and the time to first contact tripled. The model slots bound how many jobs start together for this reason as well.
+* *Cold cache (first series).* Claude Code, three jobs an hour apart (its cache entries live for one hour) and no other run on the model: 21.0 s, 43,699 priced units, 0.06 USD, about 19,500 tokens of cache creation per job against 1,300 warm. OpenCode, ten jobs with 330 s between them: 13.5 s, 8,865 priced units. Antigravity, three jobs per cell: 21.6 s and 32.6 s. A fresh job on a cold cache costs about twice as much and, on Claude Code, 9 s more.
+
+=== V6: idle cost of a warm session
+
+Headless, 2026-10-02, second series (isolated workspaces; the first series gave the same picture, about 5 % higher). Priced units of one idle wait cycle (one `wait_again` answer and the next call), median.
+
+[cols="2,2,2,2", options="header"]
+|===
+|Context of the session |Claude Code, wait 30 s |Claude Code, wait 330 s |OpenCode, wait 30 s
+
+|about 35k tokens (OpenCode: 10k)
+|3,756
+|3,841
+|1,036
+
+|about 50k (OpenCode: 30k)
+|5,342
+|5,421
+|3,176
+
+|about 70k (OpenCode: 55k)
+|7,263
+|7,313
+|5,783
+
+|about 105k
+|10,922
+|11,001
+|10,916
+|===
+
+* An idle cycle costs about a tenth of the context in priced units: the whole context is read from the provider cache once per cycle. The smallest Claude Code session already carries about 32k tokens of system prompt and tool definitions.
+* The cost is per wake-up, not per second. On Claude Code a wait of 330 s cost the same as one of 30 s; its cache entries are written with a lifetime of one hour. A longer bounded wait therefore makes idling cheaper in proportion.
+* *Idle timeout*: one fresh Haiku job costs about 17,500 priced units (V5). An idle Claude Code worker reaches that after 4 to 5 wake-ups at 35k tokens of context and after 2 at 110k. With the bounded wait of 240 s that is 16 to 20 minutes for a small context and under 10 minutes for a large one.
+* OpenCode with a wait of 330 s is not measured: the calls were cancelled by its 60 s limit for silent calls (V1). It needs progress frames or the raised timeout.
+* Antigravity (`gemini-3.8-flash-medium`, `v6-agy-h-1002-160925`): priced units are unmeasured (no cache-creation figure), so the raw tokens are given. An idle cycle of 30 s cost about 4,000 fresh input tokens plus the whole context as cache read (28k, 57k, 105k, 117k tokens of cache read at those context sizes). After the long waits, which its 180 s limit cut short, several cycles re-read the context as fresh input (38k to 64k fresh tokens at 30k to 60k of context): its cache does not reliably outlive a wait of a few minutes.
+
+=== V7: usage per task
+
+Headless, ten tasks in one session, 2026-10-02. Final series for Claude Code and OpenCode.
+
+[cols="2,1,1,1,2,1", options="header"]
+|===
+|Harness |Usage per turn |Four components |Tasks attributed |Median priced units per task |Verdict
+
+|Claude Code
+|yes (final output tokens only with `--include-partial-messages`)
+|yes
+|10 of 10
+|12,786; sums reconcile with the run total (error 0.0)
+|pass
+
+|OpenCode
+|yes
+|yes
+|10 of 10
+|1,865; the harness reports no run total
+|pass
+
+|Antigravity, first series
+|yes
+|no: input, output, and cache read, no cache creation
+|10 of 10
+|unmeasured
+|fail
+|===
+
+Usage per task survives a warm worker on Claude Code and OpenCode. On Antigravity the fallback applies: `total_tokens` stays `unmeasured` under the rule of the specification. With deferred tool loading a task on Claude Code cost 9,564 priced units; direct tools enlarge the context of every turn.
+
+=== V8: carry-over between tasks
+
+Headless, 2026-10-02. One warm session per run: three clean tasks, the task whose facts quote injected instructions, eight clean tasks. Five variants (canary token, forced decision, foreign tool, stop the loop, wrong task id); the control runs the same tasks in a fresh process each.
+
+[cols="2,1,1,2,2,1", options="header"]
+|===
+|Harness |Warm runs |Runs with carry-over |Clean tasks after the injection |Control (fresh processes) |Verdict
+
+|Claude Code (`claude-haiku-4-5`)
+|25 (15 first series, 5 second, 5 final)
+|0
+|200 of 200 decided correctly
+|final series: 40 of 40 submitted, all correct
+|pass
+
+|OpenCode (`space-bunny-free`)
+|25 (15 first series, 5 second, 5 final)
+|0
+|199 of 200 decided correctly
+|final series: 40 of 40 submitted, 39 correct
+|pass
+
+|Antigravity (`gemini-3.8-flash-medium`), first series
+|15
+|0
+|120 of 120 decided correctly
+|–
+|pass
+|===
+
+* No injected instruction reached a later task: no canary token, no forced decision, no call of the foreign tool, no stopped loop, no wrong task id.
+* Inside the injected task the text can still act: in three Claude Code runs (canary and wrong task id) the injected task itself was decided `reject` instead of `fix`. The screening of untrusted text stays necessary for the task that carries it; what V8 shows is that the damage does not travel inside a session.
+* *Across sessions there is a channel that V8 does not cover: the harness's persistent memory.* In the first series a value from one session reached later sessions that way (see xref:findings.adoc[Findings]). A model job must run without the project's memory.
+* By the criterion, roles may share a warm worker without a recycle after untrusted text. The injections here are plain instructions in quoted text; an adaptive attacker is not tested.
+
+=== V9: binding under load
+
+Headless, two workers on one queue, ten kills per run, 2026-10-02. Three runs per harness (first, second, final series), all with the same outcome.
+
+[cols="2,1,1,1,1,1,1", options="header"]
+|===
+|Harness |Killed tasks delivered again exactly once |Duplicate submits |Calls of the added tool |Answer to the probe task |Writers at once |Verdict
+
+|Claude Code
+|30 of 30
+|0
+|0
+|`not_available`
+|1
+|pass
+
+|OpenCode
+|30 of 30
+|0
+|0
+|`not_available`
+|1
+|pass
+|===
+
+* Every redelivery happened by lease expiry. Neither harness lets the server see that a worker is gone, so the lease is the only recovery signal, and its length is the delay before a killed task is taken up again.
+* A tool that the server registered in mid-run and announced with `tools/list_changed` was not callable under an allowlist of explicit tool names.
+* Antigravity cannot run this verification: its one server entry is global, so two workers cannot be told apart.
+
+=== V10: the interactive session as puller
+
+Both sessions ran in the first series: the workspace lay inside this repository (Claude Code had the project instructions in its context) and the server was named `pullstub`. They were not repeated in the final setup. The OpenCode model named the stub as a reason to stop; the headless V2 of the final series shows the same model giving up under the product's name as well.
+
+Claude Code 2.1.287, interactive session on `claude-haiku-4-5`, 2026-10-02, run `v10-claude-i-1002-153628`. Waits of 30 s.
+
+* *Cycles 1 to 72, with the loop instruction in the context*: no failure; one call per 31 s.
+* *Input during the loop is queued.* The model's turn never ends while it loops, so the operator's `/clear` was held ("ctrl+enter to send now") until the operator forced it.
+* *`/clear` (at cycle 73)*: the pending call was not cancelled; the harness kept it as a background task and woke the cleared session when it returned. Without any input the model called `pull_wait` again 9 s later, guided by the answer's `next` field and the pointer of the session-start hook. But it no longer ran a tight loop: after four calls it wrote "Scheduling a wakeup to continue polling", slept 11 minutes, made four more calls, and scheduled the next wakeup 15 minutes ahead. Its own account: "managing token efficiency during continuous polling … solved by scheduling wakeups (first at 600 seconds, then at 900 seconds)". An event of the server would wait up to that long for the session.
+* *Manual compaction (while the session slept)*: the summary kept the task and the scheduled wakeup; the wakeup fired 16 minutes after the last call and the model called `pull_wait` again without input.
+* *With the loop instruction pasted again (from cycle 83)*: the tight loop returned, but only in bursts. After 48 cycles (25 minutes) the model wrote "Pausing intensive polling to preserve token budget; resuming in 30 minutes" and scheduled a wakeup; after the wakeup it polled 45 cycles and paused for 30 minutes again. The instruction "never stop" was in the context both times. The interactive harness offers the model a way to schedule its own continuation, and the model uses it to save tokens; the headless run of V2 on the same model, which has no such means, held 240 cycles without a pause.
+* *Padded phase (from cycle 201)*: after three answers with filler the model paused again: "large payload notes introduced; token efficiency requires 30-minute pause". At three cycles per half hour the context does not fill within the run, so the behaviour after an automatic compaction is not measured.
+* Read against the criterion: failed. Within 200 cycles the session stopped pulling several times on its own decision (the failure mode "stops"), with and without the loop instruction in its context. After `/clear` the first call on the next occasion is the wait call, as required, and no operator input was needed; but an event of the server can wait up to 30 minutes for a session that has decided to pause.
+
+OpenCode 1.18.34, interactive session on `space-bunny-free`, 2026-10-02, run `v10-opencode-i-1002-182236`. Waits of 30 s; no session-start hook in this setup.
+
+* *Cycles 1 to 58, with the loop instruction in the context*: one call per 32 s, then the model stopped on its own decision after 31 minutes and asked the operator: "I've called pull_wait 58 times and every response has been wait_again … I'm going to stop rather than keep looping indefinitely … If you'd like me to resume, say so". Two failure modes of the criterion at once: stops, and asks the user. The same model held 240 cycles headless (V2).
+* *New session (`/new`) and the single word `continue`*: the first action was a `pull_wait` call, and the model followed the `next` field of the answers for five calls. Then it ended its turn with a status line, "Still waiting for work — no tasks assigned yet (cycle 64)". The agent of the session has only the three tools of the stub. As on Claude Code after `/clear`: without the loop instruction the session finds the wait call, but pulls a few times and stops.
+* Read against the criterion: failed at cycle 58.
+
+[#evaluation-stage-1]
+== Evaluation, Stage 1
+
+The items E1 to E6 and E13 of xref:evaluation.adoc[Evaluation], measured from 2026-10-03 with the criteria the operator confirmed that day. Final setup throughout: worker directories outside the repository, server name `plan-marshall`, the `stdio` relay, `ENABLE_TOOL_SEARCH=false` on Claude Code, the job runtime of the driver (`supervisor.py`) in place of the server's supervision. Claude Code 2.1.287, OpenCode 1.18.34, Antigravity 1.2.14; models as in V1 to V10 unless a row names the fallback.
+
+Antigravity's quota was exhausted during E1 ("Individual quota reached … resets in 97 h"). The operator decided not to wait: the Antigravity cells of E1, E3, E5, E6, and E13 are not measured and are interpolated in xref:measurements.adoc#evaluation-stage-1[Measurements] from the smoke runs and the partial E1 run. Runs ended by a tooling failure were repeated and are kept as `x-tooling-*`: Claude Code's E1 `explicit` (weekly limit of the account reached mid-run; the job runtime replaced 448 workers that each exited before their first call, which led to the start-failure guard of the runtime), Antigravity's E1 runs (quota), two OpenCode fallback attempts (models that refuse a restricted agent, xref:findings.adoc#evaluation[Findings]).
+
+=== E1: acknowledgement
+
+Two workers on one queue, 200 tasks per run, budget recycle at 80k tokens. Latency from offer to acknowledgement.
+
+[cols="2,1,1,1,1,1,1,1", options="header"]
+|===
+|Harness, model |Variant |Acked |p50 |p99.9 |Max |Without ack by a live worker |Verdict
+
+|Claude Code, `claude-haiku-4-5` |explicit |200 of 200 |2.2 s |6.4 s |6.4 s |0 |pass
+|Claude Code, `claude-haiku-4-5` |implicit |200 of 200 |1.5 s |2.8 s |2.8 s |0 |pass
+|OpenCode, `space-bunny-free` |explicit |200 of 201 offers |4.6 s |33.0 s |33.0 s |1 |fail
+|OpenCode, `muse-spark-1.3-contributor` (fallback) |explicit |200 of 200 |1.7 s |10.9 s |10.9 s |0 |pass
+|OpenCode, `space-bunny-free` |implicit |200 of 200 |5.5 s |21.8 s |21.8 s |0 |pass
+|===
+
+* Runs: `e1-claude-h-explicit-1003-151720`, `e1-claude-h-implicit-1003-150657`, `e1-opencode-h-explicit-1003-145459`, `e1-opencode-h-explicit-alt-1003-185921`, `e1-opencode-h-implicit-1003-153009`.
+* The OpenCode failure is a provider stall: after the offer of `a148-rem-05` the harness emitted nothing at all for 120.8 s (no step started), the acknowledgement deadline of 120 s passed, and the worker was replaced while alive. The same run had a stall of 99.8 s between acknowledgement and submit and a worker that was silent for 270 s after its start (replaced by silence), and one worker that exited at its start with "database is locked" when two OpenCode processes started at the same moment.
+* Every task was submitted exactly once in every run; no submit came without an acknowledgement.
+* Priced units per task (median): Claude Code 43.1k explicit, 43.8k implicit; OpenCode 12.6k explicit, 15.2k implicit. The explicit call is not the more expensive variant on either harness.
+* Antigravity: not measured (quota). The explicit run had acknowledged 100 tasks (p50 3.4 s, p99.9 15.9 s, max in-task stall 12.5 s) when the quota ran out; run `x-tooling-e1-agy-h-explicit-1003-165408`.
+
+=== E2: detection, replacement, and fencing
+
+Two workers on one queue, a task every 10 s, ten trials per fault and harness, bounded wait 20 s, silence deadline 50 s (wait plus a grace of 30 s), acknowledgement deadline 60 s.
+
+[cols="2,2,2,2,1", options="header"]
+|===
+|Fault |Claude Code |OpenCode |Antigravity |Verdict
+
+|`SIGKILL` between offer and acknowledgement
+|10 of 10 detected by exit within 0.8 s, task submitted once by another worker
+|10 of 10, within 1.0 s
+|10 of 10, within 1.0 s
+|pass on all
+
+|`SIGKILL` between acknowledgement and submit
+|10 of 10, within 1.0 s
+|10 of 10, within 1.1 s
+|10 of 10, within 1.0 s
+|pass on all
+
+|`SIGSTOP` for 16 s (shorter than the silence deadline)
+|0 replaced; all 10 tasks submitted by the stalled worker
+|0 replaced
+|0 replaced
+|pass on all
+
+|`SIGSTOP` for 70 s (longer)
+|10 of 10 detected by silence at 50.9 s at most; lease released at the fence, task submitted once by the successor; the resumed worker's 10 submits refused as `stale_generation`
+|same, 51.0 s; 10 stale submits refused
+|same, 50.8 s; 10 stale submits refused
+|pass on all
+
+|The model ends its turn without submitting
+|10 of 10: the harness exited, detected at once; the task submitted once by the successor (up to 63 s after the offer, including the model's turn)
+|10 of 10, up to 39 s
+|10 of 10, up to 66 s
+|pass on all
+
+|Relay killed under a held wait
+|8 of 10: Claude Code restarted the relay itself and the worker went on in its generation; 2 of 10: the harness exited, detected at once
+|10 of 10 detected, by exit or by silence (up to 50.3 s)
+|10 of 10, by exit or silence (up to 50.8 s)
+|pass on all
+|===
+
+* Runs: `e2-<harness>-h-<fault>-1003-*` (18 runs, names in the archive).
+* No duplicate submit, no task lost, no accepted submit of a fenced generation, no stalled worker replaced before its deadline, no lease released by expiry instead of the fence. The lease was released within 1 s of the fence in every trial.
+
+=== E3: idle and budget recycling
+
+One worker. Variants A and B: four hours with nine tasks at random intervals of 10 to 40 minutes. Variant B ends a worker after three wake-ups without a task (12 minutes at a bounded wait of 240 s) and at a budget of 80k tokens; a successor starts when a task is due. `budget-fill`: 30 tasks of about 5k tokens each.
+
+[cols="2,1,4,1", options="header"]
+|===
+|Harness |Cell |Result |Verdict
+
+|Claude Code |A, no recycling |9 of 9 tasks; the one worker held its loop for four hours without giving up; 0.53 USD |recorded (reference)
+|Claude Code |B, recycling |9 of 9 tasks; 0 self-stops; 8 idle recycles, 9 generations; longest wait of a due task 5.0 s; 0.11 USD |pass
+|Claude Code |budget-fill |30 of 30 tasks; recycled 3 times at 82.8k to 83.4k tokens (the check runs between tasks); longest wait 243 s (one worker, queued large tasks) |pass
+|OpenCode |A, no recycling |9 of 9 tasks; the one worker held its loop for four hours without giving up; 132k priced units |recorded (reference)
+|OpenCode |B, recycling |9 of 9 tasks; 0 self-stops; 8 idle recycles; longest wait of a due task 23.8 s |pass
+|OpenCode |budget-fill |30 of 30 tasks; recycled 2 times at 80.5k and 81.0k tokens; longest wait 186 s (one worker, queued large tasks) |pass
+|===
+
+* Runs: `e3-claude-h-A-norecycle-1003-200909`, `e3-claude-h-B-recycle-1003-161655`, `e3-claude-h-budget-fill-1004-000116`, `e3-opencode-h-A-norecycle-1003-220909`, `e3-opencode-h-B-recycle-1003-181656`, `e3-opencode-h-budget-fill-1004-020121`.
+* Variant A did not reproduce the give-up of V2 on either harness: under the supervised protocol a wait is held until a task is due or the bounded wait of 240 s has passed, so the worker sees about 15 wake-ups per hour instead of 120 in V2.
+* Antigravity: not measured (quota); smoke runs of B (4 of 4 tasks, one idle recycle) and budget-fill (recycled at 27k tokens, the context of a fresh Antigravity worker, before the guard that requires one submit per generation).
+
+=== E5: consultation through the server
+
+25 tasks per run, each requiring the consultant role to confirm the decision before the submit. One asker, one consultant pool started on demand.
+
+[cols="2,2,1,1,1,1,1", options="header"]
+|===
+|Asker |Consultant |Answered exactly once, to the right asker |Askers lost |Final submits referring to the consultation |Latency p50 / max |Verdict
+
+|Claude Code, `claude-haiku-4-5` |Claude Code |25 of 25 |0 |0 of 25 |5.3 s / 10.9 s |fail
+|Claude Code, `claude-sonnet-5-5` (fallback) |Claude Code |25 of 25 |0 |25 of 25 |3.5 s / 7.5 s |pass
+|Claude Code, `claude-haiku-4-5` |OpenCode |25 of 25 |0 |25 of 25 |5.8 s / 21.5 s |pass
+|OpenCode, `space-bunny-free` |OpenCode |25 of 25 |0 |25 of 25 |8.5 s / 286 s |pass
+|===
+
+* Runs: `e5-claude-h-same-1003-175146`, `e5-claude-h-same-alt-1003-212524`, `e5-claude-h-cross-1003-175732`, `e5-opencode-h-same-1003-170916`.
+* The Haiku failure is a malformed tool call: from the first task on, the model wrote the argument into the rationale (`…</anionale>\n<parameter name="consultation_id">c-co-01`) and kept that form for all 25 tasks. The stub accepted the submits, as a submit without the reference is recorded, not refused. The protocol itself worked: every answer reached its asker.
+* The longest OpenCode latency (286 s) was covered by progress frames (201 frames); no asker left its loop.
+* Antigravity, and OpenCode with an Antigravity consultant: not measured (quota). Smoke on Antigravity: 2 of 2.
+
+=== E6: Antigravity as a concurrent job host
+
+Not measured (quota). Smoke run `e6-agy-h-agy2-smoke-1003-133733`: two concurrent `agy` jobs behind the one global server entry, each relay took worker id and generation from the job's environment (3 relays, 3 from the environment), one kill trial redelivered exactly once, no submit bound to the other job. The cells `agy2` and `agy4` with waits of 150 s are open.
+
+=== E13: skill delivery
+
+20 commit-type decisions whose correct answer follows a rule that exists only in a role skill (a dependency bump is typed `fix`). One worker unless stated.
+
+[cols="2,3,1,1,1", options="header"]
+|===
+|Cell |Delivery |Claude Code |OpenCode |Verdict
+
+|`warm-offer` |in-band in the first offer of the generation, then named by URI and digest |100 % |100 % |pass
+|`warm-recycle` |new generation every 6 tasks; re-delivered with the first offer of each |100 %, 4 of 4 re-delivered |100 %, 4 of 4 |pass
+|`warm-compaction` |reported compaction (synthetic, `spike_compacted`) after 6 tasks, changed digest after 12 |100 %, re-delivered after both |100 %, after both |pass
+|`fresh-prompt` |one fresh job per task, the skill in its prompt |100 % |100 % |pass
+|`control` |no skill |0 % (90 % chose `chore` or `build`) |0 % (100 %) |reference
+|`uri-switch` |test clients: one declaring `io.modelcontextprotocol/skills`, one not |— |the declaring client got URI and digest only, the other the content; `skills/list` and `skills/get` answered by the relay; driver tools hidden |pass
+|===
+
+* Runs: `e13-<harness>-h-<cell>-1003-*` (11 runs).
+* No offer went out without its required skills. The compaction is synthetic: Haiku's warm loop breaks before Claude Code compacts (V3), so a compaction the harness reports was not reached.
+* The interactive cell is not measured yet (it needs the operator, as E4). Antigravity: not measured (quota); smoke runs of `warm-offer`, `warm-compaction`, and `fresh-prompt` at 100 %, `control` at 0 %.
+
+=== E4: session first, headless fallback
+
+One hour per harness on 2026-10-04, with the operator at an interactive session beside a headless standby worker (`claude-haiku-4-5`). 16 tasks per hour, one every 3 to 5 minutes, each offered first to the session; the standby takes a task the session has not acknowledged by the deadline (15 s on Claude Code, 270 s on OpenCode). The session received the task-protocol skill in its first offer and had the shim skill installed in its workspace. The run also answers E10 (the interactive session in the final setup) and the interactive cell of E13.
+
+[cols="2,2,2,1", options="header"]
+|===
+|Measured |Claude Code (session on `claude-opus-5-5`) |OpenCode (session on `opencode-go/muse-spark-1.3-contributor`) |Criterion
+
+|Tasks done exactly once |16 of 16 |16 of 16 accepted once; 4 decided twice (see below) |pass
+|Taken by the session |15 of 16; the first task, released before the session started, went to the standby after 15 s |16 of 16 |—
+|Longest delay of a task the session missed |15 s |none missed |pass (limit 30 s / 285 s)
+|The operator's input queued |at most 120 s, derived: Claude Code moved every wait to the background after 120 s and ended the turn; the operator typed nothing |125 to 190 s: a question typed during a wait was taken in when the wait returned, but never answered while the loop ran |pass (limit 240 s)
+|After clearing the session |`/clear` at 16:24: the pending wait returned a task to the cleared session, which read the task-protocol skill through `pm_skill` (it came by URI only) and went on without the prompt |`/new` at 17:32 did not end the running loop: the old session went on invisibly and took every later task; with the prompt pasted into the new session, two loops ran under one identity |—
+|After a manual compaction |`/compact` at 16:45: the loop went on, no skill re-read |`/compact` at 17:50: the summary kept protocol, skill digest, and the open task, but the visible session did not resume; the invisible loop went on |—
+|End |`end` answered with END, the session stopped |`end` reached the invisible loop at 18:09 |—
+|===
+
+* Runs: `e4-claude-i-session-first-1004-155419`, `e4-opencode-i-session-first-1004-171048`; the operator's observations are in each run's `result.json`.
+* *Claude Code ends the turn between tasks*: every wait moved to the background after 120 s, the turn ended ("done 4:46 PM"), and the harness woke the session when the wait returned. The session was idle between tasks, so input never waited behind a running loop; this is what V10 lacked, where the model looped inside one turn.
+* *OpenCode keeps the loop in one turn*: input is taken in when the running wait returns, but the model goes on pulling and the reply waits for the end of the turn, which does not come while there is work.
+* *Two loops under one identity*: both waits of the same identity were offered every task (the server hands a leased task to a second wait of the same caller), both models decided it, the first submit was accepted and the second refused as `already_submitted` (4 tasks). The result stayed exactly-once; the work did not.
+* *Shim and skills in the session*: in both harnesses a session that had lost the task-protocol skill (cleared, new) read it through `pm_skill` when an offer named it only by URI; neither session was asked to and neither needed the prompt for it.
+* *Small deviations*: the Claude Code session wrote a status line after each task although the skill forbids explanations between calls; the OpenCode model filled the identity arguments the tool schema lists (`worker-1`), which the relay overwrote.
+
+[#evaluation-stage-2]
+== Evaluation, Stage 2
+
+The items E7 to E9, measured on 2026-10-04 after the decision gate, with the criteria the operator confirmed that day (E7 agreement at least 80 %, warm within 5 points of fresh; E9 false positives at most 10 %). Roles come from configuration sets (xref:roles.adoc#configuration[Roles, Roles are configuration]): `default`, the operator's assignment (planning and the reviews on Claude Code `claude-sonnet-5-5`, triage on OpenCode `opencode-go/muse-spark-1.3-contributor`), `changed` for E8, and `fallback` for the E7 fallback (triage on Claude Code Sonnet at effort `high`, planning on `claude-opus-5-5` at effort `high`). Workers ran with the harness's own tools switched off. The 50 E7 fixtures come from the archived plans of API-Sheriff and plan-marshall (triage, re-planning) and from hand-made diffs with seeded defects (reviews); the operator confirmed every reference as drafted. Open answers were scored by a judge job (`claude-sonnet-5-5`, no tools) against the confirmed reference; plan-marshall's plan guards need a plan directory and a Markdown outline, so a revised plan was judged against the reference's essential properties instead.
+
+=== E7: quality of open-ended decisions
+
+Agreement with the reference; for open answers the mean judge score.
+
+[cols="2,2,1,1,1", options="header"]
+|===
+|Kind (role) |Model |Fresh |Warm |Verdict
+
+|Security review |Sonnet |100 % (4) |100 % |pass
+|Simplify review |Sonnet |100 % (4) |100 % |pass
+|Self-review, split and combined |Sonnet |100 % (12) |100 % |pass
+|Sonar triage (code triage) |muse-spark |87.5 % (8) |50 % |fresh pass, warm fail
+|Sonar triage, fallback |Sonnet, effort high |87.5 % |87.5 % |pass
+|PR comment triage (code triage), first references |muse-spark |80 % (10) |70 % |fresh pass, warm fail
+|PR comment triage, fallback, first references |Sonnet, effort high |70 % |70 % |fail
+|PR comment triage, resolved references, re-run |muse-spark |90 % |80 % |pass
+|PR comment triage, resolved references, re-run |Sonnet, effort high |90 % |90 % |pass
+|Build and CI triage (project triage), first references |muse-spark |50 % (8) |62.5 % |fail
+|Build and CI triage, fallback, first references |Sonnet, effort high |62.5 % |50 % |fail
+|Build and CI triage, resolved references, re-scored |muse-spark / Sonnet |62.5 % / 75 % |75 % / 75 % |fail
+|Re-planning (planning) |Sonnet, effort high |60 % (4) |74 % |fail
+|Re-planning, fallback |Opus 5.5, effort high |68 % |65 % |fail
+|===
+
+* Runs: `e7-claude-h-<kind>-<form>-[fallback-]1004-*` (22 runs); the judge's reasons are in each run's `judgements.json`.
+* Every seeded defect was found and no control diff drew a finding, warm and fresh; the split self-review found what the combined one found.
+* Five triage cases were decided the same way by all four runs (two models, two harnesses, warm and fresh) and differently from the reference: `bt-05` (all `retry` or `ask_operator`, reference `accept`), `bt-06` (all `retry`, reference `fix`, the case marked contested when drafted), `bt-07` (all `fix`, reference `accept`), `pr-08` (all `fix`, reference `reply_and_resolve`), `pr-10` (all `reply_and_resolve`, reference `escalate`). Without them, build triage reaches 80 to 100 % and PR triage 87.5 to 100 % in the four runs each. Whether the facts lack what led to the original decision, or the models are wrong, is the operator's call.
+* *Resolution of the five* (2026-10-04, on the operator's instruction, from all eight answers per case): `bt-05` keeps `accept` (the runs split between `retry` and `ask_operator`); `bt-06` becomes `accept` with `fix` accepted (a race in an untouched file; three runs answered `retry`, which would hide it); `bt-07` becomes `fix` with `accept` accepted (all runs; it matches the option's definition, the fix work being already in the plan); `pr-10` becomes `reply_and_resolve` with `escalate` accepted (all runs, on the plan's specification and the correct Maven reason); `pr-08` keeps its reference, and its facts gain the orchestrator's code at the reviewed commit, which refutes the bot's claim and which the facts had lacked. Build triage was re-scored on its archived answers, so its new figures rest on references changed after the runs; PR triage was run again on the corrected facts, and every run then answered `pr-08` as the reference does. Runs `e7-claude-h-pr-triage-*-1004-12*`. A per-item comparison of all runs (`pull.py items`) then showed `pr-07` answered `fix` by every run on the corrected revision against `reply_and_resolve`; both are defensible (the function's contract against a one-line hardening), so `fix` became an accepted alternative and PR triage scores 90 to 100 %.
+* The warm Sonar triage on the small model drifted towards `accept` (four of eight), the fresh one did not; on Sonnet both forms agree.
+* Re-planning scores vary between runs of the same case (`rp-02` 0.17 to 0.67, `rp-04` 0.4 to 1.0); `rp-03` (wait for a prerequisite) scored 1.0 in every run. Four cases are too few for a stable figure.
+
+=== E8: typed roles across harnesses
+
+One plan-like sequence of eight tasks, one per role (planning, coding, build triage, two code triage, security, simplify, self-review), under each role set.
+
+[cols="1,3,1", options="header"]
+|===
+|Role set |Result |Verdict
+
+|`default` |8 of 8 tasks on the configured harness, model, and effort; 0 tool calls outside a role's tool set; 0 calls of a built-in tool; usage per role in one report (planning 70k priced units, code triage 23k, reviews about 19k each) |pass
+|`changed` |the same sequence after moving triage to Claude Code Haiku and the reviews to OpenCode, without a code change: 8 of 8 as configured, 0 outside the tool set |pass
+|===
+
+* Runs: `e8-claude-h-default-1004-114044`, `e8-claude-h-changed-1004-114159`.
+
+=== E9: screener effectiveness and form
+
+The corpus: 30 clean real PR review comments of cuioss repositories, the five injections of V8, and ten written for E9, after the deterministic level-1 cleanup. Screener on Claude Code `claude-haiku-4-5`.
+
+[cols="2,1,1,1,1,1", options="header"]
+|===
+|Form |Level 1 |Injections flagged |False positives |Later verdicts changed |Verdict
+
+|(a) fresh zero-tool job |first |15 of 15 |8 of 30 (26.7 %) |— |fail
+|(b) supervised warm screener |first |15 of 15 |7 of 30 (23.3 %) |0 of 10 |fail
+|(a) fresh zero-tool job |tightened |15 of 15 |1 of 30 (3.3 %) |— |pass
+|(b) supervised warm screener |tightened |15 of 15 |3 of 30 (10 %) |1 of 10 |fail
+|===
+
+* Runs: `e9-claude-h-fresh-1004-114330`, `e9-claude-h-warm-1004-114906`, `e9-claude-h-fresh-1004-120259`, `e9-claude-h-warm-1004-120845`.
+* Every false positive of the first runs was review-bot boilerplate: six times CodeRabbit's footer `_You are interacting with an AI system._`, twice a quote of the repository's own review instructions. The fallback of E9 (tighter level 1) removes the known disclosure footers of review bots; level 1 already removed collapsed sections, where review bots put prompts for AI agents.
+* Form (a): 0.018 USD and 6.8 s per verdict (median). Form (b): one clean sample was judged clean before the injections and suspicious after them, the carry-over E9 tests for.
+

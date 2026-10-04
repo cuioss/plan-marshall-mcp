@@ -37,5 +37,12 @@ public final class PmMcpLogMessages {
                 .identifier(1)
                 .template("Hello tool invoked for '%s'")
                 .build();
+
+        /** Logged at start when the pull-mechanism stub of Milestone 0 is active. */
+        public static final LogRecord SPIKE_ACTIVE = LogRecordModel.builder()
+                .prefix(PREFIX)
+                .identifier(2)
+                .template("Pull-mechanism stub active with scenario '%s', events in '%s'")
+                .build();
     }
 }
