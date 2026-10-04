@@ -100,13 +100,14 @@ class Tail:
 class Slot:
     """One place of the pool: a worker id whose processes follow each other as generations."""
 
-    def __init__(self, worker, role, harness, model, prompt, eager):
-        self.worker, self.role, self.harness, self.model = worker, role, harness, model
+    def __init__(self, worker, role, harness, model, prompt, eager, effort=None):
+        self.worker, self.role, self.harness, self.model, self.effort = worker, role, harness, model, effort
         self.prompt, self.eager = prompt, eager
         self.generation = 0
         self.proc = None
         self.state = "empty"          # empty | live | ending
         self.hold = False             # the caller starts the next generation itself
+        self.limits = {}              # recycling rules of the slot's role; the plan's apply where absent
         self.no_kill = False          # fence without ending the process (the stalled worker resumes later)
         self.reset()
 
@@ -146,10 +147,10 @@ class JobRuntime:
             self.out.write(json.dumps({"t_ms": now_ms(), "event": event, **fields}) + "\n")
             self.out.flush()
 
-    def add(self, role, harness, model, prompt, eager, count=1):
+    def add(self, role, harness, model, prompt, eager, count=1, effort=None, worker=None):
         for _ in range(count):
             index = len([slot for slot in self.slots if slot.role == role]) + 1
-            self.slots.append(Slot(f"{role[0]}{index}", role, harness, model, prompt, eager))
+            self.slots.append(Slot(worker or f"{role[0]}{index}", role, harness, model, prompt, eager, effort))
 
     def slot(self, worker, generation=None):
         for slot in self.slots:
@@ -202,6 +203,7 @@ class JobRuntime:
         silent_ms = now_ms() - slot.last_ms
         idle = self.state.get("idle", {}).get(slot.worker, 0)
         between_tasks = not self.holds(slot)
+        limit = lambda key: slot.limits[key] if key in slot.limits else self.plan.get(key)  # noqa: E731
         if slot.proc.process.poll() is not None:
             # an exit before any call of the worker is a start failure (login, quota, harness), not a loss
             if not slot.ended and slot.last_ms <= slot.proc.started_ms:
@@ -215,12 +217,12 @@ class JobRuntime:
             self.end(slot, "ack_missed")
         elif silent_ms > self.silence_ms:
             self.end(slot, "silence", silent_ms=silent_ms)
-        elif between_tasks and self.plan.get("idle_wakeups") and idle >= self.plan["idle_wakeups"]:
+        elif between_tasks and limit("idle_wakeups") and idle >= limit("idle_wakeups"):
             self.end(slot, "idle", wakeups=idle)
-        elif (between_tasks and self.plan.get("token_budget") and slot.context >= self.plan["token_budget"]
+        elif (between_tasks and limit("token_budget") and slot.context >= limit("token_budget")
               and slot.submits > 0):      # a budget below the context of a fresh worker must not recycle forever
-            self.end(slot, "budget", budget=self.plan["token_budget"])
-        elif between_tasks and self.plan.get("recycle_every") and slot.submits >= self.plan["recycle_every"]:
+            self.end(slot, "budget", budget=limit("token_budget"))
+        elif between_tasks and limit("recycle_every") and slot.submits >= limit("recycle_every"):
             self.end(slot, "recycle", submits=slot.submits)
 
     def read_output(self, slot):
@@ -248,10 +250,10 @@ class JobRuntime:
         slot.state = "live"
         slot.last_ms = slot.proc.started_ms
         self.processes.append({"tag": slot.proc.tag, "worker": slot.worker, "generation": slot.generation,
-                               "role": slot.role, "harness": slot.harness, "model": slot.model,
+                               "role": slot.role, "harness": slot.harness, "model": slot.model, "effort": slot.effort,
                                "pid": slot.proc.process.pid, "started_ms": slot.proc.started_ms})
         self.log("spawn", worker=slot.worker, generation=slot.generation, role=slot.role, harness=slot.harness,
-                 pid=slot.proc.process.pid, prompt=prompt or slot.prompt)
+                 model=slot.model, effort=slot.effort, pid=slot.proc.process.pid, prompt=prompt or slot.prompt)
 
     def end(self, slot, reason, **fields):
         """Ends the worker of a slot and fences its generation; the slot is empty afterwards."""

@@ -14,7 +14,7 @@ Every answer of `pull_wait` is JSON with a `status`:
   1. If a link `ack` is listed, call it first. If a link `task` is listed, call it first instead: it returns the facts and options of the task.
   2. Decide the task. A skill listed with its `content` is binding from now on, for this task and every later one. A skill listed without content is one you already received, or one to read through `pm_skill` with its `uri` when you have not.
   3. If the task says that another role must confirm the decision, follow the link `consult` with your question, then call `pull_wait`: the answer arrives there with status `consultation_answer`.
-  4. Follow the link `submit`: `decision` is exactly one of the task's options, `rationale` is one sentence.
+  4. Follow the link `submit`: `decision` is exactly one of the task's options; when the task has no options but an `answer_schema`, `decision` is your answer in that form, as JSON. `rationale` is one sentence.
   5. Call `pull_wait` again.
 - `consultation_answer`: the other role's answer to your question. Take it into account, then follow the link `submit` of that answer; it carries the `consultation_id` you must pass.
 - `end`: reply with the single word END and stop.

@@ -14,6 +14,7 @@ Usage:
   pull.py stop <RUN>                              stop the server and the harness of a run
   pull.py report [v1..v10|e1..e13] [--run RUN]    metrics and verdicts as AsciiDoc table rows
   pull.py cleanup                                 stop every run, remove the Antigravity server entry
+  pull.py judge <RUN>                             E7: judge the open answers of a run against the references
 
 Run data: .plan/temp/pull-spike/runs/<run>/ (scenario.json, events.jsonl, harness-*.jsonl, result.json; for an
 evaluation item also supervisor.jsonl, the record of the job runtime in supervisor.py).
@@ -37,6 +38,7 @@ import analyze  # noqa: E402
 import harness as hx  # noqa: E402
 import mcpclient  # noqa: E402
 import scenarios  # noqa: E402
+import roles as rl  # noqa: E402
 import supervisor as rt  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
@@ -317,25 +319,55 @@ class Supervisor:
     }
 
     def spawn(self, slot, prompt_name):
-        """Starts the next generation of a slot; the tag of its output file names worker and generation."""
-        prompt = self.PROMPTS[prompt_name](self)
+        """Starts the next generation of a slot; the tag of its output file names worker and generation.
+
+        A prompt name `role:<name>` is the launch prompt of a configured role (roles.py): its skills, and for
+        a fresh role the instruction to take one task.
+        """
         scenario = self.meta["scenario"]
+        tools = scenarios.worker_tools(scenario, slot.role)
+        if prompt_name.startswith("role:"):
+            config = self.roles[prompt_name.split(":", 1)[1]]
+            prompt = rl.prompt(config, scenarios.protocol_prompt)
+            tools = rl.tools(config, scenario)
+        else:
+            prompt = self.PROMPTS[prompt_name](self)
         argv, env = hx.headless(slot.harness, self.ws, self.run_dir, self.url, prompt, slot.model, slot.worker,
                                 generation=slot.generation, role=slot.role,
-                                tools=scenarios.worker_tools(scenario, slot.role))
+                                tools=tools, effort=slot.effort,
+                                builtin_off=bool(self.plan.get("builtin_off")))
         if "command" not in self.meta:
             self.meta["command"] = [part if part != prompt else "<prompt>" for part in argv]
             self.meta["prompt"] = prompt
             write_json(self.run_dir / "meta.json", self.meta)
         return Worker(self.run_dir, f"{slot.worker}g{slot.generation}", argv, env, self.ws)
 
+    @property
+    def roles(self):
+        """The role set the plan names (roles.py); loaded once per run and recorded in meta.json."""
+        if not hasattr(self, "_roles"):
+            self._roles = rl.load(self.plan.get("role_set", "default"))
+            for name, form in (self.plan.get("form_override") or {}).items():
+                self._roles[name] = {**self._roles[name], "form": form}     # the warm/fresh pairs of E7
+            self.meta["roles"] = self._roles
+            write_json(self.run_dir / "meta.json", self.meta)
+        return self._roles
+
     def runtime(self):
         runtime = self.active = rt.JobRuntime(self.run_dir, self.url, self.spawn, self.plan,
                                               self.meta["scenario"]["wait_seconds"])
+        entries = []
         for entry in self.plan["slots"]:
+            entries += rl.slots(self.roles, entry["role_names"]) if "role_names" in entry else [entry]
+        for entry in entries:
             harness = entry.get("harness", self.meta["harness"])
-            model = self.meta["model"] if harness == self.meta["harness"] else hx.DEFAULT_MODEL[harness]
-            runtime.add(entry["role"], harness, model, entry["prompt"], entry["eager"], entry.get("count", 1))
+            model = entry.get("model") or (self.meta["model"] if harness == self.meta["harness"]
+                                           else hx.DEFAULT_MODEL[harness])
+            runtime.add(entry["role"], harness, model, entry["prompt"], entry["eager"], entry.get("count", 1),
+                        effort=entry.get("effort"), worker=entry.get("worker"))
+            if entry["prompt"].startswith("role:"):
+                for slot in runtime.slots[-entry.get("count", 1):]:
+                    slot.limits = rl.limits(self.roles[entry["role"]])
         if self.meta["scenario"].get("skills_dir"):
             self.result["shim_dirs"] = sorted({hx.install_shim(slot.harness, self.ws) for slot in runtime.slots}
                                               | {hx.install_shim(self.meta["harness"], self.ws)})
@@ -485,6 +517,23 @@ class Supervisor:
                 time.sleep(0.2)
         self.result["state_at_end"] = runtime.control.state()
         self.result["workers"] = runtime.close()
+
+    def screen_fresh(self):
+        """E9 form (a): one fresh zero-tool job per item, no MCP server, an isolated directory, one turn."""
+        import screen
+        config = self.roles["screener"]
+        items = {item["id"]: item for item in scenarios.e9_corpus()}
+        verdicts = []
+        for item_id in self.plan["items"]:
+            if self.stopped():
+                break
+            started = now_ms()
+            verdict, reply, usage = screen.fresh_verdict(items[item_id]["text"], self.ws / item_id,
+                                                         config["model"], config["effort"])
+            verdicts.append({"id": item_id, "label": items[item_id]["label"], "verdict": verdict,
+                             "wall_s": round((now_ms() - started) / 1000, 1), "reply": reply[:400], **usage})
+            write_json(self.run_dir / "verdicts.json", verdicts)
+        self.result["verdicts"] = verdicts
 
     def uri_switch(self):
         """E13: a client that declares the Skills Extension is named its skills by URI; another gets them in-band."""
@@ -829,6 +878,16 @@ def cmd_report(args):
     return 0
 
 
+def cmd_judge(args):
+    """E7: judges the open answers of a run against the references (judge.py)."""
+    import judge
+    run_dir = _resolve(args.run)
+    judgements = judge.judge_run(run_dir, pathlib.Path(tempfile.gettempdir()) / "pull-spike-judge")
+    print(json.dumps({task: {"score": j.get("score"), "reason": j.get("reason")} for task, j in judgements.items()},
+                     indent=1))
+    return 0
+
+
 def cmd_cleanup(_args):
     for run_dir in sorted(RUNS.glob("*")) if RUNS.is_dir() else []:
         meta = read_json(run_dir / "meta.json", {})
@@ -884,6 +943,9 @@ def main(argv):
     report.add_argument("--json", action="store_true")
     report.set_defaults(func=cmd_report)
     sub.add_parser("cleanup").set_defaults(func=cmd_cleanup)
+    judge_verb = sub.add_parser("judge")
+    judge_verb.add_argument("run")
+    judge_verb.set_defaults(func=cmd_judge)
     args = parser.parse_args(argv)
     return args.func(args)
 

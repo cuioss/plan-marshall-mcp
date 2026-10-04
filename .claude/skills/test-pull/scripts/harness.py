@@ -141,11 +141,13 @@ def _opencode_config(url, raised, worker, run_dir, transport, extra_tools=(), id
 
 
 def headless(harness, ws, run_dir, url, prompt, model, worker, transport="stdio", raised=False, resume=None,
-             extra_tools=(), generation=None, role=None, tools=None):
+             extra_tools=(), generation=None, role=None, tools=None, effort=None, builtin_off=False):
     """Returns (argv, env) for one headless run in the workspace `ws`; logs go to `run_dir`.
 
     `generation` and `role` travel with the relay, as the job token will; `tools` replaces the default tool
-    set of a worker (the allowlist of its role).
+    set of a worker (the allowlist of its role). `effort` is the harness's reasoning effort (Claude Code and
+    Antigravity `--effort`, OpenCode `--variant`); `builtin_off` switches the harness's own tools off where
+    the harness allows it (Claude Code `--tools ""`; OpenCode's agent already denies every other tool).
     """
     ws = pathlib.Path(ws)
     identity = (generation, role)
@@ -160,6 +162,10 @@ def headless(harness, ws, run_dir, url, prompt, model, worker, transport="stdio"
                 "--include-partial-messages", "--model", model]
         if resume:
             argv += ["--resume", resume]
+        if effort:
+            argv += ["--effort", effort]
+        if builtin_off:
+            argv += ["--tools", ""]
         extra = {"MCP_TOOL_TIMEOUT": RAISED_MS, "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": RAISED_MS} if raised else {}
         # Without this the MCP tools are deferred behind ToolSearch; some fresh Haiku jobs then never made
         # the call ("I don't have a direct mechanism to invoke the tool").
@@ -167,6 +173,8 @@ def headless(harness, ws, run_dir, url, prompt, model, worker, transport="stdio"
         return argv, clean_env(extra)
     if harness == "opencode":
         argv = ["opencode", "run", "--format", "json", "--agent", "pull-worker", "-m", model, "--dir", str(ws)]
+        if effort:
+            argv += ["--variant", effort]
         if resume:
             argv += ["-s", resume]
         argv.append(prompt)
@@ -179,6 +187,8 @@ def headless(harness, ws, run_dir, url, prompt, model, worker, transport="stdio"
                 "--sandbox", "--model", model]
         if resume:
             argv += ["--conversation", resume]
+        if effort:
+            argv += ["--effort", effort]
         # one global server entry: the job's identity can only travel in its environment (E6)
         return argv, clean_env(identity_env(worker, generation, role) if generation is not None else None)
     raise ValueError(f"unknown harness {harness}")
