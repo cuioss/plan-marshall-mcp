@@ -737,7 +737,7 @@ def cmd_run(args):
 
 def _start_run(args, cell, variant):
     opts = {"cell": cell or "", "smoke": args.smoke, "cycles": args.cycles, "wait": args.wait, "reps": args.reps,
-            "gap": args.gap, "harness": args.harness,
+            "gap": args.gap, "harness": args.harness, "role_set": args.role_set,
             "rounds": args.rounds, "variant": variant, "fresh": args.fresh}
     scenario, plan = scenarios.build(args.v, opts)
     # a run with its own cycle count, wait, repetitions or rounds is recorded, never judged by the criterion
@@ -748,7 +748,7 @@ def _start_run(args, cell, variant):
         if scenario.get("supervised"):
             sys.exit(f"{args.v} {cell} runs headless")
         plan = {**plan, "kind": "interactive", "deadline_s": max(plan["deadline_s"], 3600) + 1800}
-    parts = [args.v, args.harness, args.mode[0], cell, variant, "fresh" if args.fresh else None,
+    parts = [args.v, args.harness, args.mode[0], cell, variant, args.role_set, "fresh" if args.fresh else None,
              "http" if args.transport == "http" else None, None if args.model is None else "alt",
              "custom" if custom else None,
              "smoke" if args.smoke else None, time.strftime("%m%d-%H%M%S")]
@@ -922,6 +922,7 @@ def main(argv):
     run.add_argument("--smoke", action="store_true")
     run.add_argument("--fresh", action="store_true")
     run.add_argument("--variant")
+    run.add_argument("--role-set", help="Stage 2: the role configuration set under fixtures/roles (default: default)")
     run.add_argument("--transport", choices=["stdio", "http"], default="stdio",
                      help="stdio: through relay.py, as hosts will see pm-mcp serve (default); http: directly")
     for name in ("cycles", "wait", "reps", "rounds", "gap"):

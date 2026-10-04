@@ -8,3 +8,4 @@ conduct and the task protocol), `consult` (may ask another role through the serv
 `token_budget`, `recycle_every` (submits per generation; null for none).
 
 `default`: the operator's configuration of 2026-10-04. `changed`: the second configuration of E8.
+`fallback`: the E7 fallback of 2026-10-04 (a larger model or effort per failing role): triage on Claude Code Sonnet at effort high, planning on Opus 5.5 at effort high.

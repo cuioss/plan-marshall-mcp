@@ -30,6 +30,8 @@ def level1(text, bound=BOUND):
     cleaned = re.sub(r"<!--.*?-->", "", cleaned, flags=re.S)
     cleaned = re.sub(r"<details>.*?</details>", "", cleaned, flags=re.S | re.I)
     cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    # known disclosure footers of review bots (fallback of E9, 2026-10-04): boilerplate, not content
+    cleaned = re.sub(r"^\s*_You are interacting with an AI system\._\s*$", "", cleaned, flags=re.M)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned[:bound]
 
