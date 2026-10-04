@@ -121,3 +121,12 @@ headless --cell <cell>`, one cell per command (a run takes both model slots).
 V1 first (its limit sets the wait length of everything else), then V5, V7, V4, then V2 and V10 side by side,
 then V3, V6, V8, then V9. Record harness version and model with every result; harness versions move during a
 measurement series (`meta.json` keeps both per run).
+
+## Stage 2 and the verification corpus
+
+- **Roles** are configuration: `fixtures/roles/<set>/<name>.json`, read by `scripts/roles.py`; `P run … --role-set <set>`.
+- **E7** reads its cases from the model verification corpus `test/model/verification/` (`scripts/corpus.py`);
+  `P judge <run>` scores the open answers against the items' references. `scripts/fixtures.py build` writes
+  candidates from archived plans to `.plan/temp/e7-candidates/`; a candidate enters the corpus after review.
+- **E8**: `P run e8 claude headless --cell <role-set>`. **E9**: cells `fresh` (form a) and `warm` (form b).
+

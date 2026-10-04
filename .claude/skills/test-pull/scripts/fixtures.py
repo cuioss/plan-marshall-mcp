@@ -990,9 +990,10 @@ def main(argv: list[str] | None = None) -> int:
     ext.add_argument('plan_dir')
     ext.add_argument('--kind', required=True, choices=EXTRACTED_KINDS)
     ext.add_argument('--out')
-    bld = sub.add_parser('build', help='regenerate fixtures/e7/<kind>.json for the extracted kinds from SELECTIONS')
+    bld = sub.add_parser('build', help='write candidate fixtures of the extracted kinds from SELECTIONS; '
+                         'a candidate enters test/model/verification only after review (corpus.py)')
     bld.add_argument('--sources', default=str(Path.home() / 'git'))
-    bld.add_argument('--fixtures-dir', default=str(Path(__file__).resolve().parent.parent / 'fixtures' / 'e7'))
+    bld.add_argument('--fixtures-dir', default=str(Path(__file__).resolve().parents[4] / '.plan' / 'temp' / 'e7-candidates'))
     args = parser.parse_args(argv)
     if args.command == 'extract':
         result = extract(args.plan_dir, args.kind)

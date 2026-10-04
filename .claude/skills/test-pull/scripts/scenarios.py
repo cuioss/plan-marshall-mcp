@@ -433,15 +433,29 @@ def e13(opts):
 
 # --- evaluation Stage 2: roles as configuration ----------------------------------------------------
 
-E7_DIR = FIXTURES / "e7"
-
-
 def e7_kinds():
-    return sorted(path.stem for path in E7_DIR.glob("*.json")) if E7_DIR.is_dir() else []
+    import corpus
+    return sorted(corpus.E7_TOPICS)
 
 
 def e7_fixtures(kind):
-    return json.loads((E7_DIR / f"{kind}.json").read_text(encoding="utf-8"))
+    """The items of an E7 kind, read from the verification corpus (test/model/verification/), in the shape
+    the builders, the report, and the judge use: the reference is the item's target."""
+    import corpus
+    items = corpus.load(corpus.E7_TOPICS[kind])
+    fixtures = []
+    for item in items:
+        target = item["target"]
+        reference = {"decision": target.get("answer"), "reason": target["rationale"]}
+        for key in ("items", "expected_empty", "alternatives"):
+            if key in target:
+                reference[key] = target[key]
+        fixtures.append({"id": item["id"].rsplit("/", 1)[1], "kind": kind, "role": item["role"],
+                         "question": item["input"]["question"], "facts": item["input"]["facts"],
+                         "options": item["input"]["choices"], "answer_schema": item["input"]["answer_schema"],
+                         "group": item.get("group"), "reference": reference,
+                         "review_status": item["review"]["status"]})
+    return {"kind": kind, "role": items[0]["role"] if items else None, "fixtures": fixtures}
 
 
 def _role_step(fixture, task_id=None, role=None):
