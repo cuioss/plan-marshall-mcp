@@ -5,7 +5,7 @@
 
 xref:README.adoc[Overview] · xref:analysis.adoc[Analysis] · xref:journey.adoc[Journey] · *Measurements* · xref:record.adoc[Run Record] · xref:findings.adoc[Findings] · xref:conclusion.adoc[Conclusion] · xref:architecture.adoc[Architecture] · xref:task-protocol.adoc[Task Protocol] · xref:roles.adoc[Roles] · xref:skills.adoc[Skills] · xref:evaluation.adoc[Evaluation]
 
-The core figures behind the harness-as-worker direction, measured on 2026-10-01 and 2026-10-02 in roadmap Milestone 0, Part A (verifications V1 to V10 of xref:analysis.adoc#verification[Analysis]). This document holds the method, the pass criteria set before the runs, the test material, and the core figures; every single result with its run is in xref:record.adoc[Run Record].
+The core figures behind the harness-as-worker direction, measured on 2026-10-01 and 2026-10-02 in roadmap Milestone 0, Part A (verifications V1 to V10 of xref:analysis.adoc#verification[Analysis]), and from 2026-10-03 in Stage 1 of the evaluation (<<evaluation-stage-1>>). This document holds the method, the pass criteria set before the runs, the test material, and the core figures; every single result with its run is in xref:record.adoc[Run Record].
 
 == How it was measured
 
@@ -355,3 +355,69 @@ The Sonnet warm session that held 144 tasks cost 39.04 USD (about 0.27 USD per d
 * *V4*: on all three harnesses a headless session ends within a second of `SIGTERM` without orphaned processes, and a stored session can be resumed (3 to 13 s). A terminated session reports no usage.
 * *V7*: Claude Code and OpenCode report usage per turn with all four token components, so a task in a warm session gets its own figures. Antigravity reports no cache-creation figure; its `total_tokens` stays unmeasured.
 * *V8*: injected instructions in one task never reached a later task: 25 warm runs each on Claude Code and OpenCode, 15 on Antigravity, five variants. In three runs the injected text changed the decision of the task that carried it.
+
+[#evaluation-stage-1]
+== Evaluation, Stage 1
+
+=== Method
+
+The supervision protocol of xref:task-protocol.adoc[Task Protocol] was measured on the same stub and driver, extended for the evaluation:
+
+* *Stub*: switched on per scenario with `supervised`. A wait is held until a task is due for the caller's role or the bounded wait has passed; every call carries the worker's generation and role, set by the relay; an offer is leased to one generation, may need an acknowledgement (`pull_ack`, or the first `pull_task` call), lists its follow-up calls as links, and carries the skills the generation has not received. Calls of a fenced or superseded generation are refused as `stale_generation`. Consultation opens a task for the consultant role and answers the asker through its next wait. The skill catalogue is served as tools and as `skill://pm/…` resources.
+* *Job runtime*: `supervisor.py` of the driver stands in for the supervision the product puts into the server. It starts workers per role and generation and ends a worker on process exit, a missed acknowledgement, silence (no stub event for the bounded wait plus a grace), idle wake-ups, or the token budget read from the harness's per-turn usage: `SIGTERM`, `SIGKILL` after 10 s, then the fence, which releases the worker's lease at once. A successor starts when the stub shows work for the role. Five workers in a row that exit before their first call end a run as a tooling failure.
+* *Fault injector*: `SIGKILL`, `SIGSTOP`/`SIGCONT`, killing the relay, and a prompt variant that ends the turn without submitting, each at a stub event.
+* *Prompts are skills*: a worker's launch prompt is the shim paragraph plus the skills of core conduct and the task protocol (and the role's skill); nothing else tells it how to act.
+* *Criteria*: `criteria.json`, Stage 1 confirmed by the operator on 2026-10-03 before the first measured run; the values are those of xref:evaluation.adoc[Evaluation] with the operator's two rulings: a relay that the host restarts itself while the worker goes on counts as passed (E2), and E2 runs with a bounded wait of 20 s.
+* *Fallback models*: `claude-sonnet-5-5` on Claude Code; on OpenCode `opencode-go/muse-spark-1.3-contributor`, named by the operator, since the paid OpenCode Zen models are disabled for the account and the free models other than `space-bunny-free` refuse a restricted agent (xref:findings.adoc#evaluation[Findings]).
+
+=== Core figures
+
+[cols="3,2,2,2", options="header"]
+|===
+|Item |Claude Code |OpenCode |Antigravity
+
+|E1: acknowledgement latency, p99.9 (200 tasks)
+|6.4 s explicit, 2.8 s implicit
+|33.0 s explicit, 21.8 s implicit; a provider stall of 120.8 s left one task unacknowledged (fail); fallback model 10.9 s
+|interpolated: 15.9 s from 100 tasks before the quota ran out
+
+|E2: detection after a fault (ten trials each)
+|kill: at once (≤ 1 s); stall above the deadline: by silence at ≤ 50.9 s, never earlier
+|the same (≤ 1.1 s; ≤ 51.0 s)
+|the same (≤ 1.0 s; ≤ 50.8 s)
+
+|E2: exactly once, stale submits
+|every task once; 10 of 10 late submits of a fenced generation refused
+|the same
+|the same
+
+|E3: four hours of sparse work with idle and budget recycling
+|9 of 9 tasks, 0 self-stops, longest wait 5.0 s; budget recycle at 83k tokens
+|9 of 9, 0 self-stops, longest wait 23.8 s; budget: recycle at 81k tokens
+|interpolated from the smoke runs and E2: passes
+
+|E5: consultation through the server (25)
+|25 of 25 delivered to the asker; Haiku broke its own submit call (fail), Sonnet 25 of 25 referring; with an OpenCode consultant 25 of 25
+|25 of 25, longest 286 s under progress frames
+|interpolated from the smoke: passes
+
+|E6: concurrent Antigravity jobs
+|—
+|—
+|interpolated from the smoke: two jobs, identity from the environment, bound correctly; four jobs and the 150 s waits open
+
+|E13: skill rule followed (20 tasks), with skill / control
+|100 % in every form / 0 %
+|100 % in every form / 0 %
+|interpolated from the smoke: 100 % / 0 %
+|===
+
+=== Interpolation for Antigravity
+
+Antigravity's quota was exhausted on 2026-10-03, and the operator decided to go on without it. Its cells are interpolated, not measured:
+
+* *E1*: the 100 tasks acknowledged before the quota ran out give a p99.9 of 15.9 s and a longest in-task stall of 12.5 s, so a deadline of about 30 s (max(15.9 × 1.5, 12.5) + 5 s). Recorded as provisional.
+* *E2 is measured* on Antigravity (all six faults pass): detection, fencing, and exactly-once redelivery do not depend on the harness, because they rest on the process, the stub's events, and the generation in the relay.
+* *E3, E5, E13*: the job runtime and the stub behave the same for every harness, and the smoke runs passed; what is not known is Antigravity's own model behaviour over hours (it held V2 and V3 in Part A) and its acknowledgement latency under load.
+* *E6*: the hypothesis that `agy` passes its environment to the `stdio` server it starts holds (smoke); whether four jobs and waits of 150 s hold is open.
+
