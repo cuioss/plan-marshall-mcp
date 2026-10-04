@@ -187,8 +187,8 @@ After the code tasks, the documentation tasks write the concept, developer and u
 slice (§ Documentation Trees) from the matrix rows assigned to them:
 
 - **Source**: the specification sections and watch items of the slice, the requirements they trace to, and
-  the corrections of § 1.3. Read the relevant `doc/discussions/` documents where the specification cites
-  them for rationale.
+  the corrections of § 1.3. The concepts (`doc/Concepts.adoc`) give the rationale, and reference
+  specifications such as `doc/specification/evaluation.adoc` the evidence behind measured values.
 - **Truth is the code**: the documentation describes what the implementation does, checked against the code
   and tests, not the specification's target. Where they differ, either the code is wrong (fix it) or the
   specification was (correct it, § 1.3); the documentation never states the unimplemented target. Planned

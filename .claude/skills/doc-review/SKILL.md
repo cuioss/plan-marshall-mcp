@@ -65,8 +65,8 @@ to continue.
 
 Launch parallel reviewer agents (read-only; `general-purpose` or `Explore`), one per document cluster, e.g.:
 (a) requirements modules + `Requirements.adoc`; (b) workflow/DSL/state/phase specifications; (c) runtime, job,
-store, filesystem, security specifications; (d) tools, client, dispatch, domain specifications; (e) roadmap +
-implementation watch + indexes + decided discussion documents (every `* *Decision*:` actually applied?). Write
+store, filesystem, security specifications; (d) tools, client, model-work, domain specifications; (e) roadmap +
+implementation watch + indexes + open proposals in `doc/discussions/` (every `* *Decision*:` actually applied?). Write
 the common reviewer instructions to a brief file and give every reviewer the same brief:
 
 - Be adversarial: assume defects exist. Check **correctness** against the ground-truth repository (cite
@@ -211,10 +211,13 @@ When the operator gives a direction for a larger topic (or asks to handle a clus
    status NOTE, operator direction, current-design inventory with numbered contradictions, research summary with
    sources, and decision items `Zx-n` each with *Question*, *Evidence*, *Options*, *Recommendation*, *Affected*,
    de-duplicated across drafts (disagreements between drafts become options). Index it in
-   `doc/discussions/README.adoc`. Commit the decided proposal separately from the applied changes.
+   `doc/discussions/README.adoc` (Proposals). `doc/discussions/` holds only research notes and open proposals;
+   the normative corpus states the target only.
 4. Run the Phase 4 loop over the `Zx-n` items. Record each answer as `* *Decision*: Operator <date>: …` under the
    item (`scripts/decide.py`); adjustments by later decisions as `* *Adjusted by …*`; principle-level decisions as
-   lettered items (`Zx-A`, `Zx-B`, …) at the top. When all are decided, mark the document decided.
+   lettered items (`Zx-A`, `Zx-B`, …) at the top. When all are decided and applied (Phase 6), delete the proposal
+   document and its README entry in the commit that applies the last decision: the requirements and
+   specifications carry the result without decision ids, dates, or history narration.
 
 ## Phase 6 — Apply decisions in batches
 
