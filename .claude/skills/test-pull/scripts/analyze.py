@@ -892,7 +892,8 @@ def e7(run_dir, meta, events, outputs, result):
         reference, confirmed = _reference(fixture)
         unconfirmed += not confirmed
         if fixture.get("options"):
-            closed.append(event["decision"] == reference.get("decision"))
+            closed.append(event["decision"] == reference.get("decision")
+                          or event["decision"] in (reference.get("alternatives") or []))
         elif task_id in judged:
             open_scores.append(judged[task_id]["score"])
     scores = closed + open_scores
