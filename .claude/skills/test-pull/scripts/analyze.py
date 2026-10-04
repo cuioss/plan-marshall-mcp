@@ -966,6 +966,54 @@ def e8(run_dir, meta, events, outputs, result):
     return metrics, "pass" if ok else "fail"
 
 
+def item_consensus(kind, run_dirs):
+    """Per item of an E7 kind: the answers of every run, and a class that points at the item's quality.
+
+    stable          every run agrees with the reference (or an accepted alternative)
+    model-limited   some runs agree, some do not: a matter of the model or the form
+    split           no run agrees and the runs disagree among themselves: the case is contested
+    item-suspect    no run agrees and all runs give the same other answer: check the facts and the reference
+    Open answers are classed by their judge scores (1.0 counts as agreeing).
+    """
+    import scenarios
+    fixtures = scenarios.e7_fixtures(kind)["fixtures"]
+    rows = []
+    for fixture in fixtures:
+        reference = fixture["reference"]
+        accepted = {reference.get("decision"), *(reference.get("alternatives") or [])}
+        answers = []
+        for run_dir in run_dirs:
+            meta = json.loads((pathlib.Path(run_dir) / "meta.json").read_text())
+            if meta.get("plan", {}).get("e7_kind") != kind:
+                continue
+            event = _decisions(load_events(run_dir)).get(fixture["id"])
+            if event is None:
+                continue
+            if fixture.get("options"):
+                answer, agrees = event["decision"], event["decision"] in accepted
+            else:
+                score = _load_judgements(run_dir).get(fixture["id"], {}).get("score")
+                answer, agrees = score, score == 1.0
+            label = f"{_role_model(meta)}/{next(iter(meta['plan']['form_override'].values()))}"
+            answers.append({"run": pathlib.Path(run_dir).name, "config": label, "answer": answer, "agrees": agrees})
+        hits = sum(a["agrees"] for a in answers)
+        others = {json.dumps(a["answer"]) for a in answers if not a["agrees"]}
+        if not answers:
+            verdict = "unmeasured"
+        elif hits == len(answers):
+            verdict = "stable"
+        elif hits:
+            verdict = "model-limited"
+        elif len(others) == 1 and len(answers) > 1:
+            verdict = "item-suspect"
+        else:
+            verdict = "split"
+        rows.append({"item": fixture["id"], "reference": reference.get("decision"),
+                     "alternatives": reference.get("alternatives"), "class": verdict,
+                     "agreeing": f"{hits}/{len(answers)}", "answers": answers})
+    return rows
+
+
 ANALYSES_STAGE2 = {"e7": e7, "e8": e8, "e9": e9}
 
 

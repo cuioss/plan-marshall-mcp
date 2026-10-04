@@ -15,6 +15,8 @@ Usage:
   pull.py report [v1..v10|e1..e13] [--run RUN]    metrics and verdicts as AsciiDoc table rows
   pull.py cleanup                                 stop every run, remove the Antigravity server entry
   pull.py judge <RUN>                             E7: judge the open answers of a run against the references
+  pull.py items <kind> [--json]                   E7: answers of all runs per item, classed (stable, model-limited,
+                                                  split, item-suspect)
 
 Run data: .plan/temp/pull-spike/runs/<run>/ (scenario.json, events.jsonl, harness-*.jsonl, result.json; for an
 evaluation item also supervisor.jsonl, the record of the job runtime in supervisor.py).
@@ -888,6 +890,21 @@ def cmd_judge(args):
     return 0
 
 
+def cmd_items(args):
+    """E7: the answers of all runs per item of a kind, classed by what they say about the item."""
+    # compare only runs on the same corpus revision: --runs selects them by name pattern
+    runs = [d for d in sorted(RUNS.glob(args.runs or "e7-*")) if args.smoke or "smoke" not in d.name] \
+        if RUNS.is_dir() else []
+    rows = analyze.item_consensus(args.kind, runs)
+    if args.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    for row in rows:
+        answers = ", ".join(f"{a['config']}={a['answer']}" for a in row["answers"])
+        print(f"{row['class']:14} {row['agreeing']:>5}  {row['item']:44} ref={row['reference']}  {answers}")
+    return 0
+
+
 def cmd_cleanup(_args):
     for run_dir in sorted(RUNS.glob("*")) if RUNS.is_dir() else []:
         meta = read_json(run_dir / "meta.json", {})
@@ -944,6 +961,12 @@ def main(argv):
     report.add_argument("--json", action="store_true")
     report.set_defaults(func=cmd_report)
     sub.add_parser("cleanup").set_defaults(func=cmd_cleanup)
+    items = sub.add_parser("items")
+    items.add_argument("kind")
+    items.add_argument("--smoke", action="store_true")
+    items.add_argument("--runs", help="glob of the run directories to compare, e.g. 'e7-*-1004-12*'")
+    items.add_argument("--json", action="store_true")
+    items.set_defaults(func=cmd_items)
     judge_verb = sub.add_parser("judge")
     judge_verb.add_argument("run")
     judge_verb.set_defaults(func=cmd_judge)
