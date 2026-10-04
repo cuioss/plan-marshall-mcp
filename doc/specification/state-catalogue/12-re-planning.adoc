@@ -1,0 +1,144 @@
+= State Catalogue: Re-Planning
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[State Catalogue] » Re-Planning
+
+[#state-catalogue-replan]
+== Re-Planning: Trigger Points, Call States & the `replan` Unit
+_See Requirement link:../../Requirements.adoc#PM-WF-17[PM-WF-17: Dynamic Re-Planning of a Running Plan]_
+
+The mechanism, its triggers, thresholds, actions, guards, and fallbacks are specified in link:../phase-workflows/08-dynamic-re-planning.adoc#dynamic-re-planning[Phase Workflows Specification, Dynamic Re-Planning]. The checkpoint state and the two call states belong to the plan workflow (`execute.pmwf`, `finalize.pmwf`); the unit `replan` (`replan.pmwf`, compiled only) is a sub-workflow whose states declare `phase inherit` and are named `replan.<state>`. No state of the unit is a link state, and none asks the user or the operator.
+
+=== Checkpoint & Call States
+
+[cols="2,1,1,2,3,2,2"]
+|===
+|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
+
+|[[state-execute.replan-check]]`execute.replan-check`
+|`phase-5-execute`
+|`auto`
+|`execute.deliverable-build` (`succeeded`).
+|`replan.detect`: fetches the base and evaluates `base_advanced`, the projected `downstream_limit`, and `spend_exceeded`, skipping every kind and evidence key a re-planning record already carries; a raised trigger is written to `replan_pending` in the transaction of the transition. A failed fetch skips `base_advanced`.
+|`none` -> `execute.envelope-ready`; `trigger` -> `execute.replan`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-triggers[Phase Workflows Specification, Triggers & Detection]
+
+|[[state-execute.replan]]`execute.replan`
+|`phase-5-execute`
+|`call`
+|`execute.replan-check` (`trigger`); `execute.envelope-ready` (`infeasible_pending`); `execute.exit-barrier` (`none_runnable`); `execute.remediate-build` (`exhausted`, trigger `ceiling`). Every entering transaction writes `replan_pending`.
+|`call replan` (no parameters; the unit reads `replan_pending`).
+|`done` with `guard result.runnable` -> `execute.envelope-ready`; `done` with `guard not result.runnable` -> `execute.verify-sweep`; `reentered` -> `execute.envelope-ready`; `reauthor` -> `outline.route-rework` (phase set back to `phase-3-outline`, the worktree kept); `hand_back`, `stepped_out` -> `finalize.hand-back`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-apply[Phase Workflows Specification, Apply, Re-Entry & Instance Version]
+
+|[[state-finalize.replan]]`finalize.replan`
+|`phase-6-finalize`
+|`call`
+|`finalize.sync-baseline` and `finalize.merge-sync` (`replan`; the merge lease released first); `finalize.review-cap-check` (`replan`); the `exhausted` outcome of the remediation call states of finalize before the merge (`finalize.remediate-sync-conflict`, `finalize.remediate-build`, `finalize.remediate-security-audit`, `finalize.remediate-self-review`, `finalize.remediate-ci`, `finalize.remediate-analysis`, `finalize.remediate-review`, `finalize.remediate-barrier-ci`, `finalize.remediate-barrier`, `finalize.remediate-merge-conflict`), trigger `ceiling`. Every entering transaction writes `replan_pending`.
+|`call replan` (no parameters).
+|`done` -> `finalize.next-step` (verdict currency re-fires what the new `HEAD` invalidated); `reentered` -> `execute.envelope-ready` (a loop-back, `guard in_worktree`, phase set to `phase-5-execute`); `reauthor` -> `outline.route-rework` (only its budget guard, phase set back to `phase-3-outline`, the worktree kept); `hand_back`, `stepped_out` -> `finalize.hand-back`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-apply[Phase Workflows Specification, Apply, Re-Entry & Instance Version]
+|===
+
+[#state-catalogue-replan-unit]
+=== Unit `replan`
+
+Exit contract: `done` (result `{runnable: bool}`: whether a plan task is runnable), `reentered`, `reauthor`, `hand_back`, and the control outcome `stepped_out`. Every terminal clears `replan_pending` and completes the re-planning record with its outcome (link:../store-schemas/17-re-planning.adoc#replan-record[Store Schemas Specification, Re-Planning Record]).
+
+[cols="2,1,1,2,3,2,2"]
+|===
+|State id |Phase value |Kind |Entered from |Offered links / outcomes |Exits to |Defined in
+
+|[[state-replan.gather]]`replan.gather`
+|inherit
+|`auto`
+|`call` (start state).
+|`replan.gather-trigger`: reads `replan_pending`, opens the re-planning record, composes the facts with their evidence (the trigger, the outline with deliverable states, the plan tasks, the footprints, the budgets), and computes the offered actions.
+|`review` (`replan_budget` left and the plan has an outline) -> `replan.review`; `fallback` (budget spent, a `land` or `adopt` plan, or a `ceiling` whose evidence key a re-planning record already carries) -> `replan.conservative`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-task[Phase Workflows Specification, The Re-Planning Task]
+
+|[[state-replan.review]]`replan.review`
+|inherit
+|`job`
+|`replan.gather` (`review`).
+|`job llm replan role replan`: one task whose entity offers one closing link per offered action (`reintegrate_in_plan`, `split_change`, `defer_to_follow_up_plan`, `wait_for_prerequisite`, `rebase_and_reverify_only`, `hand_back`, rel `submit`, parameters defined once in `facts.options`); a revision is validated by the guards of a first plan before the submit is accepted. No `ask` link.
+|`reintegrate_in_plan`, `split_change`, `defer_to_follow_up_plan` -> `replan.apply`; `wait_for_prerequisite` -> `replan.await-prerequisite`; `rebase_and_reverify_only` -> `replan.integrate-base`; `hand_back` -> `replan.hand-back` (gap `cause: decided`); `lost`, `infeasible` -> `replan.conservative`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-actions[Phase Workflows Specification, Actions & Guards]
+
+|[[state-replan.conservative]]`replan.conservative`
+|inherit
+|`auto`
+|`replan.gather` (`fallback`); `replan.review` (`lost`, `infeasible`).
+|`replan.conservative-fallback`: takes the trigger's fallback without a task and records it with its reason (`budget_spent`, `no_outline`, the task's `task_reason` such as `role_unqualified`, or `infeasible`).
+|`continue` (`base_advanced`, `merge_conflict`, `downstream_limit`, `spend_exceeded`) -> `replan.done`; `hand_back` (`infeasible`, `ceiling`) -> `replan.hand-back`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-fallback[Phase Workflows Specification, Conservative Fallback]
+
+|[[state-replan.apply]]`replan.apply`
+|inherit
+|`auto`
+|`replan.review` (`reintegrate_in_plan`, `split_change`, `defer_to_follow_up_plan`).
+|`replan.apply-revision`: in one transaction writes the revised outline, re-derives the declared footprint, sets the moved deliverables' tasks `removed`, records gaps and an amendment, preserves the split ref, stages or records the follow-ups (an epic plan's under the epic lock), creates the new plan tasks additively, renews the remediation budgets on re-entry, and composes the instance version of event `replan`.
+|`tasks_added` -> `replan.reentered`; `outline_reentry` (charged to the outline loop-back budget) -> `replan.reauthor`; `settled` (no new plan task) -> `replan.done`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-apply[Phase Workflows Specification, Apply, Re-Entry & Instance Version]
+
+|[[state-replan.await-prerequisite]]`replan.await-prerequisite`
+|inherit
+|`composite_job`
+|`replan.review` (`wait_for_prerequisite`; the accepting transaction stages the row of a `follow_up:<index>` prerequisite).
+|`replan.await-prerequisite`: a server timer to the persisted `deadline_at` plus a watch of the prerequisite (the provider's pull-request state, or the prerequisite plan's outcome); no worker runs, the worktree is kept.
+|`landed` -> `replan.integrate-base`; `closed`, `expired` -> `replan.hand-back` (gap `cause: exhausted`, `budget: prerequisite_wait`); `interrupted` -> this state against the same `deadline_at`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-actions[Phase Workflows Specification, Actions & Guards] item 4
+
+|[[state-replan.integrate-base]]`replan.integrate-base`
+|inherit
+|`auto`
+|`replan.review` (`rebase_and_reverify_only`); `replan.await-prerequisite` (`landed`).
+|`replan.rebase-onto-base`: fetches the base and rebases the plan branch onto it in the worktree; a base that is an ancestor of `HEAD` is not rebased.
+|`rebased`, `up_to_date` -> `replan.done`; `conflict` (the rebase stays in progress) -> `replan.resolve-conflict`; `fetch_failed` -> `replan.hand-back` after the compiled server-rule retry budget.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-actions[Phase Workflows Specification, Actions & Guards] item 5
+
+|[[state-replan.resolve-conflict]]`replan.resolve-conflict`
+|inherit
+|`call`
+|`replan.integrate-base` (`conflict`).
+|`call remediation.merge-conflict (retry_budget=0, fix_budget=2, waiver_wait_seconds=0, actions=[fix])` (xref:11-remediation-units-merge-qgate-spend.adoc#state-catalogue-remediation-merge[`remediation.merge-conflict`]).
+|`resolved` -> `replan.done`; `exhausted`, `stepped_out` -> `replan.hand-back`.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-actions[Phase Workflows Specification, Actions & Guards] item 5
+
+|[[state-replan.done]]`replan.done`
+|inherit
+|`terminal`
+|`replan.conservative` (`continue`); `replan.apply` (`settled`); `replan.integrate-base` (`rebased`, `up_to_date`); `replan.resolve-conflict` (`resolved`).
+|`terminal done success`, result `{runnable}`.
+|To the caller.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-apply[Phase Workflows Specification, Apply, Re-Entry & Instance Version]
+
+|[[state-replan.reentered]]`replan.reentered`
+|inherit
+|`terminal`
+|`replan.apply` (`tasks_added`).
+|`terminal reentered unsettled`.
+|To the caller.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-apply[Phase Workflows Specification, Apply, Re-Entry & Instance Version]
+
+|[[state-replan.reauthor]]`replan.reauthor`
+|inherit
+|`terminal`
+|`replan.apply` (`outline_reentry`).
+|`terminal reauthor unsettled`.
+|To the caller.
+|link:../phase-workflows/03-q-gate-and-execute.adoc#loop-back-outline[Phase Workflows Specification, Loop-Back to the Outline]
+
+|[[state-replan.hand-back]]`replan.hand-back`
+|inherit
+|`terminal`
+|`replan.review` (`hand_back`); `replan.conservative` (`hand_back`); `replan.await-prerequisite` (`closed`, `expired`); `replan.integrate-base` (`fetch_failed`); `replan.resolve-conflict` (`exhausted`, `stepped_out`).
+|`terminal hand_back failure`; the gap is recorded with the re-planning id.
+|To the caller.
+|link:../phase-workflows/08-dynamic-re-planning.adoc#replan-fallback[Phase Workflows Specification, Conservative Fallback]
+|===

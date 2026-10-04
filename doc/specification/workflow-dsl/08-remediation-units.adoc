@@ -77,12 +77,12 @@ The budgets are call arguments of the project-owned phase units (the template va
 |`execute.remediate-build` (`execute.deliverable-build`, `execute.verify-sweep`), `land.remediate-build` (`land.verify-sweep`), `finalize.remediate-build` (`finalize.pre-push-quality-gate`)
 |`remediation.build-failure`
 |1 / 3 / 0
-|`resolved` -> in Phase 5 the `auto` router state `execute.route-build-cause`, which continues by `failed_build` (`deliverable` -> `execute.envelope-ready`, `sweep` -> `execute.verify-sweep`), in the `land` lane `land.verify-sweep`, in Phase 6 `finalize.settle-commit`; `fix_requested` -> remediation task allocation, whose commit enters the router `execute.route-commit-cause`; `exhausted`, `stepped_out` -> `finalize.hand-back` (outcome `returned` when the branch holds no commit beyond the base)
+|`resolved` -> in Phase 5 the `auto` router state `execute.route-build-cause`, which continues by `failed_build` (`deliverable` -> `execute.envelope-ready`, `sweep` -> `execute.verify-sweep`), in the `land` lane `land.verify-sweep`, in Phase 6 `finalize.settle-commit`; `fix_requested` -> remediation task allocation, whose commit enters the router `execute.route-commit-cause`; `exhausted` -> `execute.replan` or `finalize.replan` (trigger `ceiling`; in the `land` lane `finalize.hand-back`), `stepped_out` -> `finalize.hand-back` (outcome `returned` when the branch holds no commit beyond the base)
 
 |`finalize.remediate-ci` (`ci_failed` of the wait region and of `finalize.merge-evidence-wait`), `finalize.remediate-barrier-ci` (`ci_failed` of the pre-merge barrier; `actions=[retry,fix]`; `resolved`, `waived` -> `finalize.merge-gate`)
 |`remediation.ci-failure`
 |2 / 3 / 0
-|`resolved`, `waived` -> `finalize.next-step` completing `default:ci-verify`; `fix_requested` -> `finalize.allocate-remediation`; `exhausted`, `stepped_out` -> `finalize.hand-back`
+|`resolved`, `waived` -> `finalize.next-step` completing `default:ci-verify`; `fix_requested` -> `finalize.allocate-remediation`; `exhausted` -> `finalize.replan` (trigger `ceiling`); `stepped_out` -> `finalize.hand-back`
 
 |`finalize.remediate-analysis` (`analysis_failed`)
 |`remediation.analysis`
@@ -97,7 +97,7 @@ The budgets are call arguments of the project-owned phase units (the template va
 |`finalize.remediate-sync-conflict` (`finalize.sync-baseline`), `finalize.remediate-merge-conflict` (`finalize.merge-sync`)
 |`remediation.merge-conflict`
 |0 / 2 / 0
-|`resolved` -> `finalize.settle-commit` (from `finalize.remediate-sync-conflict`) or `finalize.merge-gate` (from `finalize.remediate-merge-conflict`); `exhausted`, `stepped_out` -> `finalize.hand-back`
+|`resolved` -> `finalize.settle-commit` (from `finalize.remediate-sync-conflict`) or `finalize.merge-gate` (from `finalize.remediate-merge-conflict`); `exhausted` -> `finalize.replan` (trigger `ceiling`); `stepped_out` -> `finalize.hand-back`
 
 |`finalize.remediate-spend` (`spend_overrun` of `finalize.merge-gate`)
 |`remediation.spend`
@@ -126,7 +126,7 @@ Every unit follows one state template; the unit's own states are named `remediat
 12. *`waiver-wait`* (`composite_job remediation.await-waiver`): the bounded wait for the operator, a server timer plus a watch of the waiver record (`OPERATOR_WAIVER`, `TIME`), no model turn: `raised` -> `budget-check` with the new ceiling; `waived` -> `waived`; `expired` -> `exhausted`; `interrupted` (a constituent fate other than success) -> `budget-check`, which re-enters the wait against the request's persisted `expires_at`, so a restart never extends it; `cancelled` -> `exhausted`.
 13. *Terminals*: `resolved` (`success`), `waived` (`success`, only in units whose class has a `met`-waivable gate), `exhausted` (`failure`), `fix_requested` (`unsettled`), declared only where reachable.
 
-*Budget accounting*: budgets are counted per plan and class in `mcp/status.json` `policy_counters` (link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]), persisted and never reset: re-entering a unit, a new `HEAD`, a loop-back, and a re-composition of the instance continue the same counter, and a `raise` waiver lifts only the effective ceiling. A retry is charged when the server re-runs; an in-branch fix when its task submits the change, a `loop_back` or a fix that runs in the caller when the primitive that takes it requests it. A server step-out of a nested commit consumes no further budget and writes no waiver; a phase caller routes the unit's `stepped_out` to the same fallback as `exhausted`, and the gap record distinguishes `cause: stepped_out` (with the reason) from `cause: exhausted` (with the budget) (link:../store-schemas/14-plan-instance-waivers-questions.adoc#gap-record[Store Schemas Specification, Gap Record]).
+*Budget accounting*: budgets are counted per plan and class in `mcp/status.json` `policy_counters` (link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]), persisted and never reset: re-entering a unit, a new `HEAD`, a loop-back, and a re-composition of the instance continue the same counter, a `raise` waiver lifts only the effective ceiling, and a re-planning that re-enters execution renews the allowance once by counting the ceiling from the counter at the re-entry (link:../phase-workflows/08-dynamic-re-planning.adoc#replan-apply[Phase Workflows Specification, Dynamic Re-Planning]). A retry is charged when the server re-runs; an in-branch fix when its task submits the change, a `loop_back` or a fix that runs in the caller when the primitive that takes it requests it. A server step-out of a nested commit consumes no further budget and writes no waiver; a phase caller routes the unit's `stepped_out` to the same fallback as `exhausted`, and the gap record distinguishes `cause: stepped_out` (with the reason) from `cause: exhausted` (with the budget) (link:../store-schemas/14-plan-instance-waivers-questions.adoc#gap-record[Store Schemas Specification, Gap Record]).
 
 === DSL Sketch: `remediation.ci-failure`
 
@@ -257,7 +257,7 @@ The invariants extend the table of compiled invariants (xref:04-ast-node-model.a
 |Nested commits: a call of `git.commit_and_push` inside the unit routes `stepped_out`, and `done` without a commit, back to `budget-check` (a server step-out with `cause: condition` is exempt: it unwinds every frame to the phase's fallback without taking this transition); an in-branch fix is charged in the transaction in which its task submits the change (`fixed` or `no_change`), a fix that runs in the caller when the primitive that takes it requests it.
 
 |`INV-REM-5`
-|Callers: every call site in a plan-scope unit routes `exhausted` and `stepped_out` to the phase's fallback state (`plan.return` in Phases 1–4, which forwards committed work beyond the base to `finalize.hand-back`; `finalize.hand-back` afterwards), `waived` to the continuation completing the class's step `waived`, and `fix_requested` to an authoring or allocation state; every bound and every effective ceiling of every instance version is at most the compiled hard cap (retry 5, fix 5, wait 86400 s).
+|Callers: every call site in a plan-scope unit routes `exhausted` and `stepped_out` to the phase's fallback state (`plan.return` in Phases 1–4, which forwards committed work beyond the base to `finalize.hand-back`; `finalize.hand-back` afterwards), except that a call site in Phase 5 outside the `land` lane or in finalize before the merge routes `exhausted` of every unit but `remediation.spend` to its phase's re-planning call state (`execute.replan`, `finalize.replan`, trigger `ceiling`, link:../phase-workflows/08-dynamic-re-planning.adoc#replan-existing-mechanisms[Phase Workflows Specification, Dynamic Re-Planning]), `waived` to the continuation completing the class's step `waived`, and `fix_requested` to an authoring or allocation state; every bound and every effective ceiling of every instance version is at most the compiled hard cap (retry 5, fix 5, wait 86400 s).
 
 |`INV-REM-6`
 |Accounting: the counters are per plan and class, charged only by the unit's primitives, and never reset by re-entry, a new `HEAD`, a loop-back, or a re-composition.

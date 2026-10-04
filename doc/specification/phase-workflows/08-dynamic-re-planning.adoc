@@ -1,0 +1,158 @@
+= Phase Workflows & Finalize Specification: Dynamic Re-Planning
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../phase-workflows.adoc[Phase Workflows & Finalize Specification] » Dynamic Re-Planning
+
+[#dynamic-re-planning]
+== Dynamic Re-Planning of a Running Plan
+_See Requirement link:../../Requirements.adoc#PM-WF-17[PM-WF-17: Dynamic Re-Planning of a Running Plan]_
+
+A plan is laid out in Phases 3 and 4 against the project as it stood then. When a premise changes while the plan runs in Phase 5 or in finalize before the merge, the server reconsiders the plan as a whole through one mechanism: the re-planning unit `replan` (`scope subworkflow`, `phase inherit`, file `replan.pmwf`, compiled only, link:../workflow-dsl/02-units-jobs-decisions.adoc#workflow-definition-units[Workflow DSL Specification, Workflow Definition Units]), called from the two call states `execute.replan` and `finalize.replan`. It is the only re-planning of a running plan: the infeasible review of Phase 5 is its trigger `infeasible`, and a spent remediation loop is its trigger `ceiling`. The states, kinds, and exits are catalogued in link:../state-catalogue/12-re-planning.adoc#state-catalogue-replan[State Catalogue, Re-Planning].
+
+[source,text]
+----
+ trigger point (server checkpoint)                  replan unit
+ ─────────────────────────────────   ┌──────────────────────────────────────────────┐
+ execute.replan-check ─┐             │ replan.gather ──► replan.review (role replan) │
+ envelope return,      ├─► execute.  │   │ budget spent,      │ reintegrate, split,   │
+   exit barrier ───────┤   replan /  │   │ no outline,        │ defer ─► replan.apply │
+ sync-baseline,        │   finalize. │   ▼ lost               │ wait ─► await-prereq. │
+   merge-sync ─────────┤   replan    │ replan.conservative    │ rebase ─► integrate-  │
+ review cap gate ──────┤             │   (trigger fallback)   │          base         │
+ remediation exhausted ┘             │                        │ hand_back             │
+                                     └──────────────────────────────────────────────┘
+   done ─► continue where the plan stood   reentered ─► execute.envelope-ready
+   reauthor ─► outline.route-rework        hand_back / stepped_out ─► finalize.hand-back
+----
+
+[#replan-triggers]
+=== Triggers & Detection
+
+The server detects every trigger itself, at fixed checkpoints, from recorded or freshly observed facts; no model and no session reports one. A checkpoint that raises a trigger records it as the plan's pending trigger (`mcp/status.json` → `replan_pending`, link:../store-schemas/17-re-planning.adoc#replan-record[Store Schemas Specification, Re-Planning Record]) in the transaction that enters the phase's call state, and the unit reads it there.
+
+[cols="2,3,4,3"]
+|===
+|Trigger |Checkpoint |Condition |Evidence key
+
+|`infeasible`
+|`execute.evaluate-envelope-return` (`infeasible_pending`); `execute.exit-barrier` (`none_runnable`)
+|No runnable plan task remains and at least one deliverable has an `infeasible` plan task.
+|The set of `infeasible` task ids
+
+|`base_advanced`
+|`execute.replan-check` (after each deliverable's build passed); `finalize.sync-baseline` and `finalize.merge-sync` before they integrate
+|The base branch's commits since the last judged base commit change at least `base_overlap_min_files` paths of the plan's footprint (the declared footprint united with the realized footprint).
+|The base commit
+
+|`merge_conflict`
+|`finalize.sync-baseline` and `finalize.merge-sync` before they integrate
+|A trial merge of the plan branch with the base (`git merge-tree --write-tree`, no change to the worktree) conflicts in at least `conflict_min_files` files.
+|The base commit and `HEAD`
+
+|`downstream_limit`
+|`execute.replan-check` (projected); `finalize.review-cap-check` (measured)
+|The plan's changed files or diff characters against the merge base exceed a `structural_caps` value of a *required* bot of the review-bot registry (link:05-finalize-review-metrics-descriptor.adoc#_refusals_rate_windows[Refusals & Rate Windows], item 12). The projection counts the realized footprint united with the declared paths of the deliverables not yet done.
+|`HEAD` and the bot
+
+|`ceiling`
+|The `exhausted` outcome of every remediation call of Phase 5 and of finalize before the merge, except `remediation.spend` (<<replan-existing-mechanisms>>)
+|The remediation policy spent its loop budget: a loop-back ceiling reached, a self-review or review that did not converge, a build, CI, analysis, or conflict fix that did not hold.
+|The policy class and the renewal it was spent in
+
+|`spend_exceeded`
+|`execute.replan-check`
+|The plan's cumulative spend over every phase exceeds the error column (tokens) of its budget anchor pair; for a fallback pair, `500,000` tokens times the plan's deliverable count (link:../model-work/09-completion-usage-and-spend.adoc#spend-accounting-budget-anchors[Model Work Specification, Spend Accounting & Budget Anchors]). Raised once per plan, while a deliverable is not done.
+|The plan
+|===
+
+* *Once per evidence*: A checkpoint raises a trigger only when no re-planning record of the plan carries the same trigger kind and evidence key, so a judged situation is never judged again; a later checkpoint with new evidence (a new base commit, a new `HEAD`) raises it anew. The `exhausted` outcome of a remediation call always enters the call state; when its `ceiling` key is already judged, the unit takes the fallback without a task.
+* *Order*: At one checkpoint the server raises at most one trigger, in the order `infeasible`, `ceiling`, `merge_conflict`, `base_advanced`, `downstream_limit`, `spend_exceeded`; the others are evaluated again at the next checkpoint.
+* *Lanes without an outline*: A plan of the `land` or `adopt` lane has no outline to revise; its triggers take their conservative fallback without a task.
+* *`execute.replan-check`*: An `auto` state between `execute.deliverable-build` (`succeeded`) and `execute.envelope-ready`; it fetches the base (the `git` network class budget) and evaluates `base_advanced`, the projected `downstream_limit`, and `spend_exceeded`. A failed fetch skips `base_advanced` at this checkpoint, never raising it.
+
+[#replan-constants]
+==== Compiled Constants
+
+[cols="2,1,4"]
+|===
+|Constant |Value |Use
+
+|`replan_budget` |`3` |Re-planning tasks per plan; a spent budget makes every further trigger take its conservative fallback without a task.
+|`base_overlap_min_files` |`5` |Overlapping paths that raise `base_advanced`.
+|`conflict_min_files` |`10` |Conflicted files of the trial merge that raise `merge_conflict`; fewer conflicts take `remediation.merge-conflict` directly.
+|`prerequisite_wait_seconds` |`604800` |The bound of a wait for a prerequisite (link:../timeouts/01-job-budgets-and-waits.adoc#replan-budget[Timeouts & Budgets Specification, Re-Planning Budget & Prerequisite Wait]).
+|===
+
+None of them is configurable. The outline loop-back keeps its own budget (`1` per plan, link:../timeouts/01-job-budgets-and-waits.adoc#loop-back-outline-budget[Timeouts & Budgets Specification, Outline Loop-Back Budget]).
+
+[#replan-task]
+=== The Re-Planning Task
+
+`replan.review` is a `job llm replan role replan` state (xref:01-planning-phases-1-2.adoc#phase-roles[Model Work per State]): one task of the role `replan`, class `read_only`, whose worker reads the plan worktree.
+
+* *Facts*: the trigger with its evidence (link:../model-work/06-envelopes-questions-deadlines.adoc[Model Work Specification, Envelopes, Questions & Deadlines]): for `base_advanced` and `merge_conflict` the base commits since the branch base (id and subject), the overlapping paths, and the conflicted files grouped by area; for `downstream_limit` the bot, its cap, and the measurement with the changed files by area; for `ceiling` the policy, its spent budget, and its last failure envelopes; for `infeasible` the infeasible deliverables with their evidence and their server-computed transitive dependents; for `spend_exceeded` the spend ratio and its anchor. Then the plan: the outline's deliverables with their state (`done`, `open`, `infeasible`), the plan tasks with their status, the declared and the realized footprint (paths beyond a compiled list length as a count with a resource URI), the phase and the finalize steps done, the required review bots with their caps, whether a push remote exists, the plan's epic row and its siblings' declared surfaces, and the remaining budgets (`replan_budget`, the outline loop-back budget, the remediation budgets). Logs and excerpts stay behind `pm://plan/{plan_id}/evidence/{evidence_id}`.
+* *Links*: one closing link per offered action (<<replan-actions>>), each of rel `submit` with its parameters defined once in `facts.options` (link:../hypermedia-format/01-representation-and-link-forms.adoc#options-defined-once[Hypermedia Format Specification, Options Defined Once]). The task has no `ask` link: re-planning never asks the user or the operator.
+* *Offered actions per trigger*: `rebase_and_reverify_only` is not offered for `infeasible` and `downstream_limit`; `wait_for_prerequisite` is not offered for `downstream_limit` and `spend_exceeded`; the `outline` re-entry of `reintegrate_in_plan` only while the outline loop-back budget is left. Every other action is offered for every trigger.
+* *Closed outcomes*: A submit the guards refuse is answered `rejected` with its reason and the task continues; a task that ends without a valid submit is offered again within the task re-offer budget, then closes `lost`, and `lost` and `infeasible` take the conservative fallback (<<replan-fallback>>).
+
+[#replan-actions]
+=== Actions & Guards
+
+Every action carries a `rationale` (`text[1..2000]`) citing the evidence. A revision is the parameter set `revised_outline` (each deliverable with `change`: `kept`, `amended`, `new`, `deferred`, or `removed`, its title, and for `amended` and `new` the outline fields of a first outline: intent gloss, profiles, `Affected files` with intent markers, `depends:`, verification command) and `new_tasks` (each with title, deliverable, profile, `depends_on`, description, steps, and verification, as `plan.describe-tasks` takes them).
+
+1. *`reintegrate_in_plan`* (`revised_outline`, `new_tasks`, `reentry: enum[execute|outline]`): brings the change into this plan. With `reentry: execute` the server validates and applies the revision (<<replan-apply>>) and the plan re-enters Phase 5 at `execute.envelope-ready`; a revision without new plan tasks continues where the plan stood. With `reentry: outline` the plan takes the loop-back to the outline instead (xref:03-q-gate-and-execute.adoc#loop-back-outline[Phase 5, Loop-Back to the Outline]) with the revised outline and the rationale as facts of the new `outline` task, charged to the outline loop-back budget; `new_tasks` must then be empty.
+2. *`split_change`* (`revised_outline`, `new_tasks`, `follow_up_plans`): delivers the plan as two pull requests. The deliverables marked `deferred` move to the one follow-up plan of kind `split`, which delivers them as the second pull request after this plan merged; the server preserves the current branch head as the ref `pm/<plan_id>/split-<n>` (pushed when a push remote exists), from which the follow-up starts. The `new_tasks` take the moved deliverables' changes out of this plan's branch and re-verify it; at least one deliverable stays and at least one moves.
+3. *`defer_to_follow_up_plan`* (`revised_outline`, `new_tasks`, `follow_up_plans`): drops the affected part from this plan. A `deferred` deliverable moves to a follow-up plan of kind `deferred` (no preserved work); a `removed` deliverable is only dropped. Their plan tasks and those of their server-computed dependents are set `removed` (`disposition.by: model`, the rationale as reason), except `infeasible` tasks, which keep their evidence. Removing or deferring the last remaining deliverable is refused.
+4. *`wait_for_prerequisite`* (`prerequisite`, `follow_up_plans`): holds the plan until a named prerequisite lands, then integrates the base and continues. The prerequisite is one of: an open pull request of the repository (`pull_request:<number>`), a running plan of the project (`plan:<plan_id>`), or, for a plan of an epic, a follow-up of this submit staged as a new row (`follow_up:<index>`) that the epic starts before this plan resumes. A prerequisite the server cannot observe is refused. The wait (`replan.await-prerequisite`, a `composite_job` on the provider's pull-request state or the plan's outcome) holds the worktree and no worker; it ends `landed` (merged, or the plan ended `merged`), `closed` (closed unmerged, or the plan ended otherwise), or `expired` after `prerequisite_wait_seconds`, counted from the persisted start so a restart never extends it.
+5. *`rebase_and_reverify_only`*: keeps the outline and the tasks. The server integrates the current base into the plan branch in the worktree (`replan.integrate-base`; a conflict calls `remediation.merge-conflict` with the call-site budgets of `finalize.remediate-sync-conflict`), and the plan continues where it stood; freshness and verdict currency re-run what the new `HEAD` invalidates.
+6. *`hand_back`*: the plan ends `handed_back` (`returned` without a commit beyond the base), gap `cause: decided` with the task and its rationale.
+
+*Guards*: A revision passes the server guards of a first plan before anything is applied, else the submit is rejected `invalid_link_args` naming the failed check: the outline validation rules of Phase 3 for every `amended` and `new` deliverable (intent markers, the file-type classifier and profile requirement, the `Added dependencies` section, link:02-planning-lanes-phases-3-4.adoc#outline-validation-gate[Phase 3 Validation Rules]), the derivation dry-run, the declared-path discipline of task descriptions, `TaskGraphValidator` over the existing and the new plan tasks (no cycle, no unresolved reference, no dependency on a `removed` or `infeasible` task), and the compiled mechanical checks of the Phase 3 and Phase 4 Q-Gates (link:03-q-gate-and-execute.adoc#_q_gate_validation_loop[Q-Gate Validation Loop]); a new task belongs to an `amended` or `new` deliverable; a `kept` deliverable is unchanged; a deliverable id is never reused. The Q-Gate task is not run again: the revision is a judgment of the role that owns it, and the gates of finalize verify the result.
+
+[#replan-apply]
+=== Apply, Re-Entry & Instance Version
+
+`replan.apply` applies a validated revision in one transaction: it writes the revised deliverables into `outline.md` (new deliverables numbered on; `deferred` and `removed` ones kept with their state), re-derives the declared footprint, sets the moved deliverables' plan tasks `removed`, records the gap per moved deliverable (`cause: deliverable_removed`, with the follow-up id for a deferred one), appends an `amendments[]` entry (`source: model`, the rationale, the re-planning id), sets `status.metadata.pr_title_stale` when a deliverable moved, creates the new plan tasks additively in one batch with new ids (cost sizing and envelope packing over the new tasks only; a `completed` task is never reopened), records the follow-up plans (<<replan-follow-ups>>), and composes the plan instance version of the composition event `replan` (link:../workflow-dsl/09-plan-instance.adoc#plan-instance[Workflow DSL Specification, Plan Instance]): footprint prunes and policy bindings evaluated again over the revised plan, in force from the transition that enters the unit's next state.
+
+* *Re-entry*: With new plan tasks the unit returns `reentered`, and both call states route it to `execute.envelope-ready` with the phase set to `phase-5-execute`; from finalize this is a `loop_back` (`guard in_worktree`, link:../workflow-dsl/07-loop-back-diagrams-verification.adoc[Workflow DSL Specification, Loop-Back]), and the finalize steps re-fire by verdict currency when the plan arrives in Phase 6 again. Without new plan tasks it returns `done` and the plan continues where it stood.
+* *Budget renewal*: A `reentered` re-planning renews the retry and fix budgets of every remediation policy once: the counters continue, and the effective ceiling of each policy is counted from its counter value at the re-entry (`policy_counters.<policy>.renewed_from`, link:../store-schemas/14-plan-instance-waivers-questions.adoc#policy-counter[Store Schemas Specification, Remediation Budget Accounting]). The renewals of a plan are bounded by `replan_budget`.
+* *Record*: Every re-planning appends a re-planning record (trigger, evidence key, task, action, rationale, follow-ups, prerequisite, instance version, and who decided: the task or the server fallback with its reason). The pull-request body and the landing record list the re-plannings, the moved deliverables, and the follow-ups; `pm-operator status` and the web app show the pending trigger and the last action.
+
+[#replan-follow-ups]
+=== Follow-Up Plans & Split Pull Requests
+
+A follow-up plan is recorded with its kind (`split`, `deferred`, or `prerequisite`), title, scope text, moved deliverables, the preserved ref (`split` only), and the plan it follows (link:../store-schemas/17-re-planning.adoc#replan-record[Store Schemas Specification, Follow-Up Record]).
+
+* *Plan of an epic*: The follow-up is staged as a new row of the plan's epic in the apply transaction, under the epic lock: its spec section is composed from the scope text and the moved deliverables, its declared surface from their declared paths, and its prerequisites are this plan's row; the epic's staging guards apply (`surface_overlap`, `surface_undeclared`, link:../model-work/08-epic-coordination.adoc[Model Work Specification, Epic Coordination]), and a refused staging rejects the submit with the epic's reason. The epic starts the row when this plan's row has shipped, through the plan bootstrap's `epic_row` source; a row with a preserved ref starts its branch from that ref, rebased onto the base at `execute.worktree-init`, so the second pull request holds only what the first did not merge. A `follow_up:<index>` prerequisite is staged the other way round: the new row has no prerequisite, this plan's row gains it as one (so the two are ordered and the staging guards admit both), and the epic starts it at once. This plan's row keeps its declared surface; its landing record names the follow-up rows.
+* *Plan without an epic*: The follow-up is a recorded proposal: the pull-request body, the landing record, `pm-operator status`, and the web app list it with its scope text and preserved ref; the server never starts it, and the operator starts it as a new plan.
+
+[#replan-fallback]
+=== Conservative Fallback
+
+`replan.conservative` takes the trigger's fallback without a task when `replan_budget` is spent, the plan has no outline, or the task closed `lost` (among others with the reason `role_unqualified` while `replan` has no valid qualification record, link:../model-work/01-roles-and-configuration.adoc#conservative-fallback[Model Work Specification, Conservative Fallback]) or `infeasible`. No fallback asks anyone.
+
+[cols="2,5"]
+|===
+|Trigger |Fallback
+
+|`infeasible` |`hand_back`, gap `cause: infeasible` with the infeasible tasks' evidence.
+|`ceiling` |`hand_back`, gap `cause: exhausted` with the spent policy budget: the route the remediation call takes without re-planning.
+|`base_advanced`, `merge_conflict` |`done`: the plan continues, and the base is integrated by the existing path (`finalize.sync-baseline` and `finalize.merge-sync` with `remediation.merge-conflict`); in Phase 5 nothing is integrated until finalize.
+|`downstream_limit` |`done`: the plan continues; at the review cap gate the exceeded cap takes its structural route (`remediation.review-findings`).
+|`spend_exceeded` |`done`: the plan continues; the pre-merge spend check decides at the merge gate.
+|===
+
+The record names the fallback and its reason, and the trigger's evidence key is judged, so the same situation does not raise it again.
+
+[#replan-existing-mechanisms]
+=== Relation to the Remediation Policies
+
+* *Merge conflicts*: A trial-merge conflict below `conflict_min_files` and every rebase conflict of a judged base go to `remediation.merge-conflict` as before; at or above the threshold the plan is re-planned first. The `exhausted` outcome of `remediation.merge-conflict` raises `ceiling`.
+* *Loop-back ceilings*: The `exhausted` outcome of `remediation.build-failure`, `.ci-failure`, `.analysis`, `.review-findings`, and `.merge-conflict` at their call states in Phase 5 and in finalize before the merge enters the phase's re-planning call state; `stepped_out` keeps its route to `finalize.hand-back`, and the `land` lane keeps its hand-back. The Phase 1–4 calls of `remediation.qgate-findings` keep `plan.return`: nothing runs yet that a re-planning could revise.
+* *Spend*: The pre-merge spend check and `remediation.spend` stay the gate on the finished plan (an operator waiver or the hand-back); its overrun raises no trigger, because a re-planning at the merge gate only adds spend. `spend_exceeded` acts earlier, while deliverables remain.
+* *Review size*: An exceeded cap of an optional bot keeps its structural route; an exceeded cap of a required bot is re-planned first, because a split of the change is a re-planning.

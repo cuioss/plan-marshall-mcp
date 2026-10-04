@@ -30,7 +30,8 @@ state finalize.settle-commit
 
 state finalize.sync-baseline
   phase finalize
-  composite_job finalize.sync-baseline          # fetch, overlap check, rebase attempt
+  composite_job finalize.sync-baseline          # fetch, re-planning triggers, overlap check, rebase attempt
+    replan                   -> finalize.replan
     up_to_date               -> finalize.next-step
       completes default:finalize-step-sync-baseline as skipped
     rebased                  -> finalize.next-step
@@ -46,7 +47,7 @@ state finalize.remediate-sync-conflict
   call remediation.merge-conflict (retry_budget=0, fix_budget=2, waiver_wait_seconds=0, actions=[fix])
     resolved                 -> finalize.settle-commit
       completes default:finalize-step-sync-baseline as done
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan       # trigger ceiling
     stepped_out              -> finalize.hand-back
 
 state finalize.pre-push-quality-gate
@@ -66,7 +67,7 @@ state finalize.remediate-build
     resolved                 -> finalize.settle-commit
       completes default:pre-push-quality-gate as done
     fix_requested            -> finalize.allocate-remediation
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan
     stepped_out              -> finalize.hand-back
 
 state finalize.allocate-remediation
@@ -96,6 +97,7 @@ state finalize.review-cap-check
   phase finalize
   auto review.check-structural-caps
     within_caps              -> finalize.concurrent-wait
+    replan                   -> finalize.replan       # required bot's cap, HEAD not yet judged
     cap_exceeded             -> finalize.remediate-review
 
 state finalize.concurrent-wait
@@ -130,7 +132,7 @@ state finalize.remediate-ci
     waived                   -> finalize.next-step
       completes default:ci-verify as waived
     fix_requested            -> finalize.allocate-remediation
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan
     stepped_out              -> finalize.hand-back
 
 state finalize.remediate-analysis
@@ -140,7 +142,7 @@ state finalize.remediate-analysis
       completes default:analysis-roundtrip as done
     waived                   -> finalize.next-step
       completes default:analysis-roundtrip as waived
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan
     stepped_out              -> finalize.hand-back
 
 state finalize.remediate-review
@@ -151,7 +153,7 @@ state finalize.remediate-review
     waived                   -> finalize.next-step
       completes plan-marshall:automatic-review as waived
     fix_requested            -> finalize.allocate-remediation
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan
     stepped_out              -> finalize.hand-back
 
 state finalize.remediate-security-audit
@@ -162,7 +164,7 @@ state finalize.remediate-security-audit
     waived                   -> finalize.next-step
       completes default:finalize-step-security-audit as waived
     fix_requested            -> finalize.allocate-remediation
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan
     stepped_out              -> finalize.hand-back
 
 state finalize.remediate-self-review
@@ -173,7 +175,17 @@ state finalize.remediate-self-review
     waived                   -> finalize.next-step
       completes default:pre-submission-self-review as waived
     fix_requested            -> finalize.allocate-remediation
-    exhausted                -> finalize.hand-back
+    exhausted                -> finalize.replan
+    stepped_out              -> finalize.hand-back
+
+state finalize.replan
+  phase finalize
+  call replan                                   # reads replan_pending (phase-workflows/08)
+    done                     -> finalize.next-step
+    reentered                -> execute.envelope-ready
+      guard in_worktree
+    reauthor                 -> outline.route-rework
+    hand_back                -> finalize.hand-back
     stepped_out              -> finalize.hand-back
 
 state finalize.review-window-wait
@@ -298,7 +310,7 @@ state plan.aborted terminal aborted failure
 * *Baseline-red is a server rule*: `build.quality-gate` compares every failing diagnostic's fingerprint with the base (the provider's CI result of the base first, a local build of the merge base as fallback); when every failure is baseline-only it writes a `baseline_red` build row bound to `worktree_sha` and settles `baseline_red` (class `SUCCESS`), and the step completes `done` with `assurance_verdict: degraded`. Every other red calls `remediation.build-failure`.
 * *Remediation calls*: Every blocking failure calls its remediation unit, never an operator decision: CI (`remediation.ci-failure`), code analysis over every configured provider (`remediation.analysis`), review findings, structural refusals, and missing review evidence (`remediation.review-findings`), a red quality gate (`remediation.build-failure`), a sync-baseline conflict (`remediation.merge-conflict`), and a spend overrun at `finalize.merge-gate` (`remediation.spend`). Each unit's `decide` is server logic where the call site's bound actions and budgets leave one remedy, and otherwise a task of the unit's triage role (xref:08-remediation-units.adoc#remediation-units[Remediation Policy Units]). Each call site routes the unit's reachable domain outcomes and `stepped_out` (Rule 6): `resolved` completes the class's step `done`, `waived` completes it `waived` with the waiver id (Rule 9), `fix_requested` enters `finalize.allocate-remediation`, which allocates Phase 5 remediation tasks (the `loop_back` form of `fix`, xref:07-loop-back-diagrams-verification.adoc#loop-back-bounds[Worktree-Constrained Loop-Back & Iteration Bounds]), and `exhausted` and `stepped_out` enter `finalize.hand-back`. The two Settle-band call sites `finalize.remediate-security-audit` and `finalize.remediate-self-review` bind `actions=[retry,loop_back]`: no pull request exists yet, so a fix runs only in the `loop_back` form, and its commit is the exit-barrier commit of Phase 5 (`settle_trigger` order `0`), never pushed before the push barrier (`INV-FIN-4`); the in-branch `fix` with its `push_mode=always` commit is bound only at call sites after the pull request exists. The budgets written at the call sites are the template values; the instance carries the effective ceilings with their source, and a `land` plan's composition binds `actions=[retry]` at every call site, so its `decide` takes the retry without a task.
 * *Wait-region order and re-entry*: `finalize.watch-ci-and-bots` hands one failing class at a time to its unit in the fixed order CI -> analysis -> review findings (link:../hypermedia-format/03-composite-wait-and-encoder.adoc#policy-unit-returns[Hypermedia Format Specification, Policy Unit Returns]); a unit's own await state watches only its class at the new `HEAD`. After `resolved` or `waived`, `finalize.next-step` re-enters the region: the steps whose firing is still open continue it, and verdict currency re-fires every class that is stale at the new `HEAD` (Rule 9, completion per firing).
-* *Pre-wait cap gate*: Before `finalize.concurrent-wait` is entered, `finalize.review-cap-check` measures the diff against the structural caps each required review bot declares in the review-bot registry (link:../phase-workflows.adoc[Phase Workflows Specification]). An exceeded cap records the bot as `refused` with mode `size` pre-emptively and files the refusal as a finding, which the review unit's triage job dispositions (`FIX` splits the change, `ACCEPT` accepts the refusal, `SUPPRESS` disables the bot for this pull request).
+* *Pre-wait cap gate*: Before `finalize.concurrent-wait` is entered, `finalize.review-cap-check` measures the diff against the structural caps each required review bot declares in the review-bot registry (link:../phase-workflows.adoc[Phase Workflows Specification]). An exceeded cap of a required bot at a `HEAD` not yet judged raises the re-planning trigger `downstream_limit` (link:../phase-workflows/08-dynamic-re-planning.adoc#replan-triggers[Phase Workflows Specification, Dynamic Re-Planning]); otherwise an exceeded cap records the bot as `refused` with mode `size` pre-emptively and files the refusal as a finding, which the review unit's triage job dispositions (`ACCEPT` accepts the refusal, `SUPPRESS` disables the bot for this pull request).
 * *Review-bot rate windows*: `bot_refused_awaitable` enters `finalize.review-window-wait`, a job that waits for the registered window (the registered interval times the attempt ceiling; a published ETA is a floor that is re-checked, never skipped) and then re-triggers the unproven bots automatically; a trigger is never posted inside a closed window. `bot_no_unreviewed_commit` enters `finalize.review-full-trigger`, which posts the registry's full-review trigger verb once per bot and `HEAD`. Every way the wait cannot produce evidence (hard quota, unproven bot, unestablished roster, a failed window wait, a repeated notice) reaches `remediation.review-findings` with the failure kind `evidence_missing`, whose only ends besides a window-gated re-trigger are a `review_evidence[:<bot_kind>]` waiver or the fallback.
 * *Interrupted watches*: A constituent job of the watch that ends with any fate other than success, and a cancellation of the composite by the engine, settle the composite as `watch_interrupted {constituent, fate}` or `cancelled`; `finalize.restart-watch` restarts the watch explicitly (an `enqueuesJob()` primitive whose outcome `concurrent_restarted` or `evidence_restarted` names the interrupted wait and binds the new composite job) within the compiled restart budget of `2` per wait-region firing and takes the fallback when it is spent. The engine never restarts a job on its own (xref:02-units-jobs-decisions.adoc#job-state-binding[Job State Entry & Binding]).
 * *Fallback end (`handed_back`)*: `finalize.hand-back` is the one fallback state of Phase 5, the `land` lane, and Phase 6 before the merge. In the transaction that enters it the engine records every begun, unsettled step `failed` (the on-entry rule) and composes the post-run-only instance version (composition event `fallback`, the pruned steps with reason `handed_back` or `returned`), which is in force for the rest of that chain, so `finalize.next-step` selects from it (xref:09-plan-instance.adoc#_versions_composition_events[Versions & Composition Events]). Its primitive settles uncommitted work (commit only, footprint-checked), pushes the branch when a push remote exists, opens the pull request as a draft or marks the existing one, posts the idempotent gap comment and the label `pm-mcp:handed-back`, and removes the worktree; it settles `returned` when the branch holds no commit beyond the base. In its local form (the outcome `local_only` of `finalize.merge-gate`) it keeps the plan branch as the product, records `merge_outcome: local_only`, and carries open findings out as late findings. In its ready form (the pre-merge barrier's outcome `pass_hand_back`, which the barrier returns instead of `pass` when the instance prunes the merge execution with reason `auto_merge_off` under the operator's `merge.auto_merge: false`) it marks the existing pull request ready for review and records `merge_outcome: awaiting_human_merge`. The post-run band then runs, and `finalize.archive-plan` ends the plan in `handed_back` or `returned`.

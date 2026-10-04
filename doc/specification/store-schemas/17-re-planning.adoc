@@ -1,0 +1,92 @@
+= Store Schemas Specification: Re-Planning Records
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store Schemas Specification] » Re-Planning Records
+
+[#replan-record]
+== Re-Planning Record (`mcp/status.json` → `replan_pending`, `replans[]`, `follow_ups[]`)
+_See Requirement link:../../Requirements.adoc#PM-WF-17[PM-WF-17: Dynamic Re-Planning of a Running Plan]_
+
+The plan's `mcp/status.json` (xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store]) carries the state of its re-plannings (link:../phase-workflows/08-dynamic-re-planning.adoc#dynamic-re-planning[Phase Workflows Specification, Dynamic Re-Planning]): `replan_pending`, the trigger a checkpoint raised and the unit has not yet judged (`null` otherwise); `replans[]`, append-only, one record per judged trigger, whose evidence keys decide whether a checkpoint raises a trigger again and whose task count is charged against `replan_budget`; and `follow_ups[]`, append-only, the follow-up plans the re-plannings recorded. All three are written only by the server, in the transactions of the trigger points and of the `replan` unit.
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/replan-record.json",
+  "title": "ReplanRecord",
+  "type": "object",
+  "required": ["replan_id", "trigger", "decided_by", "action", "recorded_at"],
+  "additionalProperties": false,
+  "properties": {
+    "replan_id": { "type": "string", "pattern": "^RP-[0-9]+$" },
+    "trigger": { "$ref": "#/$defs/trigger" },
+    "decided_by": { "type": "string", "enum": ["task", "fallback"], "description": "task: the replan task's submit; fallback: the trigger's conservative fallback, taken without a task or after the task closed lost or infeasible." },
+    "queue_task_id": { "type": ["string", "null"], "pattern": "^qt-[0-9a-f]{16}$", "description": "The replan task; null for a fallback taken without a task (budget spent, no outline)." },
+    "fallback_reason": { "type": ["string", "null"], "enum": ["budget_spent", "no_outline", "role_unqualified", "role_undefined", "role_unavailable", "attempts_spent", "infeasible", null] },
+    "action": { "type": "string", "enum": ["reintegrate_in_plan", "split_change", "defer_to_follow_up_plan", "wait_for_prerequisite", "rebase_and_reverify_only", "hand_back", "continue"], "description": "continue: a fallback that continued the plan where it stood." },
+    "reentry": { "type": ["string", "null"], "enum": ["execute", "outline", null], "description": "reintegrate_in_plan only." },
+    "rationale": { "type": ["string", "null"], "maxLength": 2000, "description": "The task's rationale; null for a fallback." },
+    "deliverables": { "type": "array", "items": { "type": "object", "required": ["deliverable_id", "change"], "additionalProperties": false, "properties": { "deliverable_id": { "type": "string", "pattern": "^D[0-9]+$" }, "change": { "type": "string", "enum": ["kept", "amended", "new", "deferred", "removed"] } } }, "description": "The revision's deliverable changes; empty without a revision." },
+    "new_task_ids": { "type": "array", "items": { "type": "string", "pattern": "^TASK-[0-9]{3,}$" } },
+    "follow_up_ids": { "type": "array", "items": { "type": "string", "pattern": "^FU-[0-9]+$" } },
+    "prerequisite": { "type": ["object", "null"], "required": ["kind", "ref", "wait_started_at", "deadline_at", "outcome"], "additionalProperties": false, "properties": { "kind": { "type": "string", "enum": ["pull_request", "plan", "follow_up"] }, "ref": { "type": "string" }, "wait_started_at": { "type": "string", "format": "date-time" }, "deadline_at": { "type": "string", "format": "date-time", "description": "wait_started_at plus prerequisite_wait_seconds; a restart never extends it." }, "outcome": { "type": ["string", "null"], "enum": ["landed", "closed", "expired", null] } } },
+    "split_ref": { "type": ["string", "null"], "description": "split_change only: the preserved ref pm/<plan_id>/split-<n>." },
+    "instance_version": { "type": ["integer", "null"], "minimum": 1, "description": "The version of composition event replan, when the revision composed one." },
+    "outcome": { "type": ["string", "null"], "enum": ["done", "reentered", "reauthor", "hand_back", "stepped_out", null], "description": "The unit's exit; null while the unit runs." },
+    "recorded_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "trigger": {
+      "type": "object",
+      "required": ["kind", "evidence_key", "checkpoint", "phase", "raised_at"],
+      "additionalProperties": false,
+      "description": "Also the shape of replan_pending.",
+      "properties": {
+        "kind": { "type": "string", "enum": ["infeasible", "base_advanced", "merge_conflict", "downstream_limit", "ceiling", "spend_exceeded"] },
+        "evidence_key": { "type": "string", "minLength": 1, "description": "kind-specific: the infeasible task ids, the base commit, the base commit and HEAD, HEAD and the bot, the policy and its renewal, or the plan id; a checkpoint raises no trigger whose kind and key a record already carries." },
+        "checkpoint": { "type": "string", "description": "The state that raised it (execute.replan-check, execute.evaluate-envelope-return, execute.exit-barrier, finalize.sync-baseline, finalize.merge-sync, finalize.review-cap-check, or the remediation call state)." },
+        "phase": { "type": "string" },
+        "base_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "head_sha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{40}$" },
+        "measurement": { "type": ["object", "null"], "description": "The figures the condition compared: overlapping paths, conflicted files, the cap and the measured value, the spent budget, the spend ratio." },
+        "evidence_uri": { "type": ["string", "null"], "description": "pm://plan/{plan_id}/evidence/{evidence_id} of the facts the task received." },
+        "raised_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
+----
+
+*Follow-up record* (`follow_ups[]`):
+
+[source,json]
+----
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuioss.de/plan-marshall-mcp/schemas/follow-up-record.json",
+  "title": "FollowUpRecord",
+  "type": "object",
+  "required": ["follow_up_id", "replan_id", "kind", "title", "scope", "deliverables", "recorded_at"],
+  "additionalProperties": false,
+  "properties": {
+    "follow_up_id": { "type": "string", "pattern": "^FU-[0-9]+$" },
+    "replan_id": { "type": "string", "pattern": "^RP-[0-9]+$" },
+    "kind": { "type": "string", "enum": ["split", "deferred", "prerequisite"], "description": "split: the second pull request of a split change, started from split_ref after this plan; deferred: dropped work for a later plan; prerequisite: a row this plan waits for (epic plans only)." },
+    "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "scope": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "deliverables": { "type": "array", "items": { "type": "object", "required": ["deliverable_id", "title"], "additionalProperties": false, "properties": { "deliverable_id": { "type": "string", "pattern": "^D[0-9]+$" }, "title": { "type": "string" } } } },
+    "split_ref": { "type": ["string", "null"] },
+    "epic_row": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "The plan id of the queue row staged for it in the plan's epic; null for a plan without an epic, whose follow-up is a recorded proposal." },
+    "recorded_at": { "type": "string", "format": "date-time" }
+  }
+}
+----
+
+* *Budget*: `replan_budget` is charged per record with `decided_by: task` or with a `queue_task_id` (a task that closed `lost` counts); a fallback taken without a task is not charged.
+* *Rendering*: The pull-request body and the landing record list every record with its action and rationale, the moved deliverables, and the follow-ups with their scope and preserved ref; the epic's queue row of a follow-up carries its origin (xref:04-epic-and-change-ledger.adoc#epic-queue-row[Queue Row], `follow_up`).
