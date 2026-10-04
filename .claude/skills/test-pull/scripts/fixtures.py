@@ -64,7 +64,7 @@ ROLE = {
     'self-review': 'self-review',
 }
 
-MAX_FACTS = 6000
+MAX_FACTS = 16000   # complete paths need room; a footprint is never cut mid-path
 
 # Option sets. build-triage: the per-finding dispositions of plan-marshall's triage
 # (plan-marshall/workflow/triage.md: FIX / SUPPRESS / ACCEPT / AskUserQuestion, plus the
@@ -468,7 +468,12 @@ def quote_untrusted(label: str, text: str, cap: int) -> str:
 
 
 def clip(text: str, cap: int) -> str:
-    return text if len(text) <= cap else text[:cap].rstrip() + ' [...]'
+    """Cuts at the last whitespace before the cap, so no word, key, or path is broken."""
+    if len(text) <= cap:
+        return text
+    cut = text[:cap]
+    space = max(cut.rfind(' '), cut.rfind('\n'))
+    return (cut[:space] if space > cap // 2 else cut).rstrip() + ' [...]'
 
 
 def log_entry(plan_dir: Path, rel: str, hash_id: str) -> tuple[str, str, int] | None:
@@ -539,13 +544,20 @@ def references(plan_dir: Path) -> dict[str, Any]:
 
 
 def shorten(path: str) -> str:
-    path = re.sub(r'src/(main|test)/java/(?:[a-z][a-z0-9_]*/){3,4}', r'\1:', path)
-    return re.sub(r'^marketplace/bundles/', 'mp/', path)
+    """Paths stay complete and relative to the repository root: a worker must be able to name the exact file."""
+    return path
 
 
 def file_list(paths: list[str], cap: int) -> str:
-    text = ', '.join(shorten(p) for p in paths)
-    return clip(text, cap)
+    """Complete paths, cut only between two entries; the rest is counted, never truncated mid-path."""
+    shown, used = [], 0
+    for path in (shorten(p) for p in paths):
+        if used + len(path) + 2 > cap - 30 and shown:
+            break
+        shown.append(path)
+        used += len(path) + 2
+    rest = len(paths) - len(shown)
+    return ', '.join(shown) + (f', and {rest} more' if rest else '')
 
 
 def code_excerpt(repo: Path | None, sha: str | None, path: str | None, line: int | None, radius: int) -> str | None:
