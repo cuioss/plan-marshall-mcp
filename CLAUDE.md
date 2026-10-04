@@ -16,12 +16,10 @@ Current state: a Quarkus application with one `hello` MCP tool, verified by unit
 is built (the target is native binaries on the host: the always-on daemon `pm-mcpd`, reached through
 the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
 
-Roadmap Milestone 0, Part A (verifications V1 to V10) and its evaluation (E1 to E13) are complete; the concept
-`doc/concepts/harness-as-worker/` holds analysis, method, run record, findings, conclusion, architecture, and the
-evaluation. The stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`) is kept as a reference
-implementation to learn from and is removed with Milestone 1; the driver skill `test-pull` (job runtime, relay,
-fault injector) was removed after the evaluation and is readable in git at commit `a6333d2`. The verified questions
-for model roles are the corpus `test/model/verification/`.
+Roadmap Milestone 0, Part A (the harness as worker) is complete; the concept is
+`doc/concepts/harness-as-worker/`. The stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`)
+is a reference implementation to learn from and is removed with Milestone 1. The verified questions for model roles
+are the corpus `test/model/verification/`.
 
 ## Modules
 
