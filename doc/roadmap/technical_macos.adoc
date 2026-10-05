@@ -32,9 +32,16 @@ Items marked _(measured during implementation)_ ran while the technique was bein
 
 *Pass criterion*: as link:technical_linux.adoc#_l1_local_adapter_under_native_image_gate_1[L1], with the macOS `sun_path` limit of 104 bytes and the `kqueue` transport.
 
-*Result*:
+*Result* _(measured during implementation)_:
 
-*Status*: `[ ]`
+* `DaemonStartupIT`, `McpSurfaceIT` and `HelloToolIT` pass against the native `pm-mcpd` and the JVM runner.
+* Findings:
+** Vert.x creates the socket under the process `umask` (mode `0755`). The runtime restricts it to `0600` right after the bind and verifies it, before `runtime.json` is written.
+** `StartupEvent` observers run before the HTTP server binds.
+** Quarkus 3.39 replaces the native transport by the JDK transport in a native image. `pm-mcpd` offers kqueue/epoll itself as a Vert.x `Transport` service, with JNI metadata from the tracing agent.
+** Authentication needs the `quarkus-security` extension: without it, the mechanism and the identity providers are inert.
+
+*Status*: `[~]` (repeat after the merge)
 
 === M2: PM-TECH-3 Bounds on macOS (gate 1)
 
@@ -48,9 +55,13 @@ Items marked _(measured during implementation)_ ran while the technique was bein
 |Relay `initialize` forwarded (15 runs) |19.9 / 17.0 / 51.6 ms |yes
 |`pm-operator status` first request (15 runs) |17.7 / 15.1 / 23.7 ms |yes
 |`pm-exec --probe`, plain exec |10–12 ms, 15–19 ms |—
-|`pm-mcpd` cold start, idle RSS | |
+|`pm-mcpd` cold start to ready (20 runs), Netty library beside the binary |40.5 / 38.6 / 66.3 ms |yes
+|`pm-mcpd` cold start, Netty library extracted to `$TMPDIR` by Netty |median 292 ms |no
+|`pm-mcpd` idle RSS after 10 s |37.6 MB (JVM runner: 89.8 MB) |yes
 |Binary sizes |`pm-mcp` ≈ 17 MB, `pm-operator` ≈ 17 MB, `pm-exec` 12.6 MB, `pm-mcpd` 47.7 MB |—
 |===
+
+*Finding*: the cold-start bound holds only if the release layout ships the Netty transport library (`libnetty_transport_native_kqueue_<arch>.jnilib`) beside `pm-mcpd` in `<PM_MCP_HOME>/bin/`, and the runtime loads it from there. Otherwise Netty extracts the library into the temporary directory on every start (about 250 ms) and executes native code from there. Correction candidate for the installation layout.
 
 *Status*: `[~]`
 
@@ -74,9 +85,13 @@ Items marked _(measured during implementation)_ ran while the technique was bein
 
 *Pass criterion*: as link:technical_linux.adoc#_l5_web_listener_at_runtime_gate_15[L5].
 
-*Result*:
+*Result* _(measured during implementation)_:
 
-*Status*: `[ ]`
+* `WebListenerIT` passes natively. The listener opens in 3 ms and closes in 0 ms, and an SSE stream on the socket keeps delivering across both. `/mcp` gives `404` on the web listener, and the runtime token is refused there.
+* LAN mode serves an ECDSA P-256 certificate, written by an own minimal DER encoder because `sun.security.x509` is not accessible with `--release 25`.
+* The second server shares the Quarkus router and security chain by delegating `/api/v1/` to Quarkus' root handler, which is an internal API. The token kind is decided by the listener the connection arrived on.
+
+*Status*: `[~]` (manual check with `pm-operator web enable|disable`)
 
 === M6: Keychain via FFM from the Native Binary (gate 4)
 
@@ -119,9 +134,15 @@ Items marked _(measured during implementation)_ ran while the technique was bein
 * The `PM-MCP-*` headers reach a tool handler through the security identity.
 * Progress and elicitation arrive on the call's own response stream.
 
-*Result*:
+*Result* _(measured during implementation, `McpSurfaceIT`)_:
 
-*Status*: `[ ]`
+* MCP `2026-07-28` is served sessionless: `server/discover`, with the protocol data in `_meta` of every request. `server/discover` without `_meta` is refused with `400`.
+* `initialize` (`2025-11-25`) always issues `Mcp-Session-Id` in 2.0.2. A filter strips it, and later requests without a session are served through `quarkus.mcp.server.http.streamable.auto-init`.
+* The `PM-MCP-*` headers reach a tool handler through the security identity, read through the current request (`CurrentVertxRequest`). The `params._meta` fallback is not needed.
+* Progress notifications arrive on the call's SSE stream.
+* Elicitation in `2026-07-28` is no server-initiated request: it is an `input_required` result answered by a retry with `inputResponses`. This contradicts `runtime-model/03-relay.adoc` (messages from runtime to host) and is a correction candidate.
+
+*Status*: `[~]` (repeat through the real relay and real hosts in M9 and M13)
 
 === M9: Flat Tool Schemas on Four Hosts (gate 11)
 
