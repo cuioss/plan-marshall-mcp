@@ -82,7 +82,7 @@ class MachinePathsTest {
 
         /** The socket suffix "/run/runtime.sock" is 17 bytes; the NUL makes the limit inclusive. */
         @ParameterizedTest(name = "{0}: base of {1} bytes fits = {2}")
-        @CsvSource({ "MACOS, 86, true", "MACOS, 87, false", "LINUX, 90, true", "LINUX, 91, false" })
+        @CsvSource({"MACOS, 86, true", "MACOS, 87, false", "LINUX, 90, true", "LINUX, 91, false"})
         void checksLimit(MachinePaths.Os os, int baseBytes, boolean fits) {
             var base = "/" + "a".repeat(baseBytes - 1);
             var paths = new MachinePaths(Path.of(base), os);
