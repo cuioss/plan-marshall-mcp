@@ -95,7 +95,7 @@ final class UdsClient {
             if (chunked) {
                 var buffer = new ByteArrayOutputStream();
                 for (var size = Integer.parseInt(line(in).split(";")[0].strip(), 16); size > 0;
-                        size = Integer.parseInt(line(in).split(";")[0].strip(), 16)) {
+                     size = Integer.parseInt(line(in).split(";")[0].strip(), 16)) {
                     buffer.write(in.readNBytes(size));
                     line(in);
                 }

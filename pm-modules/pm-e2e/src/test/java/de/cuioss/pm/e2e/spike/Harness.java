@@ -36,9 +36,9 @@ enum Harness {
 
     /** Claude Code. */
     CLAUDE("claude", "claude-haiku-4-5", 2400,
-            List.of(".claude", ".claude.json", ".claude.json.backup", ".cache/claude", ".cache/claude-cli-nodejs",
-                    ".local/state/claude", ".local/share/claude", ".config/claude"),
-            List.of("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")),
+        List.of(".claude", ".claude.json", ".claude.json.backup", ".cache/claude", ".cache/claude-cli-nodejs",
+                ".local/state/claude", ".local/share/claude", ".config/claude"),
+        List.of("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")),
     /** OpenCode. */
     OPENCODE("opencode", "opencode/space-bunny-free", 900,
             List.of(".local/share/opencode", ".local/state/opencode", ".cache/opencode", ".config/opencode"),
@@ -78,7 +78,7 @@ enum Harness {
      * @param timeoutMillis the MCP call timeout to configure, {@code null} for the harness default
      */
     record WorkerSpec(Path workerDir, String prompt, String model, List<String> relay, List<String> tools,
-            String jsonSchema, Long timeoutMillis) {
+    String jsonSchema, Long timeoutMillis) {
     }
 
     static Harness of(String name) {

@@ -36,9 +36,9 @@ import java.util.Locale;
  * @param extraWrites      {@code spike.write-extra}: comma-separated paths added to the Landlock write set
  */
 record SpikeSettings(Harness harness, String model, String layout, int trials, List<Fault> faults, int workers,
-        int waitSeconds, int graceSeconds, int stopShortSeconds, int stopLongSeconds, long exitDetectMaxMs,
-        int cellDeadlineSeconds, int trialTimeoutSeconds, List<Integer> sizes, int idleMaxSeconds, int progressSeconds,
-        List<Path> extraWrites) {
+int waitSeconds, int graceSeconds, int stopShortSeconds, int stopLongSeconds, long exitDetectMaxMs,
+int cellDeadlineSeconds, int trialTimeoutSeconds, List<Integer> sizes, int idleMaxSeconds, int progressSeconds,
+List<Path> extraWrites) {
 
     /** System property naming the harness; every driver IT requires it. */
     static final String HARNESS = "spike.harness";

@@ -21,6 +21,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.regex.Pattern;
 
+import com.fasterxml.jackson.core.JsonFactory;
+
 /**
  * A minimal staged installation for the harness drivers: {@code <home>/bin/pm-mcp} and {@code <home>/bin/pm-exec},
  * plus the daemon command line. The native binaries of the reactor are copied under their release names when all
@@ -97,7 +99,7 @@ record SpikeStage(Path home, boolean nativeMode, List<String> daemon, Path daemo
         var relayClassPath = String.join(File.pathSeparator, List.of(
                 jar(root.resolve("pm-clients/pm-relay/target"), "pm-relay").toString(),
                 jar(root.resolve("pm-modules/pm-api/target"), "pm-api").toString(), picocli(root).toString(),
-                location(com.fasterxml.jackson.core.JsonFactory.class).toString()));
+                location(JsonFactory.class).toString()));
         wrapper(bin.resolve("pm-mcp"), java, relayClassPath, "de.cuioss.pm.relay.PmMcp");
         wrapper(bin.resolve("pm-exec"), java, jar(root.resolve("pm-modules/pm-exec/target"), "pm-exec").toString(),
                 "de.cuioss.pm.exec.PmExec");

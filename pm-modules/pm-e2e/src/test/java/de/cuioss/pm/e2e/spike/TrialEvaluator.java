@@ -77,8 +77,8 @@ final class TrialEvaluator {
      * @param failures        the violated criteria with a reason each
      */
     record Trial(Fault fault, String worker, int generation, String taskId, long injectedMs, Long detectMs,
-            String detectReason, Long detectLatencyMs, List<String> released, int submits, Long submittedMs,
-            String submittedBy, Long recoveredMs, int lateRefused, Map<Criterion, String> failures) {
+    String detectReason, Long detectLatencyMs, List<String> released, int submits, Long submittedMs,
+    String submittedBy, Long recoveredMs, int lateRefused, Map<Criterion, String> failures) {
 
         boolean pass() {
             return failures.isEmpty();

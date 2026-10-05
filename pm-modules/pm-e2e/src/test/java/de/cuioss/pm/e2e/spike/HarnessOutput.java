@@ -34,7 +34,7 @@ import com.fasterxml.jackson.databind.JsonNode;
  * @param mcpTools   the MCP tools the harness listed at start, where it reports them
  */
 record HarnessOutput(int lines, int nonJson, boolean resultSeen, String sessionId, String finalText,
-        JsonNode structured, Map<String, Long> usage, Double costUsd, List<String> mcpTools) {
+JsonNode structured, Map<String, Long> usage, Double costUsd, List<String> mcpTools) {
 
     /**
      * @param harness the harness
