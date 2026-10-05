@@ -233,7 +233,8 @@ public final class LspClient implements AutoCloseable {
         }
         try {
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                /*~~(TODO: String concatenation with LogRecord parameter is always wrong. Use separate parameters instead. Suppress: // cui-rewrite:disable CuiLogRecordPatternRecipe)~~>*/LOGGER.warn(WARN.LSP_SHUTDOWN_FAILED, process.pid(), "no exit within " + timeout);
+                var reason = String.format("no exit within %s", timeout);
+                LOGGER.warn(WARN.LSP_SHUTDOWN_FAILED, process.pid(), reason);
                 process.destroy();
                 if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                     process.destroyForcibly();

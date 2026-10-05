@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -204,8 +205,12 @@ class RelayTest {
             send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/roots/list_changed\"}");
             send("{\"jsonrpc\":\"2.0\",\"id\":\"s-1\",\"result\":{\"action\":\"accept\"}}");
 
-            assertEquals("notifications/roots/list_changed", awaitRequest().header("Mcp-Method"));
-            assertNull(awaitRequest().header("Mcp-Method"));
+            // Each message is forwarded on its own virtual thread, so the arrival order is not fixed.
+            var methods = new ArrayList<String>();
+            methods.add(awaitRequest().header("Mcp-Method"));
+            methods.add(awaitRequest().header("Mcp-Method"));
+            assertTrue(methods.contains("notifications/roots/list_changed"), methods::toString);
+            assertTrue(methods.contains(null), methods::toString);
             assertNull(out.next(1));
         }
 
