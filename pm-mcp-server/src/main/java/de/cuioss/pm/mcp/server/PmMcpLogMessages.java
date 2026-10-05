@@ -43,5 +43,36 @@ public final class PmMcpLogMessages {
                 .identifier(2)
                 .template("Pull-mechanism stub active with scenario '%s', events in '%s'")
                 .build();
+
+        /** Logged at start with the one active credential backend and the keyring service name. */
+        public static final LogRecord CREDENTIAL_STORE_SELECTED = LogRecordModel.builder()
+                .prefix(PREFIX)
+                .identifier(30)
+                .template("Credential store '%s' active, service name '%s'")
+                .build();
+    }
+
+    /** WARN level messages. */
+    @UtilityClass
+    public static final class WARN {
+
+        /** Logged at start when no OS keyring is usable and the file credential store serves. */
+        public static final LogRecord KEYRING_UNAVAILABLE = LogRecordModel.builder()
+                .prefix(PREFIX)
+                .identifier(130)
+                .template("No OS keyring usable, the file credential store serves: %s")
+                .build();
+    }
+
+    /** ERROR level messages. */
+    @UtilityClass
+    public static final class ERROR {
+
+        /** Logged when a credential store operation of the local API fails; never contains the secret. */
+        public static final LogRecord CREDENTIAL_STORE_FAILED = LogRecordModel.builder()
+                .prefix(PREFIX)
+                .identifier(230)
+                .template("Credential store '%s' failed: %s")
+                .build();
     }
 }
