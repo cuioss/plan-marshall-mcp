@@ -26,15 +26,29 @@ and deletes the pending record; a job state whose binding and job record lie in 
 journaled transaction; a crash between its writes leaves a row `staged` beside a running plan, a lesson unclaimed by
 the plan created from it, a pending record that resumes a created scope, or a binding that names a job nobody runs,
 and a recovery that re-applies a write it cannot see as done applies it twice.
-Guard:: Crash-injection test over the fixed write order of `start.create-scope`: a crash after the plan scope, after
-the epic queue row, after the lesson claim, and after the pending-record deletion; after each restart the startup
-recovery leaves exactly one plan, the row `running` with the plan's creation instant as `started_at`, the lesson
-claimed once by that plan, and no pending record, and each reconciliation it applied has one audit record; a crash
-before the plan scope leaves only the pending record. The same for a job state: a crash after `active_job` and before
+Guard:: Crash-injection test over the fixed write order of `start.create-scope`: a crash after the plan scope,
+after the capture ref of a `local_changes` plan, after the epic queue row, after the lesson claim, and after the
+pending-record deletion; after each restart the startup recovery leaves exactly one plan, its capture ref at
+`snapshot_sha`, the row `running` with the plan's creation instant as `started_at`, the lesson claimed once by that
+plan, and no pending record, and each reconciliation it applied has one audit record; a crash before the plan scope
+leaves only the pending record. The same for an epic bootstrap: a crash after the new epic's scope and before the
+pending-record deletion leaves exactly one epic and no pending record after recovery. The same for a job state: a crash after `active_job` and before
 the job record settles the state `killed` and routes that outcome once; a crash after the job record leaves the job
 bound and running. The same for a worker's end: a crash after its job record (fate, fence, revoked token) and
 before the queue task record releases the held task's lease at recovery and queues the task again once. Matched control: a recovery run on a consistent store changes nothing and writes no audit record.
-Source:: design review (doc review round 5).
+Source:: design review.
+
+[#PM-WATCH-STORE-47]
+=== PM-WATCH-STORE-47: A crash during the carry-out of a late finding never loses the debt
+
+Anchor:: link:../specification/store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas § Transaction Journal] (Late findings),
+link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7]
+Hazard:: A late blocking finding marked `carried` before its destination (the epic message or the seeded lesson) is
+written disappears when the runtime crashes between the two writes.
+Guard:: Crash-injection test between the destination write and the `carried` mark: after recovery the finding is
+carried exactly once more, so the destination holds at most a duplicate notice and never none. Matched control: a
+crash before the destination write leaves the finding uncarried and recovery carries it once.
+Source:: design review.
 
 == Scope Session Log (`sessions.jsonl`)
 
@@ -63,7 +77,8 @@ entry resumes stale state or a lesson stays claimed by a plan that never existed
 Guard:: Scenario per bootstrap terminal (`committed`, `resumed`, `handed_over`, `abandoned`) and per crash point: the
 pending record is deleted by the terminal, for `committed` in the fixed write order after the new plan scope, the
 epic queue row, and the lesson claim; no lesson claim, queue-row change, or capture ref exists before the plan scope
-is written; a crash between these writes is completed by the startup recovery (<<PM-WATCH-STORE-44>>), and a crash
+is written, and the capture ref of a `local_changes` plan is set right after it; a crash between these writes is
+completed by the startup recovery (<<PM-WATCH-STORE-44>>; a missing capture ref is re-created at `snapshot_sha`), and a crash
 before the plan scope leaves only the pending record; a record older than the pending entry maximum age is removed by the sweep with an audit record; a
 record whose digest mismatches pauses only its own entry.
 Source:: design review.
@@ -104,12 +119,11 @@ Source:: plan-marshall review-apparatus epic § Archetype ("true when written, f
 Anchor:: link:../specification/store-schemas/03-findings-and-review-records.adoc#_findings_ledger_record_findings_jsonl[Store Schemas § Findings Ledger Record]
 Hazard:: A guard produced a finding classification outside the store's closed type set, so the finding was lost
 (`finding_persist_failed`); a persisted finding lost type, title or detail on read-back.
-Guard:: Every producer of a finding record constructs it through the Java enum (compile-time closure, no string
-types); a test enumerates all producers' emitted values against the schema enum (including `ci-verify`'s source `ci`
-with every `failure_class` and `failure_kind`); a round-trip test per producer
-writes and reads back all fields, with a boundary test at the producer's threshold (above persists, at emits
-nothing). Footprint growth mid-execute is recorded as unplanned changes with provenance, never written into the
-declared footprint.
+Guard:: Finding records are validated against the closed schema at write, `blocking` against the producer's
+declared class for the finding type; a test enumerates all producers' emitted values against the schema enums
+(including `ci-verify`'s source `ci` with every `failure_class` and `failure_kind`), and a round-trip test per
+producer writes and reads back all fields. Footprint growth mid-execute is recorded as unplanned changes with
+provenance, never written into the declared footprint.
 Fixture:: scope-creep threshold 5 with residuals 9 / 11 / 28 (API-Sheriff plan-28-closeout-residual-hardening); a
 charter assembled at run time over 16 files with `finding_persist_failed`; scope-creep `finding_persist_failed`
 counts: ledger-decomposition 7 failures (residual 12 vs 5), the-comment-pipeline 10 failures (residual 44).
@@ -124,18 +138,6 @@ Hazard:: Auto-stamped `pending` mixed real open defects with knowledge-only note
 Guard:: Reports split open findings by `blocking` and by source; they never treat every open finding as a defect.
 Fixture:: `hash_id 536818`.
 Source:: plan-marshall post-run-quality PLAN-PRQ-01 D2.
-
-[#PM-WATCH-STORE-6]
-=== PM-WATCH-STORE-6: Self-discharging advisory findings are closed by their producer
-
-Anchor:: link:../specification/store-schemas/03-findings-and-review-records.adoc#_findings_ledger_record_findings_jsonl[Store Schemas § Findings Ledger Record],
-link:../specification/phase-workflows/02-planning-lanes-phases-3-4.adoc#_planning_transition_guards_real_world_invariants[Phase Workflows § Planning Transition Guards]
-Hazard:: An advisory finding that named its own discharge condition stayed pending across three phases after the
-condition was met.
-Guard:: Findings with a machine-checkable discharge condition are re-evaluated by their producer at each phase
-boundary.
-Fixture:: finding `b47715`.
-Source:: plan-marshall truthful-signals (quality-aspect) PLAN-216 D7.
 
 [#PM-WATCH-STORE-7]
 === PM-WATCH-STORE-7: Ingestion verifies its persist post-condition
@@ -174,7 +176,7 @@ Guard:: Reader table test over `findings.jsonl` and `review-participation.jsonl`
 lines; a torn last line of a key falls back to that key's previous version and is reported with its offset; earlier
 lines stay as history and are never rewritten. Matched control: a store whose every line parses yields the same
 current records as a replay of the appends in order.
-Source:: design review (doc review round 5).
+Source:: design review.
 
 == Component Assessment Record (`assessments.jsonl`)
 
@@ -207,18 +209,17 @@ Fixture:: same-sender double write replacing the first live message (sender-repo
 Source:: plan-marshall process-compliance PLAN-10 § Claim Labels (second same-sender inbox write replaced the first).
 
 [#PM-WATCH-STORE-30]
-=== PM-WATCH-STORE-30: A plan whose request names a moved or foreign epic path keeps or reports its epic
+=== PM-WATCH-STORE-30: A plan of an archived or aborted epic keeps its epic
 
-Anchor:: link:../specification/model-work/08-epic-coordination.adoc#_git_distributed_epic_ledger_per_file_store_layout_adr_024[Model Work § Git-Distributed Epic Ledger]
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#git-distributed-epic-ledger[Model Work § Git-Distributed Epic Ledger],
+link:../specification/filesystem-layout/01-repository-workspace.adoc#shared-epic-worktree[Filesystem Layout § Shared Epic Worktree] (Epic Ledger Resolution Seam)
 Hazard:: The orchestrator store moved without a redirect; plans whose request had captured the old path lost their
 epic attribution.
-Guard:: A test archives an epic (its ledger moves to `.marshall/archived-orchestrators/<epic_id>-<YY-MM-DD>/`) while a
-plan whose request captured the live path is in flight and asserts that the plan keeps its `epic_id`. A `PM-MCP`
-plan whose request names a legacy `.plan/` epic path is reported as not orchestrated with that cause named, never
-silently attributed or silently dropped (`PM-MCP` takes over no legacy epic, `PM-MIG-2`).
-Fixture:: `source_id` `.plan/local/orchestrator/orchestrator-refactor/plans/PLAN-01-tracked-orchestrator-store-resolver.md`
-→ `orchestrated:false, detection:unrecognised_id`; the same with `.plan/orchestrator/…` → `orchestrated:true` (the
-cause is the prefix, not the id grammar).
+Guard:: A test archives, and one aborts, an epic (its ledger moves to
+`.marshall/archived-orchestrators/<epic_id>-<YY-MM-DD>/`) while a plan whose `origin.epic_id` names it is in flight:
+the plan keeps `origin.epic_id`, its `epic_linkage` resolves through the one epic-ledger resolver, which finds the
+header by `epic_id` (never by a path in the request or the dated suffix), and reads `orchestrated`, or
+`indeterminate` when the header is absent or unreadable, never `not_orchestrated`.
 Source:: plan-marshall orchestrator-refactor PLAN-03 D6.
 
 == Change Ledger Record (`change-ledger.jsonl`)
@@ -358,10 +359,11 @@ link:../specification/store-schemas/14-plan-instance-waivers-questions.adoc#ques
 link:../specification/timeouts/01-job-budgets-and-waits.adoc#waiver-wait[Timeouts & Budgets § Waiver Wait]
 Hazard:: A deadline recomputed on re-entry or restart never expires; an answer and the expiry racing in one instant
 both apply; a runtime restart loses the timer, or fires a deadline that lapsed during an integrity pause.
-Guard:: Tests on a test clock: the deadline of a question record or waiver request is written once at creation and
+Guard:: Tests on a test clock: the deadline of a question record or waiver request is written once at delivery and
 never moved by re-entry; an answer and the expiry in the same instant settle exactly one of them (the first
 committed transaction), the other refused (`question_expired`, `already_answered`); after a restart an overdue
-deadline fires once in recovery; a deadline that falls inside an integrity pause is extended by the pause's length.
+deadline fires once in recovery; a deadline that passed during an integrity pause fires once, right after the pause
+ends, and `expires_at` is unchanged.
 Source:: design review.
 
 [#PM-WATCH-STORE-41]
@@ -403,10 +405,10 @@ Source:: plan-marshall defect truthful-signals PLAN-TRUTH-155 D2 (carrying PLAN-
 Anchor:: link:../specification/store-schemas/07-project-configuration.adoc#project-configuration-store[Store Schemas § Project Configuration],
 link:../specification/store-schemas/01-format-and-session-log.adoc#format-versioning[§ Format Versioning & Atomic Write Discipline]
 Hazard:: A classification read a key that a migration had retired and got an empty value.
-Guard:: Readers of the team configuration files, of `local-config.json`, and of every server-owned store treat a key
-the current schema does not declare (retired by a `format_version` change) as an error branch
-(`unknown_config_key`, `unreadable`), never as empty; the server-rendered rewrite of `setup.reconcile-config` names
-every dropped key.
+Guard:: Readers of the team configuration files, of `local-config.json`, and of every server-owned store refuse a
+file at an older `format_version` (a key retired by a format change) with `format_outdated{file, found, current}`,
+and report a key the current schema does not declare as `unknown_config_key`, never as empty; `setup.reconcile-config`
+enters `setup.needs-repair` on `format_refused`.
 Source:: plan-marshall code-intelligence-substrate PLAN-CIS-052 D6b.
 
 == Lesson Record (project lesson store)
@@ -416,12 +418,13 @@ Source:: plan-marshall code-intelligence-substrate PLAN-CIS-052 D6b.
 
 Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas § Lesson Record] (One Resolver, Four States)
 Hazard:: A lesson enumerated by `list` was unaddressable by `get` (`unresolvable`) and could never be retired;
-headerless files were listed by file presence while `get` returned `not_found`; a recorded failure destroyed a
-lesson and returned `not_found`, and a retry then acted on a false absence.
-Guard:: Resolver tests: a record without parseable front matter is listed and returned as present-but-unreadable and
-can be retired with a reason (the operator retirement writes a minimal valid front matter and keeps the original
-bytes as the body); removing a present-but-unreadable lesson yields a distinct outcome, not `not_found`, with
-no retry; a property test checks that no code path turns `not_found` into a retry.
+headerless files were listed by file presence while `get` returned not found; a recorded failure destroyed a
+lesson and returned not found, and a retry then acted on a false absence.
+Guard:: Resolver tests: every listed lesson resolves by the exact id it is listed under; a record without parseable
+front matter is listed with its path and resolves `present_unreadable`, never `absent`, and can be retired with a
+reason (the operator retirement writes a minimal valid front matter and keeps the original bytes as the body);
+removing a `present_unreadable` lesson yields a distinct outcome, not `absent`, with no retry; a property test
+checks that no code path turns `absent` into a retry.
 Fixture:: `2026-09-22-12-001` (no parseable metadata header); 6 of 194 headerless files: `2026-09-08-22-004`,
 `-005`, `-006`, `-007`, `2026-09-13-06-001`, `-002`; nine archived process lessons with YAML-frontmatter headers
 could be listed but not addressed by their listed id (as resolver test fixtures, all nine must list and resolve by that id).
@@ -435,9 +438,8 @@ process-compliance PLAN-08 § Claim Labels claim 1.
 Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas § Lesson Record] (Promotion Provenance)
 Hazard:: A sweep routed content back to the epic that had already promoted it (boomerang); no field named which epic
 had dispositioned a lesson.
-Guard:: Sweep test with lessons carrying `promotions[]` yields `already_promoted` and zero new routes; when an epic
-dispositions a lesson, the lesson's front matter records it (`promotions[]`, or `retired` for a retirement), also
-for a retired lesson.
+Guard:: Sweep test (a routing sweep and the `lesson-cleanup` harvester) over lessons whose `promotions[]` holds a
+matching destination yields `already_promoted` for each and zero new routes.
 Fixture:: the 2026-09-22 sweep routed 7 of truthful-signals' own 2026-09-21 promotions back
 (`2026-09-21-10-002`, `-003`, `-005`, `-006`, `-007`, `-009`, `-011`) and 4 more to 3 other epics.
 Source:: plan-marshall defect lessons-routing § Open Defects (sweep re-routes promoted lessons), inbox messages
@@ -450,8 +452,9 @@ Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#less
 link:../specification/phase-workflows/02-planning-lanes-phases-3-4.adoc#_direct_in_band_text_submissions_pm_wf_2_pm_wf_6[Phase Workflows § Direct In-Band Text Submissions] (lesson creation)
 Hazard:: Deduplication by component alone merged two different defects; one defect was filed four times under
 different spellings of its component.
-Guard:: The component is normalised before deduplication (notation, empty → `unknown`, sub-component → parent), but
-dedup never keys on the component alone; tests keep the two distinct defects apart and merge the four spellings.
+Guard:: Duplicate detection keys on (`component`, normalized `rule`) for `arch-constraint` lessons and on
+(`component`, normalized `title`) for every other category, never on the component alone; a `no_duplicate` verdict
+carries the compared population; tests keep the two distinct defects apart.
 Fixture:: `plan-marshall:build-maven` twice with different defects (cui-jsf `2026-06-16-09-001` surefire zero-match;
 nifi `2026-07-16-21-002` change-ledger worktree no-op); one defect filed as `…:workflow-integration-git`, empty,
 and `…:baseline-reconcile`.
@@ -506,7 +509,7 @@ link:../Requirements.adoc#PM-TEST-2[PM-TEST-2]
 Hazard:: A port could silently drop the supersede and retirement semantics of the `plan-marshall` lesson store
 (redirect stub, permanent tombstone), which `PM-MCP` records in the lesson's own front matter instead of a tombstone file.
 Guard:: The differential corpus for the lesson store maps each legacy supersede and removal onto the in-file
-retirement (`retired{at, by, verdict}` with verdict `superseded` and the successor named in `reason`, the record
+retirement (`retired{at, by, verdict}` with verdict `superseded` and the successor named in `retired.into`, the record
 kept permanently), body purging of retired lessons (every retirement, whatever its verdict) after
 `retired_lesson_bodies_days` keeping the front matter, and the three removal
 buckets; a lesson whose `retired` block is missing is never purged.
@@ -573,9 +576,10 @@ link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7]
 Hazard:: A count comparison read 19 vs 13 as "shrunk" although the sets were not nested; files existed only in
 references and were owned by no deliverable; an operator-approved widening was reported as unassessed drift; a task
 touched skills without growing its affected files.
-Guard:: Reconciliation tests with non-nested sets report both differences; `declared_files` entries in no
-deliverable surface are reported as unowned; a realized path beyond the declared footprint is reported as a recorded
-unplanned change with its provenance (task or loop-back), not as unassessed drift.
+Guard:: Reconciliation tests with non-nested sets report the symmetric difference in both directions, never a count
+comparison; untouched `expected_modifications` are reported as `modify_shortfall`; a realized path beyond the
+declared scope is reported as a recorded unplanned change with its provenance (task or loop-back), not as
+unassessed drift.
 Fixture:: 19 declared vs 13 realized: 5 realized-not-declared (2 of them fix-task targets appended mid-execute), 4
 declared-not-realized (a whole GitLab-contract half); 11 references-only files; approved widening (a 30 s test
 budget vs a 24–57 s command, approved mid-run): 19,525 other tests passing, `affected_files_exact_match: warn`,
@@ -587,13 +591,16 @@ Source:: design review; plan-marshall defects truthful-signals PLAN-TRUTH-145 it
 PLAN-PRQ-01 D7 (carrying PLAN-TRUTH-130, inbox drain) and D8; plan-marshall lesson 2026-09-24-12-005.
 
 [#PM-WATCH-STORE-23]
-=== PM-WATCH-STORE-23: A path that landed elsewhere is not "declared, not realized"
+=== PM-WATCH-STORE-23: A rebase onto landed paths re-derives the footprint
 
 Anchor:: link:../specification/store-schemas/13-leases-integrity-testing.adoc#three-way-footprint[Store Schemas § Three-Way File Footprint Reconciliation]
 Hazard:: Part of a plan landed through another PR; after the rebase those paths vanished from `base_ref...HEAD` and
 were reported as declared-not-realized.
-Guard:: Reconciliation reports such declared paths as realized elsewhere (present in the base since plan start); the
-rename-aware fixture below is part of the test corpus.
+Guard:: After a `sync-baseline` or `branch-cleanup` rebase the realized footprint is re-derived against the new
+merge-base (`realized_state.base_ref`), and declared paths that landed through another pull request are reported by
+the specified reconciliation (untouched `expected_modifications` as `modify_shortfall`, both directions of the
+symmetric difference); a rename contributes both paths and a `realized_renames[]` pair; the rename-aware fixture
+below is part of the test corpus.
 Fixture:: #1611 (28 files): recall 36%, 8 `include_unrealised`, 29 declared-not-realized; the D8 pilot landed as
 #1605 (`39c945f81`, 5 files); 25 of 45 declared `foreign: true`; renames `pr_agent -> cuioss_review_bot`.
 Source:: plan-marshall lesson 2026-09-24-12-003.
@@ -606,9 +613,10 @@ link:../Requirements.adoc#PM-SEC-2[PM-SEC-2]
 Hazard:: A task working in a foreign repository reported that repository's paths against the home repository;
 foreign declarations counted as "missing"; recall denominators included paths the realized set could never
 contain.
-Guard:: A cross-project change set is recorded with its repository identity and never merged into the home realized
-footprint; declared paths outside the repository or worktree are excluded from the recall denominator and reported
-separately as unmeasured; tests with a delete-intent path and a foreign path.
+Guard:: The realized footprint resolves only from the plan's own worktree through one resolver, so a change in a
+foreign repository never enters it, and every footprint check compares against `realized_files` only when
+`realized_state.state` is `measured`; tests with a delete-intent path (realized through `--name-status`) and a path
+changed in a foreign repository (absent from the home realized set).
 Fixture:: lesson `2026-09-03-23-004`.
 Source:: plan-marshall lessons 2026-09-24-12-002 and 2026-09-24-12-003; plan-marshall defect post-run-quality PLAN-PRQ-09 D4.
 
@@ -668,4 +676,4 @@ decisions whose facts are no longer referenced, with their facts snapshots), eac
 transaction of the workspace scope; a decision whose facts snapshot is still referenced is kept with that keep-rule
 named; an archived epic's `epics/<epic_id>/` is removed only after `retention.archived_plans_days`. Matched
 controls: a row one day younger than the key is kept, and an open finding of any age is kept.
-Source:: design review (doc review round 5).
+Source:: design review.
