@@ -5,7 +5,7 @@
 ## Status
 
 [![Java CI with Maven](https://github.com/cuioss/plan-marshall-mcp/actions/workflows/maven.yml/badge.svg)](https://github.com/cuioss/plan-marshall-mcp/actions/workflows/maven.yml)
-[![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](LICENSE.md)
+[![License: proprietary](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE.md)
 [![Maven Central](https://img.shields.io/maven-central/v/de.cuioss/plan-marshall-mcp.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/de.cuioss/plan-marshall-mcp)
 
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=cuioss_plan-marshall-mcp&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=cuioss_plan-marshall-mcp)
@@ -73,6 +73,8 @@ reusable workflows. No repo-level secrets need to be configured.
 
 ## License
 
-This project is licensed under the [Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2)](LICENSE.md). For the plain-English rationale — what you can and can't do, and why — see [Why this license](doc/why-this-license.adoc).
+plan-marshall-mcp is proprietary software; all rights reserved. Viewing this repository grants no right to use,
+copy, modify or distribute the code. Versions up to the tag `fsl-final` (among them release 0.1.0) were published
+under FSL-1.1-ALv2. See [LICENSE.md](LICENSE.md).
 
-For organizations that cannot comply with the FSL's competing-use restriction during the licensed period (e.g., proprietary or closed-source deployments that compete with the software), commercial licenses are available. [Request a commercial license](https://tally.so/r/9qalQY) through the private licensing form (no public issue is created).
+This repository does not accept external contributions ([CONTRIBUTING.md](CONTRIBUTING.md)).
