@@ -209,7 +209,7 @@ The path attribution merge combines Axis-D `claim_paths` claims across active at
 
 1. *Single Shared Spelling Normalizer (`normalizeSpelling`)*: Claim registration and file lookup pass through the exact same normalizer. Normalization is spelling-only: it trims surrounding whitespace, folds backslashes to `/`, strips leading `./` runs, and strips trailing slashes. It resolves no symlink, touches no filesystem, does not collapse `..` segments, does not strip a leading `/`, and does not collapse `//`; whether a path is admissible is a policy decision of each side, not a spelling decision.
 2. *Claim Validity Filters (Drop and Report, Never Throw)*: A claim survives only if it is well-formed (non-null prefix and module), its normalized prefix bounds a subtree inside the repository, and its `target_module` is a known module (a discovered module or a registered synthetic domain module such as the one owning `.marshall`). A blank or root-level prefix (`""`, `.`, `..`, or a bare `/`), an absolute prefix (a leading `/` or a drive letter such as `C:/`), and a repository-escaping prefix (any normalized segment equal to `..`, not only the first) are dropped; a merely dot-relative prefix (`./doc`) is normalized to `doc`, not dropped. Every dropped claim appends a `merge: ` note naming the claim and the reason to the claiming attributor's report. *Deliberate hardening vs. `plan-marshall`*: `plan-marshall`'s `_normalize_prefix` drops only a leading `..` segment and admits `/etc` or `doc/../../x`; `PM-MCP` drops both, because such a prefix can never bound a subtree inside the repository.
-3. *Failing Attributor Isolation*: An attributor whose `claimPaths()` throws `AttributorException` is reported with status `ERROR`, `claimCount` `0`, and a `merge: ` note carrying the sanitized failure (simple class name and message, as in `DerivationMerge.sanitize`); it contributes no claims, and its siblings still contribute. A failing attributor never aborts the merge. *Duplicate attributor IDs*: when two attributors share an `attributorId`, the first registration wins; the second is not invoked, and the surviving report receives a `merge: ` note naming the dropped duplicate. All internal maps are ordered (`TreeMap` / `LinkedHashMap` in registration order), never `HashMap` or `Map.copyOf`.
+3. *Failing Attributor Isolation*: An attributor whose `claimPaths()` throws `AttributorException` is reported with status `ERROR`, `claimCount` `0`, and a `merge: ` note carrying the sanitized failure (simple class name and message, as in `DerivationMerge.sanitize`); it contributes no claims, and its siblings still contribute. A failing attributor never aborts the merge. *Registration order*: an attributor's `attributorId` is the `domain_id` of its domain, and the merge registers the attributors in `attributorId` order whatever order the caller passes them in. *Duplicate attributor IDs*: when two attributors share an `attributorId` (which unique `domain_id` values exclude for domain attributors; the guard stays), the first registration wins; the second is not invoked, and the surviving report receives a `merge: ` note naming the dropped duplicate. All internal maps are ordered (`TreeMap` by key), never `HashMap` or `Map.copyOf`, and the reports are sorted by `attributorId`.
 4. *Collision Without Winner Invariant*: If two attributors claim the same normalized `path_prefix` for **different** `target_module` IDs, the merge **never selects an iteration-order winner**. Instead, the collided `path_prefix` yields no claim, is recorded as a `PathClaimCollision` diagnostic, and every contending attributor receives a `merge: ` note naming all contending modules. Identical claims `(same prefix, same target_module)` merge idempotently into one claim carrying the sorted union of producer IDs. Differently-scoped prefixes (`.marshall` and `.marshall/local`) are not a collision.
 5. *Per-Attributor Report*: Every attributor yields exactly one `AttributorReport(attributorId, status, claimCount, notes)`, where `claimCount` counts the surviving (non-collided) claims it produced. Zero attributors is a first-class outcome (empty claims, empty reports, never an exception); the report count distinguishes "no attributor ran" from "attributors ran and none claimed the path".
 6. *Segment-Boundary Longest-Prefix Lookup*: A spelling-normalized file path `p` matches a claimed prefix `c` if and only if `p.equals(c)` or `p.startsWith(c + "/")`, so `.marshalls/x` never resolves through a `.marshall` claim. Among all matching claims, the longest prefix wins; this is resolution order, not a collision tie-break.
@@ -226,7 +226,6 @@ import de.cuioss.pm.core.domain.PathOwnershipClaim;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -310,10 +309,14 @@ public final class PathAttributionMerge {
         }
 
         Map<ClaimKey, TreeSet<String>> producers = new TreeMap<>();
-        Map<String, AttributorStatus> statusById = new LinkedHashMap<>();   // registration order
+        Map<String, AttributorStatus> statusById = new TreeMap<>();   // reports sorted by attributor id
         Map<String, List<String>> notesById = new TreeMap<>();
 
-        for (PathOwnershipAxis attributor : attributors) {
+        // Registration in attributor id (domain_id) order, independent of the caller's list order
+        List<PathOwnershipAxis> registered = attributors.stream()
+                .sorted(Comparator.comparing(PathOwnershipAxis::attributorId))
+                .toList();
+        for (PathOwnershipAxis attributor : registered) {
             String id = attributor.attributorId();
             if (statusById.containsKey(id)) {
                 // First registration wins; the duplicate is not invoked and is named on the surviving report

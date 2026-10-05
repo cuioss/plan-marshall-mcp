@@ -19,7 +19,7 @@ Every job, and every in-process `git` or `ci` operation of the native variant (<
 * `project_script` jobs: `project_script:<project_script_id>`;
 * workers (kind `llm`): `llm:<role>`, one key per role whatever the harness, for example `llm:implement` or `llm:screener` (role names of the link:../model-work/01-roles-and-configuration.adoc[effective role set]).
 
-The budget of every job starts at its spawn: a job recorded `queued` while it waits for a build or model slot (<<model-slot-wait>>; link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]) has no budget running, and its queued time is outside the budget and outside the worker's measured duration.
+The budget of every job starts at its spawn: a job recorded `queued` while it waits for a build or model slot (<<build-slot-wait>>, <<model-slot-wait>>; link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores]) has no budget running, and its queued time is outside the budget and outside the worker's measured duration.
 
 Learned values live in the project's `<PM_MCP_BASE>/projects/<project_id>/build-timings.json` (link:../store-schemas/09-derived-facts-and-build-timings.adoc#build-timings-store[Store Schemas, Build Timings Store]) under this key (link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning], which defines which runs feed the learned baseline).
 
@@ -124,7 +124,7 @@ Learned values live in the project's `<PM_MCP_BASE>/projects/<project_id>/build-
 |link:../domain-extensions.adoc[Domain Extensions] (Project Script Jobs); link:../job-runtime.adoc[Job Runtime]
 
 |[[model-job-budget]]Worker budget (`llm`)
-|Allocation as above over the key `llm:<role>`, with the role floor as $F$: the `budget_floor_seconds` of the role artifact, compiled minimum `60`; shipped floors: link:../model-work/01-roles-and-configuration.adoc#default-roles[Model Work, Default Role Set]. The budget runs for a fresh worker from its spawn to its exit, and for a warm worker per task from the offer to the attempt's end; a consultation's wait counts toward the asker's budget. Which workers feed $L$ is defined in link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning]; escalation and the cap $C$ apply as above. No other time bound of model work exists: the supervisor observes every worker's end.
+|Allocation as above over the key `llm:<role>`, with the role floor as $F$: the `budget_floor_seconds` of the role artifact, compiled minimum `60`; shipped floors: link:../model-work/01-roles-and-configuration.adoc#default-roles[Model Work, Default Role Set]. The budget runs for a fresh worker from its spawn to its exit, and for a warm worker per task from the offer to the attempt's end; a consultation's wait counts toward the asker's budget. A fresh worker feeds $L$ with its spawn-to-exit duration, a warm worker with the duration of each attempt that closed its task (offer to attempt end), only on success (link:../job-runtime/03-parsers-and-gates.adoc#_adaptive_timeout_learning[Job Runtime Specification, Adaptive Timeout Learning]); escalation and the cap $C$ apply as above. No other time bound of model work exists: the supervisor observes every worker's end.
 |via $O$ per `llm:<role>` in `command_budgets`; the floor in the role artifact
 |$t \ge$ the role floor; floor `60`..`86400`
 |workers of every role
@@ -161,7 +161,7 @@ Learned values live in the project's `<PM_MCP_BASE>/projects/<project_id>/build-
 
 A native `git` or `ci` operation runs inside the runtime, not as a process (link:../job-runtime/01-pipeline-and-subprocesses.adoc#in-process-operations[Job Runtime Specification, In-Process Operations]); the operation classes, floors, allocation, learning, escalation, and the no-verdict rule above apply to it unchanged:
 
-* *Cooperative Cancellation*: At budget expiry, on an engine cancel (a composite wait's short-circuit, an operator abort), and at drain, the runtime cancels the operation cooperatively: JGit operations through their `ProgressMonitor` (`isCancelled`) and revision-walk cancellation, provider requests by interrupting the HTTP exchange. Every HTTP request additionally carries the <<http-request-timeout>>, so no single request can outlast the class budget.
+* *Cooperative Cancellation*: At budget expiry, on an engine cancel (a composite wait's short-circuit, an operator abort), and at the expiry of the drain timeout, the runtime cancels the operation cooperatively: JGit operations through their `ProgressMonitor` (`isCancelled`) and revision-walk cancellation, provider requests by interrupting the HTTP exchange. Every HTTP request additionally carries the <<http-request-timeout>>, so no single request can outlast the class budget.
 * *Abandonment*: An operation that has not returned within the termination grace period (<<grace-period>>) after cancellation is abandoned: it is recorded at the deadline, and the result that arrives later is discarded.
 * *Partial Results Discarded*: A cancelled or abandoned operation yields no result record; nothing it observed before the cancellation is used. A mutation it may have applied is established only from the observed repository or provider state before any retry, as for a job (a push by `ls-remote`, a merge or enqueue by the provider observation, a worktree removal by the <<worktree-remove-recheck>>).
 * *Outcome*: Budget expiry records `timed_out`, which is `no_verdict` (<<no-verdict-rule>>); cancellation records `cancelled`, drain records `killed`.
@@ -223,6 +223,14 @@ _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH
 |the choices of the project setup and of the plan and epic bootstraps that the entry session drives, among them a team-configuration question of the workspace setup and the operator-channel choice of an operator-configuration setup state (link:../domain-extensions/04-setup-state-machine.adoc#setup-integration-variants[Domain Extensions, Integration Variants])
 |The server withdraws the request. A question record stays open with its own deadline (<<question-wait>>) and stays delivered through the web app; an operator-configuration choice renders `facts.operator_command` (`pm-operator config --project <project_id>`) and offers its bounded `retry`. A declined or cancelled elicitation is an answer, not an expiry.
 |link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas, Question Record]; link:../cli-and-security/02-credentials-and-operator.adoc#operator-channel-isolation[CLI & Security, Operator Channel Isolation]
+
+|[[build-slot-wait]]Build slot wait
+|No deadline of its own: a `build` job waiting for a slot is recorded `queued` in the FIFO `waiting` of `build-slots.json` and admitted in that order when a slot frees. The wait is bounded by the budgets of the running build jobs, which end every held slot.
+|fixed
+|—
+|`build` jobs recorded `queued` (link:../store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas, Machine Lease Stores])
+|—; a `pm_build` call returns the queued job with its `job_id` continuation.
+|<<job-budgets>>; xref:02-runtime-leases-operator-web.adoc#build-slot-lease[Build slot lease]
 
 |[[model-slot-wait]]Model slot wait
 |No deadline of its own: a worker waiting for a slot is recorded `queued` and admitted in FIFO order when a slot frees; at most one writer worker of a plan runs or waits at a time, and its task stays `queued`. The wait is bounded by the budgets, the idle recycle, and the token budgets of the running workers, which end every held slot.
@@ -333,6 +341,14 @@ The supervisor ends, recycles, and replaces workers by these values (link:../mod
 |The task closes `lost` with `attempts_spent`, and its state takes its conservative fallback: `retry` once when the call binds it and its budget is left, else the remediation policy's `exhausted` or the state's declared `lost` route (link:../model-work/01-roles-and-configuration.adoc#conservative-fallback[Model Work, Conservative Fallback]).
 |link:../model-work/02-task-protocol.adoc#re-offer[Model Work, Re-Offer]; link:../store-schemas/16-task-queue.adoc#queue-task-record[Store Schemas, Queue Task Record]
 
+|[[consultation-bound]]Consultation bound
+|`3` `consult` links per task over all its attempts.
+|fixed (compiled)
+|—
+|every task whose state declares consultations
+|No further `consult` link is offered; the task continues without consulting.
+|link:../model-work/05-consultation.adoc#consultation[Model Work, Consultation]
+
 |[[harness-start-spacing]]Start spacing of one harness
 |The next worker start of a harness waits until the previous worker of that harness made its first call or ended, at most `30`.
 |fixed
@@ -428,18 +444,18 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 |link:../store-schemas/17-re-planning.adoc#replan-record[Store Schemas, Re-Planning Record]
 
 |[[server-rule-retry]]Server-rule retry budget
-|`2` retries of each bounded server rule: the provider call of `finalize.open-pr`, the `.gitignore` oracle of `git.commit_and_push`, landing delivery, `sync_failed` of `finalize.merge-sync` (a fetch failure or a push failure other than the lease rejection), the `indeterminate` re-evaluation of `finalize.merge-barrier`, the `re_enter` outcomes of `finalize.merge-refused` (`behind`, `conflict`, `checks_pending`, `checks_failed`) and of `finalize.merge-queue-exit` (an ejected pull request), and `fetch_failed` of `replan.integrate-base`.
+|`2` retries of each bounded server rule: the provider call of `finalize.open-pr`, the `.gitignore` oracle of `git.commit_and_push`, landing delivery, `sync_failed` of `finalize.merge-sync` (a fetch failure or a push failure other than the lease rejection), `push_failed` of `git.push` and `git.push-with-lease` (a push failure other than a rejection), the `indeterminate` re-evaluation of `finalize.merge-barrier`, the `re_enter` outcomes of `finalize.merge-refused` (`behind`, `conflict`, `checks_pending`, `checks_failed`) and of `finalize.merge-queue-exit` (an ejected pull request), and `fetch_failed` of `replan.integrate-base`.
 |fixed
 |—
-|`finalize.open-pr`, `git.artifact-escalate`, `finalize.emit-landing-failed`, `finalize.merge-sync`, `finalize.merge-barrier`, `finalize.merge-refused`, `finalize.merge-queue-exit`, `replan.integrate-base`
-|`open-pr`: `retry_spent` enters `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); oracle: the sub-process returns `stepped_out` (cause `oracle_failed`); landing delivery: `landing_delivery: pending` (envelope kept as `landing-envelope.json` for the epic's reconciliation), the post-run band continues; merge sync: `retry_spent` enters `finalize.hand-back` (gap `budget: server_rule_retry`); barrier, refusal, and queue exit: the spent outcome (`retry_spent`, `budget_spent`) enters `finalize.hand-back`; base integration: `fetch_failed` enters `replan.hand-back`.
+|`finalize.open-pr`, `git.artifact-escalate`, `git.execute-push`, `git.push-with-lease`, `finalize.emit-landing-failed`, `finalize.merge-sync`, `finalize.merge-barrier`, `finalize.merge-refused`, `finalize.merge-queue-exit`, `replan.integrate-base`
+|`open-pr`: `retry_spent` enters `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); oracle: the sub-process returns `stepped_out` (cause `oracle_failed`); landing delivery: `landing_delivery: pending` (envelope kept as `landing-envelope.json` for the epic's reconciliation), the post-run band continues; merge sync: `retry_spent` enters `finalize.hand-back` (gap `budget: server_rule_retry`); push: `retry_spent` enters `git.stepped-out` (cause `push_failed`), and the sub-process returns `stepped_out`; barrier, refusal, and queue exit: the spent outcome (`retry_spent`, `budget_spent`) enters `finalize.hand-back`; base integration: `fetch_failed` enters `replan.hand-back`.
 |link:../state-catalogue.adoc[State Catalogue]
 
 |[[server-retry-backoff]]Server retry backoff
 |`60` seconds before the first retry, doubled for each further retry of the same firing (`60`, `120`, `240`); counted from the persisted instant of the failure, so a restart never shortens or extends it.
 |fixed
 |—
-|every server retry that waits in a `composite_job` for time: the provider call of `finalize.open-pr`, the re-observation of `finalize.archive-unobserved`, the re-adoption of `finalize.adopt-blocked`, and the rerun of the `remediation-merge` loop when no change of the observed remote head ends the wait first; and the server self-remedy retries of a condition on every scope (the re-check of `precondition_unmet`, the guard re-evaluation of `guard_indeterminate`), where the unbudgeted retries of the epic and workspace scopes stay at `240` once the doubling reaches it. No backoff applies to the `.gitignore` oracle re-detection of `git.commit_and_push` and the `fetch_failed` retry of `replan.integrate-base`: both run immediately inside their primitive within the <<server-rule-retry>>
+|every server retry that waits in a `composite_job` for time: the provider call of `finalize.open-pr`, the push retry of `git.push-retry-wait`, the re-observation of `finalize.archive-unobserved`, the re-adoption of `finalize.adopt-blocked`, and the rerun of the `remediation-merge` loop when no change of the observed remote head ends the wait first; and the server self-remedy retries of a condition on every scope (the re-check of `precondition_unmet`, the guard re-evaluation of `guard_indeterminate`), where the unbudgeted retries of the epic and workspace scopes stay at `240` once the doubling reaches it. No backoff applies to the `.gitignore` oracle re-detection of `git.commit_and_push` and the `fetch_failed` retry of `replan.integrate-base`: both run immediately inside their primitive within the <<server-rule-retry>>
 |The wait settles on the deadline (or earlier on the awaited external change) and the retry runs, within the budget of its rule (<<server-rule-retry>>, <<condition-budget>>, the unit's retry budget); the backoff never adds a retry.
 |link:../workflow-dsl/04-ast-node-model.adoc[Workflow DSL Specification] (Rule 11); link:../state-catalogue.adoc[State Catalogue]
 

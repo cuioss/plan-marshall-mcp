@@ -149,6 +149,33 @@ to `merge_outcome: local_only` and `merge_state: not_applicable`. Matched contro
 of the observed pull-request state applies.
 Source:: design review.
 
+[#PM-WATCH-STORE-51]
+=== PM-WATCH-STORE-51: A scope's identifier counters survive removals and purges
+
+Anchor:: link:../specification/store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas § Workflow State Store] (`counters`)
+Hazard:: An identifier allocated as "highest present + 1" is allocated again after its record is removed or purged by
+retention, so a `finding_id` or `question_id` quoted in a decision, an audit record, or a pull-request comment names
+two different records.
+Guard:: Per counted kind: allocate three identifiers, remove or purge the record of the last one, allocate again: the
+new identifier is the fourth, and `counters` in `mcp/status.json` reads `4`; the allocation and the counter update
+are one transaction (a crash between them leaves neither); a counter is never derived from the records present.
+Matched control: a scope without a record of a kind allocates `1`.
+Source:: design review.
+
+[#PM-WATCH-STORE-57]
+=== PM-WATCH-STORE-57: Open: retry counters that a runtime restart resets
+
+Anchor:: link:../specification/store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas § Workflow State Store]
+Hazard:: Undecided: compiled condition budgets kept outside a condition, the server-rule retries (`sync_failed`, merge-barrier
+`indeterminate`, `re_enter`, `push_failed`), and the conservative "retry once" have no persisted count; a runtime
+restart resets them, so a plan that crashes the runtime or meets a drain retries beyond its budget on every restart.
+Options: (1) persist them in the status store next to `counters`; (2) derive them from the audit and step records;
+(3) accept bounded extra retries per restart. Recommendation: 1, one persisted place for every budget.
+Guard:: The plan implementing this anchor decides the point (with the operator where it changes scope), records
+the result in the specification and the requirement it touches, and deletes this item.
+Source:: `state-catalogue/04-plan-finalize-terminal.adoc:34`, `state-catalogue/07-plan-finalize-merge-post-run.adoc:64-226`,
+`state-catalogue/08-remediation-units.adoc:83`.
+
 == Findings Ledger Record (`findings.jsonl`)
 
 [#PM-WATCH-STORE-4]
@@ -260,6 +287,48 @@ header by `epic_id` in the active and the archived orchestrator root (never by a
 suffix), and reads `detached` (the epic terminal), or `indeterminate` when the header is absent or unreadable, never
 `not_orchestrated`.
 Source:: plan-marshall orchestrator-refactor PLAN-03 D6.
+
+[#PM-WATCH-STORE-53]
+=== PM-WATCH-STORE-53: Open: epic row states that nothing writes
+
+Anchor:: link:../specification/store-schemas/04-epic-and-change-ledger.adoc#epic-queue-row[Store Schemas § Queue Row] (`status`)
+Hazard:: Undecided: the row statuses `parked`, `superseded`, `retired`, `resolved`, and `split` have no transition, submit or
+operator verb that writes them. A vocabulary member without a writer is dead code that every consumer must still
+handle, and a reader expecting it (an operator hold, a successor row) waits for a state that never comes.
+Options: (1) add writers (coordinate or re-cut submits, a park verb, `split` from `replan.apply`); (2) drop the
+members without a writer. Recommendation: 2, unless the epic slice needs one of them.
+Guard:: The plan implementing this anchor decides the point (with the operator where it changes scope), records
+the result in the specification and the requirement it touches, and deletes this item.
+Source:: `store-schemas/04-epic-and-change-ledger.adoc:126-129`, `model-work/08-epic-coordination.adoc:188`.
+
+[#PM-WATCH-STORE-54]
+=== PM-WATCH-STORE-54: Open: a handed-back plan without a pull request never settles its row
+
+Anchor:: link:../specification/store-schemas/04-epic-and-change-ledger.adoc#epic-queue-row[Store Schemas § Queue Row] (`handed_back`),
+link:../specification/model-work/08-epic-coordination.adoc#git-distributed-epic-ledger[Model Work § Git-Distributed Epic Ledger]
+Hazard:: Undecided: a `handed_back` row settles only from the observed pull request (merged -> `merged`, closed ->
+`abandoned`); a plan handed back with `merge_outcome` `local_only` or `no_pr` has no pull request, so its row stays
+live forever, its dependants never start, and `epic.next-work` never reaches `settled`. Options: (1) map
+`handed_back` without a pull request to a terminal row status; (2) keep it live with an explicit settle route.
+Recommendation: 1, the plan has ended and nothing is left to observe.
+Guard:: The plan implementing this anchor decides the point (with the operator where it changes scope), records
+the result in the specification and the requirement it touches, and deletes this item.
+Source:: `store-schemas/04-epic-and-change-ledger.adoc:129`, `model-work/08-epic-coordination.adoc:188`
+(row settlement).
+
+[#PM-WATCH-STORE-55]
+=== PM-WATCH-STORE-55: Open: how a held row is cleared
+
+Anchor:: link:../specification/store-schemas/04-epic-and-change-ledger.adoc#epic-queue-row[Store Schemas § Queue Row] (`held`)
+Hazard:: Undecided: `held` clears only on a change of the effective role set or when the operator acts on the epic, but no
+operator verb other than abort acts on it; the bootstrap refusals of a start (`setup_required`, `plan_id_taken`,
+`lifecycle_closed`, `config_invalid`) are not among the listed held reasons. A row held for a cause that has since
+gone stays skipped by `epic.next-work`, and a row refused by the bootstrap is retried or stalls without a recorded
+reason. Options: (1) an operator verb plus per-reason clearing events; (2) `epic.next-work` re-checks held launch
+refusals on every settle. Recommendation: 2, server-side and without a new verb.
+Guard:: The plan implementing this anchor decides the point (with the operator where it changes scope), records
+the result in the specification and the requirement it touches, and deletes this item.
+Source:: `store-schemas/04-epic-and-change-ledger.adoc:131-133`.
 
 == Change Ledger Record (`change-ledger.jsonl`)
 
@@ -566,8 +635,23 @@ Guard:: The audience classification test runs in a fixture repository without an
 `api-sheriff:maven-build` → `local`, a built-in step id → `upstream`, `integration-tests` → `local`. Negative
 control: a `local` lesson is never offered the release action (refused `audience_mismatch`), paired with a positive
 `upstream` case that renders the issue body and transmits nothing without the operator's confirmation.
-Fixture:: `api-sheriff:maven-build` (local) vs `plan-marshall:build-maven` (upstream); #1050 (`a7a657b00`).
+Fixture:: `api-sheriff:maven-build` (local) vs the compiled finalize-step id `default:ci-verify` (upstream); #1050
+(`a7a657b00`).
 Source:: plan-marshall lessons-routing PLAN-LR-02 D4, PLAN-LR-03 D4.
+
+[#PM-WATCH-STORE-56]
+=== PM-WATCH-STORE-56: Open: lesson operator actions that no verb performs
+
+Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas § Lesson Record]
+Hazard:: Undecided: `golden_label`/`labelled_at`, `audience_override`, `tool_version_override`, retiring a
+`present_unreadable` lesson, and releasing a stale claim each need an operator action, but the operator verb table
+has only `pm-operator lesson release`. Fields no verb writes are never set, and a lesson that only an operator can
+retire stays forever. Options: (1) a `pm-operator lesson` verb family; (2) remove the fields and paths without a
+verb (the golden label is already deferred). Recommendation: 2, unless the lesson slice needs one of them.
+Guard:: The plan implementing this anchor decides the point (with the operator where it changes scope), records
+the result in the specification and the requirement it touches, and deletes this item.
+Source:: `store-schemas/10-job-and-lesson-records.adoc:249-357`, `cli-and-security/02-credentials-and-operator.adoc:180`
+(verb table).
 
 == Machine Lease Stores (`merge-queue.json`, `review-bot-windows.json`, `build-slots.json`, `model-slots.json`)
 
@@ -584,6 +668,17 @@ stale holder is reclaimable; a test binds each producer's instant against the co
 Fixture:: merge-lock `--hold-start` declared `float` epoch (`math.isfinite` / `< 0`) while caller prose binds "the
 wall-clock instant of acquire" with no shape (lesson 2026-09-20-08-014); only the declaration side is corroborated.
 Source:: plan-marshall process-compliance PLAN-12 D3.
+
+[#PM-WATCH-STORE-52]
+=== PM-WATCH-STORE-52: Build slots admit queued builds in arrival order, and the budget starts at spawn
+
+Anchor:: link:../specification/store-schemas/13-leases-integrity-testing.adoc#machine-lease-stores[Store Schemas § Machine Lease Stores] (`build-slots.json`)
+Hazard:: Without a persisted order, a build of one plan overtakes the queued builds of others on every freed slot, so a
+plan waits without bound; a budget that starts while the job is queued times it out before it ran.
+Guard:: Concurrency test with one build slot and builds of three plans queued in a known order: they are admitted in
+FIFO order of the `waiting` list of `build-slots.json`, and each job's budget clock starts at its spawn; matched
+control: with a free slot a build is admitted at once and never enters `waiting`.
+Source:: design review.
 
 == Data Layer Integrity & Concurrency Invariants (`PM-IMPL-7`)
 
