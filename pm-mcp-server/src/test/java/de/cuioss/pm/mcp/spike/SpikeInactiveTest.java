@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.net.URI;
 
 
+import de.cuioss.pm.mcp.server.test.TestRuntime;
 import io.quarkiverse.mcp.server.test.McpAssured;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -32,7 +33,7 @@ class SpikeInactiveTest {
     @DisplayName("registers no stub tool when pm.spike.scenario is not set")
     void shouldStayInactive() {
         McpAssured.baseUri = testUri;
-        var client = McpAssured.newConnectedStreamableClient();
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
 
         client.when()
                 .toolsList(page -> {

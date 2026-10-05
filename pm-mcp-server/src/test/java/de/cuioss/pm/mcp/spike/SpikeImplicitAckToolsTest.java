@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.Map;
 
 
+import de.cuioss.pm.mcp.server.test.TestRuntime;
 import io.quarkiverse.mcp.server.ToolResponse;
 import io.quarkiverse.mcp.server.test.McpAssured;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -60,13 +61,16 @@ class SpikeImplicitAckToolsTest {
     @DisplayName("offers the question, returns the facts through pull_task and counts that call as the acknowledgement")
     void shouldAcknowledgeByTaskCall() throws Exception {
         McpAssured.baseUri = testUri;
-        var client = McpAssured.newConnectedStreamableClient();
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
 
         client.when()
                 .toolsList(page -> {
                     assertNotNull(page.findByName(SpikeTools.PULL_TASK));
+                    // pm_* names are the core tools of the server (with their own descriptions), none of the stub
                     assertTrue(page.tools().stream().noneMatch(tool -> SpikeTools.PULL_ACK.equals(tool.name())
-                            || tool.name().startsWith("pm_") || tool.name().startsWith("spike_")));
+                            || tool.name().startsWith("pm_") && !CoreToolsAccess.isCore(tool.name(),
+                            tool.description())
+                            || tool.name().startsWith("spike_")));
                 })
                 .thenAssertResults();
         client.when()

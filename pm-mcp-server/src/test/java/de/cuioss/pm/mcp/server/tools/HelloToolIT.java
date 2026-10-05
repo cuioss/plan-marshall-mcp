@@ -10,77 +10,74 @@
 package de.cuioss.pm.mcp.server.tools;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-import java.net.URI;
-import java.util.Map;
+import java.io.IOException;
+import java.nio.file.Path;
 
 
-import io.quarkiverse.mcp.server.test.McpAssured;
-import io.quarkiverse.mcp.server.test.McpAssured.McpStreamableTestClient;
-import io.quarkus.test.common.http.TestHTTPResource;
-import io.quarkus.test.junit.QuarkusIntegrationTest;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import de.cuioss.pm.mcp.server.test.DaemonProcess;
+import de.cuioss.pm.mcp.server.test.TestBases;
+import de.cuioss.pm.mcp.server.test.TestRuntime;
+import io.vertx.core.json.JsonObject;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Talks to the packaged application through the Streamable HTTP transport with the McpAssured
- * client of quarkus-mcp-server.
+ * Talks to the packaged daemon (JVM runner or native binary) over its Unix socket in the relay's sessionless
+ * form; McpAssured speaks TCP only, which the daemon does not open.
  */
-@QuarkusIntegrationTest
-@DisplayName("MCP hello tool of the packaged application")
+@DisplayName("MCP hello tool of the packaged daemon")
 class HelloToolIT {
 
-    @TestHTTPResource
-    URI testUri;
+    private static Path base;
+    private static DaemonProcess daemon;
 
-    private McpStreamableTestClient client;
-
-    @BeforeEach
-    void connect() {
-        client = McpAssured.newStreamableClient()
-                .setBaseUri(testUri)
-                .build()
-                .connect();
+    @BeforeAll
+    static void start() throws IOException {
+        base = TestBases.create("pmh");
+        daemon = DaemonProcess.startReady(base);
     }
 
-    @AfterEach
-    void disconnect() {
-        // null if connect() failed: don't mask that failure with an NPE
-        if (client != null) {
-            client.disconnect();
-        }
+    @AfterAll
+    static void stop() throws IOException {
+        daemon.close();
+        TestBases.delete(base);
     }
 
     @Test
-    @DisplayName("initialize reports the server name")
-    void shouldReportServerName() {
-        assertEquals("plan-marshall-mcp", client.initResult().serverName());
+    @DisplayName("server/discover reports the server name")
+    void shouldReportServerName() throws Exception {
+        var result = TestRuntime.result(TestRuntime.mcp(daemon.paths(), TestRuntime.bearer(daemon.token()),
+                TestRuntime.statelessMessage(1, "server/discover", new JsonObject())).body());
+
+        assertEquals("plan-marshall-mcp", result.getJsonObject("result").getJsonObject("_meta")
+                .getJsonObject("io.modelcontextprotocol/serverInfo").getString("name"));
     }
 
     @Test
     @DisplayName("tools/list exposes the hello tool")
-    void shouldListHelloTool() {
-        client.when()
-                .toolsList(page -> {
-                    var tool = page.findByName("hello");
-                    assertNotNull(tool, "hello tool must be listed");
-                    assertEquals("Returns a greeting for the given name.", tool.description());
-                })
-                .thenAssertResults();
+    void shouldListHelloTool() throws Exception {
+        var tools = TestRuntime.result(TestRuntime.mcp(daemon.paths(), TestRuntime.bearer(daemon.token()),
+                TestRuntime.statelessMessage(2, "tools/list", new JsonObject())).body())
+                .getJsonObject("result").getJsonArray("tools");
+
+        var hello = tools.stream().map(JsonObject.class::cast).filter(tool -> "hello".equals(tool.getString("name")))
+                .findFirst().orElse(null);
+        assertNotNull(hello);
+        assertEquals("Returns a greeting for the given name.", hello.getString("description"));
     }
 
     @Test
     @DisplayName("tools/call hello returns the greeting")
-    void shouldGreetViaMcp() {
-        client.when()
-                .toolsCall("hello", Map.of("name", "Integration"), response -> {
-                    assertFalse(response.isError());
-                    assertEquals("Hello, Integration!", response.content().getFirst().asText().text());
-                })
-                .thenAssertResults();
+    void shouldGreetViaMcp() throws Exception {
+        var result = TestRuntime.result(TestRuntime.mcp(daemon.paths(), TestRuntime.bearer(daemon.token()),
+                TestRuntime.statelessMessage(3, "tools/call", new JsonObject().put("name", "hello")
+                        .put("arguments", new JsonObject().put("name", "Integration")))).body());
+
+        assertEquals("Hello, Integration!", result.getJsonObject("result").getJsonArray("content")
+                .getJsonObject(0).getString("text"));
     }
 }

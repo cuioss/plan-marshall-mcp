@@ -17,6 +17,7 @@ import java.net.URI;
 import java.util.Map;
 
 
+import de.cuioss.pm.mcp.server.test.TestRuntime;
 import io.quarkiverse.mcp.server.test.McpAssured;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -39,7 +40,7 @@ class HelloToolTest {
     @Test
     @DisplayName("tools/list exposes the hello tool")
     void shouldListHelloTool() {
-        var client = McpAssured.newConnectedStreamableClient();
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
         client.when()
                 .toolsList(page -> {
                     var tool = page.findByName("hello");
@@ -52,7 +53,7 @@ class HelloToolTest {
     @Test
     @DisplayName("tools/call hello returns the greeting")
     void shouldGreet() {
-        var client = McpAssured.newConnectedStreamableClient();
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
         client.when()
                 .toolsCall("hello", Map.of("name", "World"), response -> {
                     assertFalse(response.isError());
