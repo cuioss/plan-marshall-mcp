@@ -13,62 +13,65 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.quarkus.test.junit.QuarkusIntegrationTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
-import io.quarkus.test.junit.TestProfile;
+import de.cuioss.pm.mcp.server.test.DaemonProcess;
+import de.cuioss.pm.mcp.server.test.TestBases;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Gates 4 and 5 from the packaged application (runner JAR or native {@code pm-mcpd}): the spike
- * hook {@code de.cuioss.pm.mcp.spike.keyring} runs a put, get, replace and delete through the
- * selected backend at start and writes its outcome; this test checks it and records
- * {@code target/verification-results/gate4-keychain-<mode>.json} (macOS) or
+ * Gates 4 and 5 from the packaged daemon (runner JAR or native {@code pm-mcpd}, started as a process with its own
+ * short {@code PM_MCP_BASE}): the spike hook {@code de.cuioss.pm.mcp.spike.keyring} runs a put, get, replace and
+ * delete through the backend selected for a non-default machine root at start and writes its outcome; this test
+ * checks it and records {@code target/verification-results/gate4-keychain-<mode>.json} (macOS) or
  * {@code gate5-secret-service-<mode>.json} (Linux).
  */
-@QuarkusIntegrationTest
-@TestProfile(KeyringIT.Profile.class)
-@DisplayName("OS keyring from the packaged application")
+@DisplayName("OS keyring from the packaged daemon")
 class KeyringIT {
 
     static final Path RESULT = Path.of("target", "keyring-it", "result.json").toAbsolutePath();
-    static final Path BASE = Path.of("target", "keyring-it", "base").toAbsolutePath();
+    static final Path KEYRING_BASE = Path.of("target", "keyring-it", "base").toAbsolutePath();
 
-    /** Activates the spike hook. */
-    public static class Profile implements QuarkusTestProfile {
+    private Path base;
 
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            try {
-                Files.createDirectories(BASE);
-                Files.deleteIfExists(RESULT);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
-            return Map.of("pm.spike.keyring.result", RESULT.toString(), "pm.spike.keyring.base", BASE.toString());
-        }
+    @BeforeEach
+    void prepare() throws IOException {
+        Files.createDirectories(KEYRING_BASE);
+        Files.deleteIfExists(RESULT);
+        base = TestBases.create("pmk");
+    }
+
+    @AfterEach
+    void cleanUp() {
+        TestBases.delete(base);
     }
 
     @Test
     @DisplayName("put, get, replace and delete through the selected backend")
     void roundTrip() throws Exception {
-        for (int i = 0; i < 100 && !Files.exists(RESULT); i++) {
-            Thread.sleep(100);
+        try (var daemon = DaemonProcess.start(base, List.of("-Dpm.spike.keyring.result=" + RESULT,
+                     "-Dpm.spike.keyring.base=" + KEYRING_BASE))) {
+            daemon.awaitReady(Duration.ofSeconds(30));
+            for (int i = 0; i < 100 && !Files.exists(RESULT); i++) {
+                Thread.sleep(100);
+            }
+            assertTrue(Files.exists(RESULT), daemon.output());
         }
         var outcome = new ObjectMapper().readTree(RESULT.toFile());
         var macos = System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac");
         var expectedStore = macos ? SecretStore.KEYCHAIN : SecretStore.SECRET_SERVICE;
         var values = new LinkedHashMap<String, Object>();
-        values.put("mode", VerificationResults.packagedMode());
+        values.put("mode", DaemonProcess.isNative() ? "native" : "jvm");
         values.put("store", outcome.path("store").asText());
         values.put("service", outcome.path("service").asText());
         values.put("fallback_reason", outcome.path("fallback_reason").asText(null));

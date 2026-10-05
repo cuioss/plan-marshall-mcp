@@ -47,6 +47,7 @@ public final class VerificationResult {
                 for (Map.Entry<String, Object> entry : values.entrySet()) {
                     json.writeFieldName(entry.getKey());
                     switch (entry.getValue()) {
+                        case null -> json.writeNull();
                         case Number number -> json.writeNumber(number.toString());
                         case Boolean bool -> json.writeBoolean(bool);
                         default -> json.writeString(String.valueOf(entry.getValue()));
