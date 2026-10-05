@@ -40,6 +40,12 @@ public class HostDetection {
      */
     public static final String PROVISIONAL_VERSION_PATTERN = "(\\d+(?:\\.\\d+)+)";
 
+    /** Model source of a host that declares its model identity itself. */
+    private static final String DECLARED_MODEL = "declared";
+
+    /** The argument that makes a host binary print its build. */
+    private static final String VERSION_FLAG = "--version";
+
     /**
      * One environment signal.
      *
@@ -122,15 +128,15 @@ public class HostDetection {
     /** The hosts in detection precedence: {@code antigravity -> opencode -> claude -> codex}. */
     public static final List<Host> HOSTS = List.of(
             new Host("antigravity", List.of(Signal.present("ANTIGRAVITY_AGENT")), List.of(),
-                    "ANTIGRAVITY_CONVERSATION_ID", List.of(), null, "declared", true),
+                    "ANTIGRAVITY_CONVERSATION_ID", List.of(), null, DECLARED_MODEL, true),
             new Host("opencode", List.of(Signal.present("OPENCODE"), Signal.present("OPENCODE_PID")), List.of(),
-                    null, List.of("opencode", "--version"), PROVISIONAL_VERSION_PATTERN, "declared", true),
+                    null, List.of("opencode", VERSION_FLAG), PROVISIONAL_VERSION_PATTERN, DECLARED_MODEL, true),
             new Host("claude", List.of(Signal.present("CLAUDE_CODE_SESSION_ID")),
                     List.of(new Signal("CLAUDECODE", "1")), "CLAUDE_CODE_SESSION_ID",
-                    List.of("claude", "--version"), PROVISIONAL_VERSION_PATTERN, "declared", true),
+                    List.of("claude", VERSION_FLAG), PROVISIONAL_VERSION_PATTERN, DECLARED_MODEL, true),
             new Host("codex", List.of(Signal.present("CODEX_SANDBOX"), Signal.present("CODEX_CI"),
                             Signal.present("CODEX_THREAD_ID")), List.of(), "CODEX_THREAD_ID",
-                    List.of("codex", "--version"), PROVISIONAL_VERSION_PATTERN, "declared", true));
+                    List.of("codex", VERSION_FLAG), PROVISIONAL_VERSION_PATTERN, DECLARED_MODEL, true));
 
     /**
      * Secondary agent signals not yet mapped to a host (provisional; the mapping is a host fact

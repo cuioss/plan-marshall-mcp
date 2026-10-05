@@ -56,6 +56,17 @@ class WebListenerTest {
         }
     }
 
+    /** An open LAN listener; closing it closes the listener again. */
+    private interface LanListener extends AutoCloseable {
+        @Override
+        void close() throws IOException;
+    }
+
+    private static LanListener lanEnabled(int port) throws IOException {
+        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status());
+        return () -> assertEquals(200, putWeb("{\"enabled\":false}").status());
+    }
+
     private static UdsHttp.Response putWeb(String body) throws IOException {
         var headers = TestRuntime.bearer(TestRuntime.token());
         headers.put("Content-Type", "application/json");
@@ -141,8 +152,7 @@ class WebListenerTest {
     @DisplayName("serves HTTPS with the self-signed certificate in LAN mode")
     void shouldServeLanOverTls() throws Exception {
         var port = freePort();
-        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status());
-        try {
+        try (var _ = lanEnabled(port)) {
             var pem = Files.readString(TestRuntime.paths().base().resolve("web/tls/cert.pem"));
             var certificate = CertificateFactory.getInstance("X.509")
                     .generateCertificate(new ByteArrayInputStream(pem.getBytes(StandardCharsets.US_ASCII)));
@@ -161,8 +171,6 @@ class WebListenerTest {
                 assertEquals(200, response.statusCode(), response.body());
                 assertTrue(new JsonObject(response.body()).getJsonObject("web").getBoolean("lan"));
             }
-        } finally {
-            assertEquals(200, putWeb("{\"enabled\":false}").status());
         }
     }
 

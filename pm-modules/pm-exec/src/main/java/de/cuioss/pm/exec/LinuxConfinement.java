@@ -44,7 +44,7 @@ record LinuxConfinement(Kernel kernel, Path root) {
 
         kernel.setNoNewPrivs();
         var confinement = Confinement.forAbi(kernel.landlockAbi(), true);
-        if (!confinement.confined()) {
+        if (!confinement.isConfined()) {
             return confinement;
         }
         int abi = confinement.landlockAbi();

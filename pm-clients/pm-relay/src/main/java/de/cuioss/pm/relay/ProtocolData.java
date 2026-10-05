@@ -10,6 +10,7 @@
 package de.cuioss.pm.relay;
 
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import de.cuioss.pm.api.json.JsonTree;
 
@@ -37,7 +38,7 @@ final class ProtocolData {
     record Snapshot(String protocolVersion, String clientInfo, String capabilities) {
     }
 
-    private volatile Snapshot recorded = new Snapshot(null, null, null);
+    private final AtomicReference<Snapshot> recorded = new AtomicReference<>(new Snapshot(null, null, null));
 
     /**
      * Records the protocol data of an {@code initialize} request.
@@ -62,13 +63,13 @@ final class ProtocolData {
             record(JsonTree.string(meta, META_PROTOCOL_VERSION), meta.get(META_CLIENT_INFO),
                     meta.get(META_CLIENT_CAPABILITIES));
         }
-        return recorded;
+        return recorded.get();
     }
 
-    private synchronized void record(String version, Object clientInfo, Object capabilities) {
-        var current = recorded;
-        recorded = new Snapshot(version != null ? version : current.protocolVersion(),
-                clientInfo != null ? JsonTree.writeAscii(clientInfo) : current.clientInfo(),
-                capabilities != null ? JsonTree.writeAscii(capabilities) : current.capabilities());
+    private void record(String version, Object clientInfo, Object capabilities) {
+        var info = clientInfo != null ? JsonTree.writeAscii(clientInfo) : null;
+        var caps = capabilities != null ? JsonTree.writeAscii(capabilities) : null;
+        recorded.updateAndGet(current -> new Snapshot(version != null ? version : current.protocolVersion(),
+                info != null ? info : current.clientInfo(), caps != null ? caps : current.capabilities()));
     }
 }

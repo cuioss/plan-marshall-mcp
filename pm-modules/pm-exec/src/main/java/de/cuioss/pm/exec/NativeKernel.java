@@ -96,8 +96,9 @@ final class NativeKernel implements Kernel {
         var handle = handle(Fn.PRCTL);
         try (var arena = Arena.ofConfined()) {
             var state = arena.allocate(CALL_STATE);
-            int result = invoke("prctl", () -> (int) handle.invokeExact(state, PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L));
-            check("prctl", result, state, "PR_SET_NO_NEW_PRIVS");
+            int result = invoke(Fn.PRCTL.symbol,
+                    () -> (int) handle.invokeExact(state, PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L));
+            check(Fn.PRCTL.symbol, result, state, "PR_SET_NO_NEW_PRIVS");
         }
     }
 
@@ -163,8 +164,8 @@ final class NativeKernel implements Kernel {
         var handle = handle(Fn.SETPGID);
         try (var arena = Arena.ofConfined()) {
             var state = arena.allocate(CALL_STATE);
-            int result = invoke("setpgid", () -> (int) handle.invokeExact(state, 0, 0));
-            check("setpgid", result, state, "setpgid(0, 0)");
+            int result = invoke(Fn.SETPGID.symbol, () -> (int) handle.invokeExact(state, 0, 0));
+            check(Fn.SETPGID.symbol, result, state, "setpgid(0, 0)");
         }
     }
 

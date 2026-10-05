@@ -55,6 +55,9 @@ import org.eclipse.jgit.transport.URIish;
 @Authenticated
 public class GitSpikeResource {
 
+    private static final String WORKTREE_SHA = "worktree-sha";
+    private static final String WORKTREE_LIST = "worktree-list";
+    private static final String ORIGIN = "origin";
     private static final Identity AUTHOR = new Identity("PM-MCP Spike", "spike@example.invalid");
 
     /**
@@ -84,9 +87,9 @@ public class GitSpikeResource {
         switch (request.op()) {
             case "scenario" -> scenario(git, repo, steps);
             case "open" -> step(steps, "open", git.open(repo));
-            case "worktree-sha" -> step(steps, "worktree-sha", git.worktreeSha(repo));
+            case WORKTREE_SHA -> step(steps, WORKTREE_SHA, git.worktreeSha(repo));
             case "log" -> step(steps, "log", git.log(repo, "HEAD", 10));
-            case "worktree-list" -> step(steps, "worktree-list", git.worktreeList(repo));
+            case WORKTREE_LIST -> step(steps, WORKTREE_LIST, git.worktreeList(repo));
             default -> {
                 return Response.status(Response.Status.BAD_REQUEST).entity(Map.of("error", "unknown op")).build();
             }
@@ -104,28 +107,28 @@ public class GitSpikeResource {
             Files.writeString(repo.resolve("README.md"), "spike\n", StandardCharsets.UTF_8);
             step(steps, "commit", git.commit(new CommitInput(repo, "spike: initial\n\nmulti-line body\n", AUTHOR,
                     AUTHOR)));
-            step(steps, "worktree-sha", git.worktreeSha(repo));
+            step(steps, WORKTREE_SHA, git.worktreeSha(repo));
             step(steps, "log", git.log(repo, "HEAD", 5));
             Path worktree = repo.resolve(".marshall/local/worktrees/spike-plan");
             step(steps, "worktree-add", git.worktreeAdd(new WorktreeAddInput(repo, worktree, Optional.of("pm/spike"),
                     true, "HEAD")));
             Files.writeString(worktree.resolve("feature.txt"), "feature\n", StandardCharsets.UTF_8);
             step(steps, "worktree-commit", git.commit(new CommitInput(worktree, "spike: feature", AUTHOR, AUTHOR)));
-            step(steps, "worktree-list", git.worktreeList(repo));
+            step(steps, WORKTREE_LIST, git.worktreeList(repo));
             step(steps, "worktree-remove", git.worktreeRemove(repo, worktree));
             Path remote = repo.resolveSibling(repo.getFileName() + ".remote.git");
             Git.init().setBare(true).setDirectory(remote.toFile()).setInitialBranch("main").setFs(new RefusingFS()).call()
                     .close();
             try (Git jgit = Git.open(repo.toFile(), new RefusingFS())) {
-                jgit.remoteAdd().setName("origin").setUri(new URIish(remote.toUri().toString())).call();
+                jgit.remoteAdd().setName(ORIGIN).setUri(new URIish(remote.toUri().toString())).call();
             }
-            step(steps, "push", git.push(new PushInput(repo, "origin", "HEAD", "refs/heads/main", Optional.empty(),
+            step(steps, "push", git.push(new PushInput(repo, ORIGIN, "HEAD", "refs/heads/main", Optional.empty(),
                     Optional.empty())));
-            step(steps, "fetch", git.fetch(new RemoteInput(repo, "origin", List.of(), Optional.empty())));
+            step(steps, "fetch", git.fetch(new RemoteInput(repo, ORIGIN, List.of(), Optional.empty())));
             Path hook = repo.resolve(".git/hooks/pre-commit");
             Files.createDirectories(hook.getParent());
             Files.writeString(hook, "#!/bin/sh\nexit 0\n", StandardCharsets.UTF_8);
-            Files.setPosixFilePermissions(hook, PosixFilePermissions.fromString("rwxr-xr-x"));
+            Files.setPosixFilePermissions(hook, PosixFilePermissions.fromString("rwx------"));
             Files.writeString(repo.resolve("hooked.txt"), "x\n", StandardCharsets.UTF_8);
             step(steps, "commit-with-hook", git.commit(new CommitInput(repo, "refused", AUTHOR, AUTHOR)));
         } catch (IOException | GitAPIException | URISyntaxException e) {

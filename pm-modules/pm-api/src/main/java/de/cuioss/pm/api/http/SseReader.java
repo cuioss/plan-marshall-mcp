@@ -42,47 +42,57 @@ public final class SseReader {
      * @throws IOException on a read failure
      */
     public SseEvent next() throws IOException {
-        var data = new StringBuilder();
-        var hasData = false;
-        String event = null;
+        var pending = new PendingEvent();
         String line;
         while ((line = readLine()) != null) {
             if (line.isEmpty()) {
-                if (hasData) {
-                    return new SseEvent(event == null ? DEFAULT_EVENT : event, data.toString(), lastEventId);
+                if (pending.hasData) {
+                    return new SseEvent(pending.event == null ? DEFAULT_EVENT : pending.event, pending.data.toString(),
+                            lastEventId);
                 }
-                event = null;
-                continue;
-            }
-            if (line.charAt(0) == ':') {
-                continue;
-            }
-            var colon = line.indexOf(':');
-            var field = colon < 0 ? line : line.substring(0, colon);
-            var value = colon < 0 ? "" : line.substring(colon + 1);
-            if (value.startsWith(" ")) {
-                value = value.substring(1);
-            }
-            switch (field) {
-                case "data" -> {
-                    if (hasData) {
-                        data.append('\n');
-                    }
-                    data.append(value);
-                    hasData = true;
-                }
-                case "event" -> event = value;
-                case "id" -> {
-                    if (value.indexOf('\0') < 0) {
-                        lastEventId = value;
-                    }
-                }
-                default -> {
-                    // "retry" and unknown fields are ignored
-                }
+                pending.event = null;
+            } else if (line.charAt(0) != ':') {
+                field(pending, line);
             }
         }
         return null;
+    }
+
+    /** Applies one field line ({@code name[:[ ]value]}) to the event being read. */
+    private void field(PendingEvent pending, String line) {
+        var colon = line.indexOf(':');
+        var name = colon < 0 ? line : line.substring(0, colon);
+        var value = colon < 0 ? "" : line.substring(colon + 1);
+        if (value.startsWith(" ")) {
+            value = value.substring(1);
+        }
+        switch (name) {
+            case "data" -> pending.appendData(value);
+            case "event" -> pending.event = value;
+            case "id" -> {
+                if (value.indexOf('\0') < 0) {
+                    lastEventId = value;
+                }
+            }
+            default -> {
+                // "retry" and unknown fields are ignored
+            }
+        }
+    }
+
+    /** The fields of the event being read. */
+    private static final class PendingEvent {
+        private final StringBuilder data = new StringBuilder();
+        private boolean hasData;
+        private String event;
+
+        void appendData(String value) {
+            if (hasData) {
+                data.append('\n');
+            }
+            data.append(value);
+            hasData = true;
+        }
     }
 
     /** Reads one line ending in CR, LF, or CRLF; returns {@code null} at the end of the stream. */

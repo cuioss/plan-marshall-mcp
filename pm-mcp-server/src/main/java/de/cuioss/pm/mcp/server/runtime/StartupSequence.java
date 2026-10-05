@@ -76,14 +76,19 @@ public record StartupSequence(MachinePaths paths, String user) {
             return new Outcome.LockHeld();
         }
         var lock = acquired.get();
-        Files.deleteIfExists(paths.socket());
-        Files.deleteIfExists(paths.runtimeRecord());
-        var violation = new BaseDirectoryCheck(paths, user).run();
-        if (violation.isPresent()) {
-            lock.close();
-            return new Outcome.Refused(violation.get());
+        try {
+            Files.deleteIfExists(paths.socket());
+            Files.deleteIfExists(paths.runtimeRecord());
+            var violation = new BaseDirectoryCheck(paths, user).run();
+            if (violation.isPresent()) {
+                lock.close();
+                return new Outcome.Refused(violation.get());
+            }
+            new RuntimeTokenFile(paths.runtimeToken()).writeFresh(random);
+            return new Outcome.Ready(lock);
+        } catch (IOException e) {
+            lock.closeAfterFailure(e);
+            throw e;
         }
-        new RuntimeTokenFile(paths.runtimeToken()).writeFresh(random);
-        return new Outcome.Ready(lock);
     }
 }

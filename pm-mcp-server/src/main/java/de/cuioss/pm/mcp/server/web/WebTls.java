@@ -63,6 +63,7 @@ public record WebTls(String certificatePem, String privateKeyPem, X509Certificat
     static final String CERT_FILE = "cert.pem";
     static final String KEY_FILE = "key.pem";
     static final Duration VALIDITY = Duration.ofDays(825);
+    private static final String LOCALHOST = "localhost";
     private static final int SAN_DNS = 0x82;
     private static final int SAN_IP = 0x87;
     private static final DateTimeFormatter UTC_TIME = DateTimeFormatter.ofPattern("yyMMddHHmmss'Z'")
@@ -105,7 +106,7 @@ public record WebTls(String certificatePem, String privateKeyPem, X509Certificat
         var generator = KeyPairGenerator.getInstance("EC");
         generator.initialize(new ECGenParameterSpec("secp256r1"), random);
         KeyPair pair = generator.generateKeyPair();
-        var name = Der.sequence(Der.tlv(Der.SET, Der.sequence(Der.oid("2.5.4.3"), Der.utf8("pm-mcpd"))));
+        var name = Der.sequence(Der.tlv(Der.TAG_SET, Der.sequence(Der.oid("2.5.4.3"), Der.utf8("pm-mcpd"))));
         var algorithm = Der.sequence(Der.oid("1.2.840.10045.4.3.2"));
         var tbs = Der.sequence(
                 Der.tlv(0xA0, Der.integer(BigInteger.TWO)),
@@ -154,16 +155,16 @@ public record WebTls(String certificatePem, String privateKeyPem, X509Certificat
 
     private static byte[] extension(String oid, boolean critical, byte[] value) {
         return critical
-                ? Der.sequence(Der.oid(oid), Der.tlv(Der.BOOLEAN, new byte[]{(byte) 0xFF}),
-                Der.tlv(Der.OCTET_STRING, value))
-                : Der.sequence(Der.oid(oid), Der.tlv(Der.OCTET_STRING, value));
+                ? Der.sequence(Der.oid(oid), Der.tlv(Der.TAG_BOOLEAN, new byte[]{(byte) 0xFF}),
+                Der.tlv(Der.TAG_OCTET_STRING, value))
+                : Der.sequence(Der.oid(oid), Der.tlv(Der.TAG_OCTET_STRING, value));
     }
 
     private static byte[] subjectAlternativeNames(String hostName, List<InetAddress> addresses) {
         var dns = new LinkedHashSet<String>();
         dns.add(hostName);
         dns.add(hostName.endsWith(".local") ? hostName : hostName + ".local");
-        dns.add("localhost");
+        dns.add(LOCALHOST);
         var ips = new LinkedHashSet<InetAddress>(addresses);
         ips.add(InetAddress.getLoopbackAddress());
         ips.add(loopbackV6());
@@ -175,7 +176,7 @@ public record WebTls(String certificatePem, String privateKeyPem, X509Certificat
 
     private static InetAddress loopbackV6() {
         try {
-            return InetAddress.getByAddress("localhost", new byte[]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+            return InetAddress.getByAddress(LOCALHOST, new byte[]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
         } catch (UnknownHostException e) {
             throw new IllegalStateException("a 16-byte address is always valid", e);
         }
@@ -185,7 +186,7 @@ public record WebTls(String certificatePem, String privateKeyPem, X509Certificat
         try {
             return InetAddress.getLocalHost().getHostName().toLowerCase(Locale.ROOT);
         } catch (UnknownHostException _) {
-            return "localhost";
+            return LOCALHOST;
         }
     }
 

@@ -80,7 +80,7 @@ class WebTlsTest {
     void shouldEncodeDer() {
         assertEquals("0603551d11", HexFormat.of().formatHex(Der.oid("2.5.29.17")));
         assertEquals("06072a8648ce3d0201", HexFormat.of().formatHex(Der.oid("1.2.840.10045.2.1")));
-        var longValue = Der.tlv(Der.OCTET_STRING, new byte[300]);
+        var longValue = Der.tlv(Der.TAG_OCTET_STRING, new byte[300]);
         assertEquals("0482012c", HexFormat.of().formatHex(longValue, 0, 4));
         assertEquals("020100", HexFormat.of().formatHex(Der.integer(BigInteger.ZERO)));
     }

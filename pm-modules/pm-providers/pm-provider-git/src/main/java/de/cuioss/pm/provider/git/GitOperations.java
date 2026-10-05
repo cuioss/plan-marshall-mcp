@@ -11,6 +11,7 @@ package de.cuioss.pm.provider.git;
 
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -34,7 +35,7 @@ public interface GitOperations {
 
     /**
      * {@code git.worktree-sha}: the variant-neutral working-tree digest (job runtime specification,
-     * Working-Tree Hash, version {@value WorktreeSha#VERSION}).
+     * Working-Tree Hash, version {@value WorktreeSha#CURRENT_VERSION}).
      *
      * @param root the worktree root
      * @return {@code OK} with the digest, or {@code UNAVAILABLE} naming the failing step
@@ -130,7 +131,7 @@ public interface GitOperations {
     record WorktreeSha(String digest, int version) {
 
         /** The current hash version: inputs of rule 1 with the framing of rule 2. */
-        public static final int VERSION = 1;
+        public static final int CURRENT_VERSION = 1;
     }
 
     /**
@@ -216,6 +217,17 @@ public interface GitOperations {
      * @param secret   the secret
      */
     record GitCredential(String username, char[] secret) {
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof GitCredential that && Objects.equals(username, that.username)
+                    && Arrays.equals(secret, that.secret);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * Objects.hashCode(username) + Arrays.hashCode(secret);
+        }
 
         @Override
         public String toString() {

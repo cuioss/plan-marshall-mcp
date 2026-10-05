@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 
 import de.cuioss.pm.api.MachinePaths;
@@ -40,7 +41,7 @@ public class RuntimeContext {
     private final MachinePaths paths;
     private final String version;
     private final Instant startedAt = Instant.now();
-    private volatile byte[] token;
+    private final AtomicReference<byte[]> token = new AtomicReference<>();
 
     /**
      * @param base    the locked machine root, if passed by the entry point
@@ -78,14 +79,14 @@ public class RuntimeContext {
      * @throws UncheckedIOException if the token file cannot be read
      */
     public byte[] tokenBytes() {
-        var current = token;
+        var current = token.get();
         if (current == null) {
             try {
                 current = new RuntimeTokenFile(paths.runtimeToken()).read().getBytes(StandardCharsets.UTF_8);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
-            token = current;
+            token.set(current);
         }
         return current;
     }

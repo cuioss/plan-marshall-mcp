@@ -11,13 +11,15 @@ package de.cuioss.pm.mcp.server.credentials;
 
 import de.cuioss.pm.mcp.server.PmMcpLogMessages;
 import de.cuioss.tools.logging.CuiLogger;
-import io.quarkus.runtime.Startup;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.inject.Produces;
 import jakarta.inject.Singleton;
 
 /**
- * Produces the one active {@link SecretStore}, selected when the runtime starts.
+ * Produces the one active {@link SecretStore}, selected when the runtime starts: the startup observer
+ * injects the store, which creates the singleton (and runs the selection) before the runtime serves requests.
  */
 @ApplicationScoped
 class SecretStoreProducer {
@@ -26,11 +28,14 @@ class SecretStoreProducer {
 
     @Produces
     @Singleton
-    @Startup
     SecretStore secretStore() {
         var selection = SecretStoreSelector.select();
         selection.fallbackReason().ifPresent(reason -> LOGGER.warn(PmMcpLogMessages.WARN.KEYRING_UNAVAILABLE, reason));
         LOGGER.info(PmMcpLogMessages.INFO.CREDENTIAL_STORE_SELECTED, selection.store().name(), selection.service());
         return selection.store();
+    }
+
+    void selectAtStart(@Observes StartupEvent event, SecretStore store) {
+        LOGGER.debug("Credential store %s active", store.name());
     }
 }

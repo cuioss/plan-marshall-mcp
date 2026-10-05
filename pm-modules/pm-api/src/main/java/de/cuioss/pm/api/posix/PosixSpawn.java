@@ -19,6 +19,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandle;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Starts a process through {@code posix_spawn(3)} by FFM, JDK only, following a {@link SpawnPlan};
@@ -28,6 +29,10 @@ import java.util.Objects;
 public final class PosixSpawn {
 
     private static final long POINTER_ALIGNMENT = 16;
+
+    private static final String SIGEMPTYSET = "sigemptyset";
+    private static final String ADD_OPEN = "posix_spawn_file_actions_addopen";
+    private static final String ADD_CLOSE_FROM = "posix_spawn_file_actions_addclosefrom_np";
 
     private final PosixPlatform platform;
 
@@ -77,10 +82,10 @@ public final class PosixSpawn {
         var flags = plan.flags();
         Libc.check("posix_spawnattr_setflags", () -> (int) h.setFlags.invokeExact(attr, flags));
         var emptyMask = arena.allocate(platform.sigsetSize(), POINTER_ALIGNMENT);
-        Libc.check("sigemptyset", () -> (int) h.sigEmptySet.invokeExact(emptyMask));
+        Libc.check(SIGEMPTYSET, () -> (int) h.sigEmptySet.invokeExact(emptyMask));
         Libc.check("posix_spawnattr_setsigmask", () -> (int) h.setSigMask.invokeExact(attr, emptyMask));
         var defaults = arena.allocate(platform.sigsetSize(), POINTER_ALIGNMENT);
-        Libc.check("sigemptyset", () -> (int) h.sigEmptySet.invokeExact(defaults));
+        Libc.check(SIGEMPTYSET, () -> (int) h.sigEmptySet.invokeExact(defaults));
         for (int signal : plan.defaultSignals()) {
             Libc.check("sigaddset", () -> (int) h.sigAddSet.invokeExact(defaults, signal));
         }
@@ -95,10 +100,10 @@ public final class PosixSpawn {
                     var path = arena.allocateFrom(open.path());
                     if (platform.modeLayout() == JAVA_SHORT) {
                         var mode = (short) open.mode();
-                        Libc.check("posix_spawn_file_actions_addopen", () -> (int) h.addOpen
+                        Libc.check(ADD_OPEN, () -> (int) h.addOpen
                                 .invokeExact(actions, open.fd(), path, open.flags(), mode));
                     } else {
-                        Libc.check("posix_spawn_file_actions_addopen", () -> (int) h.addOpen
+                        Libc.check(ADD_OPEN, () -> (int) h.addOpen
                                 .invokeExact(actions, open.fd(), path, open.flags(), open.mode()));
                     }
                 }
@@ -107,9 +112,9 @@ public final class PosixSpawn {
                 case SpawnPlan.CloseFrom closeFrom -> {
                     if (h.addCloseFrom == null) {
                         throw new NativeCallException(
-                                "posix_spawn_file_actions_addclosefrom_np is unavailable (glibc 2.34 or later required)");
+                                ADD_CLOSE_FROM + " is unavailable (glibc 2.34 or later required)");
                     }
-                    Libc.check("posix_spawn_file_actions_addclosefrom_np",
+                    Libc.check(ADD_CLOSE_FROM,
                             () -> (int) h.addCloseFrom.invokeExact(actions, closeFrom.lowFd()));
                 }
             }
@@ -164,7 +169,7 @@ public final class PosixSpawn {
 
     /** The downcall handles, created once per platform on first use. */
     private static final class Handles {
-        private static volatile Handles instance;
+        private static final AtomicReference<Handles> INSTANCE = new AtomicReference<>();
 
         final MethodHandle attrInit;
         final MethodHandle attrDestroy;
@@ -188,15 +193,15 @@ public final class PosixSpawn {
             setFlags = Libc.handle("posix_spawnattr_setflags", Libc.INT_PTR_SHORT);
             setSigMask = Libc.handle("posix_spawnattr_setsigmask", Libc.INT_PTR_PTR);
             setSigDefault = Libc.handle("posix_spawnattr_setsigdefault", Libc.INT_PTR_PTR);
-            sigEmptySet = Libc.handle("sigemptyset", Libc.INT_PTR);
+            sigEmptySet = Libc.handle(SIGEMPTYSET, Libc.INT_PTR);
             sigAddSet = Libc.handle("sigaddset", Libc.INT_PTR_INT);
             actionsInit = Libc.handle("posix_spawn_file_actions_init", Libc.INT_PTR);
             actionsDestroy = Libc.handle("posix_spawn_file_actions_destroy", Libc.INT_PTR);
-            addOpen = Libc.handle("posix_spawn_file_actions_addopen",
+            addOpen = Libc.handle(ADD_OPEN,
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, platform.modeLayout()));
             addDup2 = Libc.handle("posix_spawn_file_actions_adddup2", Libc.INT_PTR_INT_INT);
-            addCloseFrom = platform.usesCloseFromAction() && Libc.exists("posix_spawn_file_actions_addclosefrom_np")
-                    ? Libc.handle("posix_spawn_file_actions_addclosefrom_np", Libc.INT_PTR_INT)
+            addCloseFrom = platform.usesCloseFromAction() && Libc.exists(ADD_CLOSE_FROM)
+                    ? Libc.handle(ADD_CLOSE_FROM, Libc.INT_PTR_INT)
                     : null;
             spawn = Libc.handle("posix_spawn", Libc.SPAWN);
             waitPid = Libc.handle("waitpid", Libc.INT_INT_PTR_INT);
@@ -204,13 +209,13 @@ public final class PosixSpawn {
         }
 
         static Handles get(PosixPlatform platform) throws NativeCallException {
-            var local = instance;
+            var local = INSTANCE.get();
             if (local == null) {
                 synchronized (Handles.class) {
-                    local = instance;
+                    local = INSTANCE.get();
                     if (local == null) {
                         local = new Handles(platform);
-                        instance = local;
+                        INSTANCE.set(local);
                     }
                 }
             }

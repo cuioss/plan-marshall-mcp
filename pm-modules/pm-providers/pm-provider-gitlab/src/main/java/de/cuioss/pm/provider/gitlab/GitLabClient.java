@@ -34,6 +34,7 @@ import de.cuioss.pm.provider.ci.PagedResult;
 public final class GitLabClient {
 
     /** Page cap of paginated reads (100 entries per page). */
+    private static final String MERGE_REQUESTS = "/merge_requests/";
     static final int MAX_PAGES = 50;
 
     private final CiHttpClient http;
@@ -98,7 +99,7 @@ public final class GitLabClient {
      * @return the merge commit sha; {@code REJECTED} when not mergeable or the head moved
      */
     public CiResult<String> merge(long iid, String sha) {
-        CiResponse response = http.send("PUT", project + "/merge_requests/" + iid + "/merge",
+        CiResponse response = http.send("PUT", project + MERGE_REQUESTS + iid + "/merge",
                 Optional.of(Json.write(Map.of("sha", sha))), Optional.empty());
         if (!response.isOk()) {
             return CiResult.failed(response);
@@ -127,7 +128,7 @@ public final class GitLabClient {
      * @return the discussions; {@code complete} is {@code false} at the page cap
      */
     public CiResult<List<Discussion>> discussions(long iid) {
-        PagedResult pages = http.getAll(project + "/merge_requests/" + iid + "/discussions?per_page=100", MAX_PAGES);
+        PagedResult pages = http.getAll(project + MERGE_REQUESTS + iid + "/discussions?per_page=100", MAX_PAGES);
         if (pages.pages().isEmpty()) {
             return CiResult.failed(pages.last());
         }
@@ -203,7 +204,7 @@ public final class GitLabClient {
     }
 
     private String discussionPath(long iid, String discussionId) {
-        return project + "/merge_requests/" + iid + "/discussions/" + URLEncoder.encode(discussionId, StandardCharsets.UTF_8);
+        return project + MERGE_REQUESTS + iid + "/discussions/" + URLEncoder.encode(discussionId, StandardCharsets.UTF_8);
     }
 
     private static Discussion discussion(Object json) {

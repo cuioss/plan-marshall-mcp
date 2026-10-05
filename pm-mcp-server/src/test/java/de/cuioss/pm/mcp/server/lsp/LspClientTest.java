@@ -110,11 +110,10 @@ class LspClientTest {
                 () -> LspClient.start(List.of(workspace.resolve("no-such-server").toString()), workspace, TIMEOUT));
         var dies = assertThrows(LspException.class,
                 () -> LspClient.start(FixtureLanguageServer.command("die"), workspace, Duration.ofSeconds(5)));
-        var unreadable = assertThrows(LspException.class, () -> {
-            try (LspClient client = LspClient.start(FixtureLanguageServer.command("location"), workspace, TIMEOUT)) {
-                client.open(workspace.resolve("missing.java"), "java");
-            }
-        });
+        LspException unreadable;
+        try (LspClient client = LspClient.start(FixtureLanguageServer.command("location"), workspace, TIMEOUT)) {
+            unreadable = assertThrows(LspException.class, () -> client.open(workspace.resolve("missing.java"), "java"));
+        }
 
         assertEquals(LspException.Kind.START_FAILED, missing.getKind());
         assertEquals(LspException.Kind.START_FAILED, dies.getKind());

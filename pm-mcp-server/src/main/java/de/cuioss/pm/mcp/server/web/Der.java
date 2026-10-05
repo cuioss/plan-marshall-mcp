@@ -26,15 +26,15 @@ import lombok.experimental.UtilityClass;
 @UtilityClass
 final class Der {
 
-    static final int SEQUENCE = 0x30;
-    static final int SET = 0x31;
-    static final int INTEGER = 0x02;
-    static final int BIT_STRING = 0x03;
-    static final int OCTET_STRING = 0x04;
-    static final int OID = 0x06;
-    static final int UTF8_STRING = 0x0C;
-    static final int UTC_TIME = 0x17;
-    static final int BOOLEAN = 0x01;
+    static final int TAG_SEQUENCE = 0x30;
+    static final int TAG_SET = 0x31;
+    static final int TAG_INTEGER = 0x02;
+    static final int TAG_BIT_STRING = 0x03;
+    static final int TAG_OCTET_STRING = 0x04;
+    static final int TAG_OID = 0x06;
+    static final int TAG_UTF8_STRING = 0x0C;
+    static final int TAG_UTC_TIME = 0x17;
+    static final int TAG_BOOLEAN = 0x01;
 
     /**
      * @param tag      the tag byte
@@ -59,25 +59,25 @@ final class Der {
     }
 
     static byte[] sequence(byte[]... contents) {
-        return tlv(SEQUENCE, contents);
+        return tlv(TAG_SEQUENCE, contents);
     }
 
     static byte[] integer(BigInteger value) {
-        return tlv(INTEGER, value.toByteArray());
+        return tlv(TAG_INTEGER, value.toByteArray());
     }
 
     static byte[] utf8(String value) {
-        return tlv(UTF8_STRING, value.getBytes(StandardCharsets.UTF_8));
+        return tlv(TAG_UTF8_STRING, value.getBytes(StandardCharsets.UTF_8));
     }
 
     /** A UTCTime ({@code yyMMddHHmmssZ}), the form RFC 5280 requires for dates before 2050. */
     static byte[] utcTime(String yyMMddHHmmssZ) {
-        return tlv(UTC_TIME, yyMMddHHmmssZ.getBytes(StandardCharsets.US_ASCII));
+        return tlv(TAG_UTC_TIME, yyMMddHHmmssZ.getBytes(StandardCharsets.US_ASCII));
     }
 
     /** A BIT STRING without unused bits. */
     static byte[] bitString(byte[] bits) {
-        return tlv(BIT_STRING, new byte[]{0}, bits);
+        return tlv(TAG_BIT_STRING, new byte[]{0}, bits);
     }
 
     /**
@@ -102,7 +102,7 @@ final class Der {
                 out.write(reversed[j]);
             }
         }
-        return tlv(OID, out.toByteArray());
+        return tlv(TAG_OID, out.toByteArray());
     }
 
     static byte[] concat(byte[]... parts) {

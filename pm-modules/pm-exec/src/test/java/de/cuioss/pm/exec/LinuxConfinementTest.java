@@ -92,7 +92,7 @@ class LinuxConfinementTest {
         var confinement = new LinuxConfinement(kernel, root).apply(launch(Optional.of(base), List.of(project)));
 
         assertEquals(state, confinement.state());
-        assertFalse(confinement.confined());
+        assertFalse(confinement.isConfined());
         assertEquals("null", confinement.abiJson());
         assertEquals(List.of("prctl", "abi"), kernel.calls);
     }

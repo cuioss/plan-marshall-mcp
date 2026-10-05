@@ -34,6 +34,7 @@ import de.cuioss.pm.provider.ci.Json;
  */
 public final class GlabCommands {
 
+    private static final String MERGE_REQUESTS = "/merge_requests/";
     private static final Pattern HOST = Pattern.compile("[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?");
     private static final Pattern DISCUSSION_ID = Pattern.compile("[A-Za-z0-9]{1,64}");
     private static final Pattern BRANCH = Pattern.compile("[A-Za-z0-9._/][A-Za-z0-9._/-]{0,254}");
@@ -75,7 +76,7 @@ public final class GlabCommands {
      * @return the merge invocation
      */
     public Invocation merge(long iid, String sha) {
-        return withBody("PUT", project + "/merge_requests/" + positive(iid) + "/merge", Map.of("sha", sha));
+        return withBody("PUT", project + MERGE_REQUESTS + positive(iid) + "/merge", Map.of("sha", sha));
     }
 
     /**
@@ -92,7 +93,7 @@ public final class GlabCommands {
      * @return the paginated discussion list invocation
      */
     public Invocation discussions(long iid) {
-        return read(List.of("--paginate", project + "/merge_requests/" + positive(iid) + "/discussions?per_page=100"));
+        return read(List.of("--paginate", project + MERGE_REQUESTS + positive(iid) + "/discussions?per_page=100"));
     }
 
     /**
@@ -162,7 +163,7 @@ public final class GlabCommands {
     }
 
     private String discussionPath(long iid, String discussionId) {
-        return project + "/merge_requests/" + positive(iid) + "/discussions/"
+        return project + MERGE_REQUESTS + positive(iid) + "/discussions/"
                 + requireMatch(DISCUSSION_ID, discussionId, "discussionId");
     }
 

@@ -119,7 +119,7 @@ public final class JGitOperations implements GitOperations {
             paths.addAll(status.getConflicting());
             step = "read";
             String digest = WorktreeShaDigest.digest(head.name(), repository.getWorkTree().toPath(), paths);
-            return GitResult.ok(new WorktreeSha(digest, WorktreeSha.VERSION));
+            return GitResult.ok(new WorktreeSha(digest, WorktreeSha.CURRENT_VERSION));
         } catch (GitAPIException | IOException | JGitInternalException | IllegalArgumentException e) {
             return GitResult.of(GitOutcome.UNAVAILABLE, step + ": " + e.getClass().getName());
         }
@@ -154,35 +154,13 @@ public final class JGitOperations implements GitOperations {
     private GitResult<Worktree> addWorktree(Repository main, WorktreeAddInput input, Path target) throws IOException {
         Path commonDir = main.getCommonDirectory().toPath().toRealPath();
         Optional<String> branchRef = input.branch().map(b -> Constants.R_HEADS + b);
-        ObjectId start;
-        if (branchRef.isPresent() && !input.createBranch()) {
-            Ref existing = main.exactRef(branchRef.get());
-            if (existing == null) {
-                return GitResult.of(GitOutcome.UNKNOWN_REVISION, branchRef.get());
-            }
-            if (checkedOut(main, commonDir, input.branch().get())) {
-                return GitResult.of(GitOutcome.BRANCH_CHECKED_OUT, input.branch().get());
-            }
-            start = existing.getObjectId();
-        } else {
-            start = main.resolve(input.startPoint() + "^{commit}");
-            if (start == null) {
-                return GitResult.of(GitOutcome.UNKNOWN_REVISION, input.startPoint());
-            }
-            if (branchRef.isPresent()) {
-                if (main.exactRef(branchRef.get()) != null) {
-                    return GitResult.of(GitOutcome.ALREADY_EXISTS, branchRef.get());
-                }
-                var update = main.updateRef(branchRef.get());
-                update.setNewObjectId(start);
-                update.setExpectedOldObjectId(ObjectId.zeroId());
-                update.setRefLogMessage("branch: Created from " + input.startPoint(), false);
-                Result result = update.update();
-                if (result != Result.NEW) {
-                    return GitResult.of(GitOutcome.FAILED, "branch creation: " + result);
-                }
-            }
+        var resolved = branchRef.isPresent() && !input.createBranch()
+                ? existingBranchStart(main, commonDir, input.branch().get(), branchRef.get())
+                : newStart(main, input, branchRef);
+        if (resolved.refusal() != null) {
+            return resolved.refusal();
         }
+        ObjectId start = resolved.id();
         Files.createDirectories(target);
         Path admin = LinkedWorktrees.create(commonDir, target, branchRef.orElse(start.name()));
         try (Repository linked = openRepository(target); RevWalk walk = new RevWalk(linked)) {
@@ -197,6 +175,52 @@ public final class JGitOperations implements GitOperations {
             LinkedWorktrees.delete(commonDir, admin.getFileName().toString(), target);
             throw e;
         }
+    }
+
+    /** The commit a new worktree starts at, or the refusal that ends the operation. */
+    private record StartPoint(ObjectId id, GitResult<Worktree> refusal) {
+
+        static StartPoint of(ObjectId id) {
+            return new StartPoint(id, null);
+        }
+
+        static StartPoint refused(GitOutcome outcome, String detail) {
+            return new StartPoint(null, GitResult.of(outcome, detail));
+        }
+    }
+
+    private static StartPoint existingBranchStart(Repository main, Path commonDir, String branch, String branchRef)
+            throws IOException {
+        Ref existing = main.exactRef(branchRef);
+        if (existing == null) {
+            return StartPoint.refused(GitOutcome.UNKNOWN_REVISION, branchRef);
+        }
+        if (checkedOut(main, commonDir, branch)) {
+            return StartPoint.refused(GitOutcome.BRANCH_CHECKED_OUT, branch);
+        }
+        return StartPoint.of(existing.getObjectId());
+    }
+
+    private static StartPoint newStart(Repository main, WorktreeAddInput input, Optional<String> branchRef)
+            throws IOException {
+        ObjectId start = main.resolve(input.startPoint() + "^{commit}");
+        if (start == null) {
+            return StartPoint.refused(GitOutcome.UNKNOWN_REVISION, input.startPoint());
+        }
+        if (branchRef.isPresent()) {
+            if (main.exactRef(branchRef.get()) != null) {
+                return StartPoint.refused(GitOutcome.ALREADY_EXISTS, branchRef.get());
+            }
+            var update = main.updateRef(branchRef.get());
+            update.setNewObjectId(start);
+            update.setExpectedOldObjectId(ObjectId.zeroId());
+            update.setRefLogMessage("branch: Created from " + input.startPoint(), false);
+            Result result = update.update();
+            if (result != Result.NEW) {
+                return StartPoint.refused(GitOutcome.FAILED, "branch creation: " + result);
+            }
+        }
+        return StartPoint.of(start);
     }
 
     private static boolean checkedOut(Repository main, Path commonDir, String branch) throws IOException {

@@ -37,6 +37,7 @@ public final class DbusConnection implements AutoCloseable {
     /** Bus name, path and interface of the message bus itself. */
     public static final String BUS = "org.freedesktop.DBus";
     private static final String BUS_PATH = "/org/freedesktop/DBus";
+    private static final String CANNOT_CONNECT = "cannot connect to the bus at ";
 
     private final SocketChannel channel;
     private final Selector selector;
@@ -49,8 +50,13 @@ public final class DbusConnection implements AutoCloseable {
         this.channel = channel;
         this.timeout = timeout;
         this.selector = Selector.open();
-        channel.configureBlocking(false);
-        this.key = channel.register(selector, 0);
+        try {
+            channel.configureBlocking(false);
+            this.key = channel.register(selector, 0);
+        } catch (IOException e) {
+            closeQuietly(selector);
+            throw e;
+        }
     }
 
     /**
@@ -63,22 +69,29 @@ public final class DbusConnection implements AutoCloseable {
      * @throws DbusException if the bus cannot be reached, refuses the authentication or does not answer
      */
     public static DbusConnection open(Path socket, long uid, Duration timeout) {
+        var connection = connect(socket, timeout);
+        try {
+            connection.authenticate(uid);
+            connection.uniqueName = (String) connection.call(BUS, BUS_PATH, BUS, "Hello", "", List.of()).getFirst();
+            return connection;
+        } catch (IOException e) {
+            connection.close();
+            throw new DbusException(CANNOT_CONNECT + socket, e);
+        } catch (DbusException e) {
+            connection.close();
+            throw e;
+        }
+    }
+
+    private static DbusConnection connect(Path socket, Duration timeout) {
         SocketChannel channel = null;
         try {
             channel = SocketChannel.open(StandardProtocolFamily.UNIX);
             channel.connect(UnixDomainSocketAddress.of(socket));
-            var connection = new DbusConnection(channel, timeout);
-            try {
-                connection.authenticate(uid);
-                connection.uniqueName = (String) connection.call(BUS, BUS_PATH, BUS, "Hello", "", List.of()).getFirst();
-                return connection;
-            } catch (DbusException e) {
-                connection.close();
-                throw e;
-            }
+            return new DbusConnection(channel, timeout);
         } catch (IOException e) {
             closeQuietly(channel);
-            throw new DbusException("cannot connect to the bus at " + socket, e);
+            throw new DbusException(CANNOT_CONNECT + socket, e);
         }
     }
 

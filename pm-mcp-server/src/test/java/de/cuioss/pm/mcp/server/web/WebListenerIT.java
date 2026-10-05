@@ -76,6 +76,17 @@ class WebListenerIT {
         }
     }
 
+    /** An open LAN listener; closing it closes the listener again. */
+    private interface LanListener extends AutoCloseable {
+        @Override
+        void close() throws IOException;
+    }
+
+    private static LanListener lanEnabled(int port) throws IOException {
+        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status());
+        return () -> assertEquals(200, putWeb("{\"enabled\":false}").status());
+    }
+
     private static UdsHttp.Response putWeb(String body) throws IOException {
         var headers = TestRuntime.bearer(daemon.token());
         headers.put("Content-Type", "application/json");
@@ -146,8 +157,7 @@ class WebListenerIT {
     @DisplayName("serves HTTPS with the self-signed ECDSA certificate in LAN mode")
     void shouldServeTls() throws Exception {
         var port = freePort();
-        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status());
-        try {
+        try (var _ = lanEnabled(port)) {
             var pem = Files.readString(daemon.paths().base().resolve("web/tls/cert.pem"));
             var certificate = CertificateFactory.getInstance("X.509")
                     .generateCertificate(new ByteArrayInputStream(pem.getBytes(StandardCharsets.US_ASCII)));
@@ -168,8 +178,6 @@ class WebListenerIT {
                                 "signature_algorithm", ((X509Certificate) certificate).getSigAlgName()),
                         true);
             }
-        } finally {
-            assertEquals(200, putWeb("{\"enabled\":false}").status());
         }
     }
 }

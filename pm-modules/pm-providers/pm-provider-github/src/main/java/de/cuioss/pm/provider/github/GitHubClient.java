@@ -37,6 +37,7 @@ public final class GitHubClient {
     /** The GraphQL path relative to {@code https://api.github.com/}. */
     public static final String GRAPHQL_PATH = "graphql";
     /** Page cap of the review-thread read (100 threads per page). */
+    private static final String PAGE_INFO = "pageInfo";
     static final int MAX_THREAD_PAGES = 20;
 
     static final String REVIEW_THREADS = document("review-threads");
@@ -120,10 +121,10 @@ public final class GitHubClient {
                 return CiResult.of(CiResult.Outcome.NOT_FOUND, owner + "/" + name + "#" + number);
             }
             Json.list(connection, "nodes").forEach(node -> threads.add(thread(node)));
-            if (!Json.bool(connection, "pageInfo", "hasNextPage")) {
+            if (!Json.bool(connection, PAGE_INFO, "hasNextPage")) {
                 return CiResult.ok(List.copyOf(threads), true);
             }
-            cursor = Json.string(connection, "pageInfo", "endCursor").orElse(null);
+            cursor = Json.string(connection, PAGE_INFO, "endCursor").orElse(null);
         }
         return CiResult.ok(List.copyOf(threads), false);
     }
@@ -216,7 +217,7 @@ public final class GitHubClient {
         }
         return new ReviewThread(Json.string(node, "id").orElse(""), Json.bool(node, "isResolved"),
                 Json.bool(node, "isOutdated"), Json.string(node, "path").orElse(""), Json.string(node, "line"),
-                List.copyOf(comments), !Json.bool(node, "comments", "pageInfo", "hasNextPage"));
+                List.copyOf(comments), !Json.bool(node, "comments", PAGE_INFO, "hasNextPage"));
     }
 
     private static String document(String name) {

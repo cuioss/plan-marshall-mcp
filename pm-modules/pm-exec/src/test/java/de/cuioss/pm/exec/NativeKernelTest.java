@@ -9,6 +9,7 @@
  */
 package de.cuioss.pm.exec;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -17,6 +18,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -45,7 +47,7 @@ class NativeKernelTest {
     @Test
     @DisplayName("close of an invalid descriptor is ignored")
     void closeInvalid() {
-        kernel.close(-1);
+        assertDoesNotThrow(() -> kernel.close(-1));
     }
 
     @Test
@@ -110,6 +112,8 @@ class NativeKernelTest {
         @DisplayName("sets no-new-privileges")
         void noNewPrivs() throws Exception {
             kernel.setNoNewPrivs();
+
+            assertTrue(Files.readAllLines(Path.of("/proc/thread-self/status")).contains("NoNewPrivs:\t1"));
         }
     }
 }

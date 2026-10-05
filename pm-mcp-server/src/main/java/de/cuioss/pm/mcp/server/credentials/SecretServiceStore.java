@@ -45,7 +45,7 @@ public final class SecretServiceStore implements SecretStore {
 
     private final Path busSocket;
     private final long uid;
-    private final String service;
+    private final String serviceName;
     private final Duration timeout;
 
     /**
@@ -57,7 +57,7 @@ public final class SecretServiceStore implements SecretStore {
     public SecretServiceStore(Path busSocket, long uid, String service, Duration timeout) {
         this.busSocket = busSocket;
         this.uid = uid;
-        this.service = service;
+        this.serviceName = service;
         this.timeout = timeout;
     }
 
@@ -95,7 +95,7 @@ public final class SecretServiceStore implements SecretStore {
                 throw locked("collection " + collection + " is locked");
             }
             var properties = new LinkedHashMap<String, Variant>();
-            properties.put(ITEM + ".Label", new Variant("s", service + " " + account.account()));
+            properties.put(ITEM + ".Label", new Variant("s", serviceName + " " + account.account()));
             properties.put(ITEM + ".Attributes", new Variant("a{ss}", attributes(account)));
             var reply = session.call(collection, COLLECTION, "CreateItem", "a{sv}(oayays)b", properties, secretStruct,
                     false);
@@ -149,7 +149,7 @@ public final class SecretServiceStore implements SecretStore {
      */
     Map<String, String> attributes(CredentialAccount account) {
         var attributes = new LinkedHashMap<String, String>();
-        attributes.put("service", service);
+        attributes.put("service", serviceName);
         attributes.put("credential_key", account.key());
         account.project().ifPresent(p -> attributes.put("project", p));
         return attributes;

@@ -27,6 +27,9 @@ import java.util.Set;
  * The lock is taken with {@link FileChannel#tryLock()}: a second runtime for the same base fails to acquire it
  * and must exit without writing anything. Opening an existing lock file changes neither its content nor its
  * modification time.
+ * <p>
+ * The holder owns the channel: the lock is released when the holder is closed (the entry point closes it on
+ * shutdown) or when the process ends.
  *
  * @since 0.1
  */
@@ -53,21 +56,43 @@ public final class RuntimeLock implements AutoCloseable {
         if (!Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) {
             Files.createDirectories(dir, PosixModes.directoryAttribute());
         }
-        var channel = Files.exists(lockFile, LinkOption.NOFOLLOW_LINKS)
-                ? FileChannel.open(lockFile, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)
-                : FileChannel.open(lockFile, Set.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE),
-                PosixModes.fileAttribute());
-        FileLock lock;
+        var channel = open(lockFile);
         try {
-            lock = channel.tryLock();
+            var lock = tryLock(channel);
+            if (lock == null) {
+                channel.close();
+                return Optional.empty();
+            }
+            return Optional.of(new RuntimeLock(channel, lock));
+        } catch (IOException e) {
+            closeAfterFailure(channel, e);
+            throw e;
+        }
+    }
+
+    // Opening an existing lock file must change neither its content nor its modification time.
+    private static FileChannel open(Path lockFile) throws IOException {
+        if (Files.exists(lockFile, LinkOption.NOFOLLOW_LINKS)) {
+            return FileChannel.open(lockFile, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+        }
+        return FileChannel.open(lockFile, Set.of(StandardOpenOption.CREATE, StandardOpenOption.WRITE),
+                PosixModes.fileAttribute());
+    }
+
+    private static FileLock tryLock(FileChannel channel) throws IOException {
+        try {
+            return channel.tryLock();
         } catch (OverlappingFileLockException _) {
-            lock = null;
+            return null;
         }
-        if (lock == null) {
+    }
+
+    private static void closeAfterFailure(FileChannel channel, IOException failure) {
+        try {
             channel.close();
-            return Optional.empty();
+        } catch (IOException suppressed) {
+            failure.addSuppressed(suppressed);
         }
-        return Optional.of(new RuntimeLock(channel, lock));
     }
 
     /**
@@ -80,5 +105,14 @@ public final class RuntimeLock implements AutoCloseable {
     @Override
     public void close() throws IOException {
         channel.close();
+    }
+
+    /**
+     * Releases the lock after a failed startup step, recording a failure to close on that step's exception.
+     *
+     * @param failure the exception of the failed step
+     */
+    void closeAfterFailure(IOException failure) {
+        closeAfterFailure(channel, failure);
     }
 }

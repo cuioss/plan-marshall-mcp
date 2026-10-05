@@ -49,7 +49,7 @@ public sealed interface ToonValue
          * @param value the string, never {@code null}
          */
         public ToonString {
-            Objects.requireNonNull(value, "value");
+            requireValue(value);
         }
     }
 
@@ -64,7 +64,7 @@ public sealed interface ToonValue
          * @param value the number, never {@code null}
          */
         public ToonNumber {
-            Objects.requireNonNull(value, "value");
+            requireValue(value);
         }
     }
 
@@ -167,7 +167,7 @@ public sealed interface ToonValue
              */
             public Field {
                 Objects.requireNonNull(key, "key");
-                Objects.requireNonNull(value, "value");
+                requireValue(value);
             }
         }
 
@@ -281,5 +281,9 @@ public sealed interface ToonValue
      */
     static ToonArray ofStrings(List<String> values) {
         return new ToonArray(values.stream().map(ToonValue::of).toList());
+    }
+
+    private static <T> T requireValue(T value) {
+        return Objects.requireNonNull(value, "value");
     }
 }

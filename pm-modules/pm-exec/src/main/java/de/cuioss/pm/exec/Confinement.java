@@ -42,12 +42,12 @@ record Confinement(String state, int landlockAbi, boolean noNewPrivs) {
     }
 
     /** @return whether a Landlock ruleset is applied */
-    boolean confined() {
+    boolean isConfined() {
         return CONFINED.equals(state);
     }
 
     /** @return the JSON value of {@code landlock_abi}: the ABI when confined, else {@code null} */
     String abiJson() {
-        return confined() ? Integer.toString(landlockAbi) : "null";
+        return isConfined() ? Integer.toString(landlockAbi) : "null";
     }
 }

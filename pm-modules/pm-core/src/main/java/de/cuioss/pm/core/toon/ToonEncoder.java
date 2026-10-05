@@ -254,7 +254,7 @@ public final class ToonEncoder {
         }
         char first = value.charAt(0);
         char last = value.charAt(value.length() - 1);
-        if (isPadding(first) || isPadding(last) || first == '-' || first == '#' || root && first == '﻿') {
+        if (isPadding(first) || isPadding(last) || first == '-' || first == '#' || root && first == '\uFEFF') {
             return true;
         }
         if (NUMERIC_LIKE.matcher(value).matches()) {

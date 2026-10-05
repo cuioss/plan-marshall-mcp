@@ -474,6 +474,19 @@ class JGitOperationsTest {
                     "refs/heads/main", Optional.empty(), Optional.empty())).outcome());
             assertFalse(credential.orElseThrow().toString().contains("secret"));
         }
+
+        @Test
+        @DisplayName("compares credentials by the content of the secret")
+        void credentialEquality() {
+            var credential = new GitCredential("x-access-token", "secret".toCharArray());
+            var same = new GitCredential("x-access-token", "secret".toCharArray());
+
+            assertEquals(credential, same);
+            assertEquals(credential.hashCode(), same.hashCode());
+            assertNotEquals(credential, new GitCredential("x-access-token", "other".toCharArray()));
+            assertNotEquals(credential, new GitCredential("user", "secret".toCharArray()));
+            assertNotEquals(credential, (Object) "secret");
+        }
     }
 
     @Nested

@@ -40,15 +40,14 @@ public final class PmMcpd {
     /** Quarkus configuration key of the domain socket path. */
     public static final String SOCKET_PROPERTY = "quarkus.http.domain-socket";
 
-    private static RuntimeLock held;
-
     private PmMcpd() {
     }
 
     /**
      * @param args the command-line arguments, passed to Quarkus
+     * @throws IOException if the singleton lock cannot be released on shutdown
      */
-    public static void main(String... args) {
+    public static void main(String... args) throws IOException {
         var paths = MachinePaths.current();
         StartupSequence.Outcome outcome;
         try {
@@ -63,12 +62,13 @@ public final class PmMcpd {
                 System.exit(StartupSequence.EXIT_REFUSED);
             }
             case StartupSequence.Outcome.Ready ready -> {
-                // Held for the process lifetime: an unreachable channel would release the lock.
-                held = ready.lock();
-                System.setProperty(BASE_PROPERTY, paths.base().toString());
-                System.setProperty(SOCKET_PROPERTY, paths.socket().toString());
-                NativeLibraryPath.includeExecutableDirectory();
-                Quarkus.run(args);
+                // The lock is held while Quarkus runs (until shutdown) and released when it returns.
+                try (var _ = ready.lock()) {
+                    System.setProperty(BASE_PROPERTY, paths.base().toString());
+                    System.setProperty(SOCKET_PROPERTY, paths.socket().toString());
+                    NativeLibraryPath.includeExecutableDirectory();
+                    Quarkus.run(args);
+                }
             }
         }
     }
