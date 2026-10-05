@@ -195,8 +195,8 @@ _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH
 |[[bounded-wait]]Bounded wait window
 |Compiled default `240` per client profile.
 |`connection.bounded_wait_seconds` of the client profile; operator override in `machine-config.json` (`client_profiles.<client_id>.connection`, link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas, Machine Configuration Store])
-|`15`..`3600`; profile validation also rejects a value above `connection.idle_timeout_seconds − 30`
-|`pm_wait` of a worker or an entry session (consultation answers included), a `pm_build` call and its `job_id` continuation, when the connection does not qualify for a progress wait
+|`15`..`3600`; for a host whose `connection.progress_resets_timeout` is false, profile validation also rejects a value above `connection.idle_timeout_seconds − 30`
+|`pm_wait` of a worker or an entry session (consultation answers included; where the host's `progress_resets_timeout` is set, progress frames hold it through the window); a `pm_build` call and its `job_id` continuation when the connection does not qualify for a progress wait
 |`pm_wait` answers `wait_again` (or `end`, link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools, `pm_wait`]); `pm_build` returns the running result with its `job_id` continuation; never an MCP transport timeout.
 |link:../job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]; link:../model-work/02-task-protocol.adoc[Model Work, Task Protocol]; link:../mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools, `pm_build`]
 
@@ -204,7 +204,7 @@ _Implementation watch: link:../../implementation-watch/job-runtime.adoc#PM-WATCH
 |`1800`
 |`progress_wait_max_seconds` in `machine-config.json`
 |`60`..`7200`
-|the same waits, when the client profile declares `progress_resets_timeout: true` and the request carries a `progressToken`
+|a `pm_build` call and its `job_id` continuation, when the client profile declares `progress_resets_timeout: true` and the request carries a `progressToken`; a `pm_wait` keeps the bounded wait window
 |As bounded wait.
 |link:../job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime, Bounded Long-Poll]; link:../runtime-model/04-sessions-and-workers.adoc#_connection_scoped_rendering[Runtime Model, Connection-Scoped Rendering]
 
@@ -296,7 +296,7 @@ The supervisor ends, recycles, and replaces workers by these values (link:../mod
 |[[silence-limit]]Silence limit
 |The bounded wait (<<bounded-wait>>) plus `worker.silence_grace_seconds` of the client profile, measured from the worker's last call while it holds no open wait call.
 |client profile (compiled)
-|grace `≥ 0`
+|grace `5`..`600`
 |every running worker except a `zero_tool` worker, which has no connection and whose exit and budget alone decide
 |The worker is ended (`end_reason: silence`, then the fence), its lease released at once, and a successor started while work remains.
 |link:../model-work/03-supervision-and-recycling.adoc[Model Work, Supervision & Recycling]
@@ -380,7 +380,7 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 |link:../store-schemas/14-plan-instance-waivers-questions.adoc#waiver-request-record[Store Schemas, Waiver Request Record]; link:../job-runtime/01-pipeline-and-subprocesses.adoc#engine-deadlines[Job Runtime, Engine Deadlines]; _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-40[PM-WATCH-STORE-40]_
 
 |[[question-wait]]Question wait (`questions.wait_seconds`)
-|`1800` from the question's delivery, in `questions.mode` `auto` and for a set the adjudication escalated in mode `quorum`. No deadline in mode `operator`; no wait in mode `none`. [[vote-wait]]*Vote wait*: in mode `quorum` the adjudication before the delivery is bounded by the vote wait from the set's creation: the declaration `vote_wait_seconds` of the project's adjudication unit (shipped `900`, compiled bounds `60` to `1800`, link:../workflow-dsl/02-units-jobs-decisions.adoc#unit-declarations[Workflow DSL, Unit Declarations]), recorded with the unit's digest; at its expiry the open vote tasks are cancelled and count as without an answer (link:../model-work/10-decision-quorum.adoc#adjudication[Model Work, Ask or Quorum]).
+|`1800` from the question's delivery, in `questions.mode` `auto` and for a set the adjudication escalated in mode `quorum`. No deadline in mode `operator`; no wait in mode `none`. [[vote-wait]]*Vote wait*: in mode `quorum` the adjudication before the delivery is bounded by the vote wait from the set's creation: the declaration `vote_wait_seconds` of the project's adjudication unit (shipped `900`, compiled bounds `60` to `1800`, link:../workflow-dsl/02-units-jobs-decisions.adoc#unit-declarations[Workflow DSL, Unit Declarations]), recorded with the unit's digest; it is the vote tasks' own deadline: at its expiry every open vote task closes `lost` and counts as without an answer (link:../model-work/10-decision-quorum.adoc#adjudication[Model Work, Ask or Quorum]).
 |`questions.wait_seconds` in `<PM_MCP_BASE>/projects/<project_id>/local-config.json`, machine-wide default in `machine-config.json` `project_defaults.questions.wait_seconds`
 |floor `0` (every question resolves at once through its class fallback)
 |open question records of plan, epic, and workspace scopes; the deadline is server-owned, and no model and no session waits for it
@@ -428,12 +428,20 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 |link:../store-schemas/17-re-planning.adoc#replan-record[Store Schemas, Re-Planning Record]
 
 |[[server-rule-retry]]Server-rule retry budget
-|`2` retries of each bounded server rule: `create_failed` of `finalize.create-pr`, the `.gitignore` oracle of `git.commit_and_push`, landing delivery, and `sync_failed` of `finalize.merge-sync` (a fetch failure or a push failure other than the lease rejection).
+|`2` retries of each bounded server rule: the provider call of `finalize.open-pr`, the `.gitignore` oracle of `git.commit_and_push`, landing delivery, and `sync_failed` of `finalize.merge-sync` (a fetch failure or a push failure other than the lease rejection).
 |fixed
 |—
-|`finalize.create-pr`, `git.artifact-escalate`, `finalize.emit-landing-failed`, `finalize.merge-sync`
-|`create-pr`: `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); oracle: the sub-process returns `stepped_out` (cause `oracle_failed`); landing delivery: `landing_delivery: pending` (envelope kept as `landing-envelope.json` for the epic's reconciliation), the post-run band continues; merge sync: `retry_spent` enters `finalize.hand-back` (gap `budget: server_rule_retry`).
+|`finalize.open-pr`, `git.artifact-escalate`, `finalize.emit-landing-failed`, `finalize.merge-sync`
+|`open-pr`: `retry_spent` enters `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); oracle: the sub-process returns `stepped_out` (cause `oracle_failed`); landing delivery: `landing_delivery: pending` (envelope kept as `landing-envelope.json` for the epic's reconciliation), the post-run band continues; merge sync: `retry_spent` enters `finalize.hand-back` (gap `budget: server_rule_retry`).
 |link:../state-catalogue.adoc[State Catalogue]
+
+|[[server-retry-backoff]]Server retry backoff
+|`60` seconds before the first retry, doubled for each further retry of the same firing (`60`, `120`, `240`); counted from the persisted instant of the failure, so a restart never shortens or extends it.
+|fixed
+|—
+|every server retry that waits in a `composite_job` for time: the provider call of `finalize.open-pr`, the re-observation of `finalize.archive-unobserved`, the re-adoption of `finalize.adopt-blocked`, and the rerun of the `remediation-merge` loop when no change of the observed remote head ends the wait first
+|The wait settles on the deadline (or earlier on the awaited external change) and the retry runs, within the budget of its rule (<<server-rule-retry>>, <<condition-budget>>, the unit's retry budget); the backoff never adds a retry.
+|link:../workflow-dsl/04-ast-node-model.adoc[Workflow DSL Specification] (Rule 11); link:../state-catalogue.adoc[State Catalogue]
 
 |[[commit-attempt-caps]]Commit sub-process attempt caps
 |`3` attempts of each task loop inside one call of `git.commit_and_push`: the freshness-blocked loop (`freshness-blocked` / `freshness-build-running`), the artifact review (`artifact-review` with prohibited artifacts remaining), conflict resolution (`resolve-conflicts`), and the sync loop (`sync-required` -> verify -> push rejected); counted per call frame, reset by a new call. The `git.commit-fix` cap of `3` failed commit attempts per identical staged change set (xref:03-retention-host-config.adoc#configuration-keys[Configuration Keys]) stays separate.
@@ -444,4 +452,4 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 |link:../workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`); link:../state-catalogue.adoc[State Catalogue]
 |===
 
-*Deadline processing*: The waiver wait and the question deadline are engine-owned instants persisted with their record (`expires_at`), processed by the runtime's deadline timer (link:../job-runtime/01-pipeline-and-subprocesses.adoc#engine-deadlines[Job Runtime Specification, Engine Deadlines]); the two never overlap in one plan, the integrity pause holds both fallbacks until it ends, and `abort` / `delete-plan` close pending questions `cancelled` and waiver requests `expired`.
+*Deadline processing*: The waiver wait, the question deadline, and the prerequisite wait of a re-planning are engine-owned instants persisted with their record (`expires_at`; the prerequisite's `deadline_at`), processed by the runtime's deadline timer (link:../job-runtime/01-pipeline-and-subprocesses.adoc#engine-deadlines[Job Runtime Specification, Engine Deadlines]); the two never overlap in one plan, the integrity pause holds every fallback until it ends, and `abort` / `delete-plan` close pending questions `cancelled` and waiver requests `expired`.

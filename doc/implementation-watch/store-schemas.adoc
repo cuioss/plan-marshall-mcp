@@ -14,6 +14,27 @@ and paths, findings and change-ledger records, footprint reconciliation, and the
 run against the real plan-marshall corpora cited here as test fixtures (`PM-MCP` imports nothing, `PM-MIG-2`). The
 sections mirror the specification. Item format and lifecycle: link:../ImplementationWatch.adoc[Implementation Watch].
 
+== Format Versioning & Transaction Journal
+
+[#PM-WATCH-STORE-44]
+=== PM-WATCH-STORE-44: A cross-scope write is completed exactly once after a crash
+
+Anchor:: link:../specification/store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas § Transaction Journal] (Writes outside the scope),
+link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7]
+Hazard:: A transition that writes outside its scope (a plan creation that also starts an epic row, claims a lesson,
+and deletes the pending record; a job state whose binding and job record lie in different stores) cannot be one
+journaled transaction; a crash between its writes leaves a row `staged` beside a running plan, a lesson unclaimed by
+the plan created from it, a pending record that resumes a created scope, or a binding that names a job nobody runs,
+and a recovery that re-applies a write it cannot see as done applies it twice.
+Guard:: Crash-injection test over the fixed write order of `start.create-scope`: a crash after the plan scope, after
+the epic queue row, after the lesson claim, and after the pending-record deletion; after each restart the startup
+recovery leaves exactly one plan, the row `running` with the plan's creation instant as `started_at`, the lesson
+claimed once by that plan, and no pending record, and each reconciliation it applied has one audit record; a crash
+before the plan scope leaves only the pending record. The same for a job state: a crash after `active_job` and before
+the job record settles the state `killed` and routes that outcome once; a crash after the job record leaves the job
+bound and running. Matched control: a recovery run on a consistent store changes nothing and writes no audit record.
+Source:: design review (doc review round 5).
+
 == Scope Session Log (`sessions.jsonl`)
 
 [#PM-WATCH-STORE-1]
@@ -39,8 +60,10 @@ link:../Requirements.adoc#PM-CLIENT-1[PM-CLIENT-1]
 Hazard:: An abandoned or interrupted bootstrap leaves a pending record, a claim, or screened text behind, so a later
 entry resumes stale state or a lesson stays claimed by a plan that never existed.
 Guard:: Scenario per bootstrap terminal (`committed`, `resumed`, `handed_over`, `abandoned`) and per crash point: the
-pending record is deleted in the terminal's transaction; no lesson claim, queue-row change, or capture ref exists
-before `created`; a record older than the pending entry maximum age is removed by the sweep with an audit record; a
+pending record is deleted by the terminal, for `committed` in the fixed write order after the new plan scope, the
+epic queue row, and the lesson claim; no lesson claim, queue-row change, or capture ref exists before the plan scope
+is written; a crash between these writes is completed by the startup recovery (<<PM-WATCH-STORE-44>>), and a crash
+before the plan scope leaves only the pending record; a record older than the pending entry maximum age is removed by the sweep with an audit record; a
 record whose digest mismatches pauses only its own entry.
 Source:: design review.
 
@@ -119,7 +142,8 @@ Source:: plan-marshall truthful-signals (quality-aspect) PLAN-216 D7.
 Anchor:: link:../specification/store-schemas/03-findings-and-review-records.adoc#_findings_ledger_record_findings_jsonl[Store Schemas § Findings Ledger Record],
 link:../Requirements.adoc#PM-WF-14[PM-WF-14]
 Hazard:: The store held 5 findings where 9 had been fetched.
-Guard:: Ingestion returns the persisted count; a mismatch with the fetched count fails the step.
+Guard:: Ingestion returns the persisted count (distinct `finding_id` values, each resolved to its last readable line);
+a mismatch with the fetched count fails the step.
 Fixture:: store 5 vs true 9.
 Source:: plan-marshall review-apparatus PLAN-PR-074 D6 (PLAN-PR-049 D1).
 
@@ -134,6 +158,22 @@ with their evidence; the false-positive count per source reads `rejected` only; 
 differential tests maps all six resolutions 1:1.
 Fixture:: PR #1387 `cde958` (accepted → rejected), `8a040a`, `652212`; PR #1447 `43956d`, `8d8a87` (CWE-78).
 Source:: plan-marshall truthful-signals (quality-aspect) PLAN-208 D4 / PLAN-214 D4.
+
+[#PM-WATCH-STORE-45]
+=== PM-WATCH-STORE-45: A versioned JSONL store is read as the last readable line per key
+
+Anchor:: link:../specification/store-schemas/03-findings-and-review-records.adoc#_findings_ledger_record_findings_jsonl[Store Schemas § Findings Ledger Record] (Versioned lines),
+link:../specification/store-schemas/03-findings-and-review-records.adoc#review-participation[§ Review Participation Record],
+link:../Requirements.adoc#PM-IMPL-2[PM-IMPL-2]
+Hazard:: A store that appends every change of a record as a new line is read wrongly when the reader takes the first
+line of a key, merges the fields of several lines, or fails the whole store on a torn last line, so a resolved
+finding reads open again, or one crash during an append hides every finding of the plan.
+Guard:: Reader table test over `findings.jsonl` and `review-participation.jsonl`: for each key (`finding_id`;
+`(pr_number, round, bot_kind)`) the current record is the last readable line, taken whole, never merged with earlier
+lines; a torn last line of a key falls back to that key's previous version and is reported with its offset; earlier
+lines stay as history and are never rewritten. Matched control: a store whose every line parses yields the same
+current records as a replay of the appends in order.
+Source:: design review (doc review round 5).
 
 == Component Assessment Record (`assessments.jsonl`)
 
@@ -276,7 +316,7 @@ PLAN-TRUTH-175 D1, D2, D3, D4 and D5.
 [#PM-WATCH-STORE-12]
 === PM-WATCH-STORE-12: A task amendment is one atomic write
 
-Anchor:: link:../specification/store-schemas/06-task-references-manifest.adoc#_task_record_schema_taskstask_nnn_json[Store Schemas § Task Record Schema]
+Anchor:: link:../specification/store-schemas/06-task-and-references.adoc#_task_record_schema_taskstask_nnn_json[Store Schemas § Task Record Schema]
 Hazard:: Amendments renumbered steps and dropped `depends_on`.
 Guard:: Any amend link writes a task's verification and steps in one atomic write, preserving numbering and
 dependencies.
@@ -433,7 +473,7 @@ Source:: plan-marshall instrumentation-substrate PLAN-09 deliverable 4 (§ The t
 === PM-WATCH-STORE-18: Lesson reach is derivable
 
 Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas § Lesson Record],
-link:../specification/store-schemas/06-task-references-manifest.adoc#_references_footprint_store_schema_references_json[§ References & Footprint Store Schema] (`lessons_consulted`)
+link:../specification/store-schemas/06-task-and-references.adoc#_references_footprint_store_schema_references_json[§ References & Footprint Store Schema] (`lessons_consulted`)
 Hazard:: Defect lessons sat for weeks without ever reaching a plan, and nothing measured it.
 Guard:: Lesson-to-plan links persist (`references.lessons_consulted`, and for lesson-started plans the lesson's own
 `claim` and `retired.by` with verdict `applied`) so that reach (lessons with at least one consuming plan / all
@@ -613,3 +653,18 @@ Guard:: Concurrency test: a plan transaction and `setup.reconcile-config` refres
 writes serialize on `locks/derived-facts.lock`, which is taken after every scope lock and never before one; the
 lock-order checker rejects any acquisition outside the total order; no update is lost.
 Source:: design review.
+
+[#PM-WATCH-STORE-46]
+=== PM-WATCH-STORE-46: A retention sweep never removes a row something still references
+
+Anchor:: link:../specification/store-schemas/13-leases-integrity-testing.adoc#evidence-based-removal-sweeps[Store Schemas § Evidence-Based Removal Sweeps] (Retention purges)
+Hazard:: The workspace scope has no archive, so its rows grow for the life of the enrolment; a purge by age alone
+removes a decision whose facts snapshot a later record still cites, or a sweep that rewrites an append-only store
+loses rows appended meanwhile.
+Guard:: Sweep test with a clock fixture: `pm-operator sweep` lists and `--apply` removes the workspace rows older than
+`retention.workspace_rows_days` (closed findings, metrics rows, answered questions, ended sessions, screen verdicts,
+decisions whose facts are no longer referenced, with their facts snapshots), each store replaced in one journaled
+transaction of the workspace scope; a decision whose facts snapshot is still referenced is kept with that keep-rule
+named; an archived epic's `epics/<epic_id>/` is removed only after `retention.archived_plans_days`. Matched
+controls: a row one day younger than the key is kept, and an open finding of any age is kept.
+Source:: design review (doc review round 5).

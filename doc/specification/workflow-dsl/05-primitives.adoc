@@ -44,6 +44,12 @@ public interface PrimitiveOutcome {
      * Class of the outcome; decides which step record the engine writes (see Outcome Classes).
      */
     OutcomeClass outcomeClass();
+
+    /**
+     * True for a declared job-starting outcome of an enqueuesJob() primitive (e.g. "started",
+     * "rerun_started", "concurrent_restarted"); its transition targets a job or composite_job state (Rule 1).
+     */
+    default boolean startsJob() { return false; }
 }
 
 public record PrimitiveResult<R extends Enum<R> & PrimitiveOutcome>(
@@ -88,7 +94,8 @@ public interface Primitive<P extends Record, R extends Enum<R> & PrimitiveOutcom
      * External event this primitive waits for (Rule 11b); NONE for a primitive whose outcome
      * depends only on state it reads in the same transaction, EXTERNAL_STATE for one that
      * re-observes a provider, a remote, or the checkout (e.g. ci.pr-observe, finalize.archive-plan,
-     * finalize.retry-emit-landing, finalize.adopt-pr, merge.sync-base).
+     * finalize.retry-emit-landing, finalize.adopt-pr, merge.sync-base). A server retry after a failed
+     * re-observation waits in a composite_job state (TIME, EXTERNAL_STATE), never in an engine-chained cycle (Rule 11a).
      */
     AwaitedEvent awaitedEvent();
 
@@ -101,9 +108,17 @@ public interface Primitive<P extends Record, R extends Enum<R> & PrimitiveOutcom
 
     /**
      * True for a primitive that enqueues a job for the following job state and returns its id
-     * in PrimitiveResult.spawnedJobId with the outcome "started" (Rule 1, Job State Entry & Binding).
+     * in PrimitiveResult.spawnedJobId with one of its declared job-starting outcomes, each targeting
+     * a job or composite_job state (Rule 1, Job State Entry & Binding).
      */
     default boolean enqueuesJob() { return false; }
+
+    /**
+     * True for a dispatch hub (finalize.next-step) whose finite progress measure is the unsettled steps
+     * of the instance's step list: every pass fires and settles exactly one step (Rule 9). Its cycles are
+     * the only exemption from Rule 11a.
+     */
+    default boolean dispatchesSteps() { return false; }
 }
 ----
 
@@ -116,7 +131,7 @@ Every outcome constant declares one `OutcomeClass`, and the engine derives the s
 * *`SUCCESS`*: The step completed with its work; the engine records `done`.
 * *`SKIP`*: The step had nothing to do. A primitive with an optional input declares a `skipped_<reason>` outcome of this class for the absent-input case; the step record stores `skipped`, `work_performed: false`, and the reason, and downstream steps treat it as neither a failure nor produced content.
 * *`FAILURE`* and *`INDETERMINATE`*: The step record stores `failed` or `indeterminate`; neither is ever recorded as `done`, and `INDETERMINATE` is never folded into success or failure (`PM-EXEC-4`).
-* *`UNSETTLED`*: Outcomes that hand the step back without settling it (`loop_back`, a remediation unit's `fix_requested`, defer). The engine writes no completion record, so a re-fired step never produces two completions.
+* *`UNSETTLED`*: Outcomes that hand the step back without settling it: a remediation unit's `fix_requested` (the `loop_back` form of `fix`), the re-planning terminals `replan.reentered` and `replan.reauthor`, and a task's `task.asked`. The engine writes no completion record, so a re-fired step never produces two completions.
 * *`STEPPED_OUT`*: The control outcome `stepped_out` of a sub-workflow: the unit stepped out by itself (a terminal of class `stepped_out`, for example after exhausted commit attempts), the engine unwound every frame after a condition's self-remedy budget was spent or a task state without a declared `lost` route lost its task (`cause: condition` or `cause: lost`, which enter the phase's fallback directly), or, in a sub-workflow the entry session drives, the session followed the implicit `step_out` of one of its link states. Like `UNSETTLED` it writes no completion record: the caller routes the outcome once (Rule 6), typically to the phase's fallback, whose entry records the open firing `failed`, never to a state that continues the flow as if the operation had succeeded, and never completes a step `done`, `skipped`, or `waived` on it (xref:01-grammar.adoc#sub-workflow-exits[Sub-Workflow Exit Contract]).
 
 A remediation unit's `waived` outcome has class `SUCCESS`, but only its transition may complete a step `waived` (Rule 9).
@@ -135,7 +150,8 @@ public final class GitStageAndCommitPrimitive
     public enum Outcome implements PrimitiveOutcome {
         COMMITTED("committed", OutcomeClass.SUCCESS),
         NOTHING_TO_COMMIT("nothing_to_commit", OutcomeClass.SKIP),
-        HOOK_FAILED("hook_failed", OutcomeClass.FAILURE);
+        HOOK_FAILED("hook_failed", OutcomeClass.FAILURE),
+        ATTEMPTS_EXHAUSTED("attempts_exhausted", OutcomeClass.FAILURE);  // commit attempt cap spent
 
         private final String wireName;
         private final OutcomeClass outcomeClass;

@@ -22,17 +22,17 @@ This part lists the start, the settle band (orders `3..10`), push and pull reque
 |[[state-finalize.adopt-pr]]`finalize.adopt-pr`
 |`phase-6-finalize`
 |`auto`
-|`init.ready` (plans of source `pr`); `finalize.adopt-blocked` (`retry`).
+|`init.ready` (plans of source `pr`); `finalize.adopt-blocked` (`retry`, `cancelled`).
 |`auto finalize.adopt-pr`: fetches the pull request's head branch and creates the plan's worktree `.marshall/local/worktrees/<plan_id>/` on it (no new branch), records `worktree_path`, `branch_name` (the head branch), `pr_number`, `head_sha`, and `branch_pushed_at` from the observed remote head. The plan then runs the finalize pipeline like every other plan; `create-pr` is completed `skipped`; fixes are re-pushed through `git.commit_and_push`. A missing or failing credential raises the `precondition_unmet` condition (xref:01-conventions-generic-conditions.adoc#condition-precondition_unmet[Condition precondition unmet]), never an outcome.
-|`adopted` -> `finalize.settle-commit` (`settle_trigger` order `0`); `pr_not_open{state: closed|merged|absent}`, `head_not_writable`, `checkout_failed` -> `finalize.adopt-blocked`.
+|`adopted` -> `finalize.settle-commit` (`settle_trigger` order `0`); `pr_not_open{state: closed|merged|absent}` -> `finalize.hand-back` at once, because no retry changes a closed, merged, or absent pull request; `head_not_writable`, `checkout_failed` -> `finalize.adopt-blocked`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts (`pr`)]
 
 |[[state-finalize.adopt-blocked]]`finalize.adopt-blocked`
 |`phase-6-finalize`
-|`auto`
-|`finalize.adopt-pr` (`pr_not_open`, `head_not_writable`, `checkout_failed`).
-|`auto finalize.adopt-blocked`, the server's choice by `facts.reason`: `pr_not_open` (with the observed `state`) hands the plan back at once, because no retry changes a closed, merged, or absent pull request; `head_not_writable` and `checkout_failed` re-run the adoption, which re-observes the pull request first, within the compiled condition budget (link:../timeouts/01-job-budgets-and-waits.adoc#condition-budget[Timeouts & Budgets Specification, Condition Budget]).
-|`retry` (`head_not_writable`, `checkout_failed`, budget left) -> `finalize.adopt-pr`; `pr_not_open`, `retry_spent` -> `finalize.hand-back`.
+|`composite_job`
+|`finalize.adopt-pr` (`head_not_writable`, `checkout_failed`).
+|`composite_job finalize.adopt-blocked`, the server's retry wait: it records `facts.reason` and the attempts left of the compiled condition budget (link:../timeouts/01-job-budgets-and-waits.adoc#condition-budget[Timeouts & Budgets Specification, Condition Budget]) and waits the retry backoff (`TIME`, link:../timeouts/01-job-budgets-and-waits.adoc#server-retry-backoff[Timeouts & Budgets Specification, Server Retry Backoff]) before the adoption re-runs, which re-observes the pull request first; with the budget spent it settles at once.
+|`retry` (budget left, the backoff elapsed) -> `finalize.adopt-pr`; `retry_spent` -> `finalize.hand-back`; `cancelled` -> `finalize.adopt-pr` (the attempts already counted).
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts (`pr`)]
 
 |[[state-finalize.settle-commit]]`finalize.settle-commit`
@@ -47,7 +47,7 @@ This part lists the start, the settle band (orders `3..10`), push and pull reque
 |`phase-6-finalize`
 |`auto`
 |`finalize.settle-commit` (not pushed); every completed step; `finalize.route-push` (`not_pushed`); the remediation calls (`resolved`, `waived`); `finalize.step-failed`; `finalize.merge-gate` (`incomplete`); `finalize.merge-dispatch`, `finalize.merge-queue-wait` (`merged`); `finalize.hand-back`, `plan.return`, `outline.empty-harvest`.
-|Selects the next unsettled step of the plan instance version in force by `order` (after a fallback or an empty harvest the post-run-only version they composed, which is in force for the rest of their chain), applying verdict currency (`SKIP` / `RE_FIRE`) and Phase-Exit Completeness. `finalize.next-step` and `finalize.merge-gate` share one Phase-Exit Completeness evaluator, and `finalize.next-step` never selects order `70` while a step of lower order is unmet; it selects the lowest-order unmet step, which re-fires. It has no special mode: after a fallback or an empty harvest the version in force is post-run-only.
+|Selects the next unsettled step of the plan instance version in force by `order` (after a fallback or an empty harvest the post-run-only version they composed, which is in force for the rest of their chain), applying verdict currency (`SKIP` / `RE_FIRE`) and Phase-Exit Completeness. `finalize.next-step` and `finalize.merge-gate` share one Phase-Exit Completeness evaluator, and `finalize.next-step` never selects order `70` while a step of lower order is unmet; it selects the lowest-order unmet step, which re-fires. It has no special mode: after a fallback or an empty harvest the version in force is post-run-only. It is the one dispatch hub (`dispatchesSteps()`): every pass fires and settles one step, so its cycles through `auto` step states (`finalize.adr-propose` `no_signal`, `finalize.merge-gate` `incomplete`) are the single exemption from Rule 11a (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Static AST Verification Rules]).
 |The selected step's state: `finalize.sync-baseline` (`3`), `finalize.simplify` (`5`), `finalize.security-audit` (`7`), `finalize.self-review` (`8`), `finalize.architecture-refresh` (`9`), `finalize.pre-push-quality-gate` (`10`), `finalize.push-barrier` (`11`), `finalize.create-pr` (`20`), `finalize.review-cap-check` (the `22..40` wait region), `finalize.adr-propose` (`62`), `finalize.merge-gate` (`70`), `finalize.lessons-capture` (`991`), `finalize.preference-emitter` (`992`), `finalize.plan-retrospective` (`995`), `finalize.record-metrics` (`998`), `finalize.print-phase-breakdown` (`999`), `finalize.emit-landing` (`1000`), `finalize.archive-plan` (`1100`); a project step's state.
 |link:../phase-workflows/04-finalize-step-bands.adoc#_finalize_step_ordering_bands[Phase Workflows Specification, Finalize Step Ordering Bands]; link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_re_entry_head_at_completion_verdict_currency_rules[Verdict Currency Rules]
 
@@ -174,9 +174,17 @@ This part lists the start, the settle band (orders `3..10`), push and pull reque
 |[[state-finalize.create-pr]]`finalize.create-pr`
 |`phase-6-finalize`
 |`job`
-|`finalize.route-push` (`pushed`); `finalize.next-step` (step `default:create-pr`, order `20`); itself (`create_failed`).
-|`job llm pr-body role pr-author`: the entity offers `retitle` (`submit`, `pr_title:text[1..72]`) first while `pr_title_stale` is set, then `submit` of `body:text[1..32768]` (the server injects `pr_title`, the unplanned changes, amendments, and gaps), rejected with `invalid_link_args` (detail `pr_title_missing`) while `pr_title` is empty. The return evaluation creates the pull request with the persisted body. A re-entry whose firing already holds a persisted body creates no task and only retries the provider call. A re-fire with a recorded pull request observed open re-renders its body (`edit_pr_body`) instead; one observed closed unmerged gets a new pull request, appended to `prs[]`.
-|`opened` -> `finalize.next-step` (`completes default:create-pr as done`, records `pr_number` and `head_sha`); `pr_exists` -> `finalize.next-step` (`completes … as skipped`); `create_failed` (provider failure, budget left) -> this state, bounded by the compiled retry budget `2`; `retry_spent` -> `finalize.hand-back` (branch only); `infeasible`, `lost` -> `finalize.hand-back` (a draft pull request with the server-composed body).
+|`finalize.route-push` (`pushed`); `finalize.next-step` (step `default:create-pr`, order `20`).
+|`job llm pr-body role pr-author`: the entity offers `retitle` (`submit`, `pr_title:text[1..72]`) first while `pr_title_stale` is set, then `submit` of `body:text[1..32768]` (the server injects `pr_title`, the unplanned changes, amendments, and gaps), rejected with `invalid_link_args` (detail `pr_title_missing`) while `pr_title` is empty. The return evaluation persists the body; the provider call runs in `finalize.open-pr`.
+|`submitted` -> `finalize.open-pr`; `infeasible`, `lost` -> `finalize.hand-back` (a draft pull request with the server-composed body).
+|link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `20`]
+
+|[[state-finalize.open-pr]]`finalize.open-pr`
+|`phase-6-finalize`
+|`composite_job`
+|`finalize.create-pr` (`submitted`).
+|`composite_job finalize.open-pr`: creates the pull request with the persisted title and body (`ci.pr-create`); for a re-fire with a recorded pull request observed open it re-renders that pull request's body (`edit_pr_body`) instead, and one observed closed unmerged gets a new pull request, appended to `prs[]`. A provider failure is retried by the job's timer after the retry backoff (`TIME`, link:../timeouts/01-job-budgets-and-waits.adoc#server-retry-backoff[Timeouts & Budgets Specification, Server Retry Backoff]) within the compiled server-rule retry budget `2` (link:../timeouts/01-job-budgets-and-waits.adoc#server-rule-retry[Timeouts & Budgets Specification, Server-Rule Retry Budget]), so no retry re-enters a state.
+|`opened` -> `finalize.next-step` (`completes default:create-pr as done`, records `pr_number` and `head_sha`); `pr_exists` -> `finalize.next-step` (`completes … as skipped`); `retry_spent` -> `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); `cancelled` -> `finalize.step-failed` (`completes … as failed`).
 |link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Step Catalogue row `20`]
 
 |[[state-finalize.review-cap-check]]`finalize.review-cap-check`
@@ -224,7 +232,7 @@ This part lists the start, the settle band (orders `3..10`), push and pull reque
 |`call`
 |`finalize.concurrent-wait`, `finalize.merge-evidence-wait` (`findings_open`, `bot_refused_structural`, `review_evidence_missing`); `finalize.review-cap-check` (`cap_exceeded`); `finalize.review-window-wait` (every fate but `succeeded`); `finalize.review-full-trigger` (`already_triggered`).
 |`call remediation.review-findings (retry_budget=1, fix_budget=3, waiver_wait_seconds=0, actions=[retry,fix,loop_back])`; missing evidence of a required bot is the failure kind `evidence_missing`; a structural refusal is triaged like a finding (`ACCEPT` accepts, `SUPPRESS` disables the bot for this pull request; a split of the change is a re-planning, xref:12-re-planning.adoc#state-catalogue-replan[Re-Planning]).
-|`resolved` -> `finalize.next-step` (`completes plan-marshall:automatic-review as done`); `waived` -> `finalize.next-step` (`completes plan-marshall:automatic-review as waived`); `fix_requested` -> `finalize.allocate-remediation`; `exhausted` -> `finalize.replan` (trigger `ceiling`); `stepped_out` -> `finalize.hand-back`.
+|`resolved` -> `finalize.next-step` (`completes default:automatic-review as done`); `waived` -> `finalize.next-step` (`completes default:automatic-review as waived`); `fix_requested` -> `finalize.allocate-remediation`; `exhausted` -> `finalize.replan` (trigger `ceiling`); `stepped_out` -> `finalize.hand-back`.
 |link:../hypermedia-format/03-composite-wait-and-encoder.adoc#policy-unit-returns[Hypermedia Format Specification, Policy Unit Returns]
 
 |[[state-finalize.review-window-wait]]`finalize.review-window-wait`
@@ -262,7 +270,7 @@ This part lists the start, the settle band (orders `3..10`), push and pull reque
 |[[state-finalize.step-failed]]`finalize.step-failed`
 |`phase-6-finalize`
 |`auto`
-|The job-fate failures of settle-band and project steps (`finalize.sync-baseline`, `finalize.architecture-refresh`, a project step's state).
+|The job-fate failures of settle-band and project steps (`finalize.sync-baseline`, `finalize.architecture-refresh`, a project step's state), and the cancelled provider call of `finalize.open-pr`.
 |`auto finalize.refire-failed-step`: one automatic re-fire of the failed step (retry budget `1` per step firing).
 |`refire` -> `finalize.next-step` (the step re-fires as the lowest-order unmet step); `before_merge` (re-fire spent) -> `finalize.hand-back`; `after_merge` (re-fire spent) -> `finalize.next-step` (the step completes `failed` with an owed item; the plan stays `merged`).
 |link:../phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows Specification, Normative Step Catalogue]
@@ -271,7 +279,7 @@ This part lists the start, the settle band (orders `3..10`), push and pull reque
 [#state-catalogue-fallback]
 == Plan Fallbacks & Terminal States
 
-The two fallback states are declared in `finalize.pmwf`. The transaction entering either of them records every begun, unsettled step `failed`, records the gap (`gate`, policy, evidence summary, `cause`: `exhausted`, `stepped_out`, `hand_back`, `infeasible`, `role_unqualified`, `condition`, `question_expired`, `provider_refused`, `auto_merge_off`, `local_only` (not a failure), with the reason or the spent budget; link:../store-schemas/14-plan-instance-waivers-questions.adoc#gap-record[Store Schemas Specification, Gap Record]), and composes a post-run-only plan instance version (composition event `fallback`; every step below order `900` pruned with reason `returned` or `handed_back`), which is in force from the transition entering the fallback state for the rest of its chain.
+The two fallback states are declared in `finalize.pmwf`. The transaction entering either of them records every begun, unsettled step `failed`, records the gap (`gate`, policy, evidence summary, `cause`: `exhausted` (a spent budget, or a task without its required submission, whose `task_reason` names why, for example `role_unqualified`), `stepped_out`, `decided` (a submitted decision selected the fallback, for example `hand_back` of a re-planning), `infeasible`, `condition`, `question_expired`, `provider_refused`, `auto_merge_off` and `local_only` (neither a failure), with the reason or the spent budget; link:../store-schemas/14-plan-instance-waivers-questions.adoc#gap-record[Store Schemas Specification, Gap Record]), and composes a post-run-only plan instance version (composition event `fallback`; every step below order `900` pruned with reason `returned` or `handed_back`), which is in force from the transition entering the fallback state for the rest of its chain.
 
 [cols="2,1,1,2,3,2,2"]
 |===

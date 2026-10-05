@@ -29,8 +29,9 @@ else is decided by the operator, one point at a time, and nothing is applied on 
   the process enforces itself (no in-run operator questions, defined fallbacks, deliberate waivers only), no new
   dependency without the operator's approval, no new document without asking, temp files in the session
   scratchpad).
-- **File size**: every specification file (index or part) stays at or below 400 lines; up to 450 is acceptable when
-  a cut would separate content that belongs together.
+- **File size**: a soft limit of 400 lines per specification file (index or part), counting prose only (code and
+  schema blocks are not counted); up to 500 is fine when the content really belongs together. Split only above that
+  or where a clean topic boundary exists anyway.
 
 ## Working files
 

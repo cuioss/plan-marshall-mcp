@@ -24,10 +24,10 @@ Every piece of model work of a project is a queue task, persisted in the project
 
 One record per task. A `job llm <entity_kind> role <role> [each <primitive>]` state creates one per entity in the transaction that enters it (kind `work`); a `consult:<role>` link creates one for the consulted role (kind `consultation`, whose `queue_task_id` is the `consultation_id`, link:../model-work/05-consultation.adoc[Model Work Specification, Consultation]). The semantics of every field are those of link:../model-work/02-task-protocol.adoc[Model Work Specification, Task Protocol]; this section fixes the record.
 
-* *Status*: `queued` (waiting for a generation of its role), `offered` (leased, not acknowledged), `acknowledged`, `executing`, `consulting` (an own consultation is open), `closed`. An attempt that ends without a result returns the task to `queued`, released at once, and the task is offered again within its re-offer budget (link:../timeouts/01-job-budgets-and-waits.adoc#task-reoffer-budget[Timeouts & Budgets Specification, Task Re-Offer Budget]).
-* *Outcome and Reason*: A closed task has exactly one of the outcomes `submitted`, `asked` (with its `question_id`), `infeasible`, or `lost`; a `lost` task names its `reason`: `attempts_spent` (its re-offers are spent), `role_undefined`, `role_unqualified`, or `role_unavailable` (the model caller closed it before any attempt), or `withdrawn` (its state or scope ended while the task was open). `form_downgraded` records that the caller ran a `warm` role `fresh` because only the fresh form qualifies.
+* *Status*: `queued` (waiting for a generation of its role started with the role's current configuration digest, or for a matching session; matching: link:../model-work/02-task-protocol.adoc#offer[Model Work Specification, Offer]), `offered` (leased, not acknowledged), `acknowledged`, `executing`, `consulting` (an own consultation is open), `closed`. An attempt that ends without a result returns the task to `queued`, released at once, and the task is offered again within its re-offer budget (link:../timeouts/01-job-budgets-and-waits.adoc#task-reoffer-budget[Timeouts & Budgets Specification, Task Re-Offer Budget]).
+* *Outcome and Reason*: A closed task has exactly one of the outcomes `submitted`, `asked` (with its `question_id`), `infeasible`, or `lost`; a `lost` task names its `reason`: `attempts_spent` (its re-offers are spent), `role_undefined`, `class_mismatch`, `role_unqualified`, or `role_unavailable` (the model caller closed it before any attempt), or `withdrawn` (its state or scope ended while the task was open). `form_downgraded` records that the caller ran a `warm` role `fresh` because only the fresh form qualifies.
 * *Lease*: `lease` names the generation the task is leased to, set in the transaction of the offer (for a fresh worker: at its spawn) and cleared at the submit that closes the attempt, at the fence of the generation, and at the withdrawal of an unacknowledged session offer. Every call on the task entity is checked against it.
-* *Attempts*: One entry per offer, with its generation, its worker (`null` for a session), its instants, and how it ended. `counts` is `false` for an attempt ended by a restart, a drain, a start failure of a fresh worker, or the withdrawal of a session offer, which spend no re-offer.
+* *Attempts*: One entry per offer, with its generation, its worker (`null` for a session), the configuration digest the worker was started with (`null` for a session), its instants, and how it ended. `counts` is `false` for an attempt ended by a restart, a drain, a start failure of a fresh worker, or the withdrawal of a session offer, which spend no re-offer.
 * *Consultations*: The asking task lists its consultations in `consultations[]` (their limits: link:../model-work/05-consultation.adoc[Model Work Specification, Consultation]); the consultation task names its asker in `consultation_of`. The answer is recorded on the asker's entry when the consultation closes and delivered once, to the asking generation's next wait, or to the successor in the task's facts after a fence (`delivered_to`).
 
 [source,json]
@@ -37,7 +37,7 @@ One record per task. A `job llm <entity_kind> role <role> [each <primitive>]` st
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/queue-task.json",
   "title": "QueueTaskRecord",
   "type": "object",
-  "required": ["format_version", "queue_task_id", "kind", "role", "role_digest", "class", "scope", "entity", "state_id", "session_first", "form_downgraded", "status", "lease", "attempts", "consultations", "consultation_of", "outcome", "reason", "question_id", "created_at", "closed_at"],
+  "required": ["format_version", "queue_task_id", "kind", "role", "class", "scope", "entity", "state_id", "session_first", "form_downgraded", "status", "lease", "attempts", "consultations", "consultation_of", "outcome", "reason", "question_id", "created_at", "closed_at"],
   "additionalProperties": false,
   "$defs": {
     "generation": { "type": "string", "pattern": "^(l-[0-9a-f]{16}|sg-[0-9a-f]{16})$" }
@@ -47,7 +47,6 @@ One record per task. A `job llm <entity_kind> role <role> [each <primitive>]` st
     "queue_task_id": { "type": "string", "pattern": "^qt-[0-9a-f]{16}$", "description": "identifiers.adoc, queue_task_id; the name of the file." },
     "kind": { "type": "string", "enum": ["work", "consultation"] },
     "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$", "description": "The role the state (or the consult link) names (identifiers.adoc, role name)." },
-    "role_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "The configuration digest of the artifact the model caller resolved (model-work/01, Role Artifact Schema); only a generation started with this digest is offered the task. null for a task closed role_undefined." },
     "class": { "type": ["string", "null"], "enum": ["writer", "read_only", "zero_tool", null], "description": "The role's class at creation; null for a task closed role_undefined." },
     "scope": {
       "type": "object",
@@ -80,16 +79,17 @@ One record per task. A `job llm <entity_kind> role <role> [each <primitive>]` st
       "description": "One entry per offer, in order; the generation of every attempt is recorded (PM-WORK-2).",
       "items": {
         "type": "object",
-        "required": ["attempt", "generation_id", "job_id", "offered_at", "acknowledged_at", "ended_at", "end", "counts"],
+        "required": ["attempt", "generation_id", "job_id", "configuration_digest", "offered_at", "acknowledged_at", "ended_at", "end", "counts"],
         "additionalProperties": false,
         "properties": {
           "attempt": { "type": "integer", "minimum": 1 },
           "generation_id": { "$ref": "#/$defs/generation" },
           "job_id": { "type": ["string", "null"], "pattern": "^l-[0-9a-f]{16}$" },
+          "configuration_digest": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "The configuration digest the worker generation was started with (its job record's worker.configuration_digest), the role's current digest at the offer; null for a session attempt." },
           "offered_at": { "type": "string", "format": "date-time" },
           "acknowledged_at": { "type": ["string", "null"], "format": "date-time" },
           "ended_at": { "type": ["string", "null"], "format": "date-time" },
-          "end": { "type": ["string", "null"], "enum": ["closed", "worker_lost", "exited_without_submit", "waited_again", "budget", "start_failure", "session_withdrawn", "restart", "drain", null], "description": "closed: the attempt closed the task; every other value returned the task to queued; null while it runs." },
+          "end": { "type": ["string", "null"], "enum": ["closed", "worker_lost", "exited_without_submit", "waited_again", "budget", "start_failure", "session_withdrawn", "restart", "drain", "withdrawn", null], "description": "closed: the attempt closed the task; withdrawn: the task closed lost (reason withdrawn) while the attempt held it; every other value returned the task to queued; null while it runs." },
           "counts": { "type": "boolean", "description": "Whether the attempt spent a re-offer of the state's job_incomplete budget." }
         }
       }
@@ -116,7 +116,7 @@ One record per task. A `job llm <entity_kind> role <role> [each <primitive>]` st
     },
     "consultation_of": { "type": ["string", "null"], "pattern": "^qt-[0-9a-f]{16}$", "description": "kind consultation: the asking task; null otherwise." },
     "outcome": { "type": ["string", "null"], "enum": ["submitted", "asked", "infeasible", "lost", null], "description": "null while not closed." },
-    "reason": { "type": ["string", "null"], "enum": ["attempts_spent", "role_undefined", "role_unqualified", "role_unavailable", "withdrawn", null], "description": "lost only." },
+    "reason": { "type": ["string", "null"], "enum": ["attempts_spent", "role_undefined", "class_mismatch", "role_unqualified", "role_unavailable", "withdrawn", null], "description": "lost only." },
     "question_id": { "type": ["string", "null"], "pattern": "^Q-[0-9]{3,6}$", "description": "asked only: the question record the task filed." },
     "created_at": { "type": "string", "format": "date-time" },
     "closed_at": { "type": ["string", "null"], "format": "date-time" }
@@ -150,18 +150,19 @@ The generations of the project's interactive sessions (`PM-WORK-5`). `pm-mcp ent
       "propertyNames": { "pattern": "^sg-[0-9a-f]{16}$" },
       "additionalProperties": {
         "type": "object",
-        "required": ["session_key", "client", "client_session_id", "scope", "issued_at", "issued_by", "session_tasks", "offers_suspended", "delivered_skills", "fenced_at"],
+        "required": ["session_key", "client", "client_session_id", "scope", "workdir", "issued_at", "issued_by", "session_tasks", "offers_suspended", "delivered_skills", "fenced_at"],
         "additionalProperties": false,
         "properties": {
           "session_key": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the session identity that the relay and pm-mcp enter share; the generations of one key fence each other. With a null client_session_id the identity is the relay instance, so the key is the relay-instance key, and a generation pm-mcp enter issued is matched by no relay." },
           "client": { "type": "string", "enum": ["claude", "opencode", "antigravity", "codex", "neutral"] },
           "client_session_id": { "type": ["string", "null"], "pattern": "^[\\x21-\\x7E]{1,128}$" },
-          "scope": { "type": ["object", "null"], "required": ["type", "id"], "additionalProperties": false, "description": "The scope the session entered; a session is offered only tasks of that scope. null for a relay-issued generation until the session enters a scope; the start.create-scope commit of a bootstrap sets the committing generation's scope to the new scope.", "properties": { "type": { "type": "string", "enum": ["plan", "epic", "workspace"] }, "id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" } } },
+          "scope": { "type": ["object", "null"], "required": ["type", "id"], "additionalProperties": false, "description": "The scope the session entered; a session is offered only tasks of that scope whose working directory equals workdir. null for a relay-issued generation until the session enters a scope; the start.create-scope commit of a bootstrap sets the committing generation's scope to the new scope.", "properties": { "type": { "type": "string", "enum": ["plan", "epic", "workspace"] }, "id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$" } } },
+          "workdir": { "type": ["object", "null"], "required": ["kind", "plan_id"], "additionalProperties": false, "description": "The working directory the session entered from (the plan worktree or the project checkout, in the shape of the job record's worker.workdir); a session is offered only tasks that run there. null while scope is null.", "properties": { "kind": { "type": "string", "enum": ["plan_worktree", "project_checkout"] }, "plan_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "plan_worktree only: the plan; null otherwise." } } },
           "issued_at": { "type": "string", "format": "date-time" },
           "issued_by": { "type": "string", "enum": ["enter", "relay_start", "new_session"], "description": "enter: pm-mcp enter; relay_start: the first binding of a session relay that found no current generation; new_session: the relay observed a new host session (runtime-model/03, Generations at the Relay)." },
           "session_tasks": { "type": "boolean", "description": "The client profile marks the host eligible for session tasks (worker.session_tasks); false means the session is never offered a task." },
           "offers_suspended": { "type": "boolean", "description": "true after the relay reported a clear or compaction of the host session, until the session calls pm_wait again; the report also empties delivered_skills." },
-          "delivered_skills": { "type": "array", "description": "Skill delivery record of the generation, as in the worker block of the job record (model-work.adoc, Skill Delivery Record).", "items": { "type": "object", "required": ["uri", "digest", "delivered_at"], "additionalProperties": false, "properties": { "uri": { "type": "string", "pattern": "^skill://pm/" }, "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "delivered_at": { "type": "string", "format": "date-time" } } } },
+          "delivered_skills": { "type": "array", "description": "Skill delivery record of the generation (offers and pm_skill loads), as in the worker block of the job record (model-work.adoc, Skill Delivery Record).", "items": { "type": "object", "required": ["uri", "digest", "delivered_at"], "additionalProperties": false, "properties": { "uri": { "type": "string", "pattern": "^skill://pm/" }, "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "delivered_at": { "type": "string", "format": "date-time" } } } },
           "fenced_at": { "type": ["string", "null"], "format": "date-time", "description": "Set when a newer generation of the same session_key was issued; null for the current generation." }
         }
       }
@@ -182,21 +183,24 @@ The record of one grading of a role's configuration by `pm-operator roles qualif
   "$id": "https://cuioss.de/plan-marshall-mcp/schemas/qualification-record.json",
   "title": "QualificationRecord",
   "type": "object",
-  "required": ["format_version", "role", "configuration_digest", "configuration", "corpus_revision", "forms", "warm_fresh_gap", "graded_at", "items"],
+  "required": ["format_version", "role", "qualification_digest", "configuration", "corpus_revision", "forms", "warm_fresh_gap", "graded_at", "items"],
   "additionalProperties": false,
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$" },
-    "configuration_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The configuration digest of the graded artifact; the record is valid only for an artifact with the same digest." },
+    "qualification_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The qualification digest of the graded artifact (model-work/01, Role Qualification): the SHA-256 over exactly the graded members recorded in configuration; the record is valid only for an artifact with the same qualification digest. Members outside it (count, form, recycling, session_first, budget_floor_seconds, description) never invalidate the record." },
     "configuration": {
       "type": "object",
-      "required": ["harness", "harness_version", "model", "effort", "skill_digests"],
+      "required": ["harness", "harness_version", "model", "effort", "tools", "class", "skill_digests"],
       "additionalProperties": false,
+      "description": "The graded members the qualification digest covers (PM-WORK-6).",
       "properties": {
         "harness": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
         "harness_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$", "description": "major.minor of the enrolled harness version; a patch change keeps the record valid." },
         "model": { "type": "string", "minLength": 1 },
         "effort": { "type": ["string", "null"] },
+        "tools": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,63}$" } },
+        "class": { "type": "string", "enum": ["writer", "read_only", "zero_tool"] },
         "skill_digests": { "type": "object", "propertyNames": { "pattern": "^skill://pm/" }, "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
       }
     },
@@ -223,7 +227,7 @@ The record of one grading of a role's configuration by `pm-operator roles qualif
           "item_id": { "type": "string", "minLength": 1 },
           "form": { "type": "string", "enum": ["fresh", "warm"] },
           "answer": { "type": ["string", "object", "null"], "description": "The submitted answer; null when the task closed lost." },
-          "score": { "type": "number", "minimum": 0, "maximum": 1 },
+          "score": { "type": "number", "minimum": 0, "maximum": 1, "description": "The grade a task of the judge role gave the answer (model-work/01, Role Qualification)." },
           "cost_usd": { "oneOf": [ { "type": "number", "minimum": 0 }, { "type": "string", "const": "unmeasured" } ] },
           "duration_ms": { "type": ["integer", "null"], "minimum": 0 }
         }
@@ -263,7 +267,7 @@ The record of one calibration of a quorum declaration of a project's adjudicatio
   "properties": {
     "format_version": { "type": "integer", "const": 1 },
     "decision_kind": { "type": "string", "enum": ["interpretation", "approach", "granularity", "placement", "test_strategy", "scope", "product_behaviour", "assurance", "external_fact"], "description": "Equals the file name's kind." },
-    "declaration_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 over the decision kind, the listed roles in their declared order with their configuration digests, and the score; the record is valid only while they are unchanged." },
+    "declaration_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 over the decision kind, the listed roles in their declared order with their qualification digests, and the score; the record is valid only while they are unchanged." },
     "unit_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Digest of the adjudication unit file at the calibration, for reference." },
     "declaration": {
       "type": "object",
@@ -302,11 +306,11 @@ The record of one calibration of a quorum declaration of a project's adjudicatio
   "$defs": {
     "roleConfig": {
       "type": "object",
-      "required": ["role", "configuration_digest", "harness", "model"],
+      "required": ["role", "qualification_digest", "harness", "model"],
       "additionalProperties": false,
       "properties": {
         "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$" },
-        "configuration_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "qualification_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "The role's qualification digest at the calibration (Role Qualification Record)." },
         "harness": { "type": "string" },
         "model": { "type": "string" }
       }

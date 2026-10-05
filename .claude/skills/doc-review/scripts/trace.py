@@ -168,10 +168,13 @@ for s in sorted(spec2req):
 
 # prefix taxonomy table in Requirements.adoc
 print('\n== Taxonomy table vs actual req->spec union')
+# reference specifications (status REFERENCE) record evidence and are not primary specifications of a prefix
+reference_specs = {os.path.basename(p) for p, t in files.items()
+                   if is_spec_index(p) and re.search(r'^== Status: REFERENCE', t, re.M)}
 for m in re.finditer(r'\|`(PM-[A-Z]+)`\n\|[^\n]*\n\|[^\n]*\n\|([^\n]*)', files['Requirements.adoc']):
     pre = m.group(1); tab = spec_refs(m.group(2))
-    act = set().union(*[req2spec[r] for r in reqs if r.startswith(pre + '-')])
-    act_back = {s for s, rr in spec2req.items() if any(r.startswith(pre+'-') for r in rr)}
+    act = set().union(*[req2spec[r] for r in reqs if r.startswith(pre + '-')]) - reference_specs
+    act_back = {s for s, rr in spec2req.items() if any(r.startswith(pre+'-') for r in rr)} - reference_specs
     if tab != act or tab != act_back:
         print(pre, 'table-only:', sorted(tab-act), 'req-links-only:', sorted(act-tab), '| vs spec-backlinks table-only:', sorted(tab-act_back), 'back-only:', sorted(act_back-tab))
 
