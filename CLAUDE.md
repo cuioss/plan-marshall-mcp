@@ -12,29 +12,27 @@ most of which is not implemented yet: requirements in `doc/Requirements.adoc` (m
 `doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
 `doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification that has watch items, plus `cross-cutting.adoc`).
 
-Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
-`@QuarkusIntegrationTest` integration tests against the packaged application. No container image
-is built (the target is native binaries on the host: the always-on daemon `pm-mcpd`, reached through
-the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
+Current state: roadmap Milestone 0 Part B (technical verifications) is in progress. It builds each verified
+technique in its target module, and the modules it needs exist: the always-on daemon `pm-mcpd`
+(`pm-mcp-server`), reached through the `pm-mcp serve` STDIO relay (`pm-relay`), the operator CLI
+`pm-operator`, and the job launcher `pm-exec`, all four built as native binaries on the host (no
+container image; PM-TECH-1/3, `doc/specification/runtime-model.adoc`). Pass criteria and results are
+recorded in `doc/roadmap/technical_macos.adoc` and `doc/roadmap/technical_linux.adoc`.
 
 Roadmap Milestone 0, Part A (the harness as worker) is complete: the concept is `doc/concepts/harness-as-worker/`
 (index `doc/Concepts.adoc`), the measurements are the reference specification `doc/specification/evaluation.adoc`.
-The stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`) is a reference implementation to
-learn from and is removed with Milestone 1.
+Packages named `spike` (`de.cuioss.pm.mcp.spike` with the Part A stub, active only with `pm.spike.scenario`,
+and the verification endpoints, verbs, and harness drivers of Part B) are experiment-only code and are
+deleted at the Part B exit.
 
 ## Modules
 
-| Module | Content |
-|---|---|
-| `plan-marshall-mcp` | Quarkus app (`de.cuioss.pm.mcp`): MCP server (Streamable HTTP at `/mcp`, port 8080), health on management port 9000 (`/q/health`); `*IT` tests (`@QuarkusIntegrationTest`) run against the packaged application |
-
-Roadmap Milestone 1 creates the target module structure in one step (PM-IMPL-1 in
-`doc/requirements/14-implementation.adoc`): the root module becomes `pm-mcp-server` (Quarkus daemon
-assembly), beside the aggregators `pm-modules` (library modules, with the nested `pm-providers`)
-and `pm-clients`. The only listing of the modules, their dependencies and the specification each
-implements is `doc/specification/module-structure.adoc`; name modules from there and never repeat the
-listing elsewhere. Every module gets minimal real code and tests, never an empty shell. The table above
-and the build commands below change with that milestone.
+The target module structure (PM-IMPL-1 in `doc/requirements/14-implementation.adoc`): `pm-mcp-server`
+(Quarkus daemon assembly) beside the aggregators `pm-modules` (library modules, with the nested
+`pm-providers`) and `pm-clients`. Milestone 0 Part B created the modules it fills; Milestone 1 adds the
+rest. The only listing of the modules, their dependencies and the specification each implements is
+`doc/specification/module-structure.adoc`; name modules from there and never repeat the listing
+elsewhere. Every module gets minimal real code and tests, never an empty shell.
 
 ## Development Notes
 
@@ -46,8 +44,10 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Quality gate: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Ppre-commit"`
 - Full verify: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify"`
 - Coverage: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pcoverage"`
-- Tests (plan-marshall-mcp): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl plan-marshall-mcp -am"` — only on plan-marshall-mcp
-- Integration tests (plan-marshall-mcp): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests -pl plan-marshall-mcp -am"` — only on plan-marshall-mcp
+- Tests (one module): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl <module-path> -am"`
+- Integration tests: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests"`
+- Native binaries and their integration tests: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pnative,integration-tests"` with `GRAALVM_HOME` and `JAVA_HOME` set to a GraalVM 25 installation
+- Without `.plan/execute-script.py` (it is not tracked, for example on a fresh clone): `./mvnw` with the same arguments.
 - Use a Bash timeout of 600000ms for build commands.
 - Analyze each build's TOON result: `status`, `errors[N]{file,line,message,category}`, `log_file`.
 
@@ -90,8 +90,10 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 - JUnit 5 only (`@DisplayName`, `@Nested`, AAA, `@ParameterizedTest` for 3+ variants).
   Forbidden: Mockito, PowerMock, Hamcrest.
-- `@QuarkusTest` + `McpAssured` (quarkus-mcp-server-test) for MCP tools; management endpoints via
-  `@TestHTTPResource(value = "/health/ready", management = true)`.
+- `@QuarkusTest` + `McpAssured` (quarkus-mcp-server-test) for MCP tools. The daemon listens only on its
+  Unix socket; tests give it a short `PM_MCP_BASE` (the socket path must fit `sun_path`).
+- OS-specific behaviour (Landlock, Secret Service, Keychain) is tested with `@EnabledOnOs`; verification
+  ITs write their measured figures to `target/verification-results/<item>.json`.
 - Test data: cui-test-generator; log assertions: cui-test-juli-logger (`@EnableTestLogger`).
 - Minimum 80% instruction and branch coverage, enforced by the JaCoCo `check` of the parent's
   `-Pcoverage` profile (merged Maven and `quarkus-jacoco` data) and by the SonarCloud quality gate.
