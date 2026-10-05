@@ -1,0 +1,177 @@
+= Model Work Specification: Recommendation Score & Decision Panel
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Work] » Recommendation Score & Decision Panel
+
+[#decision-panel]
+== Recommendation Score & Decision Panel
+_See Requirements link:../../Requirements.adoc#PM-WF-18[PM-WF-18: Question Recommendation Score & Decision Panel], link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides]_
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-45[PM-WATCH-DISP-45]_
+
+Every question carries a recommendation and a score that says how sure the asker is of it. In the question mode `panel` the server adjudicates every question set before it is delivered: it asks configured panel roles the same questions without showing them the recommendation and answers the set itself where the asker and the panel agree with confidence; every other set reaches the user as in mode `auto`, with every system's answer shown. Question records, their delivery, the modes, and the deadlines are specified in xref:06-envelopes-questions-deadlines.adoc#question-records[Question Records]; this part specifies the score, the panel, and the adjudication.
+
+[#recommendation-score]
+=== Recommendation Score
+
+*Asked by a task*: Every question a task creates (`ask`, `ask:TASK-NNN`, an item of a `questions` list) carries, in its question envelope (xref:06-envelopes-questions-deadlines.adoc#question-envelope-schema[Question Envelope]):
+
+* exactly one option with `recommended: true`, the asker's choice;
+* `recommendation_confidence`, an integer `0` to `100`: the asker's confidence that the recommended option is right;
+* `rationale`, `10` to `500` characters: why the asker recommends it, naming the evidence;
+* `decision_kind`, one value of the closed set of <<decision-kinds>>.
+
+A payload without them, or with no or several recommended options, is refused `invalid_link_args`, and the worker submits again.
+
+*Raised by the server*: A question a server primitive raises carries the primitive's recommended option, its score mapped to `0` to `100`, a server-composed rationale (the scores the choice rests on), and a fixed kind. A primitive that computes no score, and a question without a recommended option, scores `0`.
+
+[cols="2,1,4"]
+|===
+|Server question |Kind |Score
+
+|`init.recipe-candidate`
+|`approach`
+|The top recipe score times `100` (link:../domain-extensions/05-recipes-and-extension-points.adoc[Domain Extensions Specification, Tier-1 Init Routing]).
+
+|`init.sibling-collision`
+|`scope`
+|`0`.
+
+|`init.domain-choice`
+|`placement`
+|The top domain's share of the detection scores times `100`; `0` without a unique top score.
+
+|`outline.review`
+|`scope`
+|`0`.
+
+|Workspace setup choices (class `setup`)
+|`external_fact`
+|`0`.
+|===
+
+*Question set and its score*: The questions of one creation form a *question set*: one `ask` or `ask:TASK-NNN` (one question), one `submit` with its `questions` list, or one server primitive. Every record of a set names the set by the `question_id` of its first question (`question_set`, link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]). The set's *score* is the lowest `recommendation_confidence` of its questions.
+
+*Shown everywhere*: The recommendation, its confidence, and its rationale are persisted with the record and shown on every delivery channel: the web app (link:../cli-and-security/03-web-server.adoc[CLI, Coordination & Security Specification, Web Access]) and the answer links of the entry session (link:../hypermedia-format/01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Hypermedia Format Specification, Task, Answer, Waiver-Request & Exit Links]).
+
+[#decision-kinds]
+=== Decision Kinds
+
+The kind says what a question decides, and so whether a model may decide it at all. The set is closed; a kind a model cannot judge from the repository and the plan is excluded from automatic decisions by default.
+
+[cols="2,4,1"]
+|===
+|`decision_kind` |The question decides |Shipped `auto_kinds`
+
+|`interpretation` |What an aspect of the request or of a finding means. |yes
+|`approach` |Which of several technical ways the plan takes. |yes
+|`granularity` |How the work is cut into deliverables or plan tasks. |yes
+|`placement` |Where a change belongs (module, package, file, domain). |yes
+|`test_strategy` |How a change is tested. |yes
+|`scope` |What is in or out of the plan, compatibility, and follow-up work. |no
+|`product_behaviour` |Behaviour a user or a client of the product sees, contracts included. |no
+|`assurance` |How much security, review, or verification a change needs. |no
+|`external_fact` |A fact or an organisational decision outside the repository and the plan. |no
+|===
+
+A worker chooses the kind that fits the question best; where two fit, the role skill directs it to the one of them that is not in the shipped `auto_kinds`.
+
+[#panel-configuration]
+=== Panel Configuration & Validation
+
+The panel is operator configuration in `local-config.json` (operator channel only, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), per project, with a machine-wide default in `project_defaults`. It applies to the classes whose effective `questions.mode` is `panel` (xref:06-envelopes-questions-deadlines.adoc#question-delivery[Delivery, Mode & Server-Owned Deadlines]).
+
+[cols="2,1,4"]
+|===
+|Key |Default |Meaning
+
+|`questions.panel.roles`
+|`[panel-a, panel-b]`
+|The panel roles, `0` to `2` distinct names of the effective role set.
+
+|`questions.panel.quorum`
+|`2`
+|`1` to `3`: how many systems must agree. The asker, or the primitive of a server-raised question, counts as one system; each panel role counts as one.
+
+|`questions.panel.min_score`
+|`90`
+|`0` to `100`: the lowest set score that is adjudicated, and the lowest confidence an agreeing answer may have.
+
+|`questions.panel.auto_kinds`
+|`interpretation`, `approach`, `granularity`, `placement`, `test_strategy`
+|The decision kinds that may be decided automatically.
+|===
+
+*Asking roles*: The asking roles of a project are the roles of every `job llm` state of its composed units whose task entities offer `ask`, `ask:TASK-NNN`, or a `submit` with a `questions` list.
+
+*Validation*: `pm-operator config` refuses a panel that fails one of these rules, naming the rule and the role, and writes nothing; every adjudication checks the rules again on the effective role set, because a role artifact may change later:
+
+[cols="2,5"]
+|===
+|Reason |Rule
+
+|`panel_invalid`
+|A panel role is not defined by the effective role set (absent or invalid, xref:01-roles-and-configuration.adoc#role-validation[Validation]), its class is not `read_only`, it sets `session_first`, or `quorum` exceeds one plus the number of panel roles.
+
+|`panel_not_diverse`
+|A panel role has the same harness and model as an asking role or as another panel role.
+|===
+
+A panel with no panel roles and quorum `1` is valid: the asker decides alone, at or above `min_score`.
+
+[#adjudication]
+=== The Adjudication (`question.adjudicate`)
+
+Every question state runs the compiled sub-workflow `question.adjudicate` for the scope's new question set before the set is delivered (unit, states, and binding: link:../workflow-dsl/02-units-jobs-decisions.adoc#question-adjudicate-unit[Workflow DSL Specification, Adjudication Unit]; rows: link:../state-catalogue/13-question-adjudication.adoc[State Catalogue, Question Adjudication]). While it runs, the set's records are open and not yet delivered: no answer link, no web entry, and no deadline.
+
+. *Check*: The set is adjudicated only when its class's effective mode is `panel`, the panel passes the validation (<<panel-configuration>>), every question's `decision_kind` is in `auto_kinds`, and the set's score is at least `min_score`. Otherwise the unit ends `delivered` at once, with the reason `mode`, `panel_invalid`, `panel_not_diverse`, `kind_ineligible`, or `below_score` (in a mode other than `panel` nothing is recorded).
+. *Panel tasks*: The server creates one task per panel role, each for its own entity of the kind `panel` (`panel-<question_set>-<role>`), through the model caller and the task protocol like every task (xref:01-roles-and-configuration.adoc#model-caller[The Model Caller], xref:02-task-protocol.adoc[Task Protocol]): qualification and its conservative fallback, the re-offer budget, the model slots, and fencing apply. Every panel task runs `fresh` and is never offered to the entry session. With no panel roles, the step completes at once.
+. *Decide*: The server applies the decision rule (<<decision-rule>>) to the answers; the unit's ending transaction records the result on every record of the set (<<panel-record>>).
+. *End*: `auto_decided` answers every question of the set with the agreed option (`channel: panel`); the question state takes the outcome of that answer like any other. `delivered` hands the set to the delivery of its mode, `auto` in mode `panel`, with the panel's answers attached; the question wait (link:../timeouts/01-job-budgets-and-waits.adoc#question-wait[Timeouts & Budgets Specification, Question Wait]) starts at the delivery.
+
+The adjudication is bounded by the compiled panel wait (link:../timeouts/01-job-budgets-and-waits.adoc#panel-wait[Timeouts & Budgets Specification, Panel Wait]): at its expiry the server cancels the open panel tasks, which count as without an answer. It never asks the operator or the user anything of its own, and it is never repeated for a set. The operator's `abort` or `delete-plan` while it runs cancels the panel tasks with the records.
+
+[#panel-blind-input]
+=== Blind Input
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-45[PM-WATCH-DISP-45]_
+
+A panel task's entity carries in its `facts`:
+
+* the question set: every question's `question_id`, `question_text`, `decision_kind`, and its options (`branch_key`, `label`, `description`) in their recorded order;
+* the facts of the asking state with the evidence the decision rests on (xref:06-envelopes-questions-deadlines.adoc#decision-evidence[Evidence in Facts]), composed as for the asking task; for a server-raised question, the facts the primitive's question state shows.
+
+It never carries the `recommended` flags, `recommendation_confidence`, `rationale`, or `default_assumption` of a question, the answers of another panel role, or the asking task's submission beyond what its facts show. The entity offers one closing link `submit:panel` (rel `submit`) with `answers: list<schema[panel-answer]>`, one item per question of the set: `{question_id, branch_key, confidence (0..100), rationale (text 10..500)}` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]); an item for an unknown question, a missing item, or an unknown `branch_key` is refused `invalid_link_args`. The entity offers no `ask`, no `consult`, and no infeasible link.
+
+[#decision-rule]
+=== Decision Rule
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-45[PM-WATCH-DISP-45]_
+
+For each question of the set, the systems are the asker (its recommended option and `recommendation_confidence`) and every panel role whose task ended `submitted` with a valid answer. A question is *agreed* on option `o` when:
+
+* at least `quorum` systems chose `o`, each with a confidence of at least `min_score`, and
+* no system chose another option with a confidence of at least `min_score`.
+
+The set is `auto_decided` when every question of the set is agreed; otherwise it is `delivered` with the reason `disagreement`. A panel task that ended `lost` (an unqualified, unavailable, or undefined role, its re-offers spent, or the panel wait expired) or `infeasible` has no answer and never counts as agreement; with too few answering systems the quorum is not reached.
+
+[#panel-record]
+=== Record, Delivery & Audit
+
+The adjudication of a set in mode `panel` is recorded on each record of the set as one `adjudicated` line (link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]): `outcome` (`auto_decided` or `delivered`), `reason` (`agreement`, `mode`, `panel_invalid`, `panel_not_diverse`, `kind_ineligible`, `below_score`, or `disagreement`), and `panel[]`, one entry per panel role with its harness, model, `branch_key`, confidence, rationale, `queue_task_id`, and task outcome. An auto-decided record is closed `answered` with `channel: panel`.
+
+* *Delivered with the panel's answers*: A delivered set shows, per question, the asker's recommendation with its confidence and rationale and every panel role's answer with its confidence and rationale, on the web app and in the facts of the answer links; the deadline, the class fallback, and the answer validation are those of mode `auto`.
+* *Audit*: Every auto-decided question is listed in the pull-request body and the landing record with the agreed option and the systems that agreed, like every other answer; an answer that changes the plan's intent creates an amendment of source `panel`. The record is the standing decision a later task, a re-planning, or the retrospective cites by its `question_id`.
+* *Accounting*: The usage of a panel task is accounted to its role and to the scope like every task (xref:09-completion-usage-and-spend.adoc[Task Completion, Usage & Spend]).
+
+[#panel-and-consultation]
+=== Panel and Consultation
+
+A panel task uses the task mechanics of a consultation (xref:05-consultation.adoc[Consultation]): a task of another role through the server, served by the model caller and the task protocol. It differs in who starts it and what it sees: the server starts it for a question set, never a worker, its facts are blind to the asker's judgment, and its answer goes to the adjudication, never to the asking task.
+
+[#panel-qualification]
+=== Panel Roles and Qualification
+
+The shipped panel roles `panel-a` and `panel-b` (xref:01-roles-and-configuration.adoc#default-roles[Default Role Set]) are graded like every `read_only` role on the generic corpus items, among them the closed decisions `decision/*` (xref:01-roles-and-configuration.adoc#qualification-topics[Corpus Topics of a Role]). An unqualified panel role's tasks close `lost`, so its set is delivered: the panel never decides on a configuration whose judgment was not shown.
