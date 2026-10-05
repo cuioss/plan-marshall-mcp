@@ -20,7 +20,8 @@ The document is self-contained. A Claude Code session on the Linux machine can r
 * *Branch.* Work on `feature/m0-part-b-linux`, created from `main`. Write results only into this document, in the item's *Result* block, its *Status* line, and <<setup-record>>.
 * *Code changes.* Code may change only in the Linux-specific classes, and every change comes with a test:
 ** `pm-modules/pm-exec` (Landlock), `pm-mcp-server/.../credentials/dbus` and `SecretServiceStore` (Secret Service);
-** the Linux branches of `pm-modules/pm-api/.../posix` (spawn).
+** the Linux branches of `pm-modules/pm-api/.../posix` (spawn);
+** the epoll native-image metadata under `pm-mcp-server/src/main/native-linux/` (<<native-transport-linux>>).
 +
 A failure elsewhere is recorded as a finding and is not fixed here; the macOS side owns that code.
 * *Builds and tests.* Use Maven and JUnit only. `.plan/execute-script.py` is not tracked, so use `./mvnw` with the arguments given here. Never run `javac` directly, and never write ad-hoc verifier programs; a shell sequence written out in an item is allowed. Analyse a failing build and never work around it.
@@ -155,6 +156,25 @@ The native build produces four binaries:
 * `pm-clients/pm-operator/target/pm-operator`
 * `pm-modules/pm-exec/target/pm-exec`
 * `pm-mcp-server/target/pm-mcp-server-*-runner` (the binary `pm-mcpd`)
+
+[#native-transport-linux]
+=== Native Transport Metadata for Linux (prerequisite of the native daemon)
+
+Vert.x binds the Unix socket only through the Netty native transport (`epoll` on Linux, `kqueue` on macOS). In a native image, Quarkus replaces the transport lookup with the JDK transport. `pm-mcp-server` therefore offers the transport itself (`de.cuioss.pm.mcp.server.runtime.NativeTransport`, a Vert.x `Transport` service). The transport also needs the JNI and resource metadata of its native library. For macOS this metadata is `pm-mcp-server/src/main/native-macos/META-INF/native-image/de.cuioss/pm-mcp-server-macos/reachability-metadata.json`. The Linux equivalent does not exist yet and is the first task of this run:
+
+. Build the JVM runner: `./mvnw package -pl pm-mcp-server -am -DskipTests`.
+. Run it once under the tracing agent with a short base. Exercise the socket: `GET /api/v1/status`, a few SSE events, then `POST /api/v1/runtime/stop`, all with `curl --unix-socket "$PM_MCP_BASE/run/runtime.sock" -H "Authorization: Bearer $(cat $PM_MCP_BASE/run/runtime.token)" http://localhost/...`:
++
+[source,bash]
+----
+export PM_MCP_BASE=$HOME/.pmt && mkdir -p /tmp/agent-out
+java -agentlib:native-image-agent=config-output-dir=/tmp/agent-out -jar pm-mcp-server/target/quarkus-app/quarkus-run.jar
+----
++
+. From the agent output, keep only the entries for `io.netty.channel.epoll.*`, `io.netty.channel.unix.*`, `io.netty.channel.ChannelException`, `io.netty.channel.DefaultFileRegion`, `io.vertx.core.impl.transports.EpollTransport`, and the `META-INF/native/libnetty_transport_native_epoll_*.so` resources. The macOS file shows the shape and the kind of entries to keep. Write the result to `pm-mcp-server/src/main/native-linux/META-INF/native-image/de.cuioss/pm-mcp-server-linux/reachability-metadata.json`.
+. Build natively and run `DaemonStartupIT` (L1). Iterate until the native daemon binds its socket.
+
+The ITs stage `libnetty_transport_native_epoll_<arch>.so` beside the native runner, as the release layout will. Without it beside the binary, Netty extracts the library into the temporary directory on every start, which costs about 250 ms on macOS and puts executed native code in `/tmp`. Record in L2 whether the same holds on Linux.
 
 A single module and its ITs run as `./mvnw verify -Pnative,integration-tests -pl <module> -am`. Record the binary sizes and the native build durations in L2.
 
@@ -588,7 +608,20 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 [#daemon-its]
 === Daemon ITs (`pm-mcp-server`)
 
-*Filled in when the daemon adapter lands; see <<open-before-run>>.*
+Each IT starts the packaged daemon as its own process: the native runner after `-Pnative`, otherwise the JVM runner. It uses a short `PM_MCP_BASE` below `/tmp` and reaches the socket through the test-scope client `UdsHttp`. Figures are written to `pm-mcp-server/target/verification-results/`.
+
+[cols="1,3", options="header"]
+|===
+|IT |Verifies
+|`DaemonStartupIT` |Socket and directory modes; `401` without or with a wrong token; a second daemon exits `0` with the base byte-identical; stale socket after `kill -9`; exit `77` for an over-long socket path; stop gives `0` (L1)
+|`StartupFiguresIT` |Cold start to ready (median of 20) and idle RSS after 10 s (L2)
+|`McpSurfaceIT` |MCP on the socket, sessionless for both host forms; flat schemas of the ten core tools; the `PM-MCP-*` headers reach the handler through the security identity; job token on `/mcp` only; progress on the call stream; the ingestion validator (`commonmark`, `cui-http`) (L1, M8)
+|`WebListenerIT` |Web listener opened and closed at runtime beside a live socket SSE stream; routes; token kinds per listener; LAN TLS (L5)
+|`HelloToolIT` |The `hello` tool over the socket
+|`LspAndGitInDaemonIT` |LSP4J and JGit inside the daemon (L6, L13)
+|`KeyringIT` |The active OS keyring from the packaged daemon (L8)
+|`SecretServiceIT` |Secret Service on the JVM against the session keyring, Linux only (L8)
+|===
 
 [#e2e-its]
 === End-to-End and Harness ITs (`pm-e2e`)
