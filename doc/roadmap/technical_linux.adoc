@@ -1,0 +1,601 @@
+= Technical Verifications on Linux
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../README.md[plan-marshall-mcp] » link:../roadmap.adoc[Roadmap] » Technical Verifications on Linux
+
+== Purpose
+
+This runbook covers the Linux half of link:../roadmap.adoc[Roadmap] Milestone 0, Part B (technical verifications): every item that runs only on Linux (Landlock, Secret Service), and every item that must hold on both platforms (native image, on-demand start, web listener, the `PM-TECH-3` bounds). The macOS half is link:technical_macos.adoc[Technical Verifications on macOS]. Each item checks a technique against a gate of the link:../Requirements.adoc#_appendix_verification_gates_risk_register_non_normative[Requirements, Appendix: Verification Gates & Risk Register]. The technique is built in its target module, so a result applies to the product code.
+
+The document is self-contained. A Claude Code session on the Linux machine can run it from top to bottom without any other context.
+
+=== Rules
+
+* *Pass criteria are fixed.* Every item states its pass criterion below, set before the first run. Never edit a pass criterion after a run. If a criterion turns out to be wrong, record that as a finding in the item's result.
+* *Branch.* Work on `feature/m0-part-b-linux`, created from `main`. Write results only into this document, in the item's *Result* block, its *Status* line, and <<setup-record>>.
+* *Code changes.* Code may change only in the Linux-specific classes, and every change comes with a test:
+** `pm-modules/pm-exec` (Landlock), `pm-mcp-server/.../credentials/dbus` and `SecretServiceStore` (Secret Service);
+** the Linux branches of `pm-modules/pm-api/.../posix` (spawn).
++
+A failure elsewhere is recorded as a finding and is not fixed here; the macOS side owns that code.
+* *Builds and tests.* Use Maven and JUnit only. `.plan/execute-script.py` is not tracked, so use `./mvnw` with the arguments given here. Never run `javac` directly, and never write ad-hoc verifier programs; a shell sequence written out in an item is allowed. Analyse a failing build and never work around it.
+* *Figures.* Every verification IT writes its measured figures to `<module>/target/verification-results/<item>.json`. Copy the figures into the result table and name the file.
+* *Fallbacks.* A failed item records the fallback its gate names (quoted in the item) and does not apply it in code. The consolidation on the macOS side decides and applies it.
+* *Handback.* At the end: commit, push `feature/m0-part-b-linux`, and open one PR against `main`, titled `docs: Part B technical verifications on Linux`. Do not merge it.
+
+== Machine Setup
+
+The machine is a vanilla Ubuntu 24.04 LTS, on `x86_64` or `aarch64`. Run every step as the normal user (not root), with `sudo` where shown.
+
+=== Kernel and Landlock
+
+[source,bash]
+----
+uname -r            # must be >= 5.19 for Landlock ABI 2; Ubuntu 24.04 ships 6.8
+cat /sys/kernel/security/lsm   # must contain "landlock"
+----
+
+The Landlock ABI itself is read with `pm-exec --probe` once the binaries are built (<<build>>).
+
+=== Packages
+
+[source,bash]
+----
+sudo apt-get update
+sudo apt-get install -y build-essential zlib1g-dev git curl zip unzip jq python3 \
+  dbus-user-session dbus-x11 gnome-keyring libsecret-tools
+----
+
+`build-essential` and `zlib1g-dev` are required by GraalVM `native-image`. `gnome-keyring` and `libsecret-tools` (`secret-tool`) are required by gate 5.
+
+=== Java: GraalVM 25
+
+[source,bash]
+----
+curl -s "https://get.sdkman.io" | bash
+source "$HOME/.sdkman/bin/sdkman-init.sh"
+sdk list java | grep -E "graalce|graal "      # pick the newest 25.x GraalVM CE
+sdk install java <25.x-graalce identifier>
+java -version && native-image --version
+----
+
+If SDKMAN's repackaging fails, download the `graalvm-community-jdk-25*_linux-<arch>_bin.tar.gz` asset of the newest `graal-25.*` release from `github.com/graalvm/graalvm-ce-builds/releases` and unpack it. In either case, set `JAVA_HOME` and `GRAALVM_HOME` to the installation and put `$JAVA_HOME/bin` first on `PATH`. The build uses the Maven wrapper `./mvnw`, so no Maven installation is needed.
+
+=== Docker Engine and Compose (gate 3)
+
+Install from Docker's apt repository (`docs.docker.com/engine/install/ubuntu/`): `docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`. Then:
+
+[source,bash]
+----
+sudo usermod -aG docker "$USER"   # log out and in again
+docker run --rm hello-world && docker compose version
+----
+
+=== Gradle and mvnd (gate 3)
+
+[source,bash]
+----
+sdk install gradle      # only to create the fixture project; builds run through its wrapper
+sdk install mvnd
+----
+
+=== GitHub CLI
+
+Install `gh` from `cli.github.com/packages` (apt). Run `gh auth login`, then:
+
+[source,bash]
+----
+git clone https://github.com/cuioss/plan-marshall-mcp.git && cd plan-marshall-mcp
+git checkout -b feature/m0-part-b-linux
+----
+
+=== Harness CLIs (gates 9, 13, 16)
+
+Install Node.js LTS (`nvm install --lts`, or the NodeSource apt repository), then:
+
+[source,bash]
+----
+npm install -g @anthropic-ai/claude-code && claude      # log in interactively once
+curl -fsSL https://opencode.ai/install | bash && opencode auth login
+npm install -g @openai/codex && codex login              # optional (item L12)
+----
+
+Each harness is logged in once interactively. The workers of L10 to L12 use the harness's own login (gate 13 verifies exactly that).
+
+=== Keyring Session (gate 5)
+
+On a desktop session the keyring already runs; record which one it is. On a headless machine, start a session bus and an unlocked keyring for the run:
+
+[source,bash]
+----
+dbus-run-session -- bash        # every gate-5 step runs inside this shell
+echo -n "pm-test-keyring" | gnome-keyring-daemon --unlock --components=secrets
+echo "$DBUS_SESSION_BUS_ADDRESS"   # must be unix:path=..., an abstract address is not usable (L8)
+secret-tool store --label=probe service probe key probe <<< "x" && secret-tool lookup service probe key probe
+----
+
+If `DBUS_SESSION_BUS_ADDRESS` names an abstract socket (`unix:abstract=...`), that is itself a finding for L8: the JDK cannot connect to an abstract socket. Record it, and start `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus --fork` to continue.
+
+[#setup-record]
+=== Setup Record
+
+Fill in before the first item.
+
+[cols="2,3", options="header"]
+|===
+|Component |Version / value
+|Ubuntu, kernel, architecture |
+|Landlock ABI (`pm-exec --probe`) |
+|GraalVM (`native-image --version`) |
+|Docker, Compose |
+|Gradle, mvnd |
+|Desktop keyring or headless `gnome-keyring-daemon` |
+|Claude Code, OpenCode, Codex (`--version`) |
+|Models used by the workers |
+|Commit of `main` the run started from |
+|===
+
+[#build]
+== Build
+
+[source,bash]
+----
+./mvnw -l target-build.log verify                                   # JVM: unit tests of all modules
+./mvnw -l target-native.log verify -Pnative,integration-tests       # native binaries and every *IT
+----
+
+The native build produces four binaries:
+
+* `pm-clients/pm-relay/target/pm-mcp`
+* `pm-clients/pm-operator/target/pm-operator`
+* `pm-modules/pm-exec/target/pm-exec`
+* `pm-mcp-server/target/pm-mcp-server-*-runner` (the binary `pm-mcpd`)
+
+A single module and its ITs run as `./mvnw verify -Pnative,integration-tests -pl <module> -am`. Record the binary sizes and the native build durations in L2.
+
+A *staged installation* for manual steps: copy the four binaries into one `bin/` directory under their release names `pm-mcp`, `pm-operator`, `pm-exec` and `pm-mcpd`, and export `PM_MCP_HOME` as its parent. Use a short `PM_MCP_BASE`, for example `export PM_MCP_BASE=$HOME/.pmv`, so that the socket path fits `sun_path`.
+
+== Items
+
+Every item has the same blocks: what it verifies, the fixed pass criterion, the procedure, the fallback if it fails, and the result.
+
+=== L1: Local Adapter under Native Image (gate 1)
+
+*Verifies*: roadmap Part B, item "local adapter under native image". `pm-mcpd` serves MCP and `/api/v1` on its Unix socket with runtime-token authentication and unbuffered SSE. It handles a stale socket under the singleton lock and refuses to start when the socket path exceeds the Linux `sun_path` limit of 108 bytes. `cui-http` and `commonmark` are part of the same native build. See link:../specification/runtime-model.adoc[Runtime & Interaction Model Specification].
+
+*Pass criterion*: all of the following hold for the native binary:
+
+. The socket has mode `0600` in a `0700` `run/`.
+. A request without the token, or with a wrong one, gets `401`.
+. The first SSE event arrives before the stream ends.
+. A second runtime exits `0` and leaves `<PM_MCP_BASE>` byte-identical.
+. After a `kill -9` the next start removes the stale socket and serves.
+. A base whose socket path exceeds 108 bytes exits `77` and writes no token and no socket.
+. The ingestion validator (which uses `commonmark` and `cui-http`) works in the native binary.
+
+*Procedure*: `./mvnw verify -Pnative,integration-tests -pl pm-mcp-server -am`, which runs the daemon ITs listed in <<daemon-its>> against the native runner.
+
+*Fallback (gate 1)*: listener fallback (1) is loopback `127.0.0.1` with the runtime token and `Host`/`Origin` validation. Fallback (2) is an own JDK `UnixDomainSocketAddress` channel bridging to the Quarkus router. Otherwise: explicit reachability metadata, or replace the incompatible library.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Figure / evidence |Pass
+|Socket and directory modes | |
+|401 without / with wrong token | |
+|Unbuffered SSE | |
+|Second runtime exits 0, base unchanged | |
+|Stale socket after `kill -9` | |
+|Exit 77 at 108+ bytes, nothing written | |
+|`commonmark` / `cui-http` in native | |
+|===
+
+*Status*: `[ ]`
+
+=== L2: PM-TECH-3 Bounds on Linux (gate 1)
+
+*Verifies*: the startup and memory bounds of `PM-TECH-3` on this machine.
+
+*Pass criterion*:
+
+* `pm-mcpd` cold start to ready (token written, socket bound and accepting; clean state, no web listener): median of 20 runs ≤ 50 ms.
+* `pm-mcpd` idle RSS 10 s after ready: ≤ 64 MB.
+* `pm-mcp serve` forwards `initialize` to a running runtime within ≤ 50 ms of process start (median of 15).
+* `pm-operator status` sends its first request within ≤ 50 ms (median of 15).
+
+*Procedure*: the cold-start and RSS ITs of `pm-mcp-server` (<<daemon-its>>), and `PmMcpProcessIT` and `PmOperatorProcessIT` (L3), all against the native binaries. Take the figures from the `verification-results` files.
+
+*Fallback*: there is none for the bounds themselves. A miss is recorded with its figures and decided on the macOS side; on reference hardware the bound is normative.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Figure |Value (median / max) |Pass
+|`pm-mcpd` cold start | |
+|`pm-mcpd` idle RSS | |
+|Relay `initialize` forwarded | |
+|`pm-operator` first request | |
+|Binary sizes (four) and native build durations | |—
+|===
+
+*Status*: `[ ]`
+
+=== L3: Client Stack under Native Image (gate 1)
+
+*Verifies*: `pm-mcp` and `pm-operator` as plain native images (picocli, the `pm-api` HTTP/1.1 and SSE client over the JDK Unix-domain channel), including the forwarding of the `pm-mcp serve` relay.
+
+*Pass criterion*: `PmMcpProcessIT` and `PmOperatorProcessIT` pass against the native binaries. That covers:
+
+* `stdout` carries only newline-framed JSON-RPC;
+* the relay ends on `stdin` EOF;
+* the relay refuses to run inside a worker without `--job`;
+* `pm-operator status` writes nothing while no runtime runs;
+* `spike events` prints each SSE event as it arrives.
+
+*Procedure*: `./mvnw verify -Pnative,integration-tests -pl pm-clients/pm-relay,pm-clients/pm-operator -am`.
+
+*Fallback (gate 1)*: explicit reachability metadata, or replace the incompatible library. Native compilation of all four binaries is non-negotiable.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Evidence |Pass
+|`PmMcpProcessIT` (native) | |
+|`PmOperatorProcessIT` (native) | |
+|===
+
+*Status*: `[ ]`
+
+=== L4: Detached On-Demand Start (gate 8)
+
+*Verifies*: `pm-mcp` and `pm-operator` start `pm-mcpd` through FFM `posix_spawn` with `POSIX_SPAWN_SETSID` (glibc value `0x80`, glibc ≥ 2.26). The descriptors of the child are closed with `posix_spawn_file_actions_addclosefrom_np` (glibc ≥ 2.34). A termination of the relay by the host never reaches the runtime.
+
+*Pass criterion*: all of the following, for the native binaries:
+
+* The started daemon's process-group id and session id equal its pid.
+* Its `stdin` is `/dev/null`, and `stdout`/`stderr` are appended to `logs/daemon.log`.
+* After `kill -9` of the relay, and after `kill -HUP` of the relay's process group, the daemon still answers `GET /api/v1/status`.
+* No zombie of the relay's children remains.
+
+*Procedure*:
+
+. Run the gate 8 tests of `PmMcpProcessIT` and `PmOperatorProcessIT` (L3 run).
+. Manually, with a staged installation:
++
+[source,bash]
+----
+setsid bash -c 'echo "" | $PM_MCP_HOME/bin/pm-mcp serve --client neutral & echo $! > /tmp/relay.pid; wait' &
+sleep 2; pid=$(jq .pid $PM_MCP_BASE/state/runtime.json)
+ps -o pid,pgid,sid,stat,cmd -p $pid
+kill -HUP -- -$(ps -o pgid= -p $(cat /tmp/relay.pid) | tr -d ' ') 2>/dev/null; sleep 1
+$PM_MCP_HOME/bin/pm-operator status
+----
+
+*Fallback (gate 8)*: on a failing platform the starting binary reports the failure and names `pm-operator runtime install`, and the per-user `systemd --user` service serves that platform. On-demand start stays the default wherever it works.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Evidence |Pass
+|pid = pgid = sid of the daemon | |
+|`stdin` / `daemon.log` | |
+|Survives relay `kill -9` and group `SIGHUP` | |
+|===
+
+*Status*: `[ ]`
+
+=== L5: Web Listener at Runtime (gate 15)
+
+*Verifies*: a second Vert.x HTTP server in the native `pm-mcpd`, opened and closed at runtime by `pm-operator web enable|disable` without touching running work. It routes only `/api/v1/` and the web app; `/mcp` gives `404`. Each listener accepts only its own token kind. LAN mode serves HTTPS with the runtime-generated ECDSA P-256 certificate.
+
+*Pass criterion*: the web-listener ITs of `pm-mcp-server` (<<daemon-its>>) pass against the native runner. Manually:
+
+* `pm-operator web enable` opens `127.0.0.1:7420` while an SSE stream on the socket keeps delivering;
+* `/mcp` on the web port gives `404`;
+* the runtime token gives `401` there;
+* `web enable --lan` serves TLS (`openssl s_client -connect 127.0.0.1:7420` shows an ECDSA P-256 certificate);
+* `web disable` closes the port, and the SSE stream continues.
+
+*Procedure*: the daemon ITs (L1 run), then manually with a staged installation, `pm-operator spike events --count 30` running in a second terminal.
+
+*Fallback (gate 15)*: the setting takes effect at the next runtime start, and the verb says so.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Evidence |Pass
+|Open/close without disturbing the socket stream | |
+|`/mcp` 404, runtime token 401 on the web listener | |
+|LAN TLS certificate (P-256) | |
+|===
+
+*Status*: `[ ]`
+
+=== L6: LSP4J and JGit under Native Image (gate 2, `PM-TECH-2`)
+
+*Verifies*: LSP4J's JSON-RPC reflection and dynamic proxies, and JGit, in the native `pm-mcpd` on Linux. On macOS both work natively.
+
+*Pass criterion*: `LspAndGitInDaemonIT` passes against the native runner. The LSP client completes `initialize`, `definition` and `shutdown` against the fixture language server, and the 12-step JGit scenario passes, including the refused hook (`CAPABILITY_MISSING`).
+
+*Procedure*: part of the L1 run. Read `gate2-lsp4j-native.json` and `jgit-native.json`.
+
+*Fallback (gate 2)*: replace LSP4J with a minimal Jackson-based JSON-RPC client for the closed LSP operation set. For JGit, take the CLI variant (`PM-EXEC-5`).
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Figure |Pass
+|LSP `initialize` / `definition` (ms) | |
+|JGit scenario (ms, all steps) | |
+|===
+
+*Status*: `[ ]`
+
+=== L7: McpAssured STDIO Harness (gate 6)
+
+*Verifies*: the `quarkus-mcp-server-test` STDIO client (`McpAssured.newStdioClient()`) against the relay `pm-mcp serve`, in front of the runner JAR and in front of the native daemon.
+
+*Pass criterion*: the STDIO harness test of `pm-e2e` (<<e2e-its>>) passes in both modes: `initialize` (or `server/discover`), `tools/list`, and a `tools/call` of `hello`.
+
+*Procedure*: `./mvnw verify -Pintegration-tests -pl pm-modules/pm-e2e -am` for the JAR, then the same with `-Pnative` added.
+
+*Fallback*: gate 6 names no fallback; it is open item PM-WATCH-GEN-59. Record the result as the input to that item.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Mode |Evidence |Pass
+|Runner JAR | |
+|Native `pm-mcpd` | |
+|===
+
+*Status*: `[ ]`
+
+=== L8: Secret Service over D-Bus (gate 5)
+
+*Verifies*: `pm-mcpd` reads and writes `org.freedesktop.secrets` over the session D-Bus through the JDK `UnixDomainSocketAddress`, with SASL `EXTERNAL`, a `plain` session, and the default collection. This runs under native image. A locked collection is reported and never prompts.
+
+*Pass criterion*: all of the following, in the keyring session of <<_keyring_session_gate_5>>:
+
+* `SecretServiceIT` (JVM) and `KeyringIT` (native) pass.
+* An item written by `pm-mcpd` is found by `secret-tool search service de.cuioss.pm-mcp`, with attributes `service`, `credential_key`, and `project` where applicable.
+* With the collection locked (`secret-tool lock --collection=login`, or by restarting the keyring daemon without `--unlock`), `pm-mcpd` starts with the file store. It logs `PM_MCP-130` and never hangs.
+* Without a session bus (`env -u DBUS_SESSION_BUS_ADDRESS`, no `$XDG_RUNTIME_DIR/bus`), the file store `<PM_MCP_BASE>/credentials/` serves, with modes `0700`/`0600`.
+
+*Procedure*:
+
+[source,bash]
+----
+./mvnw verify -Pintegration-tests -pl pm-mcp-server -am -Dit.test='SecretServiceIT,KeyringIT'
+./mvnw verify -Pnative,integration-tests -pl pm-mcp-server -am -Dit.test=KeyringIT
+# manual, staged installation, runtime running:
+$PM_MCP_HOME/bin/pm-operator spike keyring put probe-key probe-value
+secret-tool search --all service de.cuioss.pm-mcp/<suffix printed in the PM_MCP-30 log line>
+$PM_MCP_HOME/bin/pm-operator spike keyring get probe-key
+$PM_MCP_HOME/bin/pm-operator spike keyring delete probe-key
+----
+
+*Fallback (gate 5)*: `~/.plan-marshall-mcp/credentials/` with `0600` permissions.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Figure / evidence |Pass
+|`SecretServiceIT` (JVM) | |
+|`KeyringIT` (native): put / get / delete ms | |
+|Visible to `secret-tool` with the attributes | |
+|Locked collection: file store, no hang | |
+|No session bus: file store | |
+|Bus address form (path or abstract) | |
+|===
+
+*Status*: `[ ]`
+
+=== L9: Landlock Confinement in `pm-exec` (gate 3)
+
+*Verifies*: the Landlock ruleset of `pm-exec`, applied through FFM in the native binary (`PR_SET_NO_NEW_PRIVS`, ABI ≥ 2). The write set is the project root plus the declared caches, `/tmp` and `/dev`. The read set is everything except `<PM_MCP_BASE>`. Real builds are checked under confinement: wrapper caches, the Gradle daemon, `mvnd`, Testcontainers and Docker Compose. Landlock availability on WSL2 is also part of the gate.
+
+*Argument vector of `pm-exec`* (from `pm-modules/pm-exec/.../package-info.java`):
+
+----
+pm-exec --probe
+pm-exec [--write <path>]... [--read <path>]... --deny-read <PM_MCP_BASE> -- <absolute program> [<arg>...]
+----
+
+`pm-exec` passes its environment unchanged and writes one JSON launch report line to `stderr` before `execve`. Its exit codes are `64` (usage), `126` (confinement could not be applied) and `127` (`execve` failed).
+
+*Pass criterion*:
+
+. `pm-exec --probe` reports `landlock_abi` ≥ 2 and `confinement` `confined`.
+. `PmExecIT` passes natively, the `Landlock` group included:
+** a write outside the write set is denied with `EACCES`;
+** writes into `<PM_MCP_BASE>`, and reads of `run/runtime.token` and a credential file, are denied;
+** a write into the project is allowed;
+** a sibling of the base is readable;
+** a job-private `--read` directory is readable but not writable.
+. Each real build below succeeds under confinement with exactly the write set listed. Any extra path a build needs is recorded as an enrolment `write_paths` candidate.
+
+*Procedure*:
+
+. Run `./mvnw verify -Pnative,integration-tests -pl pm-modules/pm-exec`.
+. Define the confined launcher (the staged installation, and a real `PM_MCP_BASE` with a runtime token):
++
+[source,bash]
+----
+E="$PM_MCP_HOME/bin/pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev"
+----
++
+. Run the builds:
+** *Maven wrapper* (this repository; write set: repository, `~/.m2`): `$E --write $PWD --write $HOME/.m2 -- $PWD/mvnw -q -l /tmp/l9-mvn.log verify -pl pm-modules/pm-core -am`
+** *mvnd* (write set: repository, `~/.m2`, `~/.m2/mvnd`): `$E --write $PWD --write $HOME/.m2 -- $(command -v mvnd) -q verify -pl pm-modules/pm-core -am`. Then run it a second time while the daemon is still up, and record whether the daemon started under confinement keeps its ruleset.
+** *Gradle daemon*: create the fixture with `mkdir -p ~/pmfix/gradle && cd ~/pmfix/gradle && gradle init --type java-application --dsl kotlin --test-framework junit-jupiter --project-name fix --package fix --no-split-project --java-version 25`. Then run `$E --write $HOME/pmfix/gradle --write $HOME/.gradle -- $HOME/pmfix/gradle/gradlew build`, twice (the second run uses the warm daemon).
+** *Testcontainers*: create `~/pmfix/tc` as a minimal Maven project, one JUnit 5 test that starts `GenericContainer("alpine:3")` with `withCommand("true")`, using the dependencies `org.testcontainers:testcontainers` and `org.testcontainers:junit-jupiter`. These dependencies are for this fixture only, outside the repository. Run `$E --write $HOME/pmfix/tc --write $HOME/.m2 -- $PWD/mvnw -f $HOME/pmfix/tc/pom.xml -q test`. Record whether the Docker socket `/var/run/docker.sock` is reachable under Landlock.
+** *Docker Compose*: create `~/pmfix/compose/compose.yaml` with one service `hello` (`image: alpine:3`, `command: ["echo","ok"]`). Run `$E --write $HOME/pmfix/compose --write $HOME/.docker -- /usr/bin/docker compose -f $HOME/pmfix/compose/compose.yaml up --abort-on-container-exit`.
+. Adversarial check: `$E --write $PWD -- /usr/bin/touch $PM_MCP_BASE/x` must fail, and `$E --write $PWD -- /usr/bin/cat $PM_MCP_BASE/run/runtime.token` must fail.
+. Side effect of the read set: the directories on the path from `/` to `<PM_MCP_BASE>` get no rule of their own. Record whether `$E --write /tmp -- /usr/bin/ls /` and `… ls $HOME` are denied, and whether any build above needed such a listing.
+. WSL2: run only if a Windows machine with WSL2 is available. Run `pm-exec --probe` there and record the ABI; otherwise record "not run".
+
+*Fallback (gate 3)*: enrol extra explicit write paths in project enrolment. Never disable confinement where Landlock is available.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Evidence / extra write paths needed |Pass
+|Probe (ABI, confinement) | |
+|`PmExecIT` native (incl. Landlock group) | |
+|Maven wrapper | |
+|mvnd (cold, warm daemon) | |
+|Gradle (cold, warm daemon) | |
+|Testcontainers (Docker socket) | |
+|Docker Compose | |
+|Adversarial writes/reads denied | |
+|Ancestor directory listing | |
+|WSL2 | |
+|===
+
+*Status*: `[ ]`
+
+=== L10: Claude Code and OpenCode Headless, Confined (gate 13)
+
+*Verifies*: the target-condition deltas of the headless runs under Landlock:
+
+* the worker relay `pm-mcp serve --job` connects to the runtime socket from inside the confinement;
+* the harness uses its own login;
+* the harness writes only to the paths it declares (this calibrates `headless.writable_paths`);
+* resource tools, structured output, and session residue behave as specified;
+* the provisional link:../specification/timeouts/03-retention-host-config.adoc#size-limits[Worker Input Size Limits] are calibrated.
+
+V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields and the zero-tool screener, without confinement.
+
+*Pass criterion*: for each of Claude Code and OpenCode:
+
+. A confined worker completes a task through `pm-mcp serve --job`, with its job token, over the runtime socket.
+. It runs with only the harness's own login state writable.
+. The set of paths it writes is recorded, and nothing outside the declared set is needed.
+. Structured output parses.
+. Its session residue (files left after the worker ends) is recorded.
+. The largest task input that completes is recorded, against the provisional size limits.
+
+*Procedure*: the harness ITs in `de.cuioss.pm.e2e.spike` (<<e2e-its>>), with `-Dspike.harness=claude` and `-Dspike.harness=opencode`.
+
+*Fallback (gate 13)*: a harness that fails a capability runs no worker of the roles that need it, and the operator assigns those roles to another eligible harness (`PM-WORK-1`).
+
+*Result*:
+
+[cols="3,2,2,1", options="header"]
+|===
+|Capability |Claude Code |OpenCode |Pass
+|Socket connect under Landlock | | |
+|Own login | | |
+|Writable paths needed | | |
+|Resource tools | | |
+|Structured output | | |
+|Session residue | | |
+|Largest input that completes | | |
+|===
+
+*Status*: `[ ]`
+
+=== L11: E2 Fault Matrix under Target Conditions (gate 16)
+
+*Verifies*: the E2 run of Part A repeated against the real relay with confined `writer` workers. E2 ran on a stand-in relay (link:../specification/evaluation.adoc[Evaluation Reference]). The six faults, ten trials each, per harness, are:
+
+* `kill-offer`: worker killed between offer and acknowledgement;
+* `kill-exec`: killed between acknowledgement and submit;
+* `stop-short`: stalled shorter than its silence limit;
+* `stop-long`: stalled longer than its silence limit;
+* `turn-end`: ends its turn without a submit;
+* `relay-kill`: its relay killed under a held wait.
+
+*Pass criterion* (gate 16, per harness):
+
+* every task is submitted exactly once;
+* every lost worker is detected within the profile deadlines: an exit within about 1 s, a stall by silence within bounded wait + 30 s and never earlier;
+* the lease is released at the fence;
+* every late call of a replaced generation is refused;
+* no stalled-but-alive worker is replaced before its deadline.
+
+*Procedure*: the fault-matrix IT in `de.cuioss.pm.e2e.spike` (<<e2e-its>>), with `-Dspike.harness=claude|opencode -Dspike.faults=all -Dspike.trials=10`. Expect a long run: Part A took about an hour per harness and fault.
+
+*Fallback (gate 16)*: the harness is not eligible as a worker host.
+
+*Result*:
+
+[cols="2,2,2,1", options="header"]
+|===
+|Fault |Claude Code (detection, exactly-once, fencing) |OpenCode |Pass
+|`kill-offer` | | |
+|`kill-exec` | | |
+|`stop-short` | | |
+|`stop-long` | | |
+|`turn-end` | | |
+|`relay-kill` | | |
+|===
+
+*Status*: `[ ]`
+
+=== L12: Codex Confined (gates 13, 9; optional)
+
+*Verifies*: the L10 capabilities for Codex under Landlock, plus the MCP call idle timeout and progress reset of Codex. The unconfined Codex spike is macOS item M14.
+
+*Pass criterion*: as L10. In addition, the idle timeout is measured to ±10 s, and whether a progress notification resets it is recorded.
+
+*Procedure*: the harness ITs with `-Dspike.harness=codex`. Run this item only if Codex is installed and logged in; otherwise record "not run".
+
+*Fallback (gates 13, 9)*: as L10. For the idle timeout there is none; the measured value goes into the client profile.
+
+*Result*: (as L10, one column)
+
+*Status*: `[ ]`
+
+=== L13: Native Git Path on Linux (`PM-TECH-2`)
+
+*Verifies*: the JGit native variant inside `pm-mcpd` on Linux, and its footprint.
+
+*Pass criterion*: `LspAndGitInDaemonIT` (the JGit part) passes natively. The difference in idle RSS with and without one JGit scenario run is recorded.
+
+*Procedure*: part of L6. For the RSS figure, compare `ps -o rss= -p <pid>` before and 10 s after one `POST /api/v1/spike/git` with `{"op":"scenario"}`, sent with the runtime token through `curl --unix-socket`.
+
+*Fallback (`PM-TECH-2`)*: the `git` CLI variant (`PM-EXEC-5`).
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Figure |Pass
+|JGit scenario native | |
+|Idle RSS before / after | |
+|===
+
+*Status*: `[ ]`
+
+== Test Reference
+
+[#daemon-its]
+=== Daemon ITs (`pm-mcp-server`)
+
+*Filled in when the daemon adapter lands; see <<open-before-run>>.*
+
+[#e2e-its]
+=== End-to-End and Harness ITs (`pm-e2e`)
+
+*Filled in when the harness drivers land; see <<open-before-run>>.*
+
+[#open-before-run]
+== Open Before the Run
+
+Items L1 to L9 and L13 can run as soon as this document is on `main`. L10 to L12 and L7 need the harness drivers and the STDIO test of `pm-e2e`. These arrive with a follow-up merge to `main`. Pull `main` and rebase the branch before starting those items.
