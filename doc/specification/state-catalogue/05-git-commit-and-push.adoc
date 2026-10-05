@@ -128,7 +128,7 @@ The unit has no `link` state: every state is server logic or a task of a role, s
 |[[state-git.check-branch-parity]]`git.check-branch-parity`
 |inherit
 |`auto`
-|`git.verify-freshness` (`fresh_or_exempt`).
+|`git.verify-freshness` (`fresh_or_exempt`); `git.push-retry-wait` (`retry`, `cancelled`).
 |`git.push-barrier-decision`: `first_push` when `branch_pushed_at` is unset; `rewritten_by_rebase` when the recorded last push (`branch_pushed_at`) is no ancestor of `HEAD` because a server rebase rewrote the plan's own branch; otherwise `git.branch-sync-state` (fetched) with `refire` only for `ahead` and for `never_pushed` (a `remote_absent_unverified` branch for which `ci.pr-find` found no pull request). Only `synced` (the remote branch holds `HEAD`) returns `pushed: true`; a merged pull request makes the branch `remote_absent_landed` (`pushed: false`, `landed: true`); `remote_absent_unverified` with a pull request, and every unrecognised sync state, cannot be established.
 |`first_push`, `refire` -> `git.execute-push`; `rewritten_by_rebase` -> `git.push-with-lease`; `synced`, `landed` -> `git.done`; `push_state_unknown` -> `git.stepped-out` (cause `push_state_unknown`).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
@@ -138,7 +138,7 @@ The unit has no `link` state: every state is server logic or a task of a role, s
 |`auto`
 |`git.check-branch-parity` (`first_push`, `refire`).
 |`git.push`; sets `branch_pushed_at` on the first successful push and refreshes it on every later one.
-|`pushed`, `up_to_date` -> `git.done`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required` (the outcome set of `git.push`, routed alike in both push states).
+|`pushed`, `up_to_date` -> `git.done`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required`; `push_failed` (any other push failure, the server-rule retry budget left) -> `git.push-retry-wait`; `retry_spent` -> `git.stepped-out` (cause `push_failed`) (the outcome set of `git.push`, routed alike in both push states).
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
 
 |[[state-git.push-with-lease]]`git.push-with-lease`
@@ -146,7 +146,15 @@ The unit has no `link` state: every state is server logic or a task of a role, s
 |`auto`
 |`git.check-branch-parity` (`rewritten_by_rebase`).
 |`auto git.push-with-lease`, the routine forced push to the plan's own branch after a server rebase, with an explicit lease: the `remote_sha` observed at the rejection, else the last recorded push (`branch_pushed_at`), re-read by `ls-remote` before the push; never the remote-tracking ref. Refreshes `branch_pushed_at`.
-|`pushed`, `up_to_date` -> `git.done`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required`.
+|`pushed`, `up_to_date` -> `git.done`; `rejected_non_ff`, `rejected_lease` -> `git.sync-required`; `push_failed` -> `git.push-retry-wait`; `retry_spent` -> `git.stepped-out` (cause `push_failed`).
+|link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
+
+|[[state-git.push-retry-wait]]`git.push-retry-wait`
+|inherit
+|`composite_job`
+|`git.execute-push`, `git.push-with-lease` (`push_failed`).
+|`composite_job git.push-retry-wait`, the server's retry wait of a push failure other than a rejection: it records the failure and the attempts left of the server-rule retry budget (link:../timeouts/01-job-budgets-and-waits.adoc#server-rule-retry[Timeouts & Budgets Specification, Server-Rule Retry Budget]) and waits the retry backoff (`TIME`, link:../timeouts/01-job-budgets-and-waits.adoc#server-retry-backoff[Timeouts & Budgets Specification, Server Retry Backoff]), so the retry is no engine-chained cycle (Rule 11a).
+|`retry` (the backoff elapsed), `cancelled` -> `git.check-branch-parity`, which re-observes the remote before it pushes again.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_six_stage_execution_contract_of_git_commit_and_push[Workflow DSL Specification, Stage 6]
 
 |[[state-git.sync-required]]`git.sync-required`
@@ -184,7 +192,7 @@ The unit has no `link` state: every state is server logic or a task of a role, s
 |[[state-git.stepped-out]]`git.stepped-out`
 |inherit
 |`terminal`
-|`git.stage-and-commit`, `git.artifact-review`, `git.freshness-blocked`, `git.sync-required`, `git.continue-rebase` (`attempts_exhausted`); `git.artifact-escalate` (`exhausted`); `git.sync-required` (`rebase_failed`); `git.check-branch-parity` (`push_state_unknown`); the `infeasible` and `lost` routes of `git.artifact-review`, `git.commit-fix`, `git.resolve-conflicts`.
+|`git.stage-and-commit`, `git.artifact-review`, `git.freshness-blocked`, `git.sync-required`, `git.continue-rebase` (`attempts_exhausted`); `git.artifact-escalate` (`exhausted`); `git.sync-required` (`rebase_failed`); `git.check-branch-parity` (`push_state_unknown`); `git.execute-push`, `git.push-with-lease` (`retry_spent`, cause `push_failed`); the `infeasible` and `lost` routes of `git.artifact-review`, `git.commit-fix`, `git.resolve-conflicts`.
 |Returns the control outcome `stepped_out {by: server, cause, reason}`; it only leaves the sub-workflow and never ends the calling scope. An interrupted rebase is aborted before the frame unwinds.
 |The caller's `stepped_out` transition: `finalize.hand-back` from the plan callers, the remediation unit's `remediation-<class>.budget-check`, `setup.commit-changes`, `epic.active`. A server step-out of cause `condition` is not returned here: it unwinds every frame to the plan's fallback.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_stack_execution_persistence_semantics[Workflow DSL Specification, Sub-Workflow Return]
