@@ -49,8 +49,12 @@ final class NativeKernel implements Kernel {
 
     /** The native functions, linked on first use. */
     enum Fn {
-        /** {@code long syscall(long number, ...)} with three {@code long} arguments. */
-        SYSCALL("syscall", FunctionDescriptor.of(JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG),
+        /**
+         * {@code long syscall(long number, ...)} with four {@code long} arguments: {@code landlock_add_rule}
+         * takes four ({@code flags} last, which must be {@code 0}); fewer leave that register undefined and the
+         * kernel answers {@code EINVAL}.
+         */
+        SYSCALL("syscall", FunctionDescriptor.of(JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG),
             Linker.Option.firstVariadicArg(1), ERRNO),
         /** {@code int prctl(int option, ...)} with four {@code long} arguments. */
         PRCTL("prctl", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG),
@@ -208,10 +212,14 @@ final class NativeKernel implements Kernel {
     }
 
     private long syscall(long number, long a, long b, long c, String stage) throws NativeCallException {
+        return syscall(number, a, b, c, 0L, stage);
+    }
+
+    private long syscall(long number, long a, long b, long c, long d, String stage) throws NativeCallException {
         var handle = handle(Fn.SYSCALL);
         try (var arena = Arena.ofConfined()) {
             var state = arena.allocate(CALL_STATE);
-            long result = invoke(stage, () -> (long) handle.invokeExact(state, number, a, b, c));
+            long result = invoke(stage, () -> (long) handle.invokeExact(state, number, a, b, c, d));
             if (result < 0) {
                 int errno = state.get(JAVA_INT, ERRNO_OFFSET);
                 throw new NativeCallException(stage, errno, stage + " failed with errno " + errno);

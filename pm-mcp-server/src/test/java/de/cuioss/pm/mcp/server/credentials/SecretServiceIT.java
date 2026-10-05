@@ -45,8 +45,10 @@ class SecretServiceIT {
     void connect() {
         var socket = DbusConnection.sessionBusSocket(System.getenv());
         assumeTrue(socket.isPresent(), "no unix:path session bus address");
-        store = new SecretServiceStore(socket.get(), Posix.getuid(), service, SecretStoreSelector.BUS_TIMEOUT);
-        assumeTrue(store.available(), "Secret Service not reachable or default collection locked");
+        var candidate = new SecretServiceStore(socket.get(), Posix.getuid(), service, SecretStoreSelector.BUS_TIMEOUT);
+        // A session bus without org.freedesktop.secrets (a CI runner) skips the test; the cleanup then has no store
+        assumeTrue(candidate.available(), "Secret Service not reachable or default collection locked");
+        store = candidate;
     }
 
     @AfterEach
