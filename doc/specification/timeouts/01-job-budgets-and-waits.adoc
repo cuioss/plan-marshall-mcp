@@ -263,7 +263,7 @@ a|* *Rate window*: `reset_at` is the bot-stated reset ETA when one is published 
 |fixed (derived from the provider's queue configuration)
 |—
 |`finalize.merge-queue-wait`, epic landing
-|`timed_out` ends the constituent with a fate other than success, so the composite wait returns `watch_interrupted` and `finalize.restart-watch` restarts it within the watch restart budget (<<remediation-budgets>>), then `finalize.hand-back`; a `timed_out` landing is `no_verdict` (<<no-verdict-rule>>).
+|`timed_out` (`no_verdict`, <<no-verdict-rule>>) enters `finalize.merge-queue-exit`, which resumes the wait while the pull request is still queued (within the <<watch-restart-budget>>) or re-enters `finalize.merge-gate`; it ends in `finalize.hand-back` when the budget is spent or the pull request is closed. A `timed_out` landing records no merge verdict.
 |link:../phase-workflows/06-finalize-re-entry-and-merge.adoc#_cross_plan_merge_mutex_fifo_admission_queue[Phase Workflows, Cross-Plan Merge Mutex]; link:../model-work.adoc[Model Work] (Epic Landing); _Implementation watch: link:../../implementation-watch/phase-workflows.adoc#PM-WATCH-PHASE-78[PM-WATCH-PHASE-78]_
 
 |[[host-cancellation]]Host cancellation of a wait
@@ -391,15 +391,15 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 |`3` server retries per condition instance (`pending_condition.remedy_attempts`).
 |fixed
 |—
-|every non-integrity condition overlay (`footprint_violation`, `guard_indeterminate`, `job_incomplete`, whose retries are the server's re-offers of the state's tasks (<<task-reoffer-budget>>), `config_drift`, `precondition_unmet`), and the `retry` of a bootstrap's failed source step
-|The phase's fallback with the condition as the gap; `handed_back` degrades to a local branch when the fallback lacks what is missing (for example a push credential). The epic and workspace scopes have no fallback: an unreadable epic ledger keeps its `retry` and ends by the operator's `abort`, a workspace condition keeps its `retry`. A bootstrap has no fallback either: after the last source `retry` only `back` and `abandon` remain.
+|every non-integrity condition overlay (`footprint_violation`, `guard_indeterminate`, `job_incomplete`, whose retries are the server's re-offers of the state's tasks (<<task-reoffer-budget>>), `config_drift`, `precondition_unmet`), the `retry` of a bootstrap's failed source step, and the server retries of `finalize.adopt-blocked` (re-adoption), `finalize.merge-lease-interrupted` (lease re-entry), and `finalize.archive-plan` (pull-request observation)
+|The phase's fallback with the condition as the gap; `handed_back` degrades to a local branch when the fallback lacks what is missing (for example a push credential). The epic and workspace scopes have no fallback: an unreadable epic ledger keeps its `retry` and ends by the operator's `abort`, a workspace condition keeps its `retry`. A bootstrap has no fallback either: after the last source `retry` only the implicit `step_out` back to `start.choose` remains.
 |link:../state-catalogue/01-conventions-generic-conditions.adoc[State Catalogue, Conditions]
 
 |[[watch-restart-budget]]Watch restart budget
 |`2` explicit restarts per wait-region firing (`watch_restarts`).
 |fixed
 |—
-|`finalize.restart-watch` after a composite wait returned `watch_interrupted` (a constituent killed, timed out, or indeterminate)
+|`finalize.restart-watch` after a composite wait returned `watch_interrupted` (a constituent killed, timed out, or indeterminate), and `resume_wait` of `finalize.merge-queue-exit`
 |`finalize.hand-back`.
 |link:../hypermedia-format/03-composite-wait-and-encoder.adoc#_deterministic_evaluation_immediate_short_circuit_matrix[Hypermedia Format, Short-Circuit Matrix]
 
@@ -413,9 +413,9 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 
 |[[loop-back-outline-budget]]Outline loop-back budget
 |`1` `loop_back_outline` per plan (`outline_loop_backs`).
-|fixed; raised only by a `raise` waiver `fix_budget:qgate-findings`
+|fixed; raised only by a `raise` waiver `fix_budget:outline-loop-back`, its own raise identifier
 |hard cap of the fix budget
-|`loop_back_outline` from Phase 5, and the `outline` re-entry of a re-planning
+|`loop_back_outline` of `plan.revise-tasks` (Phase 4), and the `outline` re-entry of a re-planning, which charges the same counter
 |`handed_back` with the committed Phase 5 work, else `returned`.
 |link:../phase-workflows/03-q-gate-and-execute.adoc[Phase Workflows, Phase 5]
 
@@ -428,28 +428,36 @@ Every blocking condition of a plan has a bounded server retry and then a defined
 |link:../store-schemas/17-re-planning.adoc#replan-record[Store Schemas, Re-Planning Record]
 
 |[[server-rule-retry]]Server-rule retry budget
-|`2` retries of each bounded server rule: the provider call of `finalize.open-pr`, the `.gitignore` oracle of `git.commit_and_push`, landing delivery, and `sync_failed` of `finalize.merge-sync` (a fetch failure or a push failure other than the lease rejection).
+|`2` retries of each bounded server rule: the provider call of `finalize.open-pr`, the `.gitignore` oracle of `git.commit_and_push`, landing delivery, `sync_failed` of `finalize.merge-sync` (a fetch failure or a push failure other than the lease rejection), the `indeterminate` re-evaluation of `finalize.merge-barrier`, the `re_enter` outcomes of `finalize.merge-refused` (`behind`, `conflict`, `checks_pending`, `checks_failed`) and of `finalize.merge-queue-exit` (an ejected pull request), and `fetch_failed` of `replan.integrate-base`.
 |fixed
 |—
-|`finalize.open-pr`, `git.artifact-escalate`, `finalize.emit-landing-failed`, `finalize.merge-sync`
-|`open-pr`: `retry_spent` enters `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); oracle: the sub-process returns `stepped_out` (cause `oracle_failed`); landing delivery: `landing_delivery: pending` (envelope kept as `landing-envelope.json` for the epic's reconciliation), the post-run band continues; merge sync: `retry_spent` enters `finalize.hand-back` (gap `budget: server_rule_retry`).
+|`finalize.open-pr`, `git.artifact-escalate`, `finalize.emit-landing-failed`, `finalize.merge-sync`, `finalize.merge-barrier`, `finalize.merge-refused`, `finalize.merge-queue-exit`, `replan.integrate-base`
+|`open-pr`: `retry_spent` enters `finalize.hand-back` (branch only; gap `budget: server_rule_retry`); oracle: the sub-process returns `stepped_out` (cause `oracle_failed`); landing delivery: `landing_delivery: pending` (envelope kept as `landing-envelope.json` for the epic's reconciliation), the post-run band continues; merge sync: `retry_spent` enters `finalize.hand-back` (gap `budget: server_rule_retry`); barrier, refusal, and queue exit: the spent outcome (`retry_spent`, `budget_spent`) enters `finalize.hand-back`; base integration: `fetch_failed` enters `replan.hand-back`.
 |link:../state-catalogue.adoc[State Catalogue]
 
 |[[server-retry-backoff]]Server retry backoff
 |`60` seconds before the first retry, doubled for each further retry of the same firing (`60`, `120`, `240`); counted from the persisted instant of the failure, so a restart never shortens or extends it.
 |fixed
 |—
-|every server retry that waits in a `composite_job` for time: the provider call of `finalize.open-pr`, the re-observation of `finalize.archive-unobserved`, the re-adoption of `finalize.adopt-blocked`, and the rerun of the `remediation-merge` loop when no change of the observed remote head ends the wait first
+|every server retry that waits in a `composite_job` for time: the provider call of `finalize.open-pr`, the re-observation of `finalize.archive-unobserved`, the re-adoption of `finalize.adopt-blocked`, and the rerun of the `remediation-merge` loop when no change of the observed remote head ends the wait first; and the server self-remedy retries of a condition on every scope (the re-check of `precondition_unmet`, the guard re-evaluation of `guard_indeterminate`), where the unbudgeted retries of the epic and workspace scopes stay at `240` once the doubling reaches it
 |The wait settles on the deadline (or earlier on the awaited external change) and the retry runs, within the budget of its rule (<<server-rule-retry>>, <<condition-budget>>, the unit's retry budget); the backoff never adds a retry.
 |link:../workflow-dsl/04-ast-node-model.adoc[Workflow DSL Specification] (Rule 11); link:../state-catalogue.adoc[State Catalogue]
 
 |[[commit-attempt-caps]]Commit sub-process attempt caps
-|`3` attempts of each task loop inside one call of `git.commit_and_push`: the freshness-blocked loop (`freshness-blocked` / `freshness-build-running`), the artifact review (`artifact-review` with prohibited artifacts remaining), conflict resolution (`resolve-conflicts`), and the sync loop (`sync-required` -> verify -> push rejected); counted per call frame, reset by a new call. The `git.commit-fix` cap of `3` failed commit attempts per identical staged change set (xref:03-retention-host-config.adoc#configuration-keys[Configuration Keys]) stays separate.
+|`3` attempts of each task loop inside one call of `git.commit_and_push`: the freshness-blocked loop (`freshness-blocked` / `freshness-build-running`), the artifact review (`artifact-review` with prohibited artifacts remaining), conflict resolution (`resolve-conflicts`), the sync loop (`sync-required` -> verify -> push rejected), and the commit-fix loop (`git.commit-fix` tasks); counted per call frame, reset by a new call. Beside it, the `git.commit-fix` cap of `3` failed commit attempts per identical staged change set (xref:03-retention-host-config.adoc#configuration-keys[Configuration Keys]) stays a counter of its own; whichever is spent first ends the loop.
 |fixed
 |—
 |`git.commit_and_push`
 |The loop's state steps out to `git.stepped-out` (server step-out, cause `attempts_exhausted`), and the sub-process returns `stepped_out` to its caller.
-|link:../workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`); link:../state-catalogue.adoc[State Catalogue]
+|link:../workflow-dsl.adoc[Workflow DSL] (`git.commit_and_push`); link:../state-catalogue.adoc[State Catalogue]; _Implementation watch: link:../../implementation-watch/workflow-dsl.adoc#PM-WATCH-DSL-28[PM-WATCH-DSL-28]_
+
+|[[setup-reprobe-cap]]Setup variant re-probe cap
+|`1` return of `setup.verify-credentials` to `setup.probe-integration-variants` (`variant_invalidated`) per setup run; reset by the next setup run.
+|fixed (compiled constant)
+|—
+|`project-setup` (`setup.verify-credentials`)
+|A further invalidation in the same run takes `reprobe_exhausted` and enters `setup.needs-repair`; the cap is the measure of that cycle under Rule 11a.
+|link:../domain-extensions/04-setup-state-machine.adoc#setup-verify-credentials[Domain Extensions, Credential Verification]; link:../state-catalogue/06-setup-epic-other.adoc#state-setup.verify-credentials[State Catalogue, `setup.verify-credentials`]; link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification] (Rule 11a)
 |===
 
-*Deadline processing*: The waiver wait, the question deadline, and the prerequisite wait of a re-planning are engine-owned instants persisted with their record (`expires_at`; the prerequisite's `deadline_at`), processed by the runtime's deadline timer (link:../job-runtime/01-pipeline-and-subprocesses.adoc#engine-deadlines[Job Runtime Specification, Engine Deadlines]); the two never overlap in one plan, the integrity pause holds every fallback until it ends, and `abort` / `delete-plan` close pending questions `cancelled` and waiver requests `expired`.
+*Deadline processing*: The waiver wait, the question deadline, and the prerequisite wait of a re-planning are engine-owned instants persisted with their record (`expires_at`; the prerequisite's `deadline_at`), processed by the runtime's deadline timer (link:../job-runtime/01-pipeline-and-subprocesses.adoc#engine-deadlines[Job Runtime Specification, Engine Deadlines]); none of the three overlaps another in one plan, the integrity pause holds every fallback until it ends, and `abort` / `delete-plan` close pending questions `cancelled` and waiver requests `expired`.

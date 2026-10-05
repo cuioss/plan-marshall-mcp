@@ -34,11 +34,14 @@ Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#out
 link:../specification/store-schemas/10-job-and-lesson-records.adoc#job-record[Store Schemas § Job Record] (Write order at job end)
 Hazard:: Settling a job in an arbitrary order lets a crash leave a released build slot with an unsettled record, or a
 ledger row that stamps a build whose job record never recorded its fate.
-Guard:: Crash injection after each step of the fixed order (job record fate with a worker's fence, for a worker the
-metrics rows of its tasks not yet written, change-ledger row, timing observation, slot release): after restart every
-store is consistent, and the only losses are a task's missing metrics row (`record-metrics` reports it as the
-divergence `row_absent_from_metrics`, never as `0`; the job record carries no usage), a missing ledger row (the next
-freshness check re-runs the build), or a missing timing sample; no step is re-derived and no marker file exists.
+Guard:: Crash injection after each step of the fixed order (job record fate with a worker's token revocation and
+fence, for a worker the queue task record with its attempt end and lease release, the metrics row of the attempt
+that ended with the job, change-ledger row, timing observation, slot release, and last a worker's job-private
+directory removal): after restart every store is consistent, and the only losses are a task's missing metrics row
+(`record-metrics` reports it as the divergence `row_absent_from_metrics`, never as `0`; the job record carries no
+usage), a missing ledger row (the next freshness check re-runs the build), or a missing timing sample; a task lease
+left on the ended generation is released by the recovery and the task queued again once, and the recovery removes
+the job-private directory of a settled job; no other step is re-derived and no marker file exists.
 Source:: design review.
 
 == Subprocess Lifecycle & Process-Group Isolation
@@ -91,6 +94,7 @@ Source:: plan-marshall process-compliance PLAN-13 D3.
 === PM-WATCH-JOB-5: Bounded waits are wall-clock and say what happened
 
 Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../specification/mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools § `pm_build` — Enrolled Build Execution],
 link:../specification/timeouts/01-job-budgets-and-waits.adoc#waits[Timeouts & Budgets § Waits & Long-Polls],
 link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4]
 Hazard:: A wait budget passed as an iteration count expired in seconds and reported a bot "absent" while it was
@@ -98,8 +102,9 @@ running; a wait at its ceiling could not tell waiting from re-polling finished w
 Guard:: Engine waits use monotonic wall-clock deadlines (test with fast pollers); an exhausted poll is `unproven`,
 not absent; the only calls a model holds open are a worker's `pm_wait` and a running `pm_build`: a `pm_wait` returns
 an offer, `wait_again`, or `end` within its host's bounded window and never fails with a transport timeout, a
-`pm_build` returning the running build reports whether the job state changed during the window, and a `pm_build`
-on an already-settled job returns at once; time deferred by a provider rate limit is attributed
+`pm_build` whose window ends with the build still running returns `status: running` with its `job_id`, and a
+`pm_build` continuing on an unknown or finished `job_id`, or one of another scope, is refused `invalid_arguments`;
+time deferred by a provider rate limit is attributed
 `provider_rate_limit`, never counted as a timeout. The wait population below is the baseline for wait metrics.
 Fixture:: 600 s budget burned in seconds ("CodeRabbit absent" while running); a script cost rollup of 2,051 calls, 14,423,580 ms, dominated by the three wait notations
 build_server 27.4%, ci 27.3%, ci_complete_precondition 23.1% (77.8% together). Wait attribution by reason:
@@ -143,6 +148,7 @@ Source:: plan-marshall defect review-apparatus PLAN-PR-026 (lesson 2026-08-08-21
 === PM-WATCH-JOB-19: One shared provider poll honours `304` and `Retry-After`
 
 Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives],
+link:../specification/mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools § `pm_build` — Enrolled Build Execution],
 link:../specification/timeouts/01-job-budgets-and-waits.adoc#ci-repoll-cadence[Timeouts & Budgets § Provider Re-Poll Cadence]
 Hazard:: Every wait polls the provider on its own and ignores rate-limit signals; the credential's rate budget is
 exhausted, and the throttling is reported as a timeout or as a failure of the checks being waited for.
