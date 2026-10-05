@@ -238,11 +238,13 @@ verification loop runs and fails only at the first re-push.
 Guard:: The bootstrap source unit `source-pr` naming a fork head without push access fails with the reason
 `head_not_writable` before any plan directory, worktree, or branch exists, and the pending entry record stays; the
 head is re-observed in the bootstrap's `start.create-scope` transaction; matched control: a writable head starts the
-plan in the `adopt` lane. A pull request that is closed, merged, or gone by the time `finalize.adopt-pr` runs, or
-whose checkout fails, enters the `auto` state `finalize.adopt-blocked` with the reason and never leaves a partially
-adopted worktree: fixture `pr_not_open` hands the plan back at once without a retry; fixtures `head_not_writable` and
-`checkout_failed` re-run the adoption (which re-observes the pull request first) within the condition budget and,
-when it is spent, hand the plan back; no link and no operator question is offered on the way.
+plan in the `adopt` lane. `finalize.adopt-pr` never leaves a partially adopted worktree: fixture `pr_not_open` (a
+pull request closed, merged, or gone by the time it runs) hands the plan back at once without a retry and without
+entering `finalize.adopt-blocked`; fixtures `head_not_writable` and
+`checkout_failed` re-run the adoption (which re-observes the pull request first) within the condition budget, each
+retry waiting in a `composite_job` for its backoff (`TIME`) or the pull request's change (`EXTERNAL_STATE`), never an
+engine-chained cycle of `auto` states, and, when the budget is spent, hand the plan back; no link and no operator
+question is offered on the way.
 Source:: design review.
 
 [#PM-WATCH-PHASE-77]
@@ -394,8 +396,9 @@ Guard:: Every model-invoking step declares a ceiling; per-step token usage is re
 exposes per-iteration new-finding counts; two consecutive rounds with fix-induced findings surface a non-convergence
 fact before the cap. Every repeated remedy runs inside a remediation unit whose per-plan, per-class budgets bound
 it: a scenario test drives a finding class until its budgets are spent and asserts that the unit returns `exhausted`
-and the plan enters `finalize.hand-back` (`handed_back`, gap `cause: exhausted` with the spent budget) instead of
-looping, with no operator question on the way.
+and the plan enters `finalize.replan` (trigger `ceiling`) instead of looping, and that with the `ceiling` evidence
+already judged (or a re-planning that decides `hand_back`) it enters `finalize.hand-back` (`handed_back`, gap
+`cause: exhausted` with the spent budget), with no operator question on the way.
 Fixture:: PLAN-TRUTH-089 (13.9M tokens, 81%, self-review ×19, 17 loop-backs); PLAN-PR-046 (6.77M tokens, 48.5%).
 Source:: plan-marshall defect instrumentation-substrate PLAN-01 deliverable 6; plan-marshall lesson 2026-09-23-07-001.
 
@@ -654,8 +657,8 @@ link:../Requirements.adoc#PM-WF-7[PM-WF-7]
 Hazard:: The loop-back ceiling counted every loop-back alike; a productive fourth iteration followed an exhausted
 3/3, and re-fired steps ran 2–3 times without anyone seeing which firings did any work.
 Guard:: Scenario test: three loop-backs, two productive and one not, spend the class's fix budget; the unit returns
-`exhausted`, and the gap record of `finalize.hand-back` shows the counts, the per-iteration self-seeded share, and
-`findings_at_ceiling`; an operator `waive --raise fix_budget:<policy>=N` lifts the effective ceiling by the raise
+`exhausted`, the `ceiling` facts of `finalize.replan` and, when the plan is handed back, the gap record of
+`finalize.hand-back` show the counts, the per-iteration self-seeded share, and `findings_at_ceiling`; an operator `waive --raise fix_budget:<policy>=N` lifts the effective ceiling by the raise
 only and never resets the counter; the step firings carry `productive`.
 Fixture:: iteration 3/3, then a productive 4th (cuioss-review-bot `participated_stale` at `a7fa0c469` plus 4
 CodeRabbit findings); a 4-file change with 3,622,870 tokens, finalize 1,937,959 (53%), 6 steps re-fired 2–3×.
@@ -1228,7 +1231,8 @@ Guard:: Fixture: the remote is observed at `A`, a concurrent push moves it to `B
 `git.sync-required`, where the server fetches and rebases onto the observed remote head, keeping `B`, within the
 attempt cap and otherwise steps out); every retry re-verifies with `ls-remote` first; a differential test shows the
 same in both variants. In `finalize.merge-sync` the same rejection resets the branch to the pre-rebase `HEAD` and
-calls `remediation.merge-conflict`, where the server takes `fix` without a decision task (an `implement` task) and
+calls `remediation.merge-conflict`, whose gather first rebases onto the observed remote head (a clean rebase ends the
+unit `resolved` without a task); on a conflict the server takes `fix` without a decision task (an `implement` task) and
 continues the integration in `remediation.continue-integration` onto the observed remote head, keeping the foreign
 commits and never force-pushing over them.
 Source:: design review.
@@ -1285,8 +1289,8 @@ link:../specification/phase-workflows/06-finalize-re-entry-and-merge.adoc#waivab
 Hazard:: A failing barrier (untriaged findings, missing review evidence) is routed to `plan.aborted`, so one gap
 ends the plan; or the failure falls through to the dispatch and merges although no waiver covers it.
 Guard:: Scenario per barrier failure (`findings_untriaged`, `evidence_missing`): the barrier calls
-`remediation.review-findings`; `exhausted` and `stepped_out` enter `finalize.hand-back` (outcome `handed_back`, pull
-request left open), the plan is never aborted, and no `ci.merge` or `ci.enqueue` request is sent; matched control: a
+`remediation.review-findings`; `exhausted` enters `finalize.replan` (trigger `ceiling`) and `stepped_out`
+`finalize.hand-back` (outcome `handed_back`, pull request left open), the plan is never aborted, and no `ci.merge` or `ci.enqueue` request is sent; matched control: a
 `met` waiver of the failing gate is consumed at the barrier (consumption logged), the unit ends `waived`, and the
 plan re-enters `finalize.merge-gate`.
 Source:: design review.
@@ -1399,3 +1403,18 @@ in-branch `fix`; scenario: findings of each step route `fix_requested` ->
 and no push of the branch is observed before `finalize.push-barrier`; control: the wait-region call sites still bind
 the in-branch `fix`.
 Source:: design review.
+
+[#PM-WATCH-PHASE-95]
+=== PM-WATCH-PHASE-95: A failed pull-request creation retries in its own wait, never through the authoring task
+
+Anchor:: link:../specification/phase-workflows/04-finalize-step-bands.adoc#_normative_step_catalogue_across_ordering_bands[Phase Workflows § Normative Step Catalogue] (`default:create-pr`, order 20)
+Hazard:: A provider failure of the pull-request creation that re-enters the authoring state creates a second
+`pr-author` task and pays for a second body, or, with no wait between attempts, spends the retry budget in one
+transaction while the provider is still down.
+Guard:: Scenario test with a provider fixture that fails `ci.pr-create`: `finalize.open-pr` retries only after the
+server retry backoff, within the server-rule retry budget, from the persisted title and body; `finalize.create-pr` is
+never re-entered and no second queue task exists; with the budget spent `retry_spent` hands the plan back (branch
+only; gap `budget: server_rule_retry`). Matched controls: a pull request that already exists for the branch settles
+`pr_exists` and completes `default:create-pr` as `skipped`; a success settles `opened` with `pr_number` and
+`head_sha` recorded.
+Source:: design review (doc review round 5).

@@ -10,7 +10,7 @@ supervised workers of configured roles (the harness as worker). The design descr
 most of which is not implemented yet: requirements in `doc/Requirements.adoc` (modules in
 `doc/requirements/`), technical specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
 `doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
-`doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification).
+`doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification that has watch items, plus `cross-cutting.adoc`).
 
 Current state: a Quarkus application with one `hello` MCP tool, verified by unit tests and by
 `@QuarkusIntegrationTest` integration tests against the packaged application. No container image
