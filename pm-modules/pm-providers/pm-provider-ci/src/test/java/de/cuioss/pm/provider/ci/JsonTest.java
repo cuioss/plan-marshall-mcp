@@ -16,6 +16,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,7 +41,7 @@ class JsonTest {
         tree.put("b", true);
         tree.put("z", null);
         tree.put("l", Arrays.asList("a", null, Map.of("k", false)));
-        tree.put("o", java.time.Duration.ofSeconds(1));
+        tree.put("o", Duration.ofSeconds(1));
 
         String json = Json.write(tree);
         Object parsed = Json.parse(json);
@@ -76,9 +78,9 @@ class JsonTest {
         assertEquals(CiResult.Outcome.FAILED,
                 CiResult.failed(CiResponse.failure(CiResponse.Outcome.TRANSPORT_FAILED, "IOException")).outcome());
         var limited = CiResult.failed(new CiResponse(CiResponse.Outcome.RATE_LIMITED, 429, "", Optional.empty(),
-                Optional.empty(), Optional.of(java.time.Instant.EPOCH), "rate limited"));
+                Optional.empty(), Optional.of(Instant.EPOCH), "rate limited"));
         assertEquals(CiResult.Outcome.RATE_LIMITED, limited.outcome());
-        assertEquals(Optional.of(java.time.Instant.EPOCH), limited.resetAt());
+        assertEquals(Optional.of(Instant.EPOCH), limited.resetAt());
         assertFalse(limited.isOk());
         assertTrue(CiResult.ok("v", false).isOk());
     }

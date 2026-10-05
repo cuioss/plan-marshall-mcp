@@ -9,13 +9,12 @@
  */
 package de.cuioss.pm.core.toon;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.stream.Collectors;
-
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonToken;
 
 import de.cuioss.pm.core.toon.ToonValue.ToonArray;
 import de.cuioss.pm.core.toon.ToonValue.ToonBoolean;

@@ -9,6 +9,8 @@
  */
 package de.cuioss.pm.provider.ci;
 
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
@@ -20,9 +22,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-
-import com.sun.net.httpserver.Headers;
-import com.sun.net.httpserver.HttpServer;
 
 /** A JDK {@link HttpServer} fake: canned responses by method and path, recorded requests. */
 final class FakeServer implements AutoCloseable {

@@ -20,6 +20,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import de.cuioss.pm.core.toon.ToonEncodingException.Reason;
@@ -59,7 +60,7 @@ class ToonEncoderTest {
                     .add("tags", ToonValue.ofStrings(List.of("a", "b c")))
                     .add("links", new ToonArray(List.of(link("next", "pm://p/1"), link("self", "pm://p/1/s"))))
                     .add("failures", new ToonArray(List.of()))
-                    .add("facts", ToonObject.sorted(new LinkedHashMap<>(java.util.Map.of("zeta", ToonValue.of(1),
+                    .add("facts", ToonObject.sorted(new LinkedHashMap<>(Map.of("zeta", ToonValue.of(1),
                             "alpha", ToonValue.of("x")))))
                     .build();
 

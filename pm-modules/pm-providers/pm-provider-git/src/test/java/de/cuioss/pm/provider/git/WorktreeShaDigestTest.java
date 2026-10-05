@@ -12,7 +12,6 @@ package de.cuioss.pm.provider.git;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -73,7 +72,7 @@ class WorktreeShaDigestTest {
 
     @Test
     @DisplayName("frames files, links and deletions sorted by path bytes")
-    void frames(@TempDir Path root) throws IOException {
+    void frames(@TempDir Path root) throws Exception {
         Files.writeString(root.resolve("z.txt"), "zz");
         Files.createDirectories(root.resolve("dir"));
         Files.writeString(root.resolve("dir/a.txt"), "a");
@@ -87,7 +86,7 @@ class WorktreeShaDigestTest {
 
     @Test
     @DisplayName("has a fixed digest for an empty path set")
-    void emptySet(@TempDir Path root) throws IOException {
+    void emptySet(@TempDir Path root) throws Exception {
         assertEquals(independentDigest(HEAD, List.of()), WorktreeShaDigest.digest(HEAD, root, List.of()));
     }
 }

@@ -9,6 +9,7 @@
  */
 package de.cuioss.pm.provider.github;
 
+import java.io.Serial;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
@@ -18,9 +19,9 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import lombok.experimental.UtilityClass;
 
 import de.cuioss.pm.provider.ci.Json;
-import lombok.experimental.UtilityClass;
 
 /**
  * Signs the RS256 JSON Web Token a GitHub App authenticates with, using the JDK only.
@@ -93,7 +94,7 @@ public final class GitHubAppJwt {
     /** Thrown when the JWT cannot be signed; never carries key material. */
     public static final class JwtSigningException extends IllegalStateException {
 
-        @java.io.Serial
+        @Serial
         private static final long serialVersionUID = 1L;
 
         /**

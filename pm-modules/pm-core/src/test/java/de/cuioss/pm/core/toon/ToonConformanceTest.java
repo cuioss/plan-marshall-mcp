@@ -14,21 +14,24 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.core.JsonParser;
-import com.fasterxml.jackson.core.JsonToken;
-
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -70,6 +73,37 @@ class ToonConformanceTest {
         return all.stream();
     }
 
+    private static final AtomicInteger PASSED = new AtomicInteger();
+    private static final AtomicInteger REFUSED = new AtomicInteger();
+    private static final AtomicInteger OPTION_SKIPPED = new AtomicInteger();
+
+    /** Records the gate 12 figures in {@code target/verification-results/gate12-toon-conformance.json}. */
+    @AfterAll
+    static void recordVerificationResult() throws IOException {
+        Path file = Path.of("target", "verification-results", "gate12-toon-conformance.json");
+        Files.createDirectories(file.getParent());
+        int total = PASSED.get() + REFUSED.get() + OPTION_SKIPPED.get();
+        Files.writeString(file, """
+                {
+                  "item": "gate12-toon-conformance",
+                  "os": "%s",
+                  "arch": "%s",
+                  "values": {
+                    "spec_version": "%s",
+                    "spec_release": "%s",
+                    "spec_commit": "a6b801a3326980ab2cb615b0ffe44457e091f7b6",
+                    "encode_fixtures": %d,
+                    "passed": %d,
+                    "skipped_outside_subset_refused": %d,
+                    "skipped_encoder_option": %d
+                  },
+                  "pass": %s
+                }
+                """.formatted(System.getProperty("os.name"), System.getProperty("os.arch"), ToonEncoder.SPEC_VERSION,
+                ToonEncoder.SPEC_RELEASE, total, PASSED.get(), REFUSED.get(), OPTION_SKIPPED.get(),
+                PASSED.get() > 0), StandardCharsets.UTF_8);
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("fixtures")
     @DisplayName("encodes the fixture or refuses it for its listed reason")
@@ -77,12 +111,16 @@ class ToonConformanceTest {
         if (fixture.skipReason() == null) {
             assertTrue(DEFAULT_OPTIONS.contains(fixture.options()), "fixture with options must be listed as skipped");
             assertEquals(fixture.expected(), ToonEncoder.encode(fixture.input()));
+            PASSED.incrementAndGet();
             return;
         }
-        if (!fixture.skipReason().startsWith("option")) {
+        if (fixture.skipReason().startsWith("option")) {
+            OPTION_SKIPPED.incrementAndGet();
+        } else {
             var refusal = assertThrows(ToonEncodingException.class, () -> ToonEncoder.encode(fixture.input()));
             assertTrue(fixture.skipReason().startsWith(refusal.getReason().name()),
                     () -> "refused with " + refusal.getReason() + " but listed as " + fixture.skipReason());
+            REFUSED.incrementAndGet();
         }
         Assumptions.abort("outside the PM-MCP subset: " + fixture.skipReason());
     }

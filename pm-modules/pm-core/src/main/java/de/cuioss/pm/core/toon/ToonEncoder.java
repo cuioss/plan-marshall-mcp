@@ -16,6 +16,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
+import lombok.experimental.UtilityClass;
 
 import de.cuioss.pm.core.toon.ToonEncodingException.Reason;
 import de.cuioss.pm.core.toon.ToonValue.ToonArray;
@@ -24,7 +25,6 @@ import de.cuioss.pm.core.toon.ToonValue.ToonNull;
 import de.cuioss.pm.core.toon.ToonValue.ToonNumber;
 import de.cuioss.pm.core.toon.ToonValue.ToonObject;
 import de.cuioss.pm.core.toon.ToonValue.ToonString;
-import lombok.experimental.UtilityClass;
 
 /**
  * Deterministic, reflection-free TOON encoder for the subset PM-MCP emits.

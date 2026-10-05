@@ -34,7 +34,7 @@ class GitHubAppJwtTest {
 
     @Test
     @DisplayName("signs RS256 verifiable with the public key, with the specified window and issuer")
-    void signsAndVerifies() throws GeneralSecurityException {
+    void signsAndVerifies() throws Exception {
         String jwt = GitHubAppJwt.sign("Iv23liClientId", TestKeys.PKCS8_PEM, NOW);
 
         Object claims = Json.parse(TestKeys.verifiedClaims(jwt, TestKeys.PAIR.getPublic()));
@@ -50,7 +50,7 @@ class GitHubAppJwtTest {
 
     @Test
     @DisplayName("is rejected by another key and differs per signing instant")
-    void otherKeyRejects() throws GeneralSecurityException {
+    void otherKeyRejects() throws Exception {
         String jwt = GitHubAppJwt.sign("id", TestKeys.PKCS8_PEM, NOW);
         var other = KeyPairGenerator.getInstance("RSA");
         other.initialize(2048);

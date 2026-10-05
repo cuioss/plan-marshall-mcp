@@ -27,7 +27,7 @@ import java.util.Optional;
  * @since 0.1
  */
 public record CiResponse(Outcome outcome, int status, String body, Optional<String> etag, Optional<URI> next,
-        Optional<Instant> resetAt, String detail) {
+                         Optional<Instant> resetAt, String detail) {
 
     /** The closed outcome of a request. */
     public enum Outcome {

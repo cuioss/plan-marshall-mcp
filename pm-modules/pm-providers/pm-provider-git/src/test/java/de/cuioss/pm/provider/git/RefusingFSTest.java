@@ -21,7 +21,6 @@ import java.io.ByteArrayOutputStream;
 import java.nio.file.Path;
 
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.util.ProcessResult;
 
@@ -60,7 +59,7 @@ class RefusingFSTest {
 
     @Test
     @DisplayName("reports an absent hook as not present on both entry points")
-    void absentHook(@TempDir Path dir) throws GitAPIException {
+    void absentHook(@TempDir Path dir) throws Exception {
         try (Git git = Git.init().setDirectory(dir.toFile()).setFs(fs).call()) {
             Repository repository = git.getRepository();
             var out = new ByteArrayOutputStream();

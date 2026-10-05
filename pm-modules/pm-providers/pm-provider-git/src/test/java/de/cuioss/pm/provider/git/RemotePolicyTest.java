@@ -13,7 +13,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.net.URI;
-import java.net.URISyntaxException;
 
 import org.eclipse.jgit.transport.URIish;
 
@@ -37,7 +36,7 @@ class RemotePolicyTest {
             "file:///tmp/x.git, false"
     })
     @DisplayName("admits only the https origin of the credential entry")
-    void httpsOrigin(String remote, boolean permitted) throws URISyntaxException {
+    void httpsOrigin(String remote, boolean permitted) throws Exception {
         var policy = RemotePolicy.httpsOrigin(URI.create("https://github.com"));
 
         assertEquals(permitted, policy.permits(new URIish(remote)));
@@ -51,7 +50,7 @@ class RemotePolicyTest {
             "git@github.com:cuioss/x.git, false"
     })
     @DisplayName("admits local repositories only")
-    void localOnly(String remote, boolean permitted) throws URISyntaxException {
+    void localOnly(String remote, boolean permitted) throws Exception {
         assertEquals(permitted, RemotePolicy.localOnly().permits(new URIish(remote)));
     }
 

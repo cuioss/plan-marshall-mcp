@@ -10,7 +10,6 @@
 package de.cuioss.pm.core.toon;
 
 import java.io.Serial;
-
 import lombok.Getter;
 
 /**

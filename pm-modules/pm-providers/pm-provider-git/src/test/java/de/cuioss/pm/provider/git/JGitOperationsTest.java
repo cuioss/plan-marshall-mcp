@@ -15,6 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +38,7 @@ import de.cuioss.pm.provider.git.GitOperations.RemoteInput;
 import de.cuioss.pm.provider.git.GitOperations.Worktree;
 import de.cuioss.pm.provider.git.GitOperations.WorktreeAddInput;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -92,7 +95,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("opens a repository and reports its facts")
-        void opens() throws IOException {
+        void opens() throws Exception {
             var info = git.open(repo).value().orElseThrow();
 
             assertEquals(repo.toRealPath(), info.worktreeRoot());
@@ -104,7 +107,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("reports a directory outside any repository")
-        void notARepository() throws IOException {
+        void notARepository() throws Exception {
             Path plain = Files.createDirectories(temp.resolve("plain"));
 
             assertEquals(GitOutcome.NOT_A_REPOSITORY, git.open(plain).outcome());
@@ -116,7 +119,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("commits additions and deletions with author and committer, unsigned")
-        void commitsAllChanges() throws IOException {
+        void commitsAllChanges() throws Exception {
             write("src/A.java", "class A {}\n");
             Files.delete(repo.resolve("README.md"));
 
@@ -140,7 +143,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("walks the history newest first, bounded by the count")
-        void logs() throws IOException {
+        void logs() throws Exception {
             write("a.txt", "a");
             CommitInfo second = commit("second");
             write("b.txt", "b");
@@ -162,7 +165,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("is stable for the same tree and changes with every input of rule 1")
-        void equalityBehaviour() throws IOException {
+        void equalityBehaviour() throws Exception {
             String clean = sha(repo);
             assertEquals(clean, sha(repo));
 
@@ -192,7 +195,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("counts staged-only changes and ignores ignored files")
-        void stagedAndIgnored() throws IOException, GitAPIException {
+        void stagedAndIgnored() throws Exception {
             String clean = sha(repo);
             write(".gitignore", "*.log\n");
             commit("ignore logs");
@@ -211,7 +214,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("matches an independent computation of the version-1 framing")
-        void framing() throws IOException {
+        void framing() throws Exception {
             write("b.txt", "B");
             write("a.txt", "AA");
             Files.createSymbolicLink(repo.resolve("link"), Path.of("a.txt"));
@@ -226,7 +229,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("is unaffected by configuration that shapes textual diff output")
-        void configurationIndependent() throws IOException {
+        void configurationIndependent() throws Exception {
             write("README.md", "changed\n");
             String before = sha(repo);
             try (Git jgit = Git.open(repo.toFile())) {
@@ -242,7 +245,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("is unavailable for an unborn HEAD or a missing repository")
-        void unavailable() throws IOException {
+        void unavailable() throws Exception {
             Path unborn = temp.resolve("unborn");
             git.init(unborn, "main");
             Path plain = Files.createDirectories(temp.resolve("plain"));
@@ -274,7 +277,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("adds a worktree on a new branch, checked out and usable")
-        void addsOnNewBranch() throws IOException {
+        void addsOnNewBranch() throws Exception {
             Worktree added = add("plan-1", "pm/plan-1");
 
             assertEquals("hello\n", Files.readString(added.path().resolve("README.md")));
@@ -295,7 +298,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("lists the main worktree first, then the linked ones")
-        void lists() throws IOException {
+        void lists() throws Exception {
             add("plan-1", "pm/plan-1");
             var detached = git.worktreeAdd(new WorktreeAddInput(repo, worktrees().resolve("baseline-x"), Optional.empty(),
                     false, "HEAD"));
@@ -317,10 +320,10 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("writes git's own administration layout (checked with the git CLI when present)")
-        void interoperatesWithGitCli() throws IOException, InterruptedException {
+        void interoperatesWithGitCli() throws Exception {
             Worktree added = add("plan-2", "pm/plan-2");
             Path gitCli = Path.of("/usr/bin/git");
-            org.junit.jupiter.api.Assumptions.assumeTrue(Files.isExecutable(gitCli), "git CLI not installed");
+            Assumptions.assumeTrue(Files.isExecutable(gitCli), "git CLI not installed");
 
             var process = new ProcessBuilder(gitCli.toString(), "worktree", "list", "--porcelain").directory(repo.toFile())
                     .redirectErrorStream(true).start();
@@ -334,7 +337,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("refuses targets outside the root, existing targets, branches and unknown start points")
-        void refusesAdd() throws IOException {
+        void refusesAdd() throws Exception {
             add("plan-1", "pm/plan-1");
             write(".marshall/local/worktrees/occupied/file", "x");
 
@@ -371,7 +374,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("removes a clean worktree and refuses dirty, locked, main and unknown ones")
-        void removes() throws IOException {
+        void removes() throws Exception {
             Worktree clean = add("clean", "pm/clean");
             Worktree dirty = add("dirty", "pm/dirty");
             Worktree locked = add("locked", "pm/locked");
@@ -395,7 +398,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("reports a worktree whose directory is gone as prunable and removes its administration")
-        void prunable() throws IOException {
+        void prunable() throws Exception {
             Worktree gone = add("gone", "pm/gone");
             LinkedWorktrees.deleteTree(gone.path());
 
@@ -415,7 +418,7 @@ class JGitOperationsTest {
         private Path remote;
 
         @BeforeEach
-        void bareRemote() throws GitAPIException, IOException, java.net.URISyntaxException {
+        void bareRemote() throws GitAPIException, IOException, URISyntaxException {
             remote = temp.resolve("remote.git");
             Git.init().setBare(true).setDirectory(remote.toFile()).setInitialBranch("main").setFs(new RefusingFS()).call()
                     .close();
@@ -431,7 +434,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("pushes, fetches into a second clone, and rejects a non-fast-forward and a stale lease")
-        void pushFetchReject() throws IOException, GitAPIException {
+        void pushFetchReject() throws Exception {
             String head = git.open(repo).value().orElseThrow().head().orElseThrow();
             var pushed = push(repo, null);
             assertEquals(GitOutcome.OK, pushed.outcome(), pushed.detail());
@@ -452,13 +455,13 @@ class JGitOperationsTest {
             var fetched = git.fetch(new RemoteInput(repo, "origin", List.of(), Optional.empty()));
             assertEquals(GitOutcome.OK, fetched.outcome(), fetched.detail());
             assertEquals(Optional.of(otherCommit.id()), fetched.value().orElseThrow().stream()
-                    .filter(u -> u.ref().equals("refs/remotes/origin/main")).findFirst().orElseThrow().newId());
+                    .filter(u -> "refs/remotes/origin/main".equals(u.ref())).findFirst().orElseThrow().newId());
         }
 
         @Test
         @DisplayName("refuses remotes outside the policy before sending anything, and unknown remotes")
-        void refusesRemotes() throws IOException {
-            var httpsOnly = new JGitOperations(RemotePolicy.httpsOrigin(java.net.URI.create("https://github.com")));
+        void refusesRemotes() throws Exception {
+            var httpsOnly = new JGitOperations(RemotePolicy.httpsOrigin(URI.create("https://github.com")));
             var credential = Optional.of(new GitCredential("x-access-token", "secret".toCharArray()));
 
             assertEquals(GitOutcome.REMOTE_ORIGIN_MISMATCH,
@@ -479,7 +482,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("refuses a commit when a repository hook is present, writing nothing")
-        void hookPresent() throws IOException {
+        void hookPresent() throws Exception {
             Path hook = repo.resolve(".git/hooks/pre-commit");
             Files.createDirectories(hook.getParent());
             Files.writeString(hook, "#!/bin/sh\ntouch hook-ran\n");
@@ -497,7 +500,7 @@ class JGitOperationsTest {
 
         @Test
         @DisplayName("refuses filter drivers instead of running them")
-        void filterDriver() throws IOException {
+        void filterDriver() throws Exception {
             write(".gitattributes", "*.txt filter=upper\n");
             try (Git jgit = Git.open(repo.toFile())) {
                 StoredConfig config = jgit.getRepository().getConfig();

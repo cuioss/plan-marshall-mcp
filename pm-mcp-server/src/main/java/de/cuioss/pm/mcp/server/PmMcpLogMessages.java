@@ -43,5 +43,24 @@ public final class PmMcpLogMessages {
                 .identifier(2)
                 .template("Pull-mechanism stub active with scenario '%s', events in '%s'")
                 .build();
+
+        /** Logged when a language server of the LSP pool answered {@code initialize}. */
+        public static final LogRecord LSP_STARTED = LogRecordModel.builder()
+                .prefix(PREFIX)
+                .identifier(40)
+                .template("Language server '%s' started (pid %s, position encoding %s)")
+                .build();
+    }
+
+    /** WARN level messages. */
+    @UtilityClass
+    public static final class WARN {
+
+        /** Logged when a language server does not end cleanly on {@code shutdown} / {@code exit}. */
+        public static final LogRecord LSP_SHUTDOWN_FAILED = LogRecordModel.builder()
+                .prefix(PREFIX)
+                .identifier(140)
+                .template("Language server (pid %s) did not end cleanly, terminating it: %s")
+                .build();
     }
 }

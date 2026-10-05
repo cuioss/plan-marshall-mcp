@@ -78,7 +78,7 @@ public final class GitLabClient {
      * @param expiresAt the expiry date, empty when none
      */
     public record TokenIdentity(String id, String name, String userId, List<String> scopes, boolean active,
-            Optional<String> expiresAt) {
+                                Optional<String> expiresAt) {
     }
 
     /**

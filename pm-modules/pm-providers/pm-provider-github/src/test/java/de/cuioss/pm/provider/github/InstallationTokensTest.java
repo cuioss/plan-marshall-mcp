@@ -11,9 +11,9 @@ package de.cuioss.pm.provider.github;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.security.GeneralSecurityException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -86,7 +86,7 @@ class InstallationTokensTest {
 
     @Test
     @DisplayName("mints with a verifiable JWT, narrowed to the repository and permissions")
-    void mints() throws GeneralSecurityException {
+    void mints() throws Exception {
         server.on("POST", PATH, minted("ghs_one", NOW.plusSeconds(3600)));
 
         CiResult<InstallationTokens.InstallationToken> result = tokens.token(42, "plan-marshall-mcp", PERMISSIONS);
@@ -121,8 +121,7 @@ class InstallationTokensTest {
         assertEquals("ghs_one", reused);
         assertEquals("ghs_two", renewed);
         assertEquals(2, server.requests().size());
-        assertFalse(server.requests().get(0).header("Authorization")
-                .equals(server.requests().get(1).header("Authorization")), "a JWT is never reused");
+        assertNotEquals(server.requests().get(0).header("Authorization"), server.requests().get(1).header("Authorization"), "a JWT is never reused");
     }
 
     @Test
@@ -150,7 +149,7 @@ class InstallationTokensTest {
         assertEquals(CiResult.Outcome.FAILED, tokens.token(8, "repo", PERMISSIONS).outcome());
         assertTrue(tokens.tokenSource(42, "repo", PERMISSIONS).token().isEmpty());
         try (var broken = new InstallationTokens(CiEndpoint.of(server.base()), "id", () -> "garbage", redacted::add,
-                clock)) {
+                     clock)) {
             assertEquals(CiResult.Outcome.UNAUTHORIZED, broken.token(42, "repo", PERMISSIONS).outcome());
         }
         assertTrue(redacted.isEmpty());

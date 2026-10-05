@@ -70,7 +70,7 @@ public final class GitHubClient {
      * @param complete whether {@code comments} holds every comment
      */
     public record ReviewThread(String id, boolean resolved, boolean outdated, String path, Optional<String> line,
-            List<ReviewComment> comments, boolean complete) {
+    List<ReviewComment> comments, boolean complete) {
     }
 
     /**

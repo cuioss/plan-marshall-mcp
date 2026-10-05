@@ -118,7 +118,7 @@ public interface GitOperations {
      * @param linked       whether this is a linked worktree
      */
     record RepositoryInfo(Path worktreeRoot, Path gitDir, Path commonDir, Optional<String> head, Optional<String> branch,
-            boolean linked) {
+    boolean linked) {
     }
 
     /**
@@ -145,7 +145,7 @@ public interface GitOperations {
      * @param prunable whether the linked worktree's directory is gone
      */
     record Worktree(Path path, Optional<String> name, Optional<String> branch, Optional<String> head, boolean main,
-            boolean locked, boolean prunable) {
+    boolean locked, boolean prunable) {
     }
 
     /**
@@ -206,7 +206,7 @@ public interface GitOperations {
      * @param message       the full message
      */
     record CommitInfo(String id, List<String> parents, Identity author, Instant authoredAt, Identity committer,
-            Instant committedAt, String message) {
+    Instant committedAt, String message) {
     }
 
     /**
@@ -245,7 +245,7 @@ public interface GitOperations {
      * @param credential         the transport credential, if any
      */
     record PushInput(Path root, String remote, String localRef, String remoteRef, Optional<String> expectedRemoteHead,
-            Optional<GitCredential> credential) {
+    Optional<GitCredential> credential) {
     }
 
     /**

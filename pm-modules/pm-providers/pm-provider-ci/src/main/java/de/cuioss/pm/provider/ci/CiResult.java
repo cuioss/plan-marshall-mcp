@@ -10,6 +10,7 @@
 package de.cuioss.pm.provider.ci;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -25,7 +26,7 @@ import java.util.Optional;
  * @since 0.1
  */
 public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, Optional<Instant> resetAt,
-        String detail) {
+                          String detail) {
 
     /** The closed outcome of a CI contract operation. */
     public enum Outcome {
@@ -112,7 +113,7 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
     }
 
     private static String messageOf(String body) {
-        return Json.parseOrNull(body) instanceof java.util.Map<?, ?> map && map.get("message") != null
+        return Json.parseOrNull(body) instanceof Map<?, ?> map && map.get("message") != null
                 ? ": " + map.get("message")
                 : "";
     }

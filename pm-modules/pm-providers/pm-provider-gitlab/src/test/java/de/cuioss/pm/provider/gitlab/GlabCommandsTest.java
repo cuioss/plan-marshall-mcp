@@ -14,6 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
@@ -32,7 +33,7 @@ class GlabCommandsTest {
     private final GlabCommands glab = new GlabCommands("gitlab.example.com", "group/project");
 
     private static List<String> argv(List<String> head, List<String> tail) {
-        var all = new java.util.ArrayList<>(BASE);
+        var all = new ArrayList<>(BASE);
         all.addAll(head);
         all.addAll(tail);
         return all;
@@ -83,7 +84,7 @@ class GlabCommandsTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "-d1", "d1 --paginate", "../x", "" })
+    @ValueSource(strings = {"-d1", "d1 --paginate", "../x", ""})
     @DisplayName("refuses identifiers that could be read as flags or paths")
     void refusesDiscussionIds(String id) {
         assertThrows(IllegalArgumentException.class, () -> glab.resolve(12, id));
@@ -99,7 +100,7 @@ class GlabCommandsTest {
     }
 
     private static List<String> concat(List<String> list, String last) {
-        var all = new java.util.ArrayList<>(list);
+        var all = new ArrayList<>(list);
         all.add(last);
         return all;
     }

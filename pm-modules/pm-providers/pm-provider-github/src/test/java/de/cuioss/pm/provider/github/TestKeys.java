@@ -23,7 +23,7 @@ final class TestKeys {
     static final KeyPair PAIR = generate();
     static final String PKCS8_PEM = "-----BEGIN PRIVATE KEY-----\n"
             + Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.US_ASCII))
-                    .encodeToString(PAIR.getPrivate().getEncoded())
+            .encodeToString(PAIR.getPrivate().getEncoded())
             + "\n-----END PRIVATE KEY-----\n";
 
     private TestKeys() {

@@ -129,7 +129,7 @@ class CiHttpClientTest {
         @DisplayName("drops the token on a redirect to another origin")
         void dropsTokenCrossOrigin() {
             try (var other = new FakeServer(); var redirecting = new CiHttpClient(
-                    new CiEndpoint(server.base(), Set.of("localhost")), TOKEN, Map.of())) {
+                         new CiEndpoint(server.base(), Set.of("localhost")), TOKEN, Map.of())) {
                 other.on("GET", "/log", Response.json(200, "log text"));
                 server.on("GET", "/jobs/1/logs", new Response(302, "", Map.of("Location", other.base("localhost") + "log")));
 
@@ -165,7 +165,7 @@ class CiHttpClientTest {
             for (int i = 1; i <= count; i++) {
                 var headers = i < count
                         ? Map.of("Link", "<" + server.base() + "items?page=" + (i + 1) + ">; rel=\"next\", <"
-                                + server.base() + "items?page=" + count + ">; rel=\"last\"")
+                        + server.base() + "items?page=" + count + ">; rel=\"last\"")
                         : Map.<String, String>of();
                 server.on("GET", "/items?page=" + i, new Response(200, "[" + i + "]", headers));
             }

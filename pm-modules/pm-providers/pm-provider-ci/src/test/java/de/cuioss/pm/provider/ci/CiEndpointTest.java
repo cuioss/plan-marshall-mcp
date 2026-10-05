@@ -51,7 +51,7 @@ class CiEndpointTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = { "http://api.github.com/", "ftp://localhost/", "http://10.0.0.1:8080/" })
+    @ValueSource(strings = {"http://api.github.com/", "ftp://localhost/", "http://10.0.0.1:8080/"})
     @DisplayName("refuses cleartext except on loopback")
     void httpsOnly(String uri) {
         var base = URI.create(uri);

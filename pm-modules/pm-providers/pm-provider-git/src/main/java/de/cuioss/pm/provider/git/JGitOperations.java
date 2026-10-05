@@ -15,16 +15,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
 
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.errors.EmptyCommitException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.api.errors.InvalidRemoteException;
 import org.eclipse.jgit.api.errors.JGitInternalException;
-import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.dircache.DirCacheCheckout;
 import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.Constants;
@@ -331,7 +332,7 @@ public final class JGitOperations implements GitOperations {
             var updates = new ArrayList<RefUpdate>();
             for (TrackingRefUpdate update : result.getTrackingRefUpdates()) {
                 updates.add(new RefUpdate(update.getLocalName(), id(update.getOldObjectId()),
-                        id(update.getNewObjectId()), update.getResult().name().toLowerCase(java.util.Locale.ROOT)));
+                        id(update.getNewObjectId()), update.getResult().name().toLowerCase(Locale.ROOT)));
             }
             return GitResult.ok(List.copyOf(updates));
         } catch (RefusingFS.CapabilityRefusedException e) {
@@ -377,7 +378,7 @@ public final class JGitOperations implements GitOperations {
 
     private static GitResult<RefUpdate> toPushResult(RemoteRefUpdate update) {
         var ref = new RefUpdate(update.getRemoteName(), id(update.getExpectedOldObjectId()), id(update.getNewObjectId()),
-                update.getStatus().name().toLowerCase(java.util.Locale.ROOT));
+                update.getStatus().name().toLowerCase(Locale.ROOT));
         return switch (update.getStatus()) {
             case OK, UP_TO_DATE -> GitResult.ok(ref);
             case REJECTED_NONFASTFORWARD -> GitResult.of(GitOutcome.REJECTED_NON_FAST_FORWARD, update.getRemoteName());
