@@ -9,13 +9,16 @@
  */
 package de.cuioss.pm.mcp.spike;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.URI;
+import java.util.HashMap;
 
 
 import de.cuioss.pm.mcp.server.test.TestRuntime;
+import de.cuioss.pm.mcp.server.test.UdsHttp;
 import io.quarkiverse.mcp.server.test.McpAssured;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -42,5 +45,17 @@ class SpikeInactiveTest {
                             "no stub tool may be listed");
                 })
                 .thenAssertResults();
+    }
+
+    @Test
+    @DisplayName("answers 404 to the job endpoint of the harness drivers")
+    void shouldHideJobEndpoint() throws Exception {
+        var headers = new HashMap<>(TestRuntime.bearer(TestRuntime.token()));
+        headers.put("Content-Type", "application/json");
+        var socket = TestRuntime.paths().socket();
+
+        assertEquals(404, UdsHttp.request(socket, "POST", "/api/v1/spike/jobs", headers,
+                "{\"worker\":\"w1\",\"generation\":1}").status());
+        assertEquals(404, UdsHttp.request(socket, "DELETE", "/api/v1/spike/jobs/j-w1-g1", headers, null).status());
     }
 }
