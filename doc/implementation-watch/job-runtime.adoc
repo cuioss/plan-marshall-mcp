@@ -131,8 +131,10 @@ Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_unparseabl
 link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6]
 Hazard:: Jobs exited non-zero without a diagnostic, and the failure carried nothing to act on. The bounded output tail
 is specified for builds only.
-Guard:: Non-build jobs (`git`, `ci`, scripts) exiting non-zero without a parsed diagnostic also attach the exception
-class, subject, bounded output tail and log URI.
+Guard:: A build exiting non-zero without a parsed diagnostic settles `failed_unparsed`, never `failed`; the full raw
+log is kept beside the job record, and its failure envelope (class `build`, kind `unparsed`) carries the bounded,
+redacted raw-log tail and the log URI and no invented diagnostic; matched control: a build with a parsed diagnostic
+settles `failed`.
 Source:: plan-marshall lesson 2026-09-23-05-006.
 
 [#PM-WATCH-JOB-9]
@@ -170,6 +172,32 @@ Guard:: Crash injection between spawn and the post-spawn replace: after restart 
 `killed` with the audit note "orphan unidentifiable" and no signal is sent; a `running` record whose `spawned_at` lies
 before the system boot time is marked `killed` and no signal is sent; control: a same-boot record with `pid` and
 `process_started_at` is probed and its process group terminated as specified.
+Source:: design review.
+
+[#PM-WATCH-JOB-30]
+=== PM-WATCH-JOB-30: Every wait maps to exactly one `wait_reason`, and every reason is used
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#_bounded_long_poll_progress_reset_waiting_primitives_pm_wf_8_pm_impl_4[Job Runtime § Bounded Long-Poll & Progress-Reset Waiting Primitives] (Wait Attribution),
+link:../Requirements.adoc#PM-IMPL-4[PM-IMPL-4]
+Hazard:: A wait without a reason is reported under a catch-all or not at all, and an enum value no wait produces
+hides that its wait was renamed or removed, so the wait figures of `record-metrics` no longer say where a plan's
+time went.
+Guard:: Coverage test over the compiled units: every waiting state and waiting primitive (job states, model slot
+wait, question and waiver waits, review-bot windows, merge-queue wait, merge-mutex admission, server retry backoff,
+provider rate-limit deferral, prerequisite wait) maps to exactly one value of the closed enum, and every enum value
+is the reason of at least one of them; `deliberate` is `true` exactly for the waiver, question, prerequisite, and
+rate-window waits. Matched control: a fixture state that waits without a mapped reason fails the test.
+Source:: design review.
+
+[#PM-WATCH-JOB-31]
+=== PM-WATCH-JOB-31: The child wall time is null without an observed exit and never exceeds the job's wall time
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#job-wall-times[Job Runtime § Wall times]
+Hazard:: A child wall time guessed for a job without an observed exit, or one longer than the job's own wall time,
+skews the build-overhead trigger of `PM-MIG-5` (negative or inflated overhead).
+Guard:: Test: a job `killed` by recovery, a `refused` job, and an in-process operation record `child_wall_ms: null`;
+every settled job with a child process records `child_wall_ms` no greater than its wall time (`spawned_at` to
+`ended_at`). Matched control: an ordinary build job records a non-null value.
 Source:: design review.
 
 == Linux Filesystem Confinement (Landlock)
@@ -239,12 +267,13 @@ Source:: plan-marshall truthful-signals PLAN-TRUTH-150 D5.
 [#PM-WATCH-JOB-11]
 === PM-WATCH-JOB-11: A test filter matching nothing reports zero tests
 
-Anchor:: link:../specification/mcp-tools/02-service-and-skill-tools.adoc#_pm_build_enrolled_build_execution[MCP Tools § `pm_build`],
+Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_native_build_output_parsers[Job Runtime § Native Build Output Parsers],
 link:../Requirements.adoc#PM-TOOL-2[PM-TOOL-2]
 Hazard:: A scoped Maven test filter (`-Dtest=<package>.*`) matching zero classes failed the surefire build instead of
 reporting zero tests.
-Guard:: The Maven adapter passes `-Dsurefire.failIfNoSpecifiedTests=false` (or equivalent) and reports `tests_run: 0`
-distinctly; test with a non-matching filter.
+Guard:: A `no_tests_ran` verdict requires the build tool's positive marker, never a zero count, and a successful
+build whose summaries cannot be aggregated reports `tests_population: unmeasured`, never `tests_run: 0`; fixtures
+with a non-matching filter (positive marker present) and with unaggregatable summaries.
 Fixture:: cui-jsf lesson `2026-06-16-09-001`.
 Source:: plan-marshall repository cui-jsf-test-basic, `.plan/local/lessons-learned/2026-06-16-09-001.md` (git-ignored consumer lesson store); lessons-routing PLAN-LR-01 D3.
 
@@ -273,6 +302,7 @@ Source:: plan-marshall defect post-run-quality PLAN-PRQ-08 § Claim Labels (evid
 === PM-WATCH-JOB-14: Truncated payloads report forwarded and total size
 
 Anchor:: link:../specification/job-runtime/03-parsers-and-gates.adoc#_unparseable_output_fallback_failed_unparsed[Job Runtime § Unparseable Output Fallback],
+link:../specification/hypermedia-format/01-representation-and-link-forms.adoc#facts-content-rules[Hypermedia Format § Facts Content Rules] (rule 4, Truncation Is Reported),
 link:../Requirements.adoc#PM-IMPL-6[PM-IMPL-6]
 Hazard:: A payload was truncated in forwarding (2,475 bytes / 4 turns emitted, ~575 bytes / 2 turns forwarded) while
 its counts still described the original.
@@ -363,8 +393,9 @@ link:../Requirements.adoc#PM-EXEC-6[PM-EXEC-6]
 Hazard:: A red gate is excused as baseline-red on a guess, or a `baseline_red` verdict recorded for one tree is
 reused after a new commit changed it.
 Guard:: Fixtures: the base's CI result shows the same failing check with the same fingerprints -> `baseline_red`,
-bound to the `worktree_sha` of the evaluated tree and recorded as a build row; a new commit makes the row stale and
-the gate re-runs; a failure whose fingerprint the base does not show calls `remediation.build-failure`; without a CI
+bound to the `worktree_sha` of the evaluated tree and recorded as a `baseline_red` row of the change ledger; a new
+commit makes the row stale and the gate re-runs; a failure whose fingerprint the base does not show calls
+`remediation.ci-failure` for a CI check and `remediation.build-failure` for a local gate; without a CI
 result on the base the local build of the merge base is the proof, and without either the red is not baseline.
 Source:: design review.
 
@@ -391,8 +422,8 @@ Hazard:: A digest computed from variant-specific status output, or from bytes th
 a fresh build stale (or a stale build fresh) when a project switches between the native and the CLI variant.
 Guard:: Fixture repositories with changed, deleted, untracked, and ignored paths: the native (`StatusCommand`) and the
 CLI (`git status --porcelain -z`) variant of `git.worktree-sha` return identical digests and version `1`, and an
-ignored path does not change the digest; control: setting `core.autocrlf`, `core.quotePath`, and `diff.noprefix`
-leaves both digests unchanged.
+ignored path does not change the digest; control: setting `core.quotePath` and `diff.noprefix` leaves both digests
+unchanged.
 Source:: design review.
 
 == Ingestion Validator (Level 1)

@@ -27,24 +27,29 @@ derived from prose, and it stays in the plan's `mcp/status.json` through archiva
     "owed_id": { "type": "string", "pattern": "^O-[0-9]+$" },
     "kind": {
       "type": "string",
-      "enum": ["cleanup", "deferred_reconcile", "pr_body_note", "owed_source_edit", "owed_hint", "unrecorded_stall", "post_merge_cleanup", "capture_ref_retained"],
-      "description": "Closed set of 8 kinds, derived from the finalize roster and the workflow states that can defer work."
+      "enum": ["cleanup", "post_merge_cleanup", "capture_ref_retained", "post_merge_step_failed"],
+      "description": "Closed set of 4 kinds; each kind has its named writer states."
     },
     "what": { "type": "string", "minLength": 1, "maxLength": 400 },
-    "discharger": { "type": "string", "enum": ["operator", "epic", "plan_step", "next_plan"] },
+    "discharger": { "type": "string", "enum": ["operator", "plan_step"] },
     "incurred_by_step": { "type": "string" },
     "incurred_at": { "type": "string", "format": "date-time" },
-    "discharge_proof": { "type": ["string", "null"], "description": "Commit SHA, landing id, plan_id, or audit_id that discharged the item." },
+    "discharge_proof": { "type": ["string", "null"], "description": "Commit SHA or audit_id that discharged the item." },
     "discharged_at": { "type": ["string", "null"], "format": "date-time" }
   }
 }
 ----
 
-* *Kinds*: `cleanup` (worktree or branch removal owed after a non-merging run), `deferred_reconcile` (a reconcile deferred instead of performed), `pr_body_note` (a note that could not be written before the pull request existed), `owed_source_edit` (a follow-up source change, for example a triage `ACCEPT` with follow-up), `owed_hint` (a hint routed for later action by `lessons-capture`, `preference-emitter`, or disposition-to-hint routing), `unrecorded_stall` (a stall the epic view or `pm-operator status` derived from the last-transition age of a non-terminal plan), `post_merge_cleanup` (the post-merge work of a plan handed back with its pull request still queued, `enqueued_not_landed`: branch removal and the post-merge band steps that did not run; discharged by the operator once the queue landed or dropped the entry), and `capture_ref_retained` (the capture ref `refs/pm-mcp/captures/<plan_id>` of a `land` plan that ended without `merged`, kept as the user's recovery point; discharged by `pm-operator drop-capture <plan_id>`, link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane, item 6]).
+* *Kinds*: The set is closed; each kind names the states that write it.
+** `cleanup`: removal work the server leaves to the operator. Writers: `finalize.merge-dispatch` and `finalize.merge-queue-wait` (the user's local commits a `land` plan carried that landed squashed stay on the user's branch; the item names the operator command), and `finalize.hand-back` (a worktree or branch removal of a non-merging run it could not perform).
+** `post_merge_cleanup`: the post-merge work of a plan handed back with its pull request still queued (`enqueued_not_landed`): branch removal and the post-merge band steps that did not run. Writer: `finalize.merge-queue-exit` (`closed` or `budget_spent` while the pull request is still queued). Discharged by the operator once the queue landed or dropped the entry.
+** `capture_ref_retained`: the capture ref `refs/pm-mcp/captures/<plan_id>` of a `land` plan, kept as the user's recovery point. Writers: `finalize.merge-dispatch` and `finalize.merge-queue-wait` (a `merged` plan whose captured tree differs from the merged head), `finalize.hand-back`, and the engine-owned abort `plan.aborted` (also as the first transaction of `delete-plan`). Discharged by `pm-operator drop-capture <plan_id>` (link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane, item 5]).
+** `post_merge_step_failed`: a finalize step that failed after the merge; `incurred_by_step` names it. Writer: `finalize.step-failed` (`after_merge`, the re-fire spent); the plan stays `merged`.
+* *Dischargers*: `operator` (the operator CLI) and `plan_step` (the step that incurred the item, on a later firing).
 * *Explicit Empty Set*: `emit-landing` and `archive-plan` write `owed` explicitly; `[]` means the plan owes nothing, an absent or null field means the question was never asked and is rendered `unknown`, never as nothing owed.
 * *Survives Archival*: Owed items stay readable from the archived plan (link:../filesystem-layout.adoc[Filesystem Layout Specification]) and are never folded into `completed`.
 * *Listable Without Prose*: For an epic plan the landing envelope carries `owed[]` to the epic inbox. For every plan, the project owed index `pm://project/owed` (link:../mcp-tools.adoc[MCP Tools Specification]) lists the undischarged items of active and archived plans, derived from their `owed[]` (no separate store), with per-root coverage; a root that could not be read is reported, never read as zero.
-* *Discharge*: An item is discharged only by recording `discharge_proof` and `discharged_at` through the discharging party's transition (a transition of the owning epic, the step that incurred it on a later firing, or the operator CLI `pm-operator discharge-owed --plan <plan_id> --owed <owed_id> --proof <ref>`, which also serves archived plans and is the only write an archived plan accepts); a discharged item is kept, never deleted.
+* *Discharge*: An item is discharged only by recording `discharge_proof` and `discharged_at` through the discharger's transition: the step that incurred it on a later firing, or the operator CLI `pm-operator discharge-owed --plan <plan_id> --owed <owed_id> --proof <ref>` (and `pm-operator drop-capture <plan_id>` for `capture_ref_retained`), which also serve archived plans; these two verbs are the only writes an archived plan accepts; a discharged item is kept, never deleted.
 
 == Findings Ledger Record (`findings.jsonl`)
 _Implementation watch: link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-16[PM-WATCH-GEN-16], link:../../implementation-watch/cross-cutting.adoc#PM-WATCH-GEN-43[PM-WATCH-GEN-43], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-4[PM-WATCH-STORE-4], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-5[PM-WATCH-STORE-5], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-7[PM-WATCH-STORE-7], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-31[PM-WATCH-STORE-31], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-45[PM-WATCH-STORE-45]_
@@ -162,12 +167,10 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
         "thread_id": { "type": ["string", "null"] },
         "comment_id": { "type": ["string", "null"] },
         "comment_kind": { "type": ["string", "null"], "enum": ["review_thread", "issue_comment", "review_body", null] },
-        "sonar_issue_key": { "type": ["string", "null"] },
-        "edit_term": { "type": ["string", "null"] }
+        "sonar_issue_key": { "type": ["string", "null"] }
       }
     },
     "disposition_rationale": { "type": ["string", "null"] },
-    "fix_task_id": { "type": ["string", "null"] },
     "transmit_outcome": {
       "type": "string",
       "enum": ["pending", "sent", "not_sent", "sent_unresolved", "skipped_no_address", "partial"],
@@ -210,7 +213,7 @@ Each line in `findings.jsonl` (of a plan, or of the workspace scope for the find
 `scope_class` is computed by the server at triage from `file_path` against the plan's effective footprint (`declared_files ∪ realized_files`, which includes the recorded unplanned changes, xref:13-leases-integrity-testing.adoc#three-way-footprint[Three-Way File Footprint Reconciliation (`references.json`)]). No operator triage exists: the operator's only lever over findings is a waiver of the gate. `pending` is the only non-terminal resolution: the Blocking Findings Guard and the pre-merge barrier count it, and a `FIX` whose fix has not landed is still `pending`. Every report and landing figure over findings is keyed by `resolution` with every member tallied (stated zeros); the false-positive count of a source is its `rejected` count and never includes `suppressed`. *Deliberate change vs. `plan-marshall`*: `plan-marshall` lets the model choose one of the six resolutions directly; `PM-MCP` keeps the three model dispositions and derives the six-value resolution from evidence the server holds.
 * *Evidence Symmetry*: A resolution rests on evidence of the same kind whichever way it goes: `rejected` requires a concrete `evidence.ref` as a `FIX` requires a landed change, and a disposition that lowers severity cites an executed check.
 * *Re-Disposition of a Transmitted Finding*: A finding whose `transmit_outcome` is `sent` may be re-dispositioned only together with a new `reply_text`; the server then resets `transmit_outcome` to `pending`, re-derives `resolution`, and transmits again. A bare re-disposition (same or no reply) is refused with `invalid_link_args`.
-* *Late Findings Are Carried Out*: After the merge gate (order `> 70`) no step refuses on findings. A blocking finding still `pending` after the merge (filed after the barrier evaluated) is carried out by the server: appended to the parent epic inbox as a `process_finding` message, or, for a plan without an epic, seeded as a lesson (category `bug`, title from `summary`, body from `body`); while the epic linkage is `indeterminate` the message is appended to the kept landing envelope `landing-envelope.json` (xref:04-epic-and-change-ledger.adoc#kept-landing-envelope[Kept Landing Envelope]) and delivered with it. The finding is set to status `carried` with `carried_to` after the destination has accepted the record (write order and recovery: xref:01-format-and-session-log.adoc#transaction-journal[Transaction Journal], Writes outside the scope, Late findings); its `resolution` stays `pending`, so the carried debt remains visible (link:../phase-workflows.adoc[Phase Workflows Specification], rows `1000` and `1100`).
+* *Late Findings Are Carried Out*: After the merge gate (order `> 70`) no step refuses on findings. A blocking finding still `pending` after the merge (filed after the barrier evaluated) is carried out by the server: appended to the parent epic inbox as a `process_finding` message, or, for a plan without an epic or whose epic linkage is `detached` (its epic terminal, xref:02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Workflow State Store], Origin and Epic Linkage), seeded as a lesson (category `bug`, title from `summary`, body from `body`); while the epic linkage is `indeterminate` the message is appended to the kept landing envelope `landing-envelope.json` (xref:04-epic-and-change-ledger.adoc#kept-landing-envelope[Kept Landing Envelope]) and delivered with it. The finding is set to status `carried` with `carried_to` after the destination has accepted the record (write order and recovery: xref:01-format-and-session-log.adoc#transaction-journal[Transaction Journal], Writes outside the scope, Late findings); its `resolution` stays `pending`, so the carried debt remains visible (link:../phase-workflows.adoc[Phase Workflows Specification], rows `1000` and `1100`).
 * *Transmit Reasons*: `transmit_reason` is one closed vocabulary shared by every provider: `no_provider_address` (no thread, comment id, or Sonar issue key to answer on), `pr_number_unrecorded` and `belongs_to_other_pr` (the finding cannot be shown to belong to this pull request; deferred, never dropped), `nothing_to_transmit` (the disposition carries no reply), `reply_failed` and `resolve_failed` (the provider call for the reply or for the thread resolution failed), `provider_unreachable`, and `provider_rejected`. Provider error text is never packed into the reason. *Deliberate change vs. `plan-marshall`*: the GitHub, GitLab, and Sonar integrations each report their own free-text skip reasons (`no_resolution_detail`, `no thread_id or resolution_detail`, `no issue key in detail`, `thread-reply failed: <error>`; verified at `plan-marshall` `b1a9a89fa`), so one condition has three spellings.
 * *Transmission and Resolution Are Separate*: Before the provider call the server persists `transmit_outcome: pending` with the `transmit_disposition` it sends. `responded_at` is stamped after the provider accepted the reply and before the thread is resolved; `resolve_state` is persisted separately, so a resolve-only retry never re-sends the reply. After a crash, a `pending` transmission is reconciled by looking up the reply on the provider before any re-send.
 
@@ -359,7 +362,8 @@ One record per `bot_kind` is compiled into the binary; a project may add records
     "reviewed_sha_pattern": { "type": ["string", "null"] },
     "completion_check_name": { "type": ["string", "null"] },
     "refusal_patterns": { "type": "array", "items": { "type": "string" } },
-    "refusal_size_patterns": { "type": "array", "items": { "type": "string" } },
+    "refusal_size_patterns": { "type": "array", "items": { "type": "string" }, "description": "Number-free detection patterns of a size refusal (cause size)." },
+    "refusal_size_cap_patterns": { "type": "array", "items": { "type": "string" }, "description": "Extraction patterns reading the ceiling the size refusal notice states (files or diff characters), recorded with the refusal; no ceiling is encoded in a pattern." },
     "refusal_wrapper_markers": { "type": "array", "items": { "type": "string" } },
     "rate_limit_eta_patterns": { "type": "array", "items": { "type": "string" } },
     "no_new_commits_patterns": { "type": "array", "items": { "type": "string" }, "description": "Anchored patterns of the bot's 'Review skipped: No new commits' notice." },
@@ -370,6 +374,7 @@ One record per `bot_kind` is compiled into the binary; a project may add records
     "structural_caps": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Ceilings for the pre-wait cap gate; null in every compiled-in record (a bot's ceilings are read from its notice), declared only by a team record that knows its bot's plan.",
       "properties": { "max_files": { "type": ["integer", "null"] }, "max_diff_chars": { "type": ["integer", "null"] } }
     },
     "actionable_content_markers": { "type": "array", "items": { "type": "string" } },
@@ -389,4 +394,4 @@ One record per `bot_kind` is compiled into the binary; a project may add records
 }
 ----
 
-The compiled-in records carry the data verified in `plan-marshall` `automatic-review/standards/` (re-verify before implementing): `coderabbit` (one review per hour, `awaitable_window`, `max_files: 100`, trigger verbs `@coderabbitai review` / `@coderabbitai full review`, CodeRabbit refusal wrapper `<details><summary>⚠️ Action not completed</summary>`), `sourcery` (`hard_quota` of 250,000 diff characters per 7 days, per pull request 150,000 characters or 300 files), and `cuioss-review-bot` (`unknown`, reviewed SHA only in the body). `sourcery` declares `participation_requires_update: false`; `coderabbit` and `cuioss-review-bot` declare `true` (they edit their summary comment in place on re-review). The provider comment body cap (GitHub 65,536 characters) is a provider limit, not a bot record.
+The compiled-in records carry the data verified in `plan-marshall` `automatic-review/standards/` (re-verify before implementing): `coderabbit` (one review per hour, `awaitable_window`, trigger verb `@coderabbitai review`, CodeRabbit refusal wrapper `<details><summary>⚠️ Action not completed</summary>`), `sourcery` (`hard_quota`, an account-level diff-character quota over a rolling 7-day window, and per-pull-request size and file-count ceilings), and `cuioss-review-bot` (`unknown`, reviewed SHA only in the body). No record encodes a bot's ceiling or quota as a number: the detection patterns are number-free and the ceiling is read from the bot's own notice (`refusal_size_cap_patterns`, `rate_limit_eta_patterns`), so a plan change of the bot needs no record change. `sourcery` declares `participation_requires_update: false`; `coderabbit` and `cuioss-review-bot` declare `true` (they edit their summary comment in place on re-review). The provider comment body cap (GitHub 65,536 characters) is a provider limit, not a bot record.
