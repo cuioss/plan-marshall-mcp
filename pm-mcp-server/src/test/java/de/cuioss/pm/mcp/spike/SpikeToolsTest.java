@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 
 
+import de.cuioss.pm.mcp.server.test.TestRuntime;
 import io.quarkiverse.mcp.server.ToolResponse;
 import io.quarkiverse.mcp.server.test.McpAssured;
 import io.quarkus.test.common.http.TestHTTPResource;
@@ -74,7 +75,7 @@ class SpikeToolsTest {
     @Test
     @DisplayName("runs the scenario: wait with progress, task, submit, widened tool set, done")
     void shouldRunScenario() throws Exception {
-        var client = McpAssured.newConnectedStreamableClient();
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
 
         // One exchange per step: the test client sends everything queued before thenAssertResults at once.
         client.when()

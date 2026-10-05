@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 
 
+import de.cuioss.pm.mcp.server.test.TestRuntime;
 import io.quarkiverse.mcp.server.ClientCapability;
 import io.quarkiverse.mcp.server.ToolResponse;
 import io.quarkiverse.mcp.server.test.McpAssured;
@@ -103,8 +104,8 @@ class SpikeProtocolToolsTest {
     @Test
     @DisplayName("runs offer, acknowledgement, consultation, fencing and skill delivery through the tools")
     void shouldRunProtocol() throws Exception {
-        var client = McpAssured.newConnectedStreamableClient();
-        var skillHost = McpAssured.newStreamableClient()
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
+        var skillHost = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token())
                 .setClientCapabilities(new ClientCapability("extensions",
                         Map.of(SpikeTools.SKILLS_EXTENSION, Map.of())))
                 .build().connect();
@@ -195,7 +196,7 @@ class SpikeProtocolToolsTest {
     @Test
     @DisplayName("serves the catalogue through the skill tools and as resources")
     void shouldServeSkills() throws Exception {
-        var client = McpAssured.newConnectedStreamableClient();
+        var client = McpAssured.newStreamableClient().setBearerToken(TestRuntime.token()).build().connect();
         // an own URI: the other test replaces the triage skill
         call(client, SpikeTools.SPIKE_SKILL_UPDATE, Map.of("uri", "skill://pm/role/extra/SKILL.md", "content",
                 "---\nname: extra\n---\nbody"), false);
