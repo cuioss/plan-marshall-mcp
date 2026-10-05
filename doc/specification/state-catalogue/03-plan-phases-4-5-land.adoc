@@ -102,14 +102,14 @@ Envelopes run serially as tasks of the writer role `implement`: a plan runs at m
 |`job`
 |`execute.chain-tail-commit` (`done`); `execute.route-commit-cause` (`deliverable`).
 |The module-scoped build job running the configured per-deliverable verification verbs (default `compile` and `module-tests`).
-|`succeeded` -> `execute.replan-check` (xref:12-re-planning.adoc#state-execute.replan-check[re-planning checkpoint]); `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate` -> `execute.remediate-build` (fact `failed_build: deliverable`).
+|`succeeded` -> `execute.replan-check` (xref:12-re-planning.adoc#state-execute.replan-check[re-planning checkpoint]); `failed`, `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, `indeterminate` -> `execute.remediate-build` (writes `remediation_cause: deliverable`).
 |link:../phase-workflows/03-q-gate-and-execute.adoc#_per_deliverable_chain_tail_commit_module_build_git_commit_and_push[Phase Workflows Specification, Per-Deliverable Chain-Tail Commit]
 
 |[[state-execute.remediate-build]]`execute.remediate-build`
 |`phase-5-execute`
 |`call`
 |`execute.deliverable-build` (failure fates), `execute.verify-sweep` (`red`, `cancelled`).
-|As xref:01-conventions-generic-conditions.adoc#state-phase.remediate-build[`<phase>.remediate-build`]; the fact `failed_build: deliverable | sweep` is recorded by the entering transition.
+|As xref:01-conventions-generic-conditions.adoc#state-phase.remediate-build[`<phase>.remediate-build`]; the entering transition writes the status field `remediation_cause` (`deliverable` or `sweep`, link:../store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas Specification, Workflow State Store]).
 |`resolved` -> `execute.route-build-cause`; `fix_requested` -> `execute.allocate-remediation`; `exhausted` -> `execute.replan` (trigger `ceiling`); `stepped_out` -> `finalize.hand-back`.
 |link:../phase-workflows/03-q-gate-and-execute.adoc#_whole_tree_verification_gates_triage_required_routing[Phase Workflows Specification, Whole-Tree Verification Gates]
 
@@ -117,7 +117,7 @@ Envelopes run serially as tasks of the writer role `implement`: a plan runs at m
 |`phase-5-execute`
 |`auto`
 |`execute.remediate-build` (`resolved`).
-|Router: `auto execute.route-build-cause` reads the recorded fact `failed_build`.
+|Router: `auto execute.route-build-cause` reads the persisted `remediation_cause` and clears it in the routing transaction.
 |`deliverable` -> `execute.envelope-ready` (the resolved deliverable build lets the envelopes continue); `sweep` -> `execute.verify-sweep`.
 |link:../phase-workflows/03-q-gate-and-execute.adoc#_whole_tree_verification_gates_triage_required_routing[Phase Workflows Specification, Whole-Tree Verification Gates]; link:../workflow-dsl/03-reference-excerpt.adoc#_reference_workflow_dsl_excerpt_finalize_pmwf[Workflow DSL Specification, Routing by Fact]
 
@@ -125,7 +125,7 @@ Envelopes run serially as tasks of the writer role `implement`: a plan runs at m
 |`phase-5-execute`
 |`auto`
 |`execute.remediate-build` (`fix_requested`).
-|`auto plan.allocate-remediation-tasks`: allocates fix tasks and one envelope from the gathered build-failure evidence, charged to the per-plan fix budget of `remediation.build-failure`. The finalize callers use `finalize.allocate-remediation`.
+|`auto plan.allocate-remediation-tasks`: allocates fix tasks and one envelope from the gathered build-failure evidence. The finalize callers use `finalize.allocate-remediation`.
 |`allocated` -> `execute.envelope-ready`.
 |link:../workflow-dsl/07-loop-back-diagrams-verification.adoc#loop-back-bounds[Workflow DSL Specification, Loop-Back Bounds]
 
@@ -141,8 +141,8 @@ Envelopes run serially as tasks of the writer role `implement`: a plan runs at m
 |`phase-5-execute`
 |`auto`
 |`execute.remediation-commit` (`done`).
-|Router: `auto execute.route-commit-cause` reads the recorded cause of the commit (the fact `failed_build`, a finalize loop-back, or the exit barrier that found the dirty tree).
-|`deliverable` (`failed_build: deliverable`) -> `execute.deliverable-build`; `sweep` (`failed_build: sweep`, a finalize loop-back, or a dirty `execute.exit-barrier`) -> `execute.verify-sweep`; `land` (a dirty `land.exit-barrier`) -> `land.verify-sweep`.
+|Router: `auto execute.route-commit-cause` reads the persisted `remediation_cause` of the commit (link:../store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas Specification, Workflow State Store]) and clears it in the routing transaction.
+|`deliverable` (cause `deliverable`) -> `execute.deliverable-build`; `sweep` (cause `sweep`, `finalize` for a finalize loop-back, or `exit_barrier` for a dirty `execute.exit-barrier`) -> `execute.verify-sweep`; `land` (cause `land_exit`, a dirty `land.exit-barrier`) -> `land.verify-sweep`.
 |link:../workflow-dsl/06-reusable-sub-workflows.adoc#_call_site_reuse_matrix_across_workflows[Workflow DSL Specification, Call-Site Reuse Matrix]; link:../workflow-dsl/03-reference-excerpt.adoc#_reference_workflow_dsl_excerpt_finalize_pmwf[Workflow DSL Specification, Routing by Fact]
 
 |[[state-execute.verify-sweep]]`execute.verify-sweep`
@@ -150,7 +150,7 @@ Envelopes run serially as tasks of the writer role `implement`: a plan runs at m
 |`composite_job`
 |`execute.envelope-ready` (`all_complete`); `execute.route-commit-cause` (`sweep`); `execute.route-build-cause` (`sweep`); `execute.replan` (`done` without a runnable task); `execute.exit-barrier` (`stale`).
 |Runs the plan instance's Phase 5 verification steps (`module-tests`, `quality-gate`, `coverage`, `arch-gate`) with footprint-driven scope and the relocation override. A red that is red only through failures also present on the base passes by the server rule: a `baseline_red` ledger row bound to `worktree_sha`, the merge base, and the diagnostics digest (`assurance_verdict: degraded`, the baseline failures listed in the pull request body and the landing record). A constituent `failed_unparsed`, `refused`, `cancelled`, `timed_out`, `killed`, or `indeterminate` fate maps to `red`.
-|`all_green` -> `execute.exit-barrier`; `red` (plan-caused, or no verdict), `cancelled` (cancelled by the server or the operator) -> `execute.remediate-build` (fact `failed_build: sweep`).
+|`all_green` -> `execute.exit-barrier`; `red` (plan-caused, or no verdict), `cancelled` (cancelled by the server or the operator) -> `execute.remediate-build` (writes `remediation_cause: sweep`).
 |link:../phase-workflows/03-q-gate-and-execute.adoc#_whole_tree_verification_gates_triage_required_routing[Phase Workflows Specification, Whole-Tree Verification Gates]; link:../job-runtime/03-parsers-and-gates.adoc#_gate_honesty_verification[Job Runtime Specification, Gate Honesty Verification]
 
 |[[state-execute.exit-barrier]]`execute.exit-barrier`
@@ -158,7 +158,7 @@ Envelopes run serially as tasks of the writer role `implement`: a plan runs at m
 |`auto`
 |`execute.verify-sweep` (`all_green`).
 |Dual gate evaluated together: pending-tasks and clean-tree gate (every task terminal with its disposition, empty porcelain) and worktree freshness gate (`fresh`, `exempt`, `stale`, `undecidable` with `stale_reason`; a `baseline_red` row counts as passing for its `worktree_sha` only).
-|`pass` -> `finalize.settle-commit` (phase `phase-6-finalize`, `settle_trigger` order `0`); `dirty` (a dirty tree, checked before open tasks) -> `execute.remediation-commit`; `stale` (freshness `stale`, or `undecidable` for a reason a build clears) -> `execute.verify-sweep`; freshness `undecidable` with `stale_reason` `unrecognized_build_notation`, `ledger_unreadable`, or `worktree_sha_unavailable`, which no sweep clears, raises xref:01-conventions-generic-conditions.adoc#condition-guard_indeterminate[`guard_indeterminate`] on this state; `runnable_open` (open tasks, runnable tasks remain) -> `execute.envelope-ready`; `none_runnable` (open tasks, none runnable) -> `execute.replan` (trigger `infeasible`).
+|`pass` -> `finalize.settle-commit` (phase `phase-6-finalize`, `settle_trigger` order `0`); `dirty` (a dirty tree, checked before open tasks) -> `execute.remediation-commit` (writes `remediation_cause: exit_barrier`); `stale` (freshness `stale`, or `undecidable` for a reason a build clears) -> `execute.verify-sweep`; freshness `undecidable` with `stale_reason` `unrecognized_build_notation`, `ledger_unreadable`, or `worktree_sha_unavailable`, which no sweep clears, raises xref:01-conventions-generic-conditions.adoc#condition-guard_indeterminate[`guard_indeterminate`] on this state; `runnable_open` (open tasks, runnable tasks remain) -> `execute.envelope-ready`; `none_runnable` (open tasks, none runnable) -> `execute.replan` (trigger `infeasible`).
 |link:../phase-workflows/03-q-gate-and-execute.adoc#_phase_5_exit_barrier_dual_freshness_pending_tasks_gates[Phase Workflows Specification, Phase 5 Exit Barrier]
 |===
 
@@ -202,6 +202,6 @@ Plans started from `local_changes` only. The `land.*` states run in phase `phase
 |`auto`
 |`land.verify-sweep` (`all_green`).
 |The Phase 5 exit barrier with zero tasks (the pending-tasks gate is vacuous); clean-tree and freshness gates unchanged.
-|`pass` -> `finalize.settle-commit` (phase `phase-6-finalize`, `settle_trigger` order `0`); `dirty` -> `execute.remediation-commit`; `stale` (freshness `stale`, or `undecidable` for a reason a build clears) -> `land.verify-sweep`; the `undecidable` reasons no sweep clears raise xref:01-conventions-generic-conditions.adoc#condition-guard_indeterminate[`guard_indeterminate`] as in `execute.exit-barrier`.
+|`pass` -> `finalize.settle-commit` (phase `phase-6-finalize`, `settle_trigger` order `0`); `dirty` -> `execute.remediation-commit` (writes `remediation_cause: land_exit`); `stale` (freshness `stale`, or `undecidable` for a reason a build clears) -> `land.verify-sweep`; the `undecidable` reasons no sweep clears raise xref:01-conventions-generic-conditions.adoc#condition-guard_indeterminate[`guard_indeterminate`] as in `execute.exit-barrier`.
 |link:../phase-workflows/02-planning-lanes-phases-3-4.adoc#land-lane[Phase Workflows Specification, Land Lane item 3]
 |===

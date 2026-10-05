@@ -33,7 +33,7 @@ pending-record deletion; after each restart the startup recovery leaves exactly 
 plan, and no pending record, and each reconciliation it applied has one audit record; a crash before the plan scope
 leaves only the pending record. The same for an epic bootstrap: a crash after the new epic's scope and before the
 pending-record deletion leaves exactly one epic and no pending record after recovery. The same for a job state: a crash after `active_job` and before
-the job record settles the state `killed` and routes that outcome once; a crash after the job record leaves the job
+the job record leaves the job settled `killed` by recovery (it never started), and the state routes that outcome once; a crash after the job record leaves the job
 bound and running. The same for a worker's end: a crash after its job record (fate, fence, revoked token) and
 before the queue task record releases the held task's lease at recovery and queues the task again once. Matched control: a recovery run on a consistent store changes nothing and writes no audit record.
 Source:: design review.
@@ -45,9 +45,22 @@ Anchor:: link:../specification/store-schemas/01-format-and-session-log.adoc#tran
 link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7]
 Hazard:: A late blocking finding marked `carried` before its destination (the epic message or the seeded lesson) is
 written disappears when the runtime crashes between the two writes.
-Guard:: Crash-injection test between the destination write and the `carried` mark: after recovery the finding is
-carried exactly once more, so the destination holds at most a duplicate notice and never none. Matched control: a
-crash before the destination write leaves the finding uncarried and recovery carries it once.
+Guard:: Crash-injection test between the destination write and the `carried` mark: recovery derives nothing and
+leaves the finding `pending` without `carried_to`; the resumed carry-out carries it exactly once more, so the
+destination holds at most a duplicate notice and never none. Matched control: a crash before the destination write
+leaves the finding uncarried and the resumed carry-out carries it once.
+Source:: design review.
+
+[#PM-WATCH-STORE-49]
+=== PM-WATCH-STORE-49: An append journal entry without `size_before` is rejected
+
+Anchor:: link:../specification/store-schemas/01-format-and-session-log.adoc#transaction-journal[Store Schemas § Transaction Journal],
+link:../Requirements.adoc#PM-IMPL-7[PM-IMPL-7]
+Hazard:: A journal entry of mode `append` without its truncation point cannot be rolled forward: recovery either
+appends the staged block a second time or cannot tell the applied state from the torn one.
+Guard:: Schema test: a journal target with `mode: append` and no integer `size_before` is rejected when the journal is
+written; crash-injection test: an append torn after the journal write is truncated to `size_before` and appended once
+at recovery. Matched control: a `replace` target without `size_before` is accepted.
 Source:: design review.
 
 == Scope Session Log (`sessions.jsonl`)
@@ -110,6 +123,31 @@ Hazard:: "True when written, false when read": persisted artifacts snapshotted a
 landings, retrospectives) and went stale.
 Guard:: Every persisted derived fact carries the `head_sha` it describes; readers re-derive when `HEAD` differs.
 Source:: plan-marshall review-apparatus epic § Archetype ("true when written, false when read").
+
+[#PM-WATCH-STORE-48]
+=== PM-WATCH-STORE-48: `remediation_cause` is written on entry, cleared by its router, and routes once after a crash
+
+Anchor:: link:../specification/store-schemas/02-workflow-state-store.adoc#_workflow_state_store_mcpstatus_json[Store Schemas § Workflow State Store] (`remediation_cause`),
+link:../Requirements.adoc#PM-WF-7[PM-WF-7]
+Hazard:: A remediation whose cause is held only in memory, or kept after its router routed, sends the fix commit of
+one cause back to the build of another after a restart or a second remediation.
+Guard:: Test per cause (`deliverable`, `sweep`, `finalize`, `exit_barrier`, `land_exit`): the transition entering the
+remediation writes the field in its own transaction; `execute.route-build-cause` and `execute.route-commit-cause` route
+by it and set it to `null` in the routing transaction; a crash after the entry and before the router leaves the field
+set and the router routes exactly once after recovery. Matched control: with no remediation in flight the field is
+`null`.
+Source:: design review.
+
+[#PM-WATCH-STORE-50]
+=== PM-WATCH-STORE-50: The hand-back's local form maps to `local_only`
+
+Anchor:: link:../specification/store-schemas/02-workflow-state-store.adoc#merge-outcome-mapping[Store Schemas § Merge Outcome Mapping]
+Hazard:: A plan handed back without a push credential while a push remote exists is mapped through the remote rows
+(`no_pr` or a failed observation), so its archive waits on a pull request that never existed.
+Guard:: `MergeOutcomeMappingTest` row: a push remote present and no push credential (the hand-back's local form) maps
+to `merge_outcome: local_only` and `merge_state: not_applicable`. Matched control: with the credential present the row
+of the observed pull-request state applies.
+Source:: design review.
 
 == Findings Ledger Record (`findings.jsonl`)
 
@@ -218,8 +256,9 @@ epic attribution.
 Guard:: A test archives, and one aborts, an epic (its ledger moves to
 `.marshall/archived-orchestrators/<epic_id>-<YY-MM-DD>/`) while a plan whose `origin.epic_id` names it is in flight:
 the plan keeps `origin.epic_id`, its `epic_linkage` resolves through the one epic-ledger resolver, which finds the
-header by `epic_id` (never by a path in the request or the dated suffix), and reads `orchestrated`, or
-`indeterminate` when the header is absent or unreadable, never `not_orchestrated`.
+header by `epic_id` in the active and the archived orchestrator root (never by a path in the request or the dated
+suffix), and reads `detached` (the epic terminal), or `indeterminate` when the header is absent or unreadable, never
+`not_orchestrated`.
 Source:: plan-marshall orchestrator-refactor PLAN-03 D6.
 
 == Change Ledger Record (`change-ledger.jsonl`)
@@ -476,11 +515,10 @@ Source:: plan-marshall instrumentation-substrate PLAN-09 deliverable 4 (§ The t
 [#PM-WATCH-STORE-18]
 === PM-WATCH-STORE-18: Lesson reach is derivable
 
-Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas § Lesson Record],
-link:../specification/store-schemas/06-task-and-references.adoc#_references_footprint_store_schema_references_json[§ References & Footprint Store Schema] (`lessons_consulted`)
+Anchor:: link:../specification/store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas § Lesson Record]
 Hazard:: Defect lessons sat for weeks without ever reaching a plan, and nothing measured it.
-Guard:: Lesson-to-plan links persist (`references.lessons_consulted`, and for lesson-started plans the lesson's own
-`claim` and `retired.by` with verdict `applied`) so that reach (lessons with at least one consuming plan / all
+Guard:: Lesson-to-plan links persist (for lesson-started plans the lesson's own `claim` and `retired.by` with verdict
+`applied`) so that reach (lessons with at least one consuming plan / all
 lessons) is computable from the lesson store and live plans, without archived plans.
 Fixture:: 194 lessons, 23 on post-run-quality defects, 0 reached a plan before the epic, oldest filed 2026-08-27; six
 first-party reports 2026-08-27 → 2026-09-15, none reached a plan for three weeks; reach 1 of 5 (two cloud-lane run
