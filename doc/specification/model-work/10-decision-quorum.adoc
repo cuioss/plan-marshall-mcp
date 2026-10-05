@@ -1,0 +1,203 @@
+= Model Work Specification: Recommendation Score & Decisions: Ask or Quorum
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Work] » Recommendation Score & Decisions: Ask or Quorum
+
+[#ask-or-quorum]
+== Recommendation Score & Decisions: Ask or Quorum
+_See Requirements link:../../Requirements.adoc#PM-WF-18[PM-WF-18: Question Recommendation Score & Decision Quorum], link:../../Requirements.adoc#PM-WF-12[PM-WF-12: Question Records vs Operator Overrides], link:../../Requirements.adoc#PM-WORK-6[PM-WORK-6: Role Qualification], link:../../Requirements.adoc#PM-EXT-6[PM-EXT-6: Configuration Split by Owner Class (Team, Operator, Server State)]_
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-45[PM-WATCH-DISP-45]_
+
+Every question carries a recommendation and a score that says how sure the asker is of it. The project's adjudication unit declares, per decision kind, who decides a question of that kind: `ask` (the user) or `quorum(<role>, ..., <score>)` (the listed roles, answering blind, decide only when all of them choose the same option with at least the score). In the question mode `quorum` the server adjudicates every question set by these declarations before it is delivered; in every other mode every kind is `ask`. Question records, their delivery, the modes, and the deadlines are specified in xref:06-envelopes-questions-deadlines.adoc#question-records[Question Records]; this part specifies the score, the decision kinds, the declarations, the adjudication, its record, and the calibration of every quorum. A quorum exists for model diversity: its roles run on different models, so an automatic decision rests on judgments that do not share one model's blind spots.
+
+[#recommendation-score]
+=== Recommendation Score
+
+*Asked by a task*: Every question a task creates (`ask`, `ask:TASK-NNN`, an item of a `questions` list) carries, in its question envelope (xref:06-envelopes-questions-deadlines.adoc#question-envelope-schema[Question Envelope]):
+
+* exactly one option with `recommended: true`, the asker's choice;
+* `recommendation_confidence`, an integer `0` to `100`: the asker's confidence that the recommended option is right;
+* `rationale`, `10` to `500` characters: why the asker recommends it, naming the evidence;
+* `decision_kind`, one value of the closed set of <<decision-kinds>>.
+
+A payload without them, or with no or several recommended options, is refused `invalid_link_args`, and the worker submits again.
+
+*Raised by the server*: A question a server primitive raises carries the primitive's recommended option, its score mapped to `0` to `100`, a server-composed rationale (the scores the choice rests on), and the kind the adjudication unit declares for it (<<decision-declarations>>; the column below shows the shipped declaration). A primitive that computes no score, and a question without a recommended option, scores `0`.
+
+[cols="2,1,4"]
+|===
+|Server question (declaration) |Kind |Score
+
+|`init.recipe-candidate` (`kind_recipe_candidate`)
+|`approach`
+|The top recipe score times `100` (link:../domain-extensions/05-recipes-and-extension-points.adoc[Domain Extensions Specification, Tier-1 Init Routing]).
+
+|`init.sibling-collision` (`kind_sibling_collision`)
+|`scope`
+|`0`.
+
+|`init.domain-choice` (`kind_domain_choice`)
+|`placement`
+|The top domain's share of the detection scores times `100`; `0` without a unique top score.
+
+|`outline.review` (`kind_outline_review`)
+|`scope`
+|`0`.
+
+|Workspace setup choices (class `setup`, `kind_setup_choice`)
+|`external_fact`
+|`0`.
+|===
+
+*Question set and its score*: The questions of one creation form a *question set*: one `ask` or `ask:TASK-NNN` (one question), one `submit` with its `questions` list, or one server primitive. Every record of a set names the set by the `question_id` of its first question (`question_set`, link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]). The set's *score* is the lowest `recommendation_confidence` of its questions. The *asking role* of a set is the role of the task that created it; a set a server primitive raised has none.
+
+*Shown everywhere*: The recommendation, its confidence, and its rationale are persisted with the record and shown on every delivery channel: the web app (link:../cli-and-security/03-web-server.adoc[CLI, Coordination & Security Specification, Web Access]) and the answer links of the entry session (link:../hypermedia-format/01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Hypermedia Format Specification, Task, Answer, Waiver-Request & Exit Links]).
+
+[#decision-kinds]
+=== Decision Kinds
+
+The kind says what a question decides, and so who should decide it. The set is closed.
+
+[cols="2,4,1"]
+|===
+|`decision_kind` |The question decides |Shipped declaration
+
+|`interpretation` |What an aspect of the request or of a finding means. |`quorum`
+|`approach` |Which of several technical ways the plan takes. |`quorum`
+|`granularity` |How the work is cut into deliverables or plan tasks. |`quorum`
+|`placement` |Where a change belongs (module, package, file, domain). |`quorum`
+|`test_strategy` |How a change is tested. |`quorum`
+|`scope` |What is in or out of the plan, compatibility, and follow-up work. |`ask`
+|`product_behaviour` |Behaviour a user or a client of the product sees, contracts included. |`ask`
+|`assurance` |How much security, review, or verification a change needs. |`ask`
+|`external_fact` |A fact or an organisational decision outside the repository and the plan. |`ask`
+|===
+
+A worker chooses the kind that fits the question best; where two fit, the role skill directs it to the one of them that the shipped unit declares `ask`.
+
+[#decision-declarations]
+=== Decision Declarations: Role Artifacts & the Adjudication Unit
+
+Everything that shapes an automatic decision is configuration that can be read, verified, and changed without a code change, and none of it is an operator key: the *role artifacts* of the listed roles (harness, model, effort, skills; xref:01-roles-and-configuration.adoc#roles[Roles as Configuration Artifacts]) and the *declarations* of the project's adjudication unit `question-adjudicate.pmwf`, a project-owned unit in `.marshall/config/` (git-tracked, reviewed like code, link:../workflow-dsl/02-units-jobs-decisions.adoc#unit-declarations[Workflow DSL Specification, Unit Declarations]). The operator decides only who answers a class's questions (`questions.mode`, link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]): the declarations act in the classes whose effective mode is `quorum` (xref:06-envelopes-questions-deadlines.adoc#question-delivery[Delivery, Mode & Server-Owned Deadlines]).
+
+*Decision declarations*: One line per decision kind in the unit's header (grammar: link:../workflow-dsl/01-grammar.adoc#_formal_ebnf_grammar_for_the_workflow_dsl[Workflow DSL Specification, Formal EBNF Grammar]):
+
+[source,text]
+----
+decide <decision_kind> -> ask
+decide <decision_kind> -> quorum(<role>, <role>, ..., <score>)
+----
+
+* *`ask`*: The question goes to the user, handled as in mode `auto` (deadline and class fallback). A kind without a declaration is `ask`.
+* *`quorum(<role>, ..., <score>)`*: Every listed role answers the question blind (<<blind-input>>). The question is decided automatically only when all listed roles choose the same option, each with a confidence of at least `<score>` (<<decision-rule>>); otherwise it escalates to `ask`, with every listed role's answer and rationale shown. A single listed role, `quorum(<role>, 95)`, is one model deciding at that score.
+* *Asking role*: The asking role votes only when the declaration lists it; its vote is its recommended option with its `recommendation_confidence`, without a task. When it is not listed, its recommendation is shown to the user only, never to a listed role. A server-raised question has no asking role: every listed role answers it with a task, and the primitive's recommendation is shown to the user only.
+* *Compiled bounds*: `1` to `3` distinct listed roles; a score of `50` to `100`; each kind declared at most once.
+
+The unit declares in addition (`declare <name> = <value>`):
+
+[cols="2,2,2,4"]
+|===
+|Declaration |Shipped |Compiled bounds |Meaning
+
+|`vote_wait_seconds`
+|`900`
+|`60` to `1800`
+|The bound of the adjudication from the set's creation (link:../timeouts/01-job-budgets-and-waits.adoc#vote-wait[Timeouts & Budgets Specification, Vote Wait]).
+
+|`max_false_auto_percent`
+|`5`
+|`0` to `10`
+|The calibration level: the highest share of false automatic decisions at which a quorum declaration decides (<<quorum-calibration>>).
+
+|`kind_<server question>`
+|the kinds of the server-question table (<<recommendation-score>>)
+|a kind of the closed set
+|The kind of each server-raised question.
+|===
+
+*Shipped unit*: `ask` for `scope`, `product_behaviour`, `assurance`, and `external_fact`; `quorum(quorum-a, quorum-b, 90)` for `interpretation`, `approach`, `granularity`, `placement`, and `test_strategy`. The listed roles and the score of every shipped quorum declaration are the configuration that passed the calibration on the release's corpus (<<quorum-calibration>>); the models are those of the roles' artifacts.
+
+The bounds are checked on every load of the unit (`declaration_invalid`, link:../workflow-dsl/04-ast-node-model.adoc#project-owned-units[Workflow DSL Specification, Compiled Invariants], `INV-ADJ-1`). The question states of a plan run the project's unit bound in the plan instance; the question states of the epic, workspace, and bootstrap units run the binary's default unit, like every sub-workflow those compiled-only units call. Every adjudication record carries the declaration it applied with its source (`unit` with the unit's digest, or `compiled` for the default unit), so decisions stay comparable across projects (xref:11-decision-records.adoc#decision-record-content[Decision Records, Content]).
+
+*Available and qualified*: A listed role is *available* for an adjudication when its effective artifact is valid, its harness is eligible as a worker host and enrolled on the machine, and its start-failure guard does not hold (xref:03-supervision-and-recycling.adoc#start-failure-guard[Start-Failure Guard]); it is *qualified* when it has a valid qualification record (xref:01-roles-and-configuration.adoc#qualification-records[Qualification Records]). A listed role whose artifact fails only with `harness_not_eligible` or `harness_unknown` is unavailable, not invalid: a role on a harness that is not yet eligible as a worker host stays unavailable until it is.
+
+*Validation*: The unit load checks the declarations against their bounds; every composition of a plan instance or an epic workflow in a project where a class's effective mode is `quorum` checks every quorum declaration against the effective role set, refusing the composition with the reason, the rule, and the role (link:../workflow-dsl/04-ast-node-model.adoc#static-verification-rules[Workflow DSL Specification, Rule 13]); every adjudication checks the declarations of its set's kinds again, because a role artifact may change later, and escalates the set with the reason `quorum_invalid` when one fails:
+
+[cols="2,5"]
+|===
+|Reason |Rule
+
+|`quorum_invalid`
+|A listed role is not defined by the effective role set (absent, or invalid for a reason other than its harness's eligibility or enrolment, xref:01-roles-and-configuration.adoc#role-validation[Validation]), its class is not `read_only`, or it sets `session_first`.
+
+|`quorum_not_diverse`
+|Two listed roles of one declaration name the same model, on any harness (model identifiers compared without a `<provider>/` prefix).
+|===
+
+The choice of a listed model is configuration: the shipped declarations are the configuration that passed the calibration on the release's corpus (<<quorum-calibration>>), and the model a project runs follows from its own calibration, never from a fixed rule.
+
+[#adjudication]
+=== The Adjudication (`question.adjudicate`)
+
+Every question state runs the sub-workflow `question.adjudicate` (the project's unit in a plan, the default unit elsewhere, <<decision-declarations>>) for the scope's new question set before the set is delivered (unit, states, and binding: link:../workflow-dsl/02-units-jobs-decisions.adoc#question-adjudicate-unit[Workflow DSL Specification, Adjudication Unit]; rows: link:../state-catalogue/13-question-adjudication.adoc[State Catalogue, Question Adjudication]). While it runs, the set's records are open and not yet delivered: no answer link, no web entry, and no deadline.
+
+. *Check*: In a class whose effective mode is not `quorum` the unit ends `escalated` at once and records nothing. Otherwise the server checks each question of the set in order against its kind's declaration and escalates the whole set, without a task, with the first reason that holds: `kind_ask` (the kind is `ask`), `quorum_invalid` (the declaration fails the validation), `calibration_failed` (the declaration is not calibrated, <<quorum-calibration>>), `role_unavailable` (a listed role is unavailable), `role_unqualified` (a listed role is not qualified), or `below_score` (the asking role is listed and its confidence is below the score).
+. *Votes*: The server creates one task per listed role of the set's declarations that is not the asking role, covering the questions whose declaration lists it, each for its own entity of the kind `vote` (`vote-<question_set>-<role>`), through the model caller and the task protocol like every task (xref:01-roles-and-configuration.adoc#model-caller[The Model Caller], xref:02-task-protocol.adoc[Task Protocol]): the re-offer budget, the model slots, and fencing apply. Every such task runs `fresh` and is never offered to the entry session. When the asking role is the only listed role, the step completes at once.
+. *Decide*: The server applies the decision rule (<<decision-rule>>) to the votes; the unit's ending transaction records the result on every record of the set (<<adjudication-record>>).
+. *End*: `decided` answers every question of the set with its agreed option (`channel: quorum`); the question state takes the outcome of that answer like any other. `escalated` hands the set to the delivery of mode `auto`, with the votes attached; the question wait (link:../timeouts/01-job-budgets-and-waits.adoc#question-wait[Timeouts & Budgets Specification, Question Wait]) starts at the delivery.
+
+A question set is decided automatically only when every question of the set is decided by its kind's quorum; otherwise the whole set is delivered, so the questions of one creation stay together. The adjudication is bounded by the declared vote wait (link:../timeouts/01-job-budgets-and-waits.adoc#vote-wait[Timeouts & Budgets Specification, Vote Wait]): at its expiry the server cancels the open vote tasks, which count as without an answer. It never asks the operator or the user anything of its own, and it is never repeated for a set. The operator's `abort` or `delete-plan` while it runs cancels the vote tasks with the records.
+
+[#blind-input]
+=== Blind Input
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-45[PM-WATCH-DISP-45]_
+
+A vote task's entity carries in its `facts`:
+
+* the questions the role votes on: every question's `question_id`, `question_text`, `decision_kind`, and its options (`branch_key`, `label`, `description`) in their recorded order;
+* the facts of the asking state with the evidence the decision rests on (xref:06-envelopes-questions-deadlines.adoc#decision-evidence[Evidence in Facts]), composed as for the asking task; for a server-raised question, the facts the primitive's question state shows.
+
+It never carries the `recommended` flags, `recommendation_confidence`, `rationale`, or `default_assumption` of a question, the answer of another listed role, or the asking task's submission beyond what its facts show. The entity offers one closing link `submit:vote` (rel `submit`) with `answers: list<schema[vote-answer]>`, one item per question of the entity: `{question_id, branch_key, confidence (0..100), rationale (text 10..500)}` (link:../hypermedia-format/02-link-grammar.adoc#named-parameter-schemas[Hypermedia Format Specification, Named Parameter Schemas]); an item for an unknown question, a missing item, or an unknown `branch_key` is refused `invalid_link_args`. The entity offers no `ask`, no `consult`, and no infeasible link.
+
+[#decision-rule]
+=== Decision Rule
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-45[PM-WATCH-DISP-45]_
+
+For each question of the set, the votes are those of its declaration's listed roles: the asking role's recommended option with its `recommendation_confidence` where it is listed, and the answer of every other listed role whose task ended `submitted` with a valid answer. A question is *decided* on option `o` when every listed role voted for `o`, each with a confidence of at least the declared score.
+
+The set is `decided` when every question of the set is decided. Otherwise it is `escalated` with the first reason that holds: `role_unavailable` when a listed role has no vote (its task ended `lost`, because its role became undefined or unavailable after the check, its re-offers were spent, or the vote wait expired, or it ended `infeasible`), `disagreement` when the votes of a question name different options, and `below_score` when they agree but a confidence is below the score. A missing vote never counts as agreement.
+
+[#adjudication-record]
+=== Record, Delivery & Audit
+
+The adjudication of a set in mode `quorum` writes one decision record per question of the set (decision point `question.adjudicate`, xref:11-decision-records.adoc#question-decisions[Decision Records, Question Decisions & Quorum]) and one `adjudicated` line on each question record that names it (link:../store-schemas/14-plan-instance-waivers-questions.adoc#question-record[Store Schemas Specification, Question Record]). The decision record holds the outcome (`decided`: the agreed option as its `choice` and the reason `agreement`; `escalated`: `choice: null` and the reason `kind_ask`, `quorum_invalid`, `calibration_failed`, `role_unavailable`, `role_unqualified`, `below_score`, or `disagreement`), the declaration applied with its source (`unit` and the unit's digest, or `compiled`), every vote's confidence against the declared score and the agreeing votes against the listed roles as measurements, and, when votes were taken, every vote: the role with its harness and model, the chosen `branch_key`, the confidence, the rationale, and, for a vote task, its `queue_task_id` and task outcome. Every question of a set carries the set's outcome and reason; its votes are its own. A decided record is closed `answered` with `channel: quorum`.
+
+* *Delivered with the votes*: An escalated set shows, per question, the asker's recommendation with its confidence and rationale and every listed role's vote with its confidence and rationale, on the web app and in the facts of the answer links; the deadline, the class fallback, and the answer validation are those of mode `auto`.
+* *Audit*: Every automatically decided question is listed in the pull-request body and the landing record with the agreed option and the roles that voted for it, like every other answer; an answer that changes the plan's intent creates an amendment of source `quorum`. The decision record is the standing decision a later task, a re-planning, or the retrospective cites by its `decision_id`; a later question that revisits it and is answered otherwise appends a correction to it (xref:11-decision-records.adoc#decision-corrections[Corrections]).
+* *Accounting*: The usage of a vote task is accounted to its role and to the scope like every task (xref:09-completion-usage-and-spend.adoc[Task Completion, Usage & Spend]).
+
+[#quorum-and-consultation]
+=== Quorum and Consultation
+
+A vote task uses the task mechanics of a consultation (xref:05-consultation.adoc[Consultation]): a task of another role through the server, served by the model caller and the task protocol. It differs in who starts it and what it sees: the server starts it for a question set, never a worker, its facts are blind to the asker's judgment, and its answer goes to the adjudication, never to the asking task.
+
+[#quorum-calibration]
+=== Quorum Calibration
+_See Requirement link:../../Requirements.adoc#PM-WORK-6[PM-WORK-6: Role Qualification]_
+
+A listed role is graded like every `read_only` role on its corpus topics (xref:01-roles-and-configuration.adoc#qualification-topics[Corpus Topics of a Role]); a role without a valid qualification record is not qualified. Every quorum declaration is calibrated in addition, because what matters is not how often one role answers right but how often the declaration would decide automatically and wrongly.
+
+* *Configuration calibrated*: The decision kind, the listed roles in their declared order with the configuration digests of their artifacts (xref:01-roles-and-configuration.adoc#role-artifact[Role Artifact Schema]), and the score. Its *declaration digest* is the SHA-256 over these values.
+* *Run*: `pm-operator roles qualify --decisions [--kind <kind>]` (link:../cli-and-security/02-credentials-and-operator.adoc#operator-roles[CLI, Coordination & Security Specification, Roles]) calibrates every quorum declaration of the project's unit, or the one of the named kind, on the corpus items tagged `decision-kind:<kind>` (the decision export sets the tag, xref:11-decision-records.adoc#corpus-export[Corpus Export]) with `review.status` `draft` or `confirmed` and a closed answer. Per item, every listed role answers with one task in the form of a vote task (<<blind-input>>), a listed asking role included, because its production vote is its own judgment of the same question; the decision rule applies with the declared score. The tasks run under the model slots and the launch contract of production, like role grading (xref:01-roles-and-configuration.adoc#grading[Grading]).
+* *Measurements*: The record stores the items graded, the *automatic share* (items the declaration would decide automatically), and the *false automatic share* (of those, the items whose agreed option is neither `target.answer` nor one of `target.alternatives`), with every item's votes, cost, and time. It stores measurements, never a pass flag.
+* *Calibrated*: A quorum declaration decides only while its calibration record is valid, at least one item was graded, and its false automatic share is at most `max_false_auto_percent`, read from the unit at every check, so a changed level applies to the existing record at once. Otherwise every question of the kind escalates with the reason `calibration_failed` until the declaration is calibrated again. A kind without corpus items cannot be calibrated; `external_fact` is never exported (xref:11-decision-records.adoc#corpus-export[Corpus Export]).
+* *Record*: `qualification/decisions/<kind>.json` of the project role set, bound to the declaration digest and the corpus revision (link:../store-schemas/16-task-queue.adoc#decision-calibration-record[Store Schemas Specification, Decision Calibration Record]); the subdirectory keeps it apart from the role records `qualification/<role>.json`. It is invalid when the declaration of its kind, a listed role's configuration, or the corpus revision changes; `pm-operator status` then names the kind uncalibrated until it is run again. The adjudication reads the record of a kind from the project set, else from the shipped set.
+* *Shipped calibration*: The release ships the calibration of every quorum declaration of the default unit (`classpath:/roles/qualification/decisions/<kind>.json`). The project setup calibrates every quorum declaration without a valid record on the machine's harness versions with the role grading at install (xref:01-roles-and-configuration.adoc#install-grading[Grading at Install]), and the operator excludes the calibration from it with `qualification.skip_decisions` in `local-config.json` (default `false`; link:../store-schemas/08-project-configuration-local.adoc#local-config[Store Schemas Specification, Operator Local Configuration]), a key of its own because `skip_roles` names roles.
+* *Shown*: `pm-operator roles show --decisions` and the web app's roles view show per quorum declaration the items, the automatic share, the false automatic share against the level, and whether it decides.
+
+The calibration grows with the corpus: the real questions of plans, exported with the answer finally given (xref:11-decision-records.adoc#corpus-export[Corpus Export]) and harvested from existing plan-marshall runs (link:../../roadmap.adoc[Roadmap]), make the per-kind measurements meaningful; the user's overrides of a recommendation are the negative examples that show a false automatic decision.

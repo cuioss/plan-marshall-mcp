@@ -17,7 +17,7 @@ _See Requirement link:../../Requirements.adoc#PM-WF-4[PM-WF-4: Entity-Scoped Lin
 
 === Closed Link Relations (`rel`)
 
-Every link's `rel` column is drawn from a closed enumeration of 10 relation identifiers:
+Every link's `rel` column is drawn from a closed enumeration of 9 relation identifiers. Waiting on a job and cancelling it are engine events, never relations (xref:01-representation-and-link-forms.adoc#link-forms[Link Forms]):
 
 [cols="1,1,3"]
 |===
@@ -25,19 +25,19 @@ Every link's `rel` column is drawn from a closed enumeration of 10 relation iden
 
 |`next`
 |`noop`, `submit`
-|Default forward transition along the primary workflow path.
+|Default forward transition along the primary workflow path (for example the task acknowledgement `ack`).
 
 |`alt`
 |`noop`, `submit`
-|Alternative forward transition (e.g., `skip_recipe` to proceed with standard planning, or re-committing before push). The planning lane is never a model-selected link: it is computed by the server.
+|Alternative forward transition of a session-driven state (e.g., `skip_recipe` to proceed with standard planning). The planning lane is never a model-selected link: it is computed by the server.
 
 |`retry`
 |`noop`, `submit`
-|Repeat the last failed deterministic operation (build, push, CI fetch, re-scan, bot re-trigger) without changing code. The `retry` of a remediation policy's `decide` state is a `submit` link carrying `reason:enum[flaky\|infra\|timeout]`, bounded by the policy's retry budget.
+|Repeat the last failed deterministic operation (build, push, CI fetch, re-scan, bot re-trigger) without changing code. The `retry` of a remediation decision task is a `submit` link carrying `reason:enum[flaky\|infra\|timeout]`, bounded by the policy's retry budget; in a session-driven state it is the bounded self-remedy of a condition.
 
 |`fix`
 |`noop`, `submit`
-|Enter a remediation sub-state or allocate fix tasks for a failed build or gate finding; the `fix` of a remediation policy's `decide` state is bounded by the policy's fix budget.
+|Choose an in-branch fix for a failed build, check, or gate finding; the `fix` of a remediation decision task is bounded by the policy's fix budget, and a worker of the plan's writer role does the fix.
 
 |`loop_back`
 |`noop`, `submit`
@@ -45,33 +45,30 @@ Every link's `rel` column is drawn from a closed enumeration of 10 relation iden
 
 |`submit`
 |`submit`
-|Deliver model-authored judgment output to the server, from the main session or from a model job for its bound entity.
-
-|`wait`
-|`wait`
-|Block on a running asynchronous job (a model job included) or composite wait state.
+|Deliver model-authored judgment output to the server: from a worker for its leased task entity, or from the entry session on a session-driven state or an answer link (`answer:<question_id>`).
 
 |`escalate`
 |`submit`
-|File a request for operator action (`request_waiver`, xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Question, Waiver-Request & Exit Links]). The request is a record the operator answers only with an operator verb; the model never waits on the operator inside the call, and no link requests an operator decision.
+|File a request for operator action (`request_waiver`, xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Task, Answer, Waiver-Request & Exit Links]). The request is a record the operator answers only with an operator verb; the model never waits on the operator inside the call, and no link requests an operator decision.
+
+|`consult`
+|`submit`
+|Ask another role through the server (`consult:<role>`, one link per `consult role` clause of the task's state, `PM-WORK-4`); the answer arrives through the asker's next `pm_wait`.
 
 |`abort`
-|`noop`, `submit`
-|Cancel a running job (`cancel:<job_id>`), leave the current sub-process (`step_out`, which unwinds one frame and returns the control outcome `stepped_out` to its caller), or end the plan through its phase's fallback route (`hand_back`, plan scope only); xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Question, Waiver-Request & Exit Links]. Ending a plan or epic as `aborted` is never a link: it is the operator verb `pm-operator abort`.
-
-|`emit`
-|`noop`, `submit`
-|Epic-only relation: mark a staged plan in the epic ledger as launched and emit the host entry command that opens the plan's bootstrap with the source `epic_row`.
+|`submit`
+|Leave a sub-workflow the entry session drives through the implicit `step_out`, which unwinds one frame and returns the control outcome `stepped_out` to its caller. Ending a plan or epic as `aborted` is never a link: it is the operator verb `pm-operator abort`.
 |===
 
 [#link-identifier-grammar]
-=== Link Identifier Grammar (`<action>`, `<action>:<entity_id>`, `<action>:question:<question_id>`)
+=== Link Identifier Grammar (`<action>`, `<action>:<entity_id>`, `consult:<role>`, `answer:<question_id>`)
 
-Link identifiers (`link` column) are server-derived, stateless tokens of the form `<action>`, `<action>:<entity_id>`, or `<action>:question:<question_id>`. Their grammar and length bounds (action name, entity identifier, and the whole link identifier) are defined in the link:../identifiers/01-general-rules-and-registry.adoc#id-link-id[Identifier Registry]; the three forms have the following semantics:
+Link identifiers (`link` column) are server-derived, stateless tokens of the form `<action>` or `<action>:<qualifier>`. Their grammar and length bounds (action name, qualifier, and the whole link identifier) are defined in the link:../identifiers/01-general-rules-and-registry.adoc#id-link-id[Identifier Registry]; the four forms have the following semantics:
 
-1. *Scope-Wide Link (`<action>`)*: An action name alone (for example `push`, `commit`, `refine`, `outline`, `loop_back`, `ask`, `answer_questions`, `request_waiver`, `hand_back`, `step_out`, and the `resume` of a `job_incomplete` condition on a fan-out model job state); it applies to the entire `plan_id` or `epic_id` scope.
-2. *Entity-Addressed Link (`<action>:<entity_id>`)*: An action name, `:`, and a link:../identifiers/01-general-rules-and-registry.adoc#id-entity-id[entity identifier] (for example `submit:TASK-004`, `ask:TASK-004`, `revise:TASK-004`, `resume:envelope-2`, `wait:b-3f9a2c417e0d8b65`, `cancel:b-3f9a2c417e0d8b65`, `wait:l-7c01de9a3f2b4e58`, `wait:finalize.concurrent-wait`, and for a fan-out model job state `wait:setup.enrich-architecture` and `cancel:setup.enrich-architecture`, which address the state); it is validated against both the scope's state and the addressed `<entity_id>`'s state under the scope lock (`PM-WF-4`).
-3. *Question-Addressed Link (`<action>:question:<question_id>`)*: An action name, `:question:`, and a link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[`question_id`]; it addresses an open question record of the scope. The only such link is `wait:question:<question_id>` (for example `wait:question:Q-004`), the bounded long-poll of a question state whose record is delivered by elicitation or on a paired web device (xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Question, Waiver-Request & Exit Links]); it is valid only while that record is open.
+1. *Scope-Wide Link (`<action>`)*: An action name alone (for example `ack`, `submit`, `ask`, `retry`, `fix`, `loop_back`, `request_waiver`, `step_out`, or a link of a session-driven state such as `skip_recipe`); it applies to the addressed task entity or session-driven state as a whole.
+2. *Entity-Addressed Link (`<action>:<entity_id>`)*: An action name, `:`, and a link:../identifiers/01-general-rules-and-registry.adoc#id-entity-id[entity identifier] (for example `submit:TASK-004`, `ask:TASK-004`, `revise:TASK-004`); it is validated against both the addressed state and the addressed `<entity_id>`'s state under the scope lock (`PM-WF-4`).
+3. *Role-Addressed Link (`consult:<role>`)*: The action `consult`, `:`, and a role name of the effective role set (link:../identifiers/01-general-rules-and-registry.adoc[Identifier Registry, role name]), for example `consult:review-security`; it exists exactly once per `consult role <role>` clause of the task's state.
+4. *Question-Addressed Link (`answer:<question_id>`)*: The action `answer`, `:`, and a link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[`question_id`] (for example `answer:Q-004`); it addresses an open question record of the scope, is offered only to the entry session (xref:01-representation-and-link-forms.adoc#question-waiver-and-exit-links[Task, Answer, Waiver-Request & Exit Links]), and is valid only while that record is open.
 
 === Free Parameter Descriptor Grammar (`free` Column)
 
@@ -112,23 +109,32 @@ A parameter of type `schema[<schema_name>]` takes a JSON object as its value; th
 |`schema_name` |Content |Used by
 
 |`question-envelope`
-|The model-supplied part of a question record (`BatchedQuestionEnvelope` without the server-owned `question_id`, `class`, `origin`, and `source_entity`): `question_text`, `default_assumption`, and `options` as objects `{branch_key, label, description, recommended?}`; definition in link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-envelope-schema[Model Jobs & Effort Specification, Question Records]
-|`ask` and `ask:TASK-NNN` (`question:schema[question-envelope]`); the `questions:list<schema[question-envelope]>?` parameter of the `submit` link of a refine or outline entity
+|The model-supplied part of a question record (`BatchedQuestionEnvelope` without the server-owned `question_id`, `class`, `origin`, and `source_entity`): `question_text`, `default_assumption`, `recommendation_confidence`, `rationale`, `decision_kind`, the optional `revisits` (a `decision_id` the question reopens), and `options` (exactly one `recommended`) as objects `{branch_key, label, description, recommended?}`; definition in link:../model-work/06-envelopes-questions-deadlines.adoc[Model Work Specification, Questions]
+|`ask` and `ask:TASK-NNN` (`question:schema[question-envelope]`); the `questions:list<schema[question-envelope]>?` parameter of the `submit` link of a refine or outline task entity
 
 |`question-answer`
-|One answer to an open question record: `question_id` (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), `branch_key` (one of the record's option keys), optional `text` (`1..2000` characters, recorded with the answer and, where the answer changes intent, in the amendment), and `confidence` (integer `0..100`), required for a record in `questions.mode: model` and refused with `invalid_link_args` on any other record; definition in link:../dispatch-and-effort/03-escalation-roles-readers.adoc#question-records[Model Jobs & Effort Specification, Question Records]
-|`answer_questions` (`answers:list<schema[question-answer]>`)
+|One answer to an open question record: `question_id` (link:../identifiers/01-general-rules-and-registry.adoc#id-question-id[Identifier Registry, `question_id`]), `branch_key` (one of the record's option keys), and optional `text` (`1..2000` characters, recorded with the answer and, where the answer changes intent, in the amendment); definition in link:../model-work/06-envelopes-questions-deadlines.adoc[Model Work Specification, Questions]
+|The answer of the web app's answer endpoint; the entry session answers through `answer:<question_id>` with the record's `branch_key` and optional `text` as plain parameters
+
+|`vote-answer`
+|One listed role's vote on one question of an adjudicated set: `question_id`, `branch_key` (one of the question's option keys), `confidence` (integer `0..100`), and `rationale` (`10..500` characters); definition in link:../model-work/10-decision-quorum.adoc#blind-input[Model Work Specification, Blind Input]
+|`submit:vote` of a vote task (`answers:list<schema[vote-answer]>`, one item per question of the task's entity)
 
 |`triage-groups`
-|The triage of one gather firing: one entry per finding group `(domain, rule_id)` of the firing's batch with its disposition (`FIX`, `SUPPRESS`, `ACCEPT`), `reply_text` (`1..4000` characters), optional `requirement_refs`, and `population` for `FIX`, plus per-finding exceptions (`finding_id` with its own disposition and reply); a finding withheld by the screener is never part of it; definition in link:../dispatch-and-effort/06-untrusted-text-screening.adoc#batched-triage[Model Jobs & Effort Specification, Batched Triage]
-|`submit:triage-groups` of the triage job of a gather firing (`triage:schema[triage-groups]`)
+|The triage of one gather firing: one entry per finding group `(domain, rule_id)` of the firing's batch with its disposition (`FIX`, `SUPPRESS`, `ACCEPT`), `confidence` (`0..100`, the group's decision confidence), `reply_text` (`1..4000` characters), optional `requirement_refs`, and `population` for `FIX`, plus per-finding exceptions (`finding_id` with its own disposition and reply); a finding withheld by the screener is never part of it; definition in link:../model-work/07-untrusted-text-screening.adoc#batched-triage[Model Work Specification, Batched Triage]
+|`submit:triage-groups` of the triage task of a gather firing (`triage:schema[triage-groups]`)
 
 |`simplify-proposal`
-|One simplification the read-only simplify job proposes: `file` (a repository-relative path of the plan footprint), `change` (`1..4000` characters, what to change), `rationale` (`1..2000` characters); the server records it as a proposal record with its `proposal_id` (link:../identifiers/02-registry-stores-to-web.adoc#id-proposal-id[Identifier Registry, `proposal_id`]) and never applies it itself
-|`submit:simplify` of the simplify job (`proposals:list<schema[simplify-proposal]>`)
+|One simplification the read-only simplify task proposes: `file` (a repository-relative path of the plan footprint), `change` (`1..4000` characters, what to change), `rationale` (`1..2000` characters); the server records it as a proposal record with its `proposal_id` (link:../identifiers/02-registry-stores-to-web.adoc#id-proposal-id[Identifier Registry, `proposal_id`]) and never applies it itself
+|`submit:simplify` of the simplify task (`proposals:list<schema[simplify-proposal]>`)
 |===
 
 NOTE: Boolean parameters are prohibited in workflow transitions to preserve explicit closed-enum intent (e.g., `decision:enum[approve|reject]` rather than `approved:bool`). A trailing `?` marks an optional parameter (such as `paths:list<text>?` or `questions:list<schema[question-envelope]>?`).
+
+[#decision-confidence-parameter]
+==== Decision Confidence Parameter
+
+Every closing link of a task entity whose state is a decision point of a role (link:../model-work/11-decision-records.adoc#decision-confidence[Model Work Specification, Decision Confidence of a Task]: `outline.classify-change-type`, `<phase>.qgate`, `replan.review`, `remediation-<class>.choose`) carries `confidence:int[0..100]` in its `free` list after its own parameters; the server records it in the decision record and refuses a submit without it `invalid_link_args`. A vote carries its confidence per question inside `schema[vote-answer]` instead, and a triage submit per finding group inside `schema[triage-groups]`. The actions of `replan.review` also carry `corrects:list<text>?` (at most ten `decision_id` values the revision departs from).
 
 === Direct In-Band Multi-Line Text Payloads (`PM-WF-2`, `PM-WF-6`)
 

@@ -1,0 +1,162 @@
+= Filesystem Layout Specification: Machine-Wide Runtime Layout
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../filesystem-layout.adoc[Filesystem Layout Specification] » Machine-Wide Runtime Layout
+
+[#machine-layout]
+== Machine-Wide Runtime Layout (`<PM_MCP_BASE>`)
+
+The runtime (`pm-mcpd`) persists machine-wide configuration, cross-process `FileChannel.lock()` files, audit logs, project enrolments, the fallback credential store, and the per-project machine stores in its instance directory `<PM_MCP_BASE>`, default `~/.plan-marshall-mcp/`; the only override is the environment variable `PM_MCP_BASE` (`PM-ARCH-2`, `PM-ARCH-6`, `PM-DIST-5`). `PM-MCP` never reads `PLAN_MARSHALL_HOME` or `PLAN_MARSHALL_CREDENTIALS_DIR`, and never reads or writes `~/.plan-marshall/`. The four binaries (`pm-mcp`, `pm-operator`, `pm-mcpd`, `pm-exec`) live apart from it in the read-only installation directory `<PM_MCP_HOME>/bin/` (link:../cli-and-security/01-cli-and-installer.adoc#installation-layout[CLI, Coordination & Security Specification, Installation Layout]), which holds no configuration file: machine settings are `machine-config.json`.
+
+[source,text]
+----
+~/.plan-marshall-mcp/                    # <PM_MCP_BASE>: PM-MCP instance directory (mode 0700)
+├── machine-config.json                  # Slot caps, LSP pool, client-profile connection overrides, proxy, web access, project_defaults (mode 0600)
+├── harnesses.json                       # Enrolled harness CLIs of workers: path, digest, version (mode 0600)
+├── harnesses.json.hmac                  # HMAC-SHA-256 sidecar of harnesses.json (mode 0600)
+├── enrolments/                          # Operator enrolments, one file per project (mode 0700)
+│   ├── <project_id>.json                # Root, wrappers, tools, templates, scripts, budgets (mode 0600)
+│   └── <project_id>.json.hmac           # HMAC-SHA-256 sidecar of that file, written with every enrolment write (mode 0600)
+│
+├── roles/                               # Machine role set: operator role artifacts (mode 0700)
+│   ├── <role>.json                      # Role artifact; replaces the shipped artifact of the same name
+│   └── qualification/<role>.json        # Qualification record of that artifact's configuration
+│
+├── skills/                              # Machine skill directory: operator extension skills (mode 0700)
+│   └── <name>/                          # One skill: SKILL.md and its supporting files, served as skill://pm/ext/<name>/
+│
+├── credentials/                         # Token-lane file credential fallback (PM-CRED-3, mode 0700)
+│   ├── <credential_key>.json            # Global entry (e.g. sonar.json, mode 0600)
+│   └── <project>/
+│       └── <credential_key>.json        # Project-scoped override (mode 0600)
+│
+├── projects/                            # Per-project machine stores (mode 0700, see below)
+│   └── <project_id>/                    # One store per enrolled project: plans, archive, lessons, ...
+│
+├── state/                               # Persistent cross-session operational state
+│   ├── install-records.json             # Client bundle ownership & SHA-256 manifest records
+│   ├── build-slots.json                 # Active PID-keyed build concurrency leases
+│   ├── model-slots.json                 # Model slot leases of running workers (warm and fresh) and the FIFO of queued workers
+│   ├── merge-queue.json                 # Per-repo FIFO merge admission queues & active holders
+│   ├── review-bot-windows.json          # Per-bot cross-plan rate-window claims
+│   ├── web-devices.json                 # Paired web devices: device_id, label, secret hash, timestamps (mode 0600)
+│   ├── enrolment-hmac.key               # Enrolment HMAC key, only on hosts without an OS keyring (mode 0600)
+│   └── runtime.json                     # Runtime record: pid, start instant, version, listener, socket path; written at socket bind
+│
+├── run/                                 # Runtime directory (mode 0700); outside every job's Landlock read set, except jobs/<job_id>/ for its own worker
+│   ├── runtime.token                    # Runtime token, rewritten at every runtime start before bind (mode 0600)
+│   ├── runtime.sock                     # Unix domain socket of the runtime (mode 0600); a path over sun_path refuses the start
+│   └── jobs/                            # Job-private directories of workers (mode 0700)
+│       └── <job_id>/                    # Server-composed launch files (0600) and cwd/; read-only for its own job, removed at fate
+│
+├── web/                                 # Web access files of the runtime (mode 0700)
+│   └── tls/                             # Self-signed LAN certificate and key of the web listener, written by the runtime (key mode 0600)
+│
+├── locks/                               # Cross-process OS FileChannel.lock() primitives
+│   ├── runtime.lock                     # Runtime singleton lock (held for the runtime lifetime)
+│   ├── runtime-start.lock               # Serializes on-demand runtime start by pm-mcp and pm-operator (their only lock)
+│   │                                    # Machine store locks, one sibling lock per renamed store,
+│   │                                    # acquired alphabetically after all scope locks:
+│   ├── build-slots.lock                 # state/build-slots.json
+│   ├── enrolments/
+│   │   └── <project_id>.lock            # enrolments/<project_id>.json and its .hmac (lexicographic by project_id)
+│   ├── harnesses.lock                   # harnesses.json and its .hmac
+│   ├── install-records.lock             # state/install-records.json
+│   ├── machine-config.lock              # machine-config.json
+│   ├── merge.lock                       # state/merge-queue.json (merge leases)
+│   ├── model-slots.lock                 # state/model-slots.json
+│   ├── review-bot.lock                  # state/review-bot-windows.json
+│   └── web-devices.lock                 # state/web-devices.json
+│
+└── logs/                                # Diagnostic logs and structured security audit
+    ├── daemon.log                       # Rolling runtime diagnostic log (mode 0600)
+    ├── audit.jsonl                      # Append-only audit (mode 0600); locked directly, leaf lock
+    ├── audit-<first_event_id>.jsonl     # Rotated audit files, closed by a checkpoint record
+    ├── audit-index.jsonl                # Hash-chained index of rotated audit files
+    └── audit.head                       # HMAC-anchored head: file, record count, last event_id, head hash
+----
+
+The Linux Landlock write set of a job contains only its own project root (with its worktrees and `.marshall/local/temp/`), the declared toolchain caches, `/tmp`, and `/dev`, and for a worker (job kind `llm`) additionally the paths its client profile declares in `headless.writable_paths`: only the sub-paths of the harness home that the headless harness must write to run (its login or credential file, its caches, its session directory; the concrete paths are _(provisional)_ until the Milestone 0 host spikes confirm them), never a settings file that the bundle manifest manages, with network access allowed; it never contains `<PM_MCP_BASE>`, including `projects/` and `run/jobs/`, or another enrolled project's root (`PM-SEC-5`): jobs never write the machine stores, and nothing the daemon trusts lies in a job-writable place. The client bundles install host file-tool deny rules for `<PM_MCP_BASE>/**` as defense in depth (a model-driven shell bypasses them), and the HMAC sidecar `enrolments/<project_id>.json.hmac` detects edits of a project's enrolment file outside the operator verbs. The runtime is the only writer of every store under `<PM_MCP_BASE>` (the role artifacts of the role sets are operator files, not stores, xref:03-project-store.adoc#role-sets[Role Sets & Task Queue]); `pm-mcp` and `pm-operator` write none (link:../runtime-model/01-processes-and-transport.adoc#local-api[Runtime & Interaction Model Specification, Local API]). The files of web access are the runtime's as well: the web device store and the TLS material in `web/tls/` (link:../store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification, Web Access Records]). The Landlock read set of jobs is the whole filesystem except all of `<PM_MCP_BASE>`, with one exception: a worker reads its own job-private directory (<<job-private-directories>>), so on Linux with Landlock ABI >= 2 no job reads the runtime token, a credential file, an enrolment, or another project's machine store; on macOS and on Linux without Landlock a job can read `<PM_MCP_BASE>` like any process of the user; the installation directory `<PM_MCP_HOME>` stays readable (link:../job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification]). A worker reaches the runtime only through its job relay `pm-mcp serve --job`, which connects to the runtime socket `run/runtime.sock` with the job token and generation from its environment and never reads `run/runtime.token` (link:../runtime-model/03-relay.adoc#_connection_metadata[Runtime & Interaction Model Specification, Connection Metadata]).
+
+[#job-private-directories]
+=== Job-Private Directories (`<PM_MCP_BASE>/run/jobs/<job_id>/`)
+
+Every worker gets one job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (mode `0700`, its files `0600`, owned by the effective UID; created by the runtime at the job's spawn and removed after its fate is recorded, and removed by the project's recovery for a job recorded `killed`). No job can write it: it lies under `<PM_MCP_BASE>`, outside every Landlock write set. The job it belongs to, and no other job, gets read access to it, the one explicit exception to "jobs never read `<PM_MCP_BASE>`" (link:../job-runtime/02-confinement-and-environment.adoc#_linux_filesystem_confinement_landlock[Job Runtime Specification, Read set]). Nothing of a launch lies in the system temporary directory, which every job can write. It holds only what the server composes for the launch, never state: the launch prompt file (the core conduct skill, the role skill in-band, and the contract envelope), the result schema, and, except for the screener, the MCP configuration that starts the job relay (mode `0600`). The screener's working directory is the empty subdirectory `cwd/` of it, read-only for the screener like the rest of the directory and outside every project tree, so no project or user instruction file of the harness reaches it; every other worker runs in the plan worktree or the project checkout (xref:01-repository-workspace.adoc#worktree-lifecycle[Worktree Lifecycle]).
+
+=== File Permissions & Security Attributes
+
+The runtime creates every file under `<PM_MCP_BASE>` with mode `0600` and every directory with mode `0700`. At start it checks only `<PM_MCP_BASE>`, `enrolments/`, and `run/` (owned by the effective UID, mode `0700`) and the files in `state/` (mode `0600`); enrolment and credential files are checked on every use (`PM-SEC-4`). The `0700` base directory is what protects the rest.
+
+[cols="2,1,3"]
+|===
+|Path |POSIX Permissions |Security Requirement
+
+|`<PM_MCP_BASE>/credentials/`
+|`0700` (`drwx------`)
+|Strict user-only read/write directory (`PM-CRED-3`). Checked when a credential is resolved, not at runtime start: if group/others have read, write, or execute permissions, the runtime reads no credential from it and the step needing the credential raises the `precondition_unmet` condition on its current state with the repairing `pm-operator credentials` command and a bounded `retry` (`PM-CRED-4`).
+
+|`<PM_MCP_BASE>/credentials/<credential_key>.json` and `<project>/<credential_key>.json`
+|`0600` (`-rw-------`)
+|Strict user-only access (`PM-CRED-3`). The runtime refuses to read any credential file whose permissions are broader than `0600`; only the step needing that credential is held (`precondition_unmet` with `credentials_file_insecure`, `PM-CRED-4`).
+
+|`<PM_MCP_BASE>/enrolments/`
+|`0700` (`drwx------`)
+|Operator-owned enrolment directory; one file per project. Owned by the effective UID; checked at runtime start with `<PM_MCP_BASE>`.
+
+|`<PM_MCP_BASE>/enrolments/<project_id>.json` and `<project_id>.json.hmac`
+|`0600` (`-rw-------`)
+|Operator-verified project root, pinned tool and wrapper digests, command templates, and project scripts (`PM-EXEC-2`). A file with permissions broader than `0600` blocks only its project (`enrolment_insecure`), like a tampered one. Every write of it (by the runtime, on an operator verb) also writes the file's HMAC-SHA-256 sidecar, verified before the project is first served after a runtime start and before every verify-not-resolve check (`enrolment_tampered` on mismatch, link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-integrity[CLI, Coordination & Security Specification]).
+
+|`<PM_MCP_BASE>/harnesses.json` and `harnesses.json.hmac`
+|`0600` (`-rw-------`)
+|Enrolled harness CLIs of workers (path, digest, version, and nothing else: no environment value and no credential), written only by the runtime on `pm-operator enrol-harness` and on an accepted self-update, verified with its HMAC sidecar before every worker spawn; a mismatch refuses the worker (`harness_tampered`, reported to the operator) until `enrol-harness` re-baselines the file (link:../store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas Specification, Harness Enrolment Store]).
+
+|`<PM_MCP_BASE>/state/enrolment-hmac.key`
+|`0600` (`-rw-------`)
+|Enrolment HMAC key on hosts without an OS keyring only; its residual risk is documented with the enrolment integrity (`PM-SEC-5`).
+
+|`<PM_MCP_BASE>/projects/` and every `<project_id>/` below it
+|`0700` (`drwx------`)
+|Covered by the `<PM_MCP_BASE>` rules: owned by the effective UID, never in a job's Landlock read or write set, and behind the host deny rules for `<PM_MCP_BASE>/**`. The store digest sidecars still detect out-of-band edits by a host shell (link:../store-schemas/13-leases-integrity-testing.adoc#store-digest-verification[Store Schemas Specification]).
+
+|`<PM_MCP_BASE>/locks/*.lock` and `<PM_MCP_BASE>/projects/<project_id>/locks/*.lock`
+|`0600` (`-rw-------`)
+|Held via OS kernel `FileChannel.lock()`. The store and scope locks are taken only by the runtime, the only store writer; `runtime-start.lock` is also taken by a `pm-mcp` or `pm-operator` command during the on-demand start, and no other process takes a lock.
+
+|`<PM_MCP_BASE>/run/`
+|`0700` (`drwx------`), no symlink
+|Checked by the runtime at start and by every client before it reads the token or connects; a foreign owner, a broader mode, or a symlink makes the runtime exit with code `77` and a client refuse (`PM-SEC-4`).
+
+|`<PM_MCP_BASE>/run/runtime.token`
+|`0600` (`-rw-------`), no symlink
+|The runtime token of the running instance (link:../runtime-model/01-processes-and-transport.adoc#runtime-token[Runtime & Interaction Model Specification, Runtime Token]), written atomically at every start before the socket is bound; format in link:../store-schemas/12-machine-stores.adoc#web-access-records[Store Schemas Specification]. Never in a job's Landlock read set, never in a log or job environment.
+
+|`<PM_MCP_BASE>/run/runtime.sock`
+|`0600` (`srw-------`) in the `0700` directory `run/`
+|The runtime's listener for its local clients (`PM-SEC-4`); it has no other location. The web listener, open only while the operator enabled web access, is a TCP port and has no file (link:../runtime-model/01-processes-and-transport.adoc#_transport_endpoint[Runtime & Interaction Model Specification, Transport Endpoint]). A path over the platform's `sun_path` limit (104 bytes including NUL on macOS, 108 on Linux) makes the runtime refuse to start with a diagnostic naming the path and telling the operator to choose a shorter `PM_MCP_BASE` (link:../runtime-model/01-processes-and-transport.adoc#_singleton_discovery[Runtime & Interaction Model Specification, Singleton & Discovery]).
+
+|`<PM_MCP_BASE>/web/tls/` with `cert.pem` and `key.pem`
+|`0700` (`drwx------`), files `0600`
+|Self-signed certificate and private key of the web listener in LAN mode, generated by the runtime at the first LAN enable and reused afterwards (link:../cli-and-security/03-web-server.adoc#web-listener[CLI, Coordination & Security Specification, Listener Exposure]); never written by a client process and never in a job's Landlock read set.
+
+|`<PM_MCP_BASE>/run/jobs/<job_id>/`
+|`0700` (`drwx------`), files `0600`
+|Job-private directory of one worker (<<job-private-directories>>): written only by the runtime, readable by its own job only, writable by no job.
+
+|`<PM_MCP_BASE>/roles/` and `<PM_MCP_BASE>/projects/<project_id>/roles/` with their files
+|`0700` (`drwx------`), files `0600`
+|Operator role sets (`PM-EXT-6`, `PM-WORK-1`): role artifacts, which the operator writes as files and the runtime validates on every load (an invalid artifact counts as undefined), and their qualification records and the decision calibration records of the project set, written only by the runtime on `pm-operator roles qualify` and the setup run's grading; never in a job's Landlock read or write set, never git-tracked, and never read from the repository.
+
+|`<PM_MCP_BASE>/skills/` with its files
+|`0700` (`drwx------`), files `0600`
+|Machine skill directory (`PM-EXT-6`, `PM-SKILL-5`): extension skills the operator writes as files and the runtime validates on every read (a refused skill is absent from the catalogue); never written by the runtime, never in a job's Landlock read or write set, and never git-tracked.
+
+|`<PM_MCP_BASE>/logs/audit.jsonl`
+|`0600` (`-rw-------`)
+|Append-only security and transition audit log, hash-chained through each record's `prev_hash`, with its head anchored in the HMAC-protected `audit.head` and rotated files listed in `audit-index.jsonl` (same mode); the chain is verified incrementally at runtime start, and a broken chain (including a deleted, reset, or truncated log) is reported and recorded, never repaired (`PM-SEC-6`).
+|===

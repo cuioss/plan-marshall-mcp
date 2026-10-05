@@ -5,9 +5,10 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 ## Project
 
 plan-marshall-mcp (PM-MCP) is a local MCP server that takes over the process logic of plan-marshall
-through a hypermedia-driven workflow. The design describes the target state, most of which is not
-implemented yet: requirements in `doc/Requirements.adoc` (modules in `doc/requirements/`), technical
-specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
+through a hypermedia-driven workflow: the server drives plans and epics, and harness processes are
+supervised workers of configured roles (the harness as worker). The design describes the target state,
+most of which is not implemented yet: requirements in `doc/Requirements.adoc` (modules in
+`doc/requirements/`), technical specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
 `doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
 `doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification).
 
@@ -16,12 +17,10 @@ Current state: a Quarkus application with one `hello` MCP tool, verified by unit
 is built (the target is native binaries on the host: the always-on daemon `pm-mcpd`, reached through
 the `pm-mcp serve` STDIO relay of the `pm-mcp` CLI, PM-TECH-1/3 and `doc/specification/runtime-model.adoc`).
 
-Roadmap Milestone 0, Part A (verifications V1 to V10) and its evaluation (E1 to E13) are complete; the concept
-`doc/concepts/harness-as-worker/` holds analysis, method, run record, findings, conclusion, architecture, and the
-evaluation. The stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`) is kept as a reference
-implementation to learn from and is removed with Milestone 1; the driver skill `test-pull` (job runtime, relay,
-fault injector) was removed after the evaluation and is readable in git at commit `a6333d2`. The verified questions
-for model roles are the corpus `test/model/verification/`.
+Roadmap Milestone 0, Part A (the harness as worker) is complete: the concept is `doc/concepts/harness-as-worker/`
+(index `doc/Concepts.adoc`), the measurements are the reference specification `doc/specification/evaluation.adoc`.
+The stub package `de.cuioss.pm.mcp.spike` (active only with `pm.spike.scenario`) is a reference implementation to
+learn from and is removed with Milestone 1.
 
 ## Modules
 
@@ -103,9 +102,12 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 ## Documentation
 
 AsciiDoc (`.adoc`) for all project documentation. Requirements go into `doc/requirements/`,
-technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`),
-analyses and variants into `doc/discussions/`. Documentation of the implemented system goes into three
-trees: concepts (`doc/Concepts.adoc`, `doc/concepts/`), developer (`doc/DeveloperGuide.adoc`,
+technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`; a reference
+specification with status `REFERENCE`, such as `evaluation.adoc`, records evidence and defines nothing),
+research notes and open proposals into `doc/discussions/` (a decided proposal is applied and then deleted).
+The normative documents state the target only: no decision ids, decision dates, or history narration.
+Model roles are verified against the corpus `test/model/verification/` (`validate.py`).
+Documentation of the implemented system goes into three trees: concepts (`doc/Concepts.adoc`, `doc/concepts/`), developer (`doc/DeveloperGuide.adoc`,
 `doc/developer/`) and user (`doc/UserGuide.adoc`, `doc/user/`). Don't create new documents without asking,
 except topic documents inside those three trees written by `traced-implementation`.
 

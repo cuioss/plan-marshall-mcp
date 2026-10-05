@@ -1,0 +1,737 @@
+= Model Work Implementation Watch
+:toc: left
+:toclevels: 2
+:toc-title: Table of Contents
+:sectnums:
+:nofooter:
+
+link:../ImplementationWatch.adoc[Implementation Watch] » Model Work
+
+== Overview
+
+Watch items for the link:../specification/model-work.adoc[Model Work Specification]: the task protocol and its
+leases, worker supervision and skill delivery, envelope yield, worker cost records and the plan-marshall cost
+baseline, the launch contract, the screener, and the epic ledger, landings and server-started plans. Many items carry
+measured plan-marshall data that the PM-MIG-5 cost comparison and future cost levers need. The sections mirror the
+specification. Item format and lifecycle: link:../ImplementationWatch.adoc[Implementation Watch].
+
+== Task Protocol, Supervision & Skill Delivery
+
+[#PM-WATCH-DISP-41]
+=== PM-WATCH-DISP-41: A leased task is never offered to a second loop of the same generation
+
+Anchor:: link:../specification/model-work/02-task-protocol.adoc#pm-wait[Model Work § `pm_wait`: The Worker's Only Wait],
+link:../specification/model-work/02-task-protocol.adoc#leases-fencing[§ Leases, Generations & Fencing],
+link:../Requirements.adoc#PM-WORK-2[PM-WORK-2]
+Hazard:: Two wait loops ran under one identity (after `/new` on OpenCode the previous loop went on pulling behind
+the same relay), and the server handed a task leased to the caller to its second concurrent wait as well: both loops
+decided it, and the second submit was refused.
+Guard:: Scenario test: two concurrent `pm_wait` calls of one generation: the earlier is answered `wait_again` at once
+and never with a task, the later receives the offer, and the task is leased exactly once; a generation that holds a
+lease is offered no second task; a new session generation fences the earlier one, whose calls are refused
+`generation_fenced` and whose lease is released; matched control: two generations of one role each receive their
+own task.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).
+
+[#PM-WATCH-DISP-42]
+=== PM-WATCH-DISP-42: A task is lost only through a recorded attempt end
+
+Anchor:: link:../specification/model-work/02-task-protocol.adoc#task-outcomes[Model Work § Closed Task Outcomes],
+link:../specification/model-work/09-completion-usage-and-spend.adoc#job-completion[§ Task Completion & the `job_incomplete` Condition],
+link:../Requirements.adoc#PM-WORK-2[PM-WORK-2]
+Hazard:: Tasks still open when a measurement run ended were counted as lost, so the loss figure described where the
+run was stopped instead of what the workers did.
+Guard:: Table test over the queue records: `lost` is recorded only with an attempt end that the server observed
+(fence of the holding generation, spent re-offers, a closing role check, a withdrawal of its state or scope) and
+always with its reason; a task that is queued, offered, or executing when the runtime drains or a report is taken
+counts as open, never as lost; after a restart such a task is offered again without counting a re-offer; reports and
+`pm-operator status` count outcomes only from closed queue records.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).
+
+[#PM-WATCH-DISP-43]
+=== PM-WATCH-DISP-43: The token budget reads the per-turn context, never a run total
+
+Anchor:: link:../specification/model-work/03-supervision-and-recycling.adoc#recycling[Model Work § Recycling Warm Workers],
+link:../specification/model-work/09-completion-usage-and-spend.adoc#job-result-schema[§ Worker Result & Usage Parsing],
+link:../Requirements.adoc#PM-WORK-3[PM-WORK-3]
+Hazard:: A run-total usage record (the sum over all turns of a warm worker) was read as its context size, which grows
+with every turn although the context does not, and recycled workers far too early.
+Guard:: Parser fixture per harness with several turns: the context of a warm worker is the input, cache-read, and
+cache-creation tokens of its latest turn; a run-total record never changes it; a worker recycles on `token_budget`
+only after its generation closed at least one task, even when its start context exceeds the budget; matched control:
+a worker whose latest turn exceeds the budget is answered `end` at its next `pm_wait`, never in the middle of a task.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).
+
+[#PM-WATCH-DISP-44]
+=== PM-WATCH-DISP-44: A reported clear or compaction re-delivers the skills
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#skill-delivery[Model Work § Skill Delivery Record & Re-Delivery],
+link:../specification/model-work/02-task-protocol.adoc#session-worker[§ The Session as Optional Worker],
+link:../Requirements.adoc#PM-SKILL-4[PM-SKILL-4]
+Hazard:: A clear of the host session was invisible to the server: the cleared Claude Code session got its next offer
+with the task-protocol skill named by URI only, because the server had delivered it to that generation already, and
+only the shim made the session read it again.
+Guard:: Scenario test with a host marker passed by the relay: after a clear or compaction marker the generation's
+delivery record is empty, an unacknowledged offer is withdrawn, and the next offer carries every required skill
+in-band; a skill whose digest changed is delivered again; a new generation starts with an empty record; matched
+control: without a marker the next offer carries only the skills the record lacks, and every launch prompt of a
+`writer` or `read_only` worker starts with the shim paragraph.
+Source:: harness-as-worker evaluation (doc/specification/evaluation.adoc).
+
+== Task Envelope Bin-Packing & Sequential Task Yield
+
+[#PM-WATCH-DISP-1]
+=== PM-WATCH-DISP-1: A yield-majority run raises a signal
+
+Anchor:: link:../specification/model-work/06-envelopes-questions-deadlines.adoc#_sequential_task_yield_within_an_envelope[Model Work § Sequential Task Yield Within an Envelope],
+link:../specification/model-work/06-envelopes-questions-deadlines.adoc#_deterministic_envelope_packing_algorithm_envelopepacker[§ Deterministic Envelope Packing Algorithm],
+link:../specification/phase-workflows/03-q-gate-and-execute.adoc#_task_envelope_execution_independent_server_verification[Phase Workflows § Task Envelope Execution] (item 3, `yield:envelope-M`)
+Hazard:: Most dispatches of a run ended in a voluntary checkpoint and nobody noticed that the envelopes were
+oversized.
+Guard:: The share of `yield_reason: context` per envelope size over the envelope tasks, measured by the server from
+`metrics.json` (the reason recorded by the server from the exit taken); above 50% it is a fact for an
+envelope-sizing review.
+Fixture:: 6 of 10 dispatches `voluntary_checkpoint` (60%); 4 of 5 (80%).
+Source:: plan-marshall defect truthful-signals (quality-aspect) PLAN-213 (checkpoint-majority runs need a dispatch-time share signal).
+
+== Task Completion, Usage & Spend
+
+[#PM-WATCH-DISP-2]
+=== PM-WATCH-DISP-2: The plan-marshall cost baseline ran dark
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#spend-accounting-budget-anchors[Model Work § Spend Accounting & Budget Anchors],
+link:../Requirements.adoc#PM-MIG-5[PM-MIG-5],
+link:../specification/filesystem-layout/03-project-store.adoc#coexistence-lifecycle[Filesystem Layout § Coexistence with plan-marshall, Enrolment & Release]
+Hazard:: The plan-marshall cost instrument ran dark: every usage column of every dispatch row was unmeasured on
+whole plans, so the plan-marshall baseline the PM-MIG-5 comparison needs does not exist; an aggregate through a
+zero-fabricating instrument had produced a retired headline figure ("a third of finalize spend").
+Guard:: Measure the plan-marshall baseline over a declared population before Stage 3 (Milestone 7), for the
+parallel-run comparison; alert when a worker's metrics row has every usage field unmeasured (usage is parsed from the
+harness output; a field the harness does not report is `unmeasured` with reason `not_reported_by_harness`). The
+baseline excludes plan-marshall metrics produced before the unmeasured-vs-zero fix and never restores figures derived
+through a zero-fabricating instrument.
+Fixture:: 41 of 41 and 33 of 33 dispatch rows unmeasured (the latter on a 9.4M-token plan); a second population:
+3,547,890 tokens dispatched, 0 of 11 rows measured, billing total 0 at population 0. Population available for a
+baseline: n=5 plans at staging, n=1 six-phase record, 35–36 metrics files, 35 of them carrying
+`exploration_index_answerable_bytes`.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-050 F-009, F-LH-001 and D10, PLAN-CIS-039 D1,
+PLAN-CIS-054 D7 (population gate), epic F7/D21.
+
+[#PM-WATCH-DISP-3]
+=== PM-WATCH-DISP-3: Sub-agent tokens are not billing cost
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#job-result-schema[Model Work § Worker Result & Usage Parsing],
+link:../specification/model-work/09-completion-usage-and-spend.adoc#spend-accounting-budget-anchors[Model Work § Spend Accounting & Budget Anchors],
+link:../Requirements.adoc#PM-MIG-5[PM-MIG-5]
+Hazard:: Reports presented dispatched tokens as plan cost, while billing tracks context residency multiplied by
+turns and is dominated by cache reads; a 3-file change cost 71.4M billing tokens.
+Guard:: Reports label which figure they show (worker tokens vs billing) and never present worker tokens as plan
+cost. The data below is the evidence base for any cost model (`cost = resident_context × turns`,
+`cost(byte) ≈ 1.25 + 0.1 × turns_remaining`).
+Fixture:: PLAN-TRUTH-098: 9,203,064 dispatched vs 185,422,539 billing (~20×); phase 6 4,996,549 / 96,178,416; 3
+loop-backs; residency 209K → 771K. PLAN-TRUTH-075: +745/−2 over 3 files for 71.4M billing; 6-finalize 45.3M (63%),
+342 tool uses, 80% idle; dispatch rows covered 19.3% (238,455 of 1,233,654). 842.6M `cache_read` / 18.9M
+`cache_creation`; ~122-turn envelope; re-read factor 44.6×; 5.7× mean, 13.4× for an early byte. Composition
+(plan-45): `cache_read` 73.15%, `cache_creation` 25.69%, output 1.13%, input 0.03% (n=47: 76.1 / 22.8 / 1.1);
+recompute 66,212,048 vs 66,212,049; context ≈ 99% (99.08% for CIS-031). A 4-plan population spends 65.4% on
+cache creation (population-blocked).
+Source:: plan-marshall code-intelligence-substrate epic W-047, W-048, F7 and D-c, PLAN-CIS-054 D10, PLAN-CIS-036 D1.
+
+[#PM-WATCH-DISP-4]
+=== PM-WATCH-DISP-4: Exploration attribution is per phase and never pooled
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#job-result-schema[Model Work § Worker Result & Usage Parsing]
+Hazard:: A single-plan exploration share was quoted as a corpus band ("76–85% everywhere") and phases were pooled;
+"unattributed" mixed two populations with different denominators.
+Guard:: PM-MCP observes a worker's usage only as the harness reports it per turn (tokens, tool uses, cost), never
+its tool-result bytes; this applies only if attribution is computed, e.g. from the harness's stream output. Then the
+sub-sources sum exactly to the phase exploration bytes (absent excludes, a measured 0
+is kept), shares are reported per phase with the contributing-plan count and a degenerate-spread guard, never
+pooled, re-entered phases are not double-counted, and index-answerable bytes are a lower bound.
+Fixture:: n=1 record: index 15.9% / documents 65.2% / unattributed 18.9%, ≈50% of tool-result bytes (65.2% × 77%;
+PR #1126); per-phase exploration share 85.4 / 74.8 / 57.2 / 80.4 / 73.1%, worst phase 2-refine; unattributed bytes
+18.9% (30.5% on #1086); `cache_read` unattributed 65.9%, at least 83% except finalize 40.5%; first six-phase
+fixture `2026-08-09-self-review-resweeps-full-surface-every-round` (5-execute close_count 2), per phase index /
+documents / unattributed: 2-refine 3.3 / 90.7 / 6.0; 3-outline 16.8 / 73.0 / 10.2; 4-plan 0.0 / 43.9 / 56.1;
+5-execute 33.6 / 59.5 / 6.9; 6-finalize 13.8 / 64.5 / 21.6; whole plan 15.9 / 65.2 / 18.9. #1086 finalize-only
+record: 7.0 / 62.5 / 30.5% (109,531 / 975,401 / 476,922 bytes, sum 1,561,854; the source rotated out of the corpus).
+The plan-45 6-finalize figure of 49.7% of billing is unreliable, because 5-execute was re-entered.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-050 D5(c) and D5(d), PLAN-CIS-054 D8 and D9, PLAN-CIS-036 D1 and D2,
+PLAN-CIS-039 D1 and D4, epic F6.
+
+[#PM-WATCH-DISP-5]
+=== PM-WATCH-DISP-5: The cache-read attribution formula is exact
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#job-result-schema[Model Work § Worker Result & Usage Parsing]
+Hazard:: Residency attribution attributed the whole cache-read total, including sub-agent reads.
+Guard:: If residency attribution is computed, it uses exactly
+`attributable = max(0, cache_read_total − max(0, subagent_cache_read))`, split by residency weights, with a
+zero-weight branch; the suite kills the mutation `attributable = total`.
+Fixture:: the mutation `attributable = total` gave 2 failed / 6 passed.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-054 D1 item 1 (030/G1, 030/G2).
+
+[#PM-WATCH-DISP-6]
+=== PM-WATCH-DISP-6: Two-ledger pairing is iterative
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#post-completion-invariants[Model Work § Post-Completion Integrity Invariants]
+Hazard:: A recursive augmenting-path matcher failed at ~1,000 rows sharing one timestamp.
+Guard:: Timestamp-sorted rows of two ledgers are paired by index-order first-fit (a convex bipartite graph, so
+first-fit is a maximum matching); test with 1,200 identical timestamps per side.
+Fixture:: equivalence probed over 21,056 corpora; ~1,200 identical-timestamp rows.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-050 D1(m), PLAN-CIS-052 D6f.
+
+[#PM-WATCH-DISP-7]
+=== PM-WATCH-DISP-7: Spend is never classified by termination status
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#post-completion-invariants[Model Work § Post-Completion Integrity Invariants],
+link:../Requirements.adoc#PM-WF-14[PM-WF-14]
+Hazard:: plan-marshall counted 39% of a run's tokens as waste because the self-review firings ended with status
+`error`, although they produced 26 real findings that were all fixed.
+Guard:: Spend aggregations key on what a task produced (submitted entity, findings filed), never on its worker's
+fate or its `job-result` status; the spend of a task that ended without success is labelled a proxy, never "wasted";
+a read-cost identity such as cache reads per tool use is defined over the tool uses of workers and documented as
+arithmetic only. Test: a task whose worker ended `failed` after it filed findings.
+Fixture:: lesson `2026-08-27-16-002`: `error_total_tokens` 2,323,435, 26 findings fixed.
+Source:: plan-marshall post-run-quality PLAN-PRQ-08 D3; code-intelligence-substrate PLAN-CIS-050 D4(d).
+
+[#PM-WATCH-DISP-8]
+=== PM-WATCH-DISP-8: Every worker cost row names the task and step it served
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#post-completion-invariants[Model Work § Post-Completion Integrity Invariants],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: Dispatch cost rows could not be joined to the finalize steps they served.
+Guard:: Every metrics row of a task carries its `queue_task_id` and `attempt`, and the queue task names its creating
+state and entity (finalize step, plan task, or envelope); the job record carries no usage; a test asserts that
+`record-metrics` joins 100% of task rows to a state and entity, and that every warm worker's turns outside a task land
+in its `worker_idle` row.
+Fixture:: ledger-decomposition: 11 dispatch lines vs 30 completions (0.367), 17 boundary rows without `step_id`, 0 of
+30 paired; PLAN-PR-067: 7 vs 42, 0 of 17 paired.
+Source:: plan-marshall lesson 2026-09-24-09-008.
+
+[#PM-WATCH-DISP-9]
+=== PM-WATCH-DISP-9: The unconditional core skill has a byte budget
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#job-prompt[Model Work § Launch Prompt & Contract Envelope],
+link:../Requirements.adoc#PM-SKILL-1[PM-SKILL-1]
+Hazard:: The base persona loaded by every dispatch grew unnoticed; pre-loaded guidance stopped some exploration but
+was itself the larger cost.
+Guard:: The core conduct skill (`skill://pm/core/SKILL.md`), composed in-band into every worker's launch prompt, has a
+byte budget and a test that reports its rendered size per client and its share of the composed prompt; the role's and
+the task's skills rendered in-band are sized against measured exploration savings.
+Fixture:: plan-marshall base persona 14,835 B + 101,897 B at staging, 15,874 B + 114,977 B later.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-039 D1 and D4.
+
+[#PM-WATCH-DISP-10]
+=== PM-WATCH-DISP-10: The job contract envelope has one definition
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#job-prompt[Model Work § Launch Prompt & Contract Envelope],
+link:../specification/model-work/04-worker-launch.adoc#job-token[§ Job Token, Generation & Connection Binding],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: A validator required a repository-relative `WORKTREE` while every finalize dispatch template forwarded an
+absolute one: the contract existed twice.
+Guard:: One definition of the contract envelope drives both the server-composed launch prompt and the job-bound
+checks of the worker's calls (task binding, the entity's links and named schemas); property test: the composed
+envelope of every model state names only links and schemas its entity offers and passes the validator; the working
+directory is the worker's process working directory, never a prompt field; no contract field is validated by the
+model.
+Fixture:: `display_detail: "execution-context: WORKTREE must be a repo-relative path"`, `missing_field: "invalid
+WORKTREE"`.
+Source:: plan-marshall process-compliance inbox module-budget-campaign-completion-006.
+
+[#PM-WATCH-DISP-32]
+=== PM-WATCH-DISP-32: A task that ended without its submits raises `job_incomplete`, whatever its worker's fate
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#job-completion[Model Work § Task Completion & the `job_incomplete` Condition],
+link:../specification/model-work/02-task-protocol.adoc#re-offer[§ Re-Offer within the Self-Remedy Budget],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: A worker cancelled, killed, or timed out before its `submit` is treated as a delivered result, or the engine
+offers the task again without bound and loops; a submission recorded just before the kill is lost.
+Guard:: Table test over every fate (`succeeded`, `failed`, `timed_out`, `killed`, `cancelled`, `indeterminate`) with
+the required records present or absent: with the records present the return evaluation decides the outcome whatever
+the fate; without them the state raises `job_incomplete`, and the server offers the task again with the observed
+partial progress in its facts, without a model link, within the task re-offer budget; when the budget is spent the
+task closes `lost` (`attempts_spent`) and the state takes its conservative fallback; an attempt ended by a restart,
+a drain, or a start failure counts against no budget; the attribution defect is audit-logged.
+Source:: design review.
+
+[#PM-WATCH-DISP-27]
+=== PM-WATCH-DISP-27: One envelope task in flight, returns evaluated in fixed precedence
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#return-evaluation[Model Work § Return Evaluation],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: Two envelopes in flight share one worktree and one chain-tail commit; a return that is both a chain tail
+and carries a question is routed by whichever check runs first.
+Guard:: Scenario tests: while a `writer` task of a plan is leased, no second `writer` task of that plan is offered and
+no second `writer` worker of that plan runs or waits for a slot; `execute.evaluate-envelope-return`, run at the
+envelope task's end over returns carrying several conditions, settles in the order `question_pending`,
+`infeasible_pending`, `chain_tail`, `continue`, `all_complete` (table test over every combination); a return with unplanned changes records them and settles by the same precedence (no `deviations`
+outcome).
+Source:: design review.
+
+[#PM-WATCH-DISP-28]
+=== PM-WATCH-DISP-28: A task question ends the envelope task and the work continues in a new envelope task
+
+Anchor:: link:../specification/model-work/06-envelopes-questions-deadlines.adoc#task-questions[Model Work § Task Questions],
+link:../Requirements.adoc#PM-WF-12[PM-WF-12]
+Hazard:: A sub-agent waits in-leaf for an answer (blocking the envelope and holding the worktree), or its question
+is lost when the entity ends, or an unanswered task question blocks the plan without bound.
+Guard:: Scenario: the worker of an envelope task follows `ask:TASK-NNN`; the record is persisted, the task ends
+`asked` with `yield_reason: question` recorded by the server, its worker and model slot are free, and the plan
+enters `execute.task-question`; no further envelope task is queued while the record is open; the record is
+delivered on the web app and as `answer:<question_id>` to an entry session viewing the plan; after the answer the
+remaining plan tasks, the asking one included, form the next envelope task with the answer in its facts; with
+`questions.mode: auto` an expired record takes the question's stated default, validated against its options and
+recorded with `channel: assumption`; no condition and no operator verb exist for it.
+Source:: design review.
+
+[#PM-WATCH-DISP-29]
+=== PM-WATCH-DISP-29: Question expiry follows the class in mode `auto`, never in mode `operator`
+
+Anchor:: link:../specification/model-work/06-envelopes-questions-deadlines.adoc#question-delivery[Model Work § Delivery, Mode & Server-Owned Deadlines],
+link:../specification/timeouts/01-job-budgets-and-waits.adoc#question-wait[Timeouts & Budgets § Question Wait],
+link:../Requirements.adoc#PM-WF-12[PM-WF-12]
+Hazard:: One fallback for every class turns an unanswered outline review into execution, or a question in mode
+`operator` expires and takes a fallback the operator chose to prevent.
+Guard:: Table test per class in mode `auto` with `questions.wait_seconds` elapsed: `init` takes the recommended
+option or `returned`, `clarification` the default assumption, `review` `returned`, `task` and `ask` the question's
+stated default, `setup` the state's declared fallback, each recorded as an assumption; with `wait_seconds: 0` the
+fallback applies at creation; a record in mode `operator` has no deadline and never expires; in mode `quorum` a set
+the adjudication delivers takes the `auto` handling with its deadline counted from the delivery; the server-side
+timer runs without a session and needs no model call.
+Source:: design review.
+
+[#PM-WATCH-DISP-45]
+=== PM-WATCH-DISP-45: A quorum decides blind, and a missing vote is never agreement
+
+Anchor:: link:../specification/model-work/10-decision-quorum.adoc#ask-or-quorum[Model Work § Recommendation Score & Decisions: Ask or Quorum],
+link:../specification/model-work/10-decision-quorum.adoc#blind-input[§ Blind Input],
+link:../specification/model-work/10-decision-quorum.adoc#decision-rule[§ Decision Rule],
+link:../Requirements.adoc#PM-WF-18[PM-WF-18]
+Hazard:: A vote task whose facts are composed from the asking task's representation carries the asker's
+`recommended` flag, its confidence, its rationale, or its default assumption, so a listed role anchors on the
+recommendation and "agrees" without judging; or an agreement check that iterates over the votes received instead of
+the declaration's listed roles treats a lost, unavailable, cancelled, or refused vote task as absent rather than as a
+failed quorum, so a set is decided automatically on fewer judgments than declared, or on the asker's alone.
+Guard:: Scenario test with the adjudication unit declaring `decide approach -> quorum(quorum-a, quorum-b, 90)` and
+`decide scope -> ask`, calibrated, and a set of kind `approach` asked by a role the declaration does not list: the
+facts and the offer of each vote task contain none of `recommended`, `recommendation_confidence`, `rationale`,
+`default_assumption`, or another role's answer (asserted on the serialized representation, not on the facts
+builder); with `quorum-b` lost through its re-offers and `quorum-a` submitting the option at `95` the set ends
+`escalated` with reason `role_unavailable`, the vote entries `task_outcome: lost` and `branch_key: null`; with
+`quorum-a` unqualified it ends `escalated` with reason `role_unqualified` and creates no task; with the vote wait
+expired before any submit the open tasks are cancelled and the set is escalated; both on one option with `quorum-b` at
+`85` ends `below_score`. Matched control: both listed roles submit the same option at `95` and the set is answered
+`channel: quorum` with one `adjudicated` line per record. Second control: a set with one question of kind `scope` and
+one of kind `approach` ends `escalated` with reason `kind_ask` and creates no vote task; a declaration without a
+valid calibration record ends `calibration_failed`.
+Source:: design review.
+
+[#PM-WATCH-DISP-46]
+=== PM-WATCH-DISP-46: A correction is appended, never written over, and an export takes the decision finally taken
+
+Anchor:: link:../specification/model-work/11-decision-records.adoc#decision-records[Model Work § Decision Records],
+link:../specification/model-work/11-decision-records.adoc#corpus-export[§ Corpus Export],
+link:../specification/store-schemas/18-decision-records.adoc#decision-record[Store Schemas § Decision Record],
+link:../Requirements.adoc#PM-WF-19[PM-WF-19]
+Hazard:: A store that keeps one current object per decision updates its `choice` when a later decision departs from
+it, so the original decision, its decider, and its confidence are lost and the threshold it was taken against can no
+longer be calibrated; or the export reads the question record's `recommended` option, or the decision's first
+`choice`, as the reference, so an item teaches the model the recommendation the user overruled or the decision a
+re-planning reverted, and an operator waiver read as a correction turns a policy override into a reference.
+Guard:: Scenario test: a plan whose outline question the user answers against the asker's recommendation, whose
+finding group is triaged `ACCEPT` and later `FIX`, whose re-planning names the change-type decision in `corrects`,
+and whose blocking Q-Gate verdict is waived: `decisions.jsonl` holds every `decided` line byte-identical after the
+run, with one `corrected` line per departure (causes `reverted`, `replanned`, `overridden`), and the export writes
+the question item with the user's `branch_key`, the triage item with `FIX`, no change-type item (skipped
+`corrected_without_choice`), and the Q-Gate item with the task's own verdict and the waiver only in `review.notes`;
+no item's input contains `recommended`, `recommendation_confidence`, the asker's rationale, or the choice. Matched
+control: a decision without a correction is exported with its own choice and an unchanged line.
+Source:: design review.
+
+[#PM-WATCH-DISP-40]
+=== PM-WATCH-DISP-40: A usage total is the sum of four measured components or unmeasured
+
+Anchor:: link:../specification/model-work/09-completion-usage-and-spend.adoc#job-result-schema[Model Work § Worker Result & Usage Parsing] (Usage),
+link:../specification/model-work/09-completion-usage-and-spend.adoc#post-completion-invariants[Model Work § Post-Completion Integrity Invariants] (item 6)
+Hazard:: A total summed over the components that happen to be present reads as a measured figure and understates the
+spend; a total of `0` for a job that ran fabricates a free job; and a sum formed for another population mixes
+figures that have no common breakdown.
+Guard:: Parser fixtures per harness output: all four components measured yield `total_tokens` as their sum; three
+measured and one `unmeasured` yield `total_tokens: "unmeasured"`, never the partial sum; four components measured
+`0` yield `"unmeasured"`; the `cache_read` and `cache_creation` pointers fill `cache_read_input_tokens` and
+`cache_creation_input_tokens`; no `total` pointer is accepted in `headless.usage`.
+Source:: design review.
+
+== Worker Launch
+
+[#PM-WATCH-DISP-30]
+=== PM-WATCH-DISP-30: A job token binds one worker to its leased task entities and dies with its fence or fate
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#job-token[Model Work § Job Token, Generation & Connection Binding],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: A sub-agent that connects with the runtime token, or with a token that outlives its job, can drive any scope
+of the machine or keep acting after its fate was recorded; a relay that falls back to the runtime token silently
+widens a worker to the rights of an interactive session.
+Guard:: Scenario tests over a running worker fixture: a call naming a scope or entity that is not a task entity leased
+to the worker's generation is refused `job_scope_mismatch`; `tools/list` returns only the role's tool set; a `pm_do`
+of a link that starts a model is refused, and a consultation passes only through a `consult:<role>` link of the
+task's state; after the generation is fenced every call is refused `generation_fenced`, and after the fate every
+request with the token `job_ended`; the job record holds only the token's SHA-256; the worker's environment, argument
+vector, and MCP configuration never contain the runtime token, and a relay started with `--job` but without a job
+token exits without connecting instead of reading `state/runtime.json`.
+Source:: design review.
+
+[#PM-WATCH-DISP-31]
+=== PM-WATCH-DISP-31: At most one writer worker per plan, and model slots admit in order
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#model-slots[Model Work § Model Slots & One Writer per Plan],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: Two writer jobs of one plan share its worktree and chain-tail commit and overwrite each other; unbounded
+concurrent harness runs exhaust the machine and the provider quota; a queued job whose budget already runs times out
+before it starts.
+Guard:: Scenario with `model_slots: 2`: three plans each queue a `writer` task and one of them also a second `writer`
+task; the second `writer` task of that plan is not offered and starts no worker until the first closes although a
+slot is free; admission follows request order; a `read_only` worker of the plan runs beside its writer; a warm
+worker holds its slot while idle until its idle recycle, and a task of another role waiting for a slot recycles the
+longest-idle warm worker without a lease; a worker's budget starts at spawn and its slot wait is recorded apart as
+`queued_ms`; a stale slot left by a killed daemon is reaped in the next admission transaction.
+Source:: design review.
+
+[#PM-WATCH-DISP-33]
+=== PM-WATCH-DISP-33: A harness update is accepted only inside the supported version range
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#harness-selection[Model Work § Harness Eligibility & Launch Refusals],
+link:../specification/store-schemas/11-enrolment-store.adoc#harness-enrolment-store[Store Schemas § Harness Enrolment Store],
+link:../Requirements.adoc#PM-EXEC-1[PM-EXEC-1]
+Hazard:: Harness CLIs update themselves: a runtime that pins the enrolled digest refuses every worker after an
+update, and one that accepts any digest runs an unvetted executable or an argument template the new version no longer
+understands.
+Guard:: Fixture harness executable replaced between two spawns: a version inside `headless.supported_versions` is
+accepted, the file and its HMAC sidecar are rewritten under `harnesses.lock` in the accepting transaction, and an
+`operator` audit record `harness_updated`
+names both versions and digests; a version outside the range and an unenrolled harness refuse the launch before
+spawn (fate `refused`, `harness_version_unsupported`, `harness_not_enrolled`), each refusal counts as a start failure
+of the role on that harness, and after the compiled count the start-failure guard holds, the role's tasks close
+`role_unavailable` and take their conservative fallback, and `pm-operator status` names `pm-operator enrol-harness`;
+a tampered `harnesses.json` (HMAC mismatch) refuses the launch with `harness_tampered` and the audit `security`
+record `enrolment_tampered`, counted the same way and naming `pm-operator enrol-harness <client>`, no scope is
+paused, and that verb
+re-baselines the file and its sidecar with the named client only after showing path, version, and digest (the
+entries of other clients are dropped, and their jobs are refused `harness_not_enrolled` until each is enrolled
+again); the enrolment record holds path,
+version, and digest only, and neither it, the credential store, nor the worker's environment carries a harness
+authentication value (the harness runs on its own login, and one that is not logged in fails its start).
+Source:: design review.
+
+[#PM-WATCH-DISP-34]
+=== PM-WATCH-DISP-34: The host bundle stays inert inside a worker
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#job-token[Model Work § Job Token, Generation & Connection Binding],
+link:../Requirements.adoc#PM-WF-5[PM-WF-5]
+Hazard:: A headless harness run loads the host's own PM-MCP integration: a second MCP server connects with the
+runtime token, or an entry command records an entry, issues a session generation, or starts a bootstrap from inside
+a worker.
+Guard:: Per harness with a `headless` block, a launch-vector test asserts the exclusive per-call MCP configuration
+(only the job relay); an entry-command test with `PM_MCP_JOB_ID` set asserts that each of the three entry commands
+exits at once with no entry row, no pending entry record, no session generation, and no API call; an integration test
+runs one worker in a project with the client bundle installed and finds no entry row, no session generation, and no
+second connection in the audit log.
+Source:: design review.
+
+[#PM-WATCH-DISP-24]
+=== PM-WATCH-DISP-24: A failed mandatory skill load stops the job
+
+Anchor:: link:../specification/model-work/04-worker-launch.adoc#job-prompt[Model Work § Launch Prompt & Contract Envelope],
+link:../Requirements.adoc#PM-SKILL-3[PM-SKILL-3]
+Hazard:: A leaf continued its work after the mandatory foundational skill failed to load twice.
+Guard:: The server renders the shim, core conduct, task-protocol, and role skills in-band into every launch prompt,
+and a prompt that cannot be composed refuses the launch with `prompt_composition_failed`, so no worker starts without
+them; an offer carries in-band every required skill its generation lacks, and a task whose missing skills exceed the
+bound goes to a fresh worker; where a fresh worker's prompt carries only the section index (above the bound),
+scenario test: two consecutive failed or empty `pm_skill` loads end the worker with the structured output
+`status: error` and `display_detail: "skill load failed: <uri>"`, never `success`, and no entity submit.
+Fixture:: the skill tool returned `ripgrep execution failed` on 2 consecutive attempts (opencode) and the run
+continued.
+Source:: plan-marshall process-compliance inbox opencode-bootstrap-executor-fix-001 § Violations item 1.
+
+== Screener
+
+[#PM-WATCH-DISP-25]
+=== PM-WATCH-DISP-25: The screener holds no tool and no MCP connection
+
+Anchor:: link:../specification/model-work/07-untrusted-text-screening.adoc#screener[Model Work § Screener],
+link:../Requirements.adoc#PM-SEC-1[PM-SEC-1]
+Hazard:: A model that reads untrusted content while it holds a tool can be steered by that content to read local
+files and carry them out.
+Guard:: For every client profile whose `headless` block declares the `zero_tools` capability, the composed launch of
+a `screener` worker has zero tools, no MCP configuration, project and user settings off, and the empty `cwd/`
+subdirectory of its job-private directory as working directory, which it cannot write; a launch-vector test per
+profile fails on any tool, MCP entry, or loaded project setting; a role artifact of class `zero_tool` that names a
+harness without the capability is invalid when the role set loads (`role_undefined`), never a screener with a tool;
+the verdict is validated fail-closed (a missing, extra, or unparseable item counts as `suspicious`).
+Source:: design review.
+
+[#PM-WATCH-DISP-35]
+=== PM-WATCH-DISP-35: Only returned verdicts are cached, and a suspicious text never reaches a model as content
+
+Anchor:: link:../specification/model-work/07-untrusted-text-screening.adoc#screener[Model Work § Screener],
+link:../specification/store-schemas/15-screening-and-grants.adoc#screen-verdict-cache[Store Schemas § Screening Verdict Cache],
+link:../Requirements.adoc#PM-SEC-1[PM-SEC-1]
+Hazard:: A fail-closed verdict (a crashed or unparseable screener run) is cached as `suspicious` for good, or a
+missing verdict is cached as `clean`; a flagged text is still delivered to the triage job or the plan's model as
+content.
+Guard:: Scenario per firing: a screener worker that ends `timed_out` or returns invalid output marks every item of its
+part `suspicious` for this firing and writes nothing to `screen-verdicts.jsonl`, so the next firing screens them
+again; a valid verdict is appended once and reused by SHA-256 without a second screener task; inside a plan a
+`suspicious` item reaches triage and representations only as its structured fields plus `withheld: flagged by
+screener`, the finding stays pending, and the unit ends through its budget unless a `met` waiver covers it; in a
+bootstrap it offers only `accept` (audited) or `back`.
+Source:: design review.
+
+[#PM-WATCH-DISP-36]
+=== PM-WATCH-DISP-36: A firing's batch is complete, and triage disposes of every finding that is not withheld
+
+Anchor:: link:../specification/model-work/07-untrusted-text-screening.adoc#batch-v1[Model Work § Batch Format],
+link:../specification/model-work/07-untrusted-text-screening.adoc#batched-triage[§ Batched Triage],
+link:../Requirements.adoc#PM-SEC-1[PM-SEC-1]
+Hazard:: Per-item screening and per-finding triage multiply tasks; a batch that drops an item lets unscreened
+text through, and a group disposition that silently skips a finding leaves it untriaged yet counted as settled.
+Guard:: Property test over generated firings: the batch holds exactly the new items of the firing (each with `item_id`
+and the SHA-256 of its level-1-cleaned text); the screener parts (one task per part of the screen state,
+`job llm screen role screener each screen.batch-parts`) cover every uncached item exactly once; one triage task per
+firing receives every finding that is not withheld, grouped by `(domain, rule_id)`; a finding that a `triage-groups`
+submission does not cover stays untriaged and is never counted as settled; a per-finding exception overrides only
+its finding; a disposition that contradicts a finding's class is refused `invalid_link_args` naming the finding.
+Source:: design review.
+
+== Epic Coordination & Server-Started Plans
+
+[#PM-WATCH-DISP-13]
+=== PM-WATCH-DISP-13: One address, one grammar on both sides of every epic–plan channel
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#_git_distributed_epic_ledger_per_file_store_layout_adr_024[Model Work § Git-Distributed Epic Ledger],
+link:../Requirements.adoc#PM-WF-15[PM-WF-15]
+Hazard:: plan-marshall built the routing set from the epic-local ordinal (`PLAN-NN`) while the plan-side mailbox
+was read by kebab plan id; the target never matched and delivery silently fell back to the queue. A fixture masked
+it: its synthetic row id equalled its own target.
+Guard:: Round-trip tests for the server start of a launchable row → `source-epic-row` → row set `running` in the
+bootstrap's `start.create-scope` transaction → `outbox:send` → inbox append → `submit mailbox_send` → plan mailbox →
+landing reconcile, using real row shapes in which the ordinal differs from the plan id; assert delivery, and assert
+that a mismatched id is refused (`epic_pointer_mismatch` for a session bootstrap that derives a row's `plan_id`, a
+held row with `row_unknown` for a start whose row is missing), never re-routed silently.
+Fixture:: `+{"id": "PLAN-01", "slug": "tracked-orchestrator-store-resolver", "workstream": "WS-01", "status": "shipped", "plan_marshall_plan_id": "tracked-orchestrator-store-resolver", "pr": "#1557, #1558, #1561", "landing": "landings/PLAN-01.md", "seq": 1}+`
+Source:: plan-marshall orchestrator-refactor PLAN-05 D6.
+
+[#PM-WATCH-DISP-14]
+=== PM-WATCH-DISP-14: Plan-id scans exclude the sender
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#_git_distributed_epic_ledger_per_file_store_layout_adr_024[Model Work § Git-Distributed Epic Ledger] (`inbox.jsonl`)
+Hazard:: A landing names its sender, whose plan still reads `running`; an unqualified payload scan therefore refused
+every landing.
+Guard:: Inbox envelopes carry an explicit target; any plan-id scan over a payload excludes the sender's own id.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-052 D6d.
+
+[#PM-WATCH-DISP-15]
+=== PM-WATCH-DISP-15: A spec amendment or an ingested message is followed only after the target's spec section was shown
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#_git_distributed_epic_ledger_per_file_store_layout_adr_024[Model Work § Git-Distributed Epic Ledger]
+Hazard:: A message was folded into a plan without reading the target plan's deliverables, which duplicated writers.
+Guard:: The `message` entity of a `coordinate` task presents the target row's spec section (its deliverables) in
+`facts` before it offers `submit mailbox_send` of kind `spec_amendment`, `submit ingest`, or an intake `submit stage`;
+a representation test asserts that none of these submits is offered on an entity whose `facts` lack that section.
+Source:: plan-marshall code-intelligence-substrate epic F0b/D14.
+
+[#PM-WATCH-DISP-16]
+=== PM-WATCH-DISP-16: A fail-closed epic gate needs a correct population and a recovery path
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#epic-surface-disjointness[Model Work § Staging-Time Surface Disjointness]
+Hazard:: One unrelated indeterminate member blocked every candidate: sibling-epic staged specs and a plan-less live
+entry were population members and blocked all emission. Parse failures produced empty populations that read as
+disjoint. A fix claimed "fully unblocked" while only about half of the indeterminate candidates came from the
+collision it fixed, and duplicating an epic doubled its candidate population.
+Guard:: Disjointness is checked when a plan is staged, not as a runtime gate: tests assert that the comparison
+population is exactly the other non-terminal rows of the staging epic, and that staged specs and rows of other epics,
+queue entries without a plan (the plan-marshall placeholder row named `NO_PLAN`; in PM-MCP `NO_PLAN` is only the scope
+sentinel and never a queue row), plans started without an epic, and the epic's own dated
+archive are never members. An unordered overlap refuses with `surface_overlap` naming every overlapping plan and
+path; an overlap ordered through prerequisites is admitted; a surface that cannot be declared (prose, empty,
+unparseable, untracked) refuses with `surface_undeclared` and is never read as empty or disjoint. A plan start
+compares no surfaces, so no unrelated member can block a start. Every refusal names its recovery (re-cut the plans or
+declare the ordering).
+Fixture:: 95 of 581 sibling-epic-spec candidates across 25 epics plus one plan-marshall `NO_PLAN` placeholder row blocked
+emission;
+94 indeterminate candidates, about half from a self-collision; 12 of 62 case-variant headings → 0 overlaps (69
+after the fix); 154 table claims parsed to 0; partition 104 / 0 / 26 / 201 = 331.
+Source:: plan-marshall orchestrator-refactor epic Open Defect (disjointness), PLAN-11 D3; code-intelligence-substrate epic D10,
+D11 and D13.
+
+[#PM-WATCH-DISP-17]
+=== PM-WATCH-DISP-17: Grounded evidence pinning is a candidate, not a design
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#server-derived-landing-facts[Model Work § Spec Re-Grounding]
+Hazard:: Pinning each re-grounding claim to hashed evidence (current / stale / unresolved) looks attractive but
+buys no protection against false negatives.
+Guard:: Do not adopt it before a population of pins has aged under real edits.
+Source:: plan-marshall code-intelligence-substrate epic W-049.
+
+[#PM-WATCH-DISP-18]
+=== PM-WATCH-DISP-18: Citations are verified when written
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#server-derived-landing-facts[Model Work § Server-Derived Landing Facts, Spec Re-Grounding & Cross-Plan Locks],
+link:../Requirements.adoc#PM-WF-6[PM-WF-6]
+Hazard:: A verdict attributed a fix to a PR whose diff did not touch the file; records cited symbols that did not
+exist and credited the wrong PR; "none blocking" was written over open gaps.
+Guard:: When a verdict, landing analysis, lesson or ADR cites a commit, PR, SHA or symbol, the server resolves it
+(git job) at write time and verifies that a cited commit's diff touches the cited file; an unresolvable citation
+is rejected (`invalid_link_args`).
+Fixture:: #1370 (empty stat for `orchestrator.py`) vs the real fix #1366 (`b758d5c02`); plan 010 cited 3 non-existent
+symbols; #1039 credited as #1153.
+Source:: plan-marshall orchestrator-refactor PLAN-06 HYPOTHESIS; review-apparatus PLAN-PR-031 D1.
+
+[#PM-WATCH-DISP-19]
+=== PM-WATCH-DISP-19: Landing records are complete or say what is missing
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#server-derived-landing-facts[Model Work § Server-Derived Landing Facts],
+link:../specification/phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-metrics-and-landing[Phase Workflows § Post-Run Metrics & Landing Envelope] (Landing Envelope),
+link:../specification/store-schemas/02-workflow-state-store.adoc#merge-outcome-mapping[Store Schemas § Merge Outcome Mapping],
+link:../Requirements.adoc#PM-TEST-4[PM-TEST-4]
+Hazard:: Most plan-marshall landings carried narrative only or were silently `complete: false`; merge facts had to be
+re-corroborated by hand; filed and transported findings differed silently; post-merge landings always read
+`merge_state: unknown`; replaced and split PRs broke the PR set.
+Guard:: Scenario test: every completed plan's landing record passes the landing schema, complete or with an explicit
+list of missing facts; no path produces a narrative-only landing. Negative control: a landing of a `request`-sourced plan with
+`deliverables_total = n/a` stays incomplete (`n/a` is legal at deliverable and task keys only for `local_changes` landings). The landing records findings filed and findings
+transported, and a test with one dropped finding goes red. `merge_state` and the plan's `merge_outcome` come from one
+`ci.pr-observe` observation through the one mapping table (`MergeOutcomeMappingTest` asserts every row for both); a
+failed observation yields `merge_state: unknown` listed in `missing_facts` and never a `completed` plan. Differential test (`PM-TEST-2`): mapping the plan-marshall
+landings in test code yields records with unknown facts where facts are missing (the mapping exists in test code only; plan-marshall epics are never taken over).
+Fixture:: 9 of 13 process-compliance landings narrative-only (4 complete, two with inline `landing-check complete:
+true`); test-quality PLAN-180 carve-1: 2 landings `complete: false`, 9 of 9 keys missing. #1368 `31d42db871…`
+with `missing_keys: [merge_state]`. PR sets: PLAN-PR-032 (unmerged PR), PLAN-PR-036 (two-PR split), PLAN-PR-025B
+(replaced PR), #1419 split into #1423 and #1429. #1349: all 8 fact keys missing (`grep -c landing-facts` = 0), one
+day after #1344 recorded `complete: true` (intermittent omission); #1337 (5 keys permanently missing); PLAN-PR-041
+(ad-hoc landing).
+Source:: plan-marshall process-compliance PLAN-11 § Claim Labels claim 1; truthful-signals PLAN-TRUTH-149 D9; review-apparatus PLAN-PR-028 D2 and fold,
+PLAN-PR-055, PLAN-PR-052 D4.
+
+[#PM-WATCH-DISP-20]
+=== PM-WATCH-DISP-20: An epic's archived snapshot is never its own sibling
+
+Anchor:: link:../specification/filesystem-layout/03-project-store.adoc#archives[Filesystem Layout § Plan & Epic Archives],
+link:../specification/model-work/08-epic-coordination.adoc#server-derived-landing-facts[Model Work § Spec Re-Grounding] (Archived Snapshots Are Not Siblings)
+Hazard:: The sibling filter deduplicated by exact name, so a live epic and its own dated archive were compared as
+siblings. Titles are no identity: the live "Automated PR review apparatus reliability" and the archived "Review
+Apparatus — archived 2026-09-21" share no substring, and neither plan-marshall `status.json` carries a slug or epic id.
+Guard:: Differential test (`PM-TEST-2`): both snapshots map to the same `epic_id`. Scenario test: an epic with a live directory and
+a dated archive of its own corpus yields zero self-candidates; matched negative control: a genuinely distinct
+sibling epic is still enumerated and compared.
+Fixture:: the two titles above verbatim.
+Source:: plan-marshall orchestrator-refactor PLAN-11 D1, D2.
+
+[#PM-WATCH-DISP-21]
+=== PM-WATCH-DISP-21: Real-corpus disjointness fixture with dated snapshots of live epics
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#epic-surface-disjointness[Model Work § Staging-Time Surface Disjointness],
+link:../specification/filesystem-layout/03-project-store.adoc#archives[Filesystem Layout § Plan & Epic Archives],
+link:../Requirements.adoc#PM-TEST-2[PM-TEST-2]
+Hazard:: Differential and gate tests over store ports alone never meet an archived root that holds dated snapshots of
+live epics, which is where the self-collision arose.
+Guard:: Use the real corpus as differential-test and staging-check fixture: every dated snapshot maps to its live
+`epic_id`, and staging a row of a live epic compares it only against that epic's own non-terminal rows, never
+against a dated snapshot or a sibling epic; a surface the check cannot declare refuses with `surface_undeclared`
+per row, never as a population-wide indeterminate count.
+Fixture:: `code-intelligence-substrate-26-09-21`, `review-apparatus-26-09-21`, `test-quality-26-09-21`,
+`truthful-signals-26-09-21` (4 of 9 live epics); review-apparatus measured `candidates_indeterminate: 96`, of which
+`sibling_epic_spec indeterminate: 94`, `candidate_comparison_determinate: false`.
+Source:: plan-marshall orchestrator-refactor PLAN-11 Claim Labels.
+
+[#PM-WATCH-DISP-22]
+=== PM-WATCH-DISP-22: A staged spec is re-grounded before its plan starts
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#server-started-plans[Model Work § Server-Started Plans] (Launchable, Staleness in the view),
+link:../specification/model-work/08-epic-coordination.adoc#server-derived-landing-facts[§ Server-Derived Landing Facts, Spec Re-Grounding & Cross-Plan Locks] (item 2)
+Hazard:: A staged spec decays against a moving tree; emitting it unchecked nearly re-shipped finished work.
+Guard:: A test advances the default branch after a staged row's last re-grounding and asserts that the server does not
+start the row until a `reground` task re-grounded its specification at the current `HEAD`; a row never re-grounded is
+re-grounded before its first start; a row whose latest row verdict is `stale` is not started until its spec section
+is re-submitted through `spec_section`; the epic's view shows `regrounded_at_sha` and `main_commits_since` per staged
+row; matched control: a row re-grounded at the current `HEAD` whose prerequisites shipped starts in the next
+`epic.next-work`.
+Fixture:: two staged plans were one emit from re-shipping finished work; the oldest staged specs are the least
+trustworthy.
+Source:: plan-marshall code-intelligence-substrate epic F0.
+
+[#PM-WATCH-DISP-23]
+=== PM-WATCH-DISP-23: The landing commit is found under a squash merge queue
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#server-derived-landing-facts[Model Work § Server-Derived Landing Facts, Spec Re-Grounding & Cross-Plan Locks] (Squash-Aware Landing Commit)
+Hazard:: The landing-commit lookup relied on a two-parent merge commit, which never exists under a squash merge
+queue.
+Guard:: A test on a squash-merged landing locates the commit as the base-branch commit whose subject ends with
+`(#<pr_number>)`; the merge-commit tier is never the only tier.
+Fixture:: PR #1348 landed as `9aaf22d8f` with the single parent `a2be2691c`, so a two-parent merge-commit tier can
+never fire under a squash merge queue.
+Source:: plan-marshall code-intelligence-substrate PLAN-CIS-050 D3.i.
+
+[#PM-WATCH-DISP-26]
+=== PM-WATCH-DISP-26: The plan mailbox has its own leaf lock
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#plan-mailbox[Model Work § Plan Mailbox],
+link:../specification/store-schemas/13-leases-integrity-testing.adoc#lock-free-snapshot-reads[Store Schemas § Lock-Free Snapshot Reads, Transaction Locks & Leases] (leaf locks)
+Hazard:: A mailbox appended under the plan lock inverts the lock order when an epic transaction writes it, and two
+unsynchronized writers read the same last `message_id` and append duplicates.
+Guard:: Concurrent `mailbox_send` and plan-side consumption acknowledgements keep every `message_id` unique; a torn
+last line is ignored by readers; the lock manager accepts the order epic lock -> mailbox leaf lock and records no
+`lock_order_violation`.
+Source:: design review.
+
+[#PM-WATCH-DISP-37]
+=== PM-WATCH-DISP-37: A handed-back plan keeps its queue row live until its pull request is observed
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#_git_distributed_epic_ledger_per_file_store_layout_adr_024[Model Work § Git-Distributed Epic Ledger & Per-File Store Layout],
+link:../Requirements.adoc#PM-WF-15[PM-WF-15]
+Hazard:: Mapping a plan's `handed_back` outcome onto a shipped status reports unmerged work as shipped and lets a
+dependent row start on a base that lacks it.
+Guard:: Reconciliation test per plan outcome: `merged` -> `merged`, `no_change` -> `completed`, `aborted` ->
+`abandoned`, `returned` -> `returned`, `handed_back` -> `handed_back` (live); a `handed_back` row becomes `merged`
+only when the landing reconciliation observes its pull request merged, and a row that depends on it is not started
+before; it becomes `abandoned` when the reconciliation observes the pull request closed without a merge, and a row
+that depends on it is then never started. Matched control: while the pull request is open the row stays
+`handed_back`.
+Source:: design review.
+
+[#PM-WATCH-DISP-38]
+=== PM-WATCH-DISP-38: Adopting an existing epic ledger never rewrites it and derives the entry state
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#epic-workflow[Model Work § Epic Workflow],
+link:../specification/state-catalogue/09-bootstrap-and-lessons.adoc#state-catalogue-bootstrap-epic[State Catalogue § Bootstrap of an Epic] (`start-epic.adopt`),
+link:../Requirements.adoc#PM-WF-15[PM-WF-15]
+Hazard:: An epic whose git-tracked ledger arrived by clone has no machine scope; a bootstrap that treats it as new
+re-creates `epic.json` and the vision over the durable ledger, or an adoption that "repairs" the header (`lifecycle`,
+rows) rewrites team-shared state as a side effect of entering it; an entry state taken from the header instead of
+the rows sends an epic with staged rows back to decomposition.
+Guard:: Scenario test over a cloned ledger without `epics/<epic_id>/`: `pm-mcp enter epic <epic_id>` routes to
+`start-epic.adopt`, and without an id `start-epic.define` offers `adopt_epic:<epic_id>`; after `adopted` the bytes of
+every file under `.marshall/orchestrator/<epic_id>/` are unchanged (digest before and after, and no commit on
+`pm-mcp/epics`), the machine scope holds `status.json`, and the entry state is `epic.decompose`
+only for a ledger without any queue row and `epic.active` for every other ledger, whatever the header's `lifecycle` says.
+Matched controls: a truncated `epic.json` ends in `start-epic.adopt-failed` with `ledger_unreadable` naming the file
+and creates no machine scope; a `define` with that `epic_id` reaches `start-epic.ready`, whose `create` is refused
+with the reason `plan_id_taken` and stays in that state.
+Source:: design review.
+
+[#PM-WATCH-DISP-39]
+=== PM-WATCH-DISP-39: A refused `spec_section` is `invalid_link_args` with a `detail` code, never a reason of its own
+
+Anchor:: link:../specification/model-work/08-epic-coordination.adoc#epic-workflow[Model Work § Epic Workflow] (`spec_section` content validator)
+Hazard:: A content validator that answers its cause as a rejection reason of its own (`section_too_large`,
+`claim_section_unreadable`) widens the closed rejection-reason set per link; a client or a test that switches on
+`reason` then misses the refusal, and the self-correction path of `invalid_link_args` is not taken.
+Guard:: Scenario test on the `decompose` entity of `epic.decompose` and `epic.recut` and on the `message` entity of
+`epic.ingest`: a `submit spec_section` whose section has more than six deliverables is refused with the reason
+`invalid_link_args`
+and the `detail` code `section_too_large`, and one with an `unreadable` claim section with `invalid_link_args` and
+`claim_section_unreadable`; neither code ever appears as a `reason`, the closed rejection-reason set is unchanged,
+and a refused payload writes nothing to `spec.md`. Matched control: a section of six deliverables whose claim
+sections parse is written.
+Source:: design review.

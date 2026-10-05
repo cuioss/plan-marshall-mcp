@@ -1,0 +1,60 @@
+= Model Work Specification: Consultation
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../model-work.adoc[Model Work] » Consultation
+
+[#consultation]
+== Consultation through the Server
+_See Requirements link:../../Requirements.adoc#PM-WORK-4[PM-WORK-4: Consultation through the Server], link:../../Requirements.adoc#PM-WF-5[PM-WF-5: Model Work as Role Tasks & Single-Level Leaf Constraint]_
+
+A worker that needs another model's judgment asks through the server, and only where its workflow state provides for it. The consultation is a task of the consulted role like any other (xref:02-task-protocol.adoc[Task Protocol]), so the flow stays deterministic, accounted, and within the single-level leaf constraint: no worker starts a model itself.
+
+image::../../resources/harness-as-worker-consultation.svg[A worker asks another role through the server and receives the answer through its pending wait, align=center]
+
+[#consult-declaration]
+=== Declared by the Workflow
+
+A model state declares the consultations it offers, each by a role name, with the clause `consult role <role>` (for example `consult role triage-review`; grammar: link:../workflow-dsl.adoc[Workflow DSL Specification]). A state may declare several roles, each once. The runtime resolves every declared role in the project's effective role set at composition like every other role name and refuses a unit that names an undefined role with `role_undefined` (xref:01-roles-and-configuration.adoc#role-composition[Composition Check]). A role artifact holds no consultation setting: whether a role may be consulted, and by whom, is decided by the workflow alone.
+
+[#consult-link]
+=== The `consult:<role>` Link
+
+While a task is executing, its entity offers exactly one link `consult:<role>` (rel `consult`, form `submit`) per role its state declares, and no other consultation link. Its parameter is `question: text[1..4000]` (link:../hypermedia-format/01-representation-and-link-forms.adoc[Hypermedia Format Specification, Representation & Link Forms]).
+
+Following it creates a queue task of the consulted role (kind `consultation`, xref:02-task-protocol.adoc#queue-task[Queue Task]) whose `queue_task_id` is the `consultation_id`, records it on the asking task, and moves the asking task and its worker to `consulting` (xref:02-task-protocol.adoc#worker-states[Worker States]). The answer of the call is the asking entity's representation in `consulting`, whose only next step is `pm_wait`.
+
+* *One at a time*: A task has at most one open consultation; while it is open, no `consult` link is offered.
+* *Bound*: A task follows at most the compiled `3` consultation links over all its attempts; after that, no `consult` link is offered.
+
+[#consult-serving]
+=== Serving the Consultation
+
+The consultation task goes through the model caller (xref:01-roles-and-configuration.adoc#model-caller[The Model Caller]) and the task protocol like every task: qualification and its fallback, the queue, offer, acknowledgement, re-offer, and fencing. Consultation tasks are offered before the work tasks of their role. The consulted role runs on its own artifact's harness and model, which may differ from the asker's.
+
+* *Facts*: The consultation entity carries the question, the asking role, and the facts of the asking task's state, which the server composes with the evidence the asked judgment rests on (xref:06-envelopes-questions-deadlines.adoc#decision-evidence[Evidence in Facts]).
+* *Depth one*: The consultation entity offers only its submit `submit:answer` (the answer, a text of `1` to `4000` characters) and no `consult`, `ask`, or infeasible link; a consulted task never consults.
+* *Outcomes*: A consultation ends `submitted` or `lost` (xref:02-task-protocol.adoc#task-outcomes[Closed Task Outcomes]).
+
+[#consult-answer]
+=== The Answer through the Next Wait
+
+The asker waits in `pm_wait`, held within its bounded wait with progress frames where its host needs them, and receives `wait_again` at the end of each window while the consultation is open; the held wait is an open call, so a consulting worker is never silent (xref:03-supervision-and-recycling.adoc#detection[Detection]).
+
+* *Delivery*: When the consultation closes, the server answers the asker's pending `pm_wait`, or its next one, with the asking task's representation in `executing`, whose `facts.consultations` lists `{consultation_id, role, status, answer}`. The answer is delivered exactly once and only to the asking generation.
+* *No answer*: A consultation that closes `lost` (its re-offers spent, or its role undefined, unqualified, or unavailable) is delivered with `status: unavailable` and the reason, and no answer; the asker continues on its own judgment.
+* *Fenced asker*: When the asking generation is fenced while the consultation is open or its answer undelivered, the answer is recorded in the asking task's facts, and the successor's offer of the task carries it (xref:02-task-protocol.adoc#redelivery[Exactly-Once Redelivery]); the successor does not consult again for it.
+
+[#consult-reference]
+=== The Submit Refers to the Consultation
+
+Every submit link of an entity whose state declares consultations takes the parameter `consultation_ids` (`list<consultation_id>`). Once the task received an answer, its required submission must list every delivered `consultation_id`; a submit that omits one is refused `invalid_link_args` with a reason that names the missing reference, and the worker may submit again (xref:02-task-protocol.adoc#execute-submit[Execute & Submit]). The reference is recorded with the result, so the decision and the judgment it rested on stay linked.
+
+[#consult-accounting]
+=== Accounting
+
+The usage of a consultation is accounted to the consultation task and its role, from the per-turn usage of the turns that served it (xref:04-worker-launch.adoc[Worker Launch]), and linked to the asking task through `consultation_of`; it is never added to the asking task's own usage. The time the asking task spent in `consulting` is recorded on its attempt. `pm-operator status` and the web app show an open consultation with both tasks.

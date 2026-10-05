@@ -3,164 +3,70 @@
 :toclevels: 2
 :nofooter:
 
-xref:README.adoc[Overview] · xref:analysis.adoc[Analysis] · xref:journey.adoc[Journey] · xref:measurements.adoc[Measurements] · xref:record.adoc[Run Record] · xref:findings.adoc[Findings] · xref:conclusion.adoc[Conclusion] · xref:architecture.adoc[Architecture] · *Task Protocol* · xref:roles.adoc[Roles] · xref:skills.adoc[Skills] · xref:evaluation.adoc[Evaluation]
+xref:../../Concepts.adoc[Concepts] » xref:README.adoc[Harness as Worker] » Task Protocol
 
-NOTE: *Status: proposal (2026-10-04)*. The loop of wait, task, and submit is measured; the acknowledgement, detection, fencing, recycling, consultation, and skill delivery are measured on Claude Code and OpenCode in Stage 1 of xref:evaluation.adoc[Evaluation] (Antigravity extrapolated, the session-first offer open).
+xref:README.adoc[Overview] · xref:journey.adoc[Journey] · xref:architecture.adoc[Architecture] · *Task Protocol* · xref:roles.adoc[Roles] · xref:skills.adoc[Skills]
 
-The exchange between the server and a worker. Every worker complies with it, whether the server spawned it or it is the interactive session that started the plan. The protocol is a reusable sub-workflow of the workflow DSL: every transition is server logic, and the model only follows the links it is offered.
+The exchange between the server and a worker. Every worker follows it, whether the server started it or it is the interactive session that started the plan. The one exception is the screener of untrusted text: it has no tools and no connection to the server, so its task ends with its process, by a valid verdict or without one (xref:roles.adoc#untrusted-content[Roles, Untrusted content]). The protocol is a reusable sub-workflow of the workflow DSL: every transition is server logic, and the model only follows the links it is offered. The states, parameters, and rules are specified in link:../../specification/model-work.adoc[Model Work]; the values per host in link:../../specification/client-profiles.adoc[Client Profiles].
 
 == Steps
 
 image::../../resources/harness-as-worker-task-exchange.svg[One task from offer to submit between workflow engine, task queue, and worker, including the wait-again answer and the acknowledgement, align=center]
 
-. *Wait*: the worker holds a wait call open. The call is bounded below the host's limit by the client profile (<<parameters>>); where the host needs it, the server sends progress frames during the wait.
-. *Offer*: the server answers the wait with a task. The task is leased to the worker's current generation and carries the skills it requires that this generation has not received yet (xref:skills.adoc#delivery[Skills, Deterministic delivery]). (MCP gives the server no way to make a harness act; the offer is always the answer to a pending call.)
-. *Acknowledge*: the worker confirms the task, explicitly or by its first call that follows the task's link. The explicit call is the default: it was not the more expensive variant on any harness (xref:evaluation.adoc#e1[E1]). The acknowledgement tells the server that the worker is alive and has the task.
+. *Wait*: the worker holds a wait call open, bounded below the host's limit; where the host needs it, the server sends progress frames during the wait.
+. *Offer*: the server answers the wait with a task. MCP gives the server no way to make a harness act, so an offer is always the answer to a pending call. The task is leased to the worker's current generation and carries the skills it requires that this generation has not received yet.
+. *Acknowledge*: the worker confirms the task. The acknowledgement tells the server that the worker is alive and has the task.
 . *Execute*: the worker does the task by following the links of the task's representation. During long work its calls serve as heartbeats.
-. *Submit*: the worker submits a structured result through the offered link. The server checks it against the lease and the generation and refuses a submit of a replaced generation.
+. *Submit*: the worker submits a structured result through the offered link. The server checks it against the link's schema, the lease, and the generation.
 . *Wait or end*: the server answers the next wait with the next task, with "wait again", or with "end".
 
-== States of the sub-workflow
+== States
 
 image::../../resources/harness-as-worker-task-states.svg[Worker states: waiting, offered, acknowledged, executing, consulting, submitted, lost, and ended, with their transitions, align=center]
 
-[cols="2,4,3", options="header"]
-|===
-|State |Meaning |Leaves to
-
-|`waiting`
-|the worker holds a wait call; no task leased to it
-|`offered` (task available), `ended` (idle timeout, budget, shutdown), `lost` (silence, exit)
-
-|`offered`
-|a task is leased to the worker's generation, its required skills delivered; no acknowledgement yet
-|`acknowledged`, `lost` (deadline passed, exit)
-
-|`acknowledged`
-|the worker confirmed the task
-|`executing` (first call along the task's links), `lost`
-
-|`executing`
-|the worker works along the links; its calls are heartbeats
-|`submitted`, `consulting`, `lost` (silence, exit)
-
-|`consulting`
-|the worker asked another role and waits for the answer
-|`executing` (answer delivered), `lost`
-
-|`submitted`
-|the result is accepted; the lease is released
-|`waiting`, `ended`
-
-|`lost`
-|the server has ended the worker; its lease is released at once
-|terminal for the worker; the task returns to the queue for a successor
-
-|`ended`
-|the worker ended on the server's instruction
-|terminal
-|===
+A worker is _waiting_ while it holds a wait call, _offered_ once a task is leased to it, _acknowledged_ and then _executing_ while it works along the task's links, and _consulting_ while it waits for another role's answer. A submit leads back to waiting or to the end. A worker the server gives up on is _lost_: its lease is released at once and its task returns to the queue for a successor.
 
 [#supervision]
 == Supervision
 
-The server ends a worker, and starts a successor when there is work:
+Neither the transport nor the model reports that a worker is lost or about to give up. The server therefore watches each worker itself and tells two cases apart.
 
-[cols="2,3,3", options="header"]
-|===
-|Trigger |Rule |Basis in Part A
+A worker is *lost* when it stops doing its part: its process exits without the server's instruction, it does not acknowledge an offer in time, or it falls silent, with no open wait call and no other call for longer than its host allows. The server ends it, and its task goes to a successor.
 
-|Process exit
-|the harness process ends without the server's instruction
-|the strongest signal: both measured failure modes ended the headless process (V2, V3)
+A warm worker is *recycled* before it fails: after a run of wake-ups without a task, because a long-idle worker tends to give up and every wake-up costs, or when its context approaches the role's token budget, because a warm loop breaks as its context grows. A recycle is no loss: the server answers the worker's next wait with "end", never in the middle of a task.
 
-|Silence
-|no open wait call and no call for longer than the bounded wait plus a grace
-|the grace lies above the longest provider stall measured (V2), set per profile
-
-|Missing acknowledgement
-|no acknowledgement within the deadline after an offer
-|to be calibrated by xref:evaluation.adoc#e1[E1]; the deadline must tolerate provider stalls
-
-|Idle period
-|a few wake-ups without a task (about 15 minutes)
-|workers gave up after long empty waits (V2); idling costs per wake-up (V6)
-
-|Token budget
-|the context, taken from the per-turn usage, approaches the budget of the role and model
-|the warm loop breaks as the context grows (V3); the budget lies well below that point
-
-|Untrusted text (optional)
-|after a task that carried untrusted text
-|not required by V8, which found no carry-over between tasks
-|===
-
-Ending a worker: `SIGTERM` (V4), then `SIGKILL`. A terminated worker reports no usage; its usage is recorded as unmeasured.
+A worker that exits before its first call has not been lost but failed to start, typically because its harness cannot start at all. Replacing it would start workers without end, so after a few such starts the server starts no more workers of that role on that harness, tells the operator, and lets the role's tasks take their fallback (<<task-end>>). The detection rules are specified in link:../../specification/model-work/03-supervision-and-recycling.adoc[Model Work Specification, Supervision & Recycling].
 
 == Fencing and leases
 
 image::../../resources/harness-as-worker-worker-replacement.svg[A stalled worker of generation 1 is replaced by generation 2, which receives the same task; the late submit of generation 1 is refused, align=center]
 
-* Every worker has a generation, issued by the supervisor with the job token and carried by the relay.
-* A task is leased to one generation. A call or submit of another generation for that task is refused (V9).
-* When the server replaces a worker, it releases the lease at once instead of waiting for its expiry, and offers the task to the successor exactly once.
+* Every worker has a generation, issued with its job token and carried by the relay.
+* A task is leased to one generation; a call or submit of another generation for that task is refused.
+* When the server replaces a worker, it releases the lease at once and offers the task to the successor exactly once.
 * The successor starts with an empty context. Nothing is handed over, because every task carries what its state needs.
+
+[#task-end]
+== How a task ends
+
+A task ends in one of four outcomes. It is _submitted_ when the worker delivered its result through the offered link. It is _asked_ when the worker needs an answer it cannot find: the question becomes a record the server serves, and the work continues in a new task with the answer in its facts. It is _infeasible_ when the worker shows with evidence that the task cannot be done as given, which the creating state answers by its infeasible route. It is _lost_ when no worker delivers.
+
+A lost attempt is not yet a lost task: the server offers the task again, to a successor, within a small budget of re-offers. Only when that budget is spent, or when no qualified worker of the role can be started at all, does the task end lost, and the state that created it takes its declared conservative fallback. No outcome asks the operator mid-plan.
 
 [#consultation]
 == Consultation
 
-A worker that needs another model's judgment asks through the server, never directly:
+A worker that needs another model's judgment asks through the server, never directly, and only where the workflow provides for it: a state declares the consultations it offers by role name (for example `consult role triage-review`), and the server looks up that role's configuration like any other.
 
-. In `executing`, the worker follows a consultation link and submits the question.
-. The server creates a task for the consulted role and runs it like any other task (warm worker or fresh job).
-. The asker waits in `consulting` within its bounded wait, with progress frames where the host needs them.
+. While executing, the worker follows one of the consultation links its state offers and submits the question.
+. The server creates a task for the named role and runs it like any other task.
+. The asker waits within its bounded wait, with progress frames where the host needs them.
 . The answer arrives as the answer to the asker's next wait; the asker continues and refers to the consultation in its final submit.
 
 image::../../resources/harness-as-worker-consultation.svg[A worker asks another role through the server and receives the answer through its pending wait, align=center]
 
 The flow is deterministic and stays within the single-level leaf constraint: a worker never starts another model itself.
 
-[#parameters]
-== Parameters per host
+== The interactive session as a worker
 
-Derived from the transport limits of xref:measurements.adoc#transport-limits[Measurements, V1] and the supervision values of xref:measurements.adoc#evaluation-stage-1[Measurements, Evaluation Stage 1] (small models; Antigravity extrapolated).
-
-[cols="2,2,2,2", options="header"]
-|===
-|Parameter |Claude Code |OpenCode |Antigravity
-
-|`bounded_wait_seconds`
-|240
-|240, with progress frames
-|150
-
-|`progress_resets_timeout`
-|true
-|true
-|false
-
-|Acknowledgement
-|explicit
-|explicit, informational
-|explicit (extrapolated)
-
-|`ack_deadline_seconds`
-|15 (p99.9 6.4 s, longest stall 5.9 s)
-|270, the silence limit: a live worker stalled for 120.8 s after an offer, so no shorter deadline separates live from lost workers
-|30 (extrapolated from 100 tasks: p99.9 15.9 s)
-
-|Silence: bounded wait plus `silence_grace_seconds`
-|240 + 30
-|240 + 30
-|150 + 30
-
-|Idle recycle
-|after 3 wake-ups without a task (12 minutes)
-|after 3 wake-ups (12 minutes)
-|after 3 wake-ups (7.5 minutes, extrapolated)
-
-|Token budget (small model)
-|80k; recycled at 83k, below the break at 135k of V3
-|80k ; recycled at 81k
-|80k (extrapolated)
-|===
+The session that started a plan may take a task when it is attentive, beside a headless worker that takes the task when the session does not acknowledge in time. It takes only tasks that change nothing, of a `read_only` role whose configuration offers its tasks to a session first, and only on a host whose session can take tasks at all; a writer's task never goes to a session, because the session runs outside the confinement. The plan never waits on the session. Each start of a session gives it a new generation, which fences an earlier loop of the same session that may still be running.

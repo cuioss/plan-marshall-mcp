@@ -1,0 +1,135 @@
+= Runtime & Interaction Model Specification: Relay
+:toc: left
+:toclevels: 3
+:toc-title: Table of Contents
+:sectnums:
+:source-highlighter: highlight.js
+:nofooter:
+
+link:../../Specification.adoc[Specification] » link:../runtime-model.adoc[Runtime & Interaction Model Specification] » Relay
+
+== Relay (`pm-mcp serve`)
+_See Requirement link:../../Requirements.adoc#PM-SEC-4[PM-SEC-4: Local Transport Isolation, Operator-Gated Network Exposure & Stream Hygiene]_
+
+_See Requirement link:../../Requirements.adoc#PM-TOOL-5[PM-TOOL-5: Tool Schema Stability & Context Budget Discipline]_
+
+The relay is the only way a host session or a worker reaches the runtime's MCP endpoint. It carries the identity and generation of its session or worker, so that a model never sees, passes, or invents them, and it keeps the host's view of the runtime consistent when a stream or the runtime is lost. The measurements behind its rules are recorded in the link:../evaluation.adoc[Evaluation Reference].
+
+=== Contract
+
+* *Two modes*: `pm-mcp serve --client <client>` is the relay of a host session; the client bundle writes it, with the host's client id (`claude`, `opencode`, `antigravity`, `codex`, `neutral`), into the host's MCP configuration (link:../cli-and-security/01-cli-and-installer.adoc#client-installer[CLI, Coordination & Security Specification, Client Bundle Installer]). `pm-mcp serve --job --socket <path>` is the relay of a worker; only the MCP configuration the runtime composes for a worker starts it (link:../model-work/04-worker-launch.adoc[Model Work Specification, Worker Launch]). Started without `--job` while `PM_MCP_JOB_ID` is set, `pm-mcp serve` exits at once with a diagnostic on `stderr`, so a harness that loads a project's own MCP configuration cannot open a session connection from inside a worker.
+* *Transparent otherwise*: The relay is a JSON-RPC 2.0 message relay. It maps each `stdin` message to a request to the runtime's Streamable HTTP endpoint `/mcp` and writes every message the runtime emits for this connection to `stdout`, preserving JSON-RPC `id` values unchanged. It changes a message only where <<relay-rules,Relay Rules>> say so; it does not render representations, interpret tool results, or hold workflow state.
+* *Stream hygiene*: `stdout` carries only newline-delimited JSON-RPC 2.0 messages, each serialized as one UTF-8 line and flushed immediately. Diagnostics go to `stderr` only (`PM-SEC-4`).
+* *Credentials*: The session relay holds no credential other than the runtime token, which it reads with the client check of link:01-processes-and-transport.adoc#runtime-token[Local Trust: Runtime Token] and sends as `Authorization: Bearer` on every request (re-reading it once on a `401`); the token never reaches `stdout`, `stderr`, or the host. The worker relay holds the job token instead: it reads it from `PM_MCP_JOB_TOKEN`, sends it as `PM-MCP-Job-Token`, connects to the socket path the runtime put into the worker's MCP configuration, reads no file of `<PM_MCP_BASE>` (outside its job-private directory a worker cannot), and never starts the runtime; a refused token ends it with a diagnostic on `stderr` (link:01-processes-and-transport.adoc#job-token[Local Trust: Job Token]). No relay starts jobs.
+* *Build*: The relay is the `serve` command of the relay binary `pm-mcp` (module `pm-relay`: plain native image, no Quarkus, no MCP server); the session relay starts `pm-mcpd` on demand (link:01-processes-and-transport.adoc#_start_modes[Start Modes]). Its startup budget is defined in `PM-TECH-3`.
+
+=== Host Protocol Forms
+
+Hosts reach a server in two forms, and the relay serves both while it always talks to the runtime without an MCP session:
+
+* *Sessionless hosts* (MCP `2026-07-28`; Claude Code and Antigravity): the host first sends `server/discover` and then every request on its own, with the protocol version, `clientInfo`, and capabilities in `params._meta` of each request. Claude Code falls back to `initialize` when discovery fails.
+* *Session-opening hosts* (MCP `2025-11-25`; OpenCode): the host sends `initialize` and `notifications/initialized` once and then its requests.
+
+The runtime answers `server/discover` and `initialize` itself, issues no `Mcp-Session-Id`, and keeps nothing per connection (`PM-ARCH-4`). The relay records the protocol data of the host's `initialize`, or takes it from each request's `params._meta`, and sends it with every forwarded request (<<_connection_metadata,Connection Metadata>>), so every request is self-describing and a runtime restart loses only the requests in flight. Milestone 0 verifies that the pinned MCP version and the Quarkus MCP server support sessionless Streamable HTTP for both forms. If they do not, the documented fallback is a session-holding runtime whose relay replays the recorded `initialize` and `notifications/initialized` when the runtime answers an unknown session or reports a new instance, suppresses the duplicate response to the host, and fails the old session's open server requests.
+
+=== Connection Metadata
+
+The relay sends the following HTTP headers on every request it forwards. The runtime evaluates them per request in its authentication mechanism, which turns them into the request's security identity; tool and resource handlers read that identity and never an HTTP header, because headers do not reach a handler of the Quarkus MCP server. Milestone 0, Part B verifies that the security identity reaches every handler; the fallback is that the relay carries the same values in `params._meta` under the key prefix `de.cuioss.pm-mcp/`.
+
+[cols="1,1,3"]
+|===
+|Header |Sent by |Content
+
+|`Authorization` / `PM-MCP-Job-Token`
+|session / worker
+|The runtime token, or the worker's job token (link:01-processes-and-transport.adoc#job-token[Local Trust: Job Token]).
+
+|`Mcp-Method`, `Mcp-Name`
+|both
+|The JSON-RPC method of the message and, for a call by name (`tools/call`), the tool name, derived by the relay from each message, because the runtime's transport refuses a request without them and a sessionless host does not send them.
+
+|`PM-MCP-Relay-Version`
+|both
+|The relay binary's version (for mismatch detection, link:02-startup-recovery-drain.adoc#_drain_stop_upgrade[Drain, Stop & Upgrade]).
+
+|`PM-MCP-Protocol-Version`, `PM-MCP-Client-Info`, `PM-MCP-Client-Capabilities`
+|both
+|The protocol version, `clientInfo`, and capabilities (for example elicitation, progress, and the client capability of the MCP Skills Extension) of the host, from its `initialize` request or from the request's `params._meta`; the runtime derives every capability-dependent behaviour from these values on each request (link:04-sessions-and-workers.adoc#_connection_scoped_rendering[Connection-Scoped Rendering]).
+
+|`PM-MCP-Client`
+|session
+|The client the relay declares (`--client`). The runtime renders every call of the session from that client's profile (`PM-CLIENT-1`); a call is never checked against the host environment, which is audited once at entry (link:../cli-and-security/02-credentials-and-operator.adoc#_security_audit_trail_three_tier_identity_verification[CLI, Coordination & Security Specification, Security Audit Trail]).
+
+|`PM-MCP-Workspace`
+|session
+|The canonical git top-level of the relay's working directory. Resolves every workspace-addressed request (`PM-ARCH-4`): `pm_plans`, `pm_epics`, every call with `plan_id: NO_PLAN` (link:../identifiers/01-general-rules-and-registry.adoc#id-no-plan[Identifier Registry, `NO_PLAN`]; `pm_build`, `pm_lsp`, `pm_skill`, `pm_skills`, `pm_skill_file`, `pm_state`, `pm_do`), `resources/read` of `skill://` URIs, and the upstream pass-through tools `up_*`. The runtime resolves the header on every such request by the project resolution rule (link:../filesystem-layout/03-project-store.adoc#project-resolution[Filesystem Layout Specification, Project Resolution Rule]), the same rule `pm-mcp enter` applies; a directory that does not resolve to an enrolled project fails with `project_not_enrolled`. For scope-addressed calls (`plan_id`, `epic_id`) the header only selects the per-project machine store in which the scope is looked up (link:../filesystem-layout/03-project-store.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]); the main checkout is the enrolled `project_root`.
+
+|`PM-MCP-Generation`
+|both
+|The generation of the session or the worker (<<_generations_at_the_relay,Generations at the Relay>>).
+
+|`PM-MCP-Host-Marker`
+|session
+|A clear, compaction, or new-session marker of the host, passed on with the next request where the host provides one; `worker.host_markers` of the client profile lists the marker kinds a host reports (link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Profile Schema]).
+|===
+
+A request carrying `PM-MCP-Job-Token` is a worker connection: the runtime ignores every header but the token, the generation, the relay version, and the protocol data, and takes the project, role, client profile, and the leased task entities from the job record and the task queue, for a tool call and for `resources/list` and `resources/read` alike. The host session identifier is no connection metadata: `pm-mcp enter` records it in the entry row, and the session relay sends it only in its generation binding.
+
+=== Generations at the Relay
+_See Requirement link:../../Requirements.adoc#PM-WORK-5[PM-WORK-5: Interactive Session as Optional Worker]_
+
+A generation identifies one worker or one session start; tasks are leased to it, and every call of a fenced generation is refused (`generation_fenced`). Its semantics are those of the task protocol (link:../model-work/02-task-protocol.adoc[Model Work Specification, Task Protocol]); this section defines how a relay comes to carry one.
+
+* *Worker*: The generation is the worker's `job_id`, read from `PM_MCP_JOB_ID`. A host that kills and restarts its `stdio` server mid-session (Claude Code does so by itself) starts a new relay with the same environment, so the new relay carries the same generation, and the runtime binds it as long as that generation is not fenced. A worker relay never asks for another generation.
+* *Session identity*: The project, the declared client, and the host session identifier, which the relay reads, like `pm-mcp enter`, from the session ID variable of the link:../client-profiles/02-placeholders-and-detection.adoc#host-integration-table[Host Integration Table]; where the host provides none, the identity is the relay instance itself. Then a generation that `pm-mcp enter` issues (with a null host session identifier) is matched by no relay, the relay binds per relay instance (`relay_start`), and the `session_key` of its generations is the relay-instance key (link:../store-schemas/16-task-queue.adoc#session-generation-record[Store Schemas Specification, Session Generation Record]).
+* *Binding*: Before its first forwarded request the session relay binds its generation (`POST /api/v1/session-generations` with the workspace, the declared client, the host session identifier, and the reason `relay_start`). The runtime returns the identity's current generation when one exists and is not fenced (a relay restarted by its host continues in its session's generation) and otherwise issues a new `sg-` generation. The relay binds again with the reason `new_session` only when it observes a new host session: a change of the host session identifier it reads, or a host marker that reports a new session; the runtime then always issues a new generation. A repeated `initialize` or `server/discover` on a live relay is no new session (a sessionless host sends `server/discover` again on its own, and Claude Code falls back to `initialize` after a failed discovery): the relay records its protocol data and keeps its generation. `pm-mcp enter` issues a new generation for its session identity as well (link:../cli-and-security/01-cli-and-installer.adoc#_entry_identity_recording_pm_mcp_enter[CLI, Coordination & Security Specification, Entry Identity Recording]).
+* *Fencing*: A new generation fences every earlier generation of the same session identity at once; their task leases are released, and their tasks are offered again (link:../model-work/02-task-protocol.adoc[Model Work Specification, Task Protocol]). A request carrying a generation that `pm-mcp enter` of the same identity replaced (the entry command ran in this host session) is answered at the transport with `409` and the code `generation_superseded` (link:../mcp-tools/04-errors-and-testing.adoc#relay-transport-codes[MCP Tools Specification, Relay and Transport Codes]), before it reaches a handler; the relay then binds again with `relay_start` and repeats the request once. Every other request of a fenced generation reaches its handler and is refused with `generation_fenced` (link:../mcp-tools/04-errors-and-testing.adoc[MCP Tools Specification, Errors]).
+* *One loop per relay*: The runtime tells loops apart only by the generation their relay carries. Two loops of a host that share one relay (a new host session that leaves the earlier loop running behind the same relay) are indistinguishable; such a host takes no session tasks (`worker.session_tasks: false` in its client profile, link:../client-profiles/01-profile-schema.adoc[Client Profiles Specification, Profile Schema]). Within one generation, the runtime never offers a leased task to a second concurrent `pm_wait`.
+* *Host markers*: After a clear or compaction marker the runtime treats the session as gone for task offers until it calls `pm_wait` again, and delivers the required skills again to that generation (link:../model-work/04-worker-launch.adoc[Model Work Specification, Skill Delivery]). A clear or compaction the host does not report stays invisible to the runtime; the shim skill of the client bundle covers it (`PM-SKILL-4`).
+
+[#relay-rules]
+=== Relay Rules
+_See Requirement link:../../Requirements.adoc#PM-ARCH-3[PM-ARCH-3: STDIO Host Transport, Local Relay & Frontier Protocol Compliance]_
+
+_Implementation watch: link:../../implementation-watch/runtime-model.adoc#PM-WATCH-RUN-10[PM-WATCH-RUN-10], link:../../implementation-watch/runtime-model.adoc#PM-WATCH-RUN-11[PM-WATCH-RUN-11]_
+
+image::../../resources/harness-as-worker-relay-rules.svg[Three relay rules: add the headers a sessionless host does not send, never answer a notification, report a lost server at once, align=center]
+
+The relay changes the message stream only by these rules:
+
+. *Add the transport headers*: It derives `Mcp-Method` and `Mcp-Name` from each message and sends them with the headers of <<_connection_metadata,Connection Metadata>>.
+. *Never answer a notification*: It forwards a host notification and discards whatever the runtime's transport returns for it (the transport returns a body for some notifications of a sessionless host, for example `notifications/roots/list_changed`); nothing reaches `stdout` for a notification, because a host may end the server on an unexpected message.
+. *Report a lost runtime at once*: When its stream to the runtime is lost, or the runtime does not accept connections within the start timeout, it answers every pending request at once with a JSON-RPC error carrying the closed code `runtime_unavailable` (link:../mcp-tools/04-errors-and-testing.adoc#relay-transport-codes[MCP Tools Specification, Relay and Transport Codes]), so a host never waits out its own limit on a dead server; it keeps retrying on subsequent requests.
+. *Ignore a cancellation of an answered request*: It drops a host's `notifications/cancelled` whose `requestId` it has already answered (a host may cancel every call after its answer); the runtime likewise ignores a cancellation of a request it has answered.
+. *Hide identity arguments*: It removes every property of the closed identity set (`generation_id`, `role`, `worker`, `job_token`) from the `inputSchema` of every tool in a `tools/list` result before writing it to `stdout`, and drops such an argument from a host's `tools/call` before forwarding it. Identity, role, and generation travel only in the relay's headers; the runtime's own tool schemas declare none, and a value a model invents is never forwarded.
+. *Tolerate a restart*: It holds no state a restart could lose: a relay started again by its host reads its identity from its environment again and binds to the same generation (<<_generations_at_the_relay,Generations at the Relay>>).
+. *Pass host markers*: It passes a clear, compaction, or new-session marker its host provides as `PM-MCP-Host-Marker` with the next request, and binds a new generation for a new session.
+
+== Request and Response Flow
+
+=== Normal Call
+
+[source,text]
+----
+Host or worker      pm-mcp serve (relay)             pm-mcpd runtime
+ │ stdin: request id=7    │                                │
+ ├───────────────────────▶│ POST /mcp (token, Mcp-*,       │
+ │                        │  PM-MCP-* headers)             │
+ │                        ├───────────────────────────────▶│ bind identity, lock, validate,
+ │                        │                                │ transition, persist, render
+ │                        │◀───────────────────────────────┤ response id=7 (JSON or SSE event)
+ │ stdout: response id=7  │                                │
+ │◀───────────────────────┤                                │
+----
+
+Each host request receives exactly one response with its own `id`.
+
+=== Messages from Runtime to Host
+
+* *Progress notifications* (`notifications/progress`) and *server requests* related to a pending call (`elicitation/create`, only on a session connection and only for the choices of the project setup and the bootstraps, link:04-sessions-and-workers.adoc#_connection_scoped_rendering[Connection-Scoped Rendering]) arrive on that call's SSE response stream. The relay writes them to `stdout` in arrival order.
+* The host's answer to a server request arrives on `stdin`. The relay posts it to the runtime, which routes it to the waiting call.
+* There are no messages unrelated to a pending call: without sessions the runtime opens no standalone SSE stream (`GET /mcp`) and offers no resource subscriptions or `list_changed` notifications. Clients detect changed skills through their content digest (link:../mcp-tools/02-service-and-skill-tools.adoc[MCP Tools Specification, Skill Tools]). A task reaches a worker only as the answer to its pending `pm_wait` (link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, `pm_wait`]).
+
+=== Cancellation
+
+A host `notifications/cancelled` for a pending call is forwarded to the runtime and cancels only that call. A cancelled `pm_wait` ends without consuming a task: a task is leased only with the offer that answers a wait, never before. A cancelled `pm_build` wait leaves the build running. A cancellation never cancels a job: jobs are cancelled only by the engine (a short-circuited composite wait, a fenced worker) and by the operator (`PM-WF-8`). A cancellation of a request already answered is ignored (<<relay-rules,Relay Rules>>, rule 4).

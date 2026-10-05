@@ -12,7 +12,7 @@ link:../../Specification.adoc[Specification] » link:../state-catalogue.adoc[Sta
 == Bootstrap of a Plan: `bootstrap-plan`
 _See Requirement link:../../Requirements.adoc#PM-WF-1[PM-WF-1: Hypermedia State Representation (HATEOAS)]_
 
-Every scope is created by the bootstrap of its kind; there is no creation tool. `pm-mcp enter` records a pending entry record (kind, the requested id, a free-text hint of the user's words) and prints its `entry_id` unless it names a live scope (link:../cli-and-security/01-cli-and-installer.adoc[CLI, Coordination & Security Specification, `pm-mcp enter`]). `bootstrap-plan.pmwf` and `bootstrap-epic.pmwf` are compiled-only entity units hosted by the workspace scope (`phase inherit`, phase value `workspace`): one instance per pending entry record, instance id = `entry_id`, state kept in the record, addressed with `pm_state` / `pm_do(plan_id: "NO_PLAN", entity: "<entry_id>")` (link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, Core Workflow Tools]). Nothing exists under `plans/` or `epics/` before the `create` link succeeds, so an abandoned or swept entry leaves no scope. Choosing what to work on is the user's intent relayed by the model: the bootstrap offers links, never question records, waits, or fallbacks (link:../phase-workflows/07-questions-waivers-operator-influence.adoc#questions-waivers-operator-influence[Phase Workflows Specification, Questions, Waivers & Operator Influence]). Each way to start is one source unit and one link; the model maps the user's words onto a link, and the server validates every argument. Every terminal deletes the pending record in the transaction that enters it; the pending-record sweep removes records that never reach one, and a later `pm_state` on that `entry_id` is refused `scope_not_found`.
+Every scope is created by the bootstrap of its kind; there is no creation tool. `pm-mcp enter` records a pending entry record (kind, the requested id, a free-text hint of the user's words) and prints its `entry_id` unless it names a live scope (link:../cli-and-security/01-cli-and-installer.adoc[CLI, Coordination & Security Specification, `pm-mcp enter`]). `bootstrap-plan.pmwf` and `bootstrap-epic.pmwf` are compiled-only entity units hosted by the workspace scope (`phase inherit`, phase value `workspace`): one instance per pending entry record, instance id = `entry_id`, state kept in the record, addressed with `pm_state` / `pm_do(plan_id: "NO_PLAN", entity: "<entry_id>")` (link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, Core Workflow Tools]). Nothing exists under `plans/` or `epics/` before the `create` link succeeds, so an abandoned or swept entry leaves no scope. Choosing what to work on is the user's intent relayed by the model: the bootstrap offers links, never question records, waits, or fallbacks (link:../phase-workflows/07-questions-waivers-operator-influence.adoc#questions-waivers-operator-influence[Phase Workflows Specification, Questions, Waivers & Operator Influence]). Each way to start is one source unit and one link; the model maps the user's words onto a link, and the server validates every argument. The one exception is a plan of an epic: the server writes its pending entry record itself when it starts the epic's row (`epic.next-work` in `epic.active`) and drives that bootstrap without a session, from `start.resolve` through `start.source-epic-row` to `start.launch`; no link of it is followed. Every terminal deletes the pending record in the transaction that enters it; the pending-record sweep removes records that never reach one, and a later `pm_state` on that `entry_id` is refused `scope_not_found`.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -22,8 +22,8 @@ Every scope is created by the bootstrap of its kind; there is no creation tool. 
 |inherit (`workspace`)
 |`auto`
 |The pending entry record of kind `plan` (the unit's start state); `start.setup-required` (`recheck`).
-|`auto start.resolve` over the record: the setup predicates (first run not completed, `setup.needs-repair` current, integration variant unset, `.marshall/config/` dirty), then the entry: a requested id naming a live plan; a record with `from_epic` (written only from the `--from-epic` flag of `pm-mcp enter`, the authoritative epic pointer; never derived from the id), routed to its source unit, which verifies the queue row; an archived plan (fact `archived`, read-only); or an unknown id (kept as the slug proposal). A requested id that equals a `launched` queue row while `from_epic` is absent or names another epic is not a row entry: it goes to `start.choose` with the fact `epic_pointer_mismatch`, and the commit re-check refuses it both ways (link:../mcp-tools/01-core-workflow-tools.adoc#bootstrap-commit-recheck[MCP Tools Specification, Bootstrap Commit Re-Check]). The hint is carried into `facts`.
-|`setup_required` -> `start.setup-required`; `live` -> `start.resumed`; `epic_row` (`from_epic` set) -> `start.source-epic-row`; `choose` (archived, unknown, no id, or a launched row id without its epic) -> `start.choose`.
+|`auto start.resolve` over the record: the setup predicates (first run not completed, `setup.needs-repair` current, integration variant unset, `.marshall/config/` dirty), then the entry: a requested id naming a live plan; a record with `from_epic` (written only by the server when it starts an epic's row, the authoritative epic pointer; never derived from the id), routed to its source unit, which verifies the queue row; an archived plan (fact `archived`, read-only); or an unknown id (kept as the slug proposal). A requested id that equals a non-terminal queue row of some epic while `from_epic` is absent is not a row entry: it goes to `start.choose` with the fact `epic_pointer_mismatch`, and the commit re-check refuses it, because that row's plan is started only by its epic (link:../mcp-tools/01-core-workflow-tools.adoc#bootstrap-commit-recheck[MCP Tools Specification, Bootstrap Commit Re-Check]). The hint is carried into `facts`.
+|`setup_required` -> `start.setup-required`; `launch_refused` (a record with `from_epic` whose setup predicates fail: no session can drive the setup, so the row is marked `held` with the reason `setup_required`) -> `start.abandoned`; `live` -> `start.resumed`; `epic_row` (`from_epic` set) -> `start.source-epic-row`; `choose` (archived, unknown, no id, or a queue row id without its epic) -> `start.choose`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]
 
 |[[state-start.setup-required]]`start.setup-required`
@@ -38,31 +38,39 @@ Every scope is created by the bootstrap of its kind; there is no creation tool. 
 |inherit (`workspace`)
 |`link`
 |`start.resolve` (`choose`); `start.source-<kind>` (`stepped_out`); `start.ready` (`back`).
-|`facts`: five server-computed local listings, each with its count and at most ten entries, most recent first: live plans with phase and `last_entered`; active, unclaimed lessons (id, title, category); recipes, compiled and project-local (key, title, whether they take parameters); local changes present (a boolean, path count, commits ahead); `launched` epic rows not yet started. Full lists: `pm://workspace/lessons`, `pm://workspace/recipes` (link:../mcp-tools/03-resource-uris.adoc[MCP Tools Specification, Resource URIs]); plans with `pm_plans`. Issues and pull requests are not listed; the user names a number. Links: `resume:<plan_id>`; `new_request` (`submit`, `request: text[1..32768]`); `new_issue` (`submit`, `issue_number`); `new_lesson:<lesson_id>`; `new_recipe:<recipe_key>`; `new_local_changes`; `new_pr` (`submit`, `pr_number`); `new_epic_row:<plan_id>`; `maintain:lessons`; `abandon`.
-|`resume` -> `start.resumed`; `new_request` -> `start.ready`; `new_issue`, `new_lesson`, `new_recipe`, `new_local_changes`, `new_pr`, `new_epic_row` -> the matching `start.source-<kind>`; `maintain:lessons` -> `start.handed-over`; `abandon` -> `start.abandoned`.
+|`facts`: four server-computed local listings, each with its count and at most ten entries, most recent first: live plans with phase; active, unclaimed lessons (id, title, category); recipes, compiled and project-local (key, title, whether they take parameters); local changes present (a boolean, path count, commits ahead). Full lists: `pm://workspace/lessons`, `pm://workspace/recipes` (link:../mcp-tools/03-resource-uris.adoc[MCP Tools Specification, Resource URIs]); plans with `pm_plans`. Issues and pull requests are not listed; the user names a number. Links: `resume:<plan_id>`; `new_request` (`submit`, `request: text[1..32768]`); `new_issue` (`submit`, `issue_number`); `new_lesson:<lesson_id>`; `new_recipe:<recipe_key>`; `new_local_changes`; `new_pr` (`submit`, `pr_number`); `maintain:lessons`; `abandon`. A plan of an epic is never started here: the server launches it.
+|`resume` -> `start.resumed`; `new_request` -> `start.ready`; `new_issue`, `new_lesson`, `new_recipe`, `new_local_changes`, `new_pr` -> the matching `start.source-<kind>`; `maintain:lessons` -> `start.handed-over`; `abandon` -> `start.abandoned`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]
 
 |[[state-start.source]][[state-start.source-issue]][[state-start.source-lesson]][[state-start.source-recipe]][[state-start.source-local-changes]][[state-start.source-pr]][[state-start.source-epic-row]]`start.source-<kind>`: `start.source-issue`, `start.source-lesson`, `start.source-recipe`, `start.source-local-changes`, `start.source-pr`, `start.source-epic-row`
 |inherit (`workspace`)
 |`call`
 |`start.choose` (the matching `new_<kind>` link); `start.resolve` (`epic_row`, `start.source-epic-row` only).
-|`call source-<kind>` with the link's argument (<<state-catalogue-source,Source Units>>); guided step-in to the unit's first resting state.
-|`done` -> `start.ready` (the source record kept in the pending record); for `start.source-lesson` `done` with `result.retired` -> `start.abandoned` (the lesson was retired, no plan); `stepped_out` -> `start.choose`.
+|`call source-<kind>` with the link's argument (<<state-catalogue-source,Source Units>>); the unit's first state becomes current.
+|`done` -> `start.ready` (the source record kept in the pending record); for `start.source-lesson` `done` with `result.retired` -> `start.abandoned` (the lesson was retired, no plan); `stepped_out` -> `start.choose`. `start.source-epic-row`: `done` -> `start.launch`; `stepped_out` (a server step-out naming the refusal) -> `start.abandoned`, the row marked `held` with the reason.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]
 
 |[[state-start.ready]]`start.ready`
 |inherit (`workspace`)
 |`link`
 |`start.choose` (`new_request`); `start.source-<kind>` (`done`); itself (`set_slug`, a refused `create`).
-|`facts`: the source summary (the request, the screened issue title, the lesson and its premise evidence, the recipe and its parameters, the local change set, the pull request, or the epic row's spec section), the derived `plan_id` and whether it is free, and after a refused `create` the fact `commit_refused` (`reason`, `detail`; link:../mcp-tools/01-core-workflow-tools.adoc#bootstrap-commit-recheck[MCP Tools Specification, Bootstrap Commit Re-Check]). Links: `create` (`submit`: plan options `posture?`, `review_outline?`, `base_branch?`); `set_slug` (`submit`, `plan_slug`; not for the derived ids of `recipe`, `pr`, and `epic_row` sources) re-derives the id; `resume:<plan_id>` while the derived id names a live plan (an archived one offers only `set_slug`); `back`; `abandon`.
-|`create` runs `start.create-scope`, which re-checks in its transaction what could change since the choice (identifier taken, the lifecycle gate: while it is closed only a project enrolled as a pilot creates scopes, otherwise `lifecycle_closed`; configuration state, lesson still unclaimed, epic row still `launched`, pull request head, a non-empty local-changes capture): `created` (the plan scope exists at `init.classify`, the lesson claimed, the epic row set `running`, the local changes captured as a snapshot commit) -> `start.committed`; `refused{reason}` -> this state. `set_slug` -> this state; `resume` -> `start.resumed`; `back` -> `start.choose`; `abandon` -> `start.abandoned`.
+|`facts`: the source summary (the request, the screened issue title, the lesson and its premise evidence, the recipe and its parameters, the local change set, or the pull request), the derived `plan_id` and whether it is free, and after a refused `create` the fact `commit_refused` (`reason`, `detail`; link:../mcp-tools/01-core-workflow-tools.adoc#bootstrap-commit-recheck[MCP Tools Specification, Bootstrap Commit Re-Check]). Links: `create` (`submit`: plan options `posture?`, `review_outline?`, `base_branch?`); `set_slug` (`submit`, `plan_slug`; not for the derived ids of `recipe` and `pr` sources) re-derives the id; `resume:<plan_id>` while the derived id names a live plan (an archived one offers only `set_slug`); `back`; `abandon`.
+|`create` runs `start.create-scope`, which re-checks in its transaction what could change since the choice (identifier taken, the lifecycle gate: while it is closed only a project enrolled as a pilot creates scopes, otherwise `lifecycle_closed`; configuration state, lesson still unclaimed, pull request head, a non-empty local-changes capture): `created` (the plan scope exists at `init.classify`, the lesson claimed, the local changes captured as a snapshot commit) -> `start.committed`; `refused{reason}` -> this state. `set_slug` -> this state; `resume` -> `start.resumed`; `back` -> `start.choose`; `abandon` -> `start.abandoned`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts]; link:../store-schemas/01-format-and-session-log.adoc[Store Schemas Specification, Pending Entry Record]
+
+|[[state-start.launch]]`start.launch`
+|inherit (`workspace`)
+|`auto`
+|`start.source-epic-row` (`done`).
+|`auto start.create-scope` for a plan the server launches for its epic, without a session and without a link: the same transaction and re-checks as the `create` link of `start.ready` (identifier free, the lifecycle gate or the project's pilot enrolment, configuration state, the epic row still launchable); `request.md` is the row's staged spec section, the `plan_id` the row's, and the plan options the projection's defaults.
+|`created` (the plan scope exists at `init.classify` with `origin.epic_id` and `origin.source: epic_row`, the epic row set `running`) -> `start.committed`; `refused{reason}` -> `start.abandoned` (the row marked `held` with the reason).
+|link:../model-work/08-epic-coordination.adoc#server-started-plans[Model Work Specification, Server-Started Plans]
 
 |[[state-start.committed]][[state-start.resumed]][[state-start.handed-over]][[state-start.abandoned]]`start.committed`, `start.resumed`, `start.handed-over`, `start.abandoned`
 |inherit (`workspace`)
 |`terminal`
-|`start.ready` (`created`); `start.resolve` (`live`), `start.choose` and `start.ready` (`resume`); `start.choose` (`maintain:lessons`); `abandon` links and `start.source-lesson` (`done`, retired).
-|`links[0]`. Declared `terminal committed success`, `terminal resumed success`, `terminal handed_over success`, `terminal abandoned failure`. `facts` name the scope to continue with: the new or resumed plan (`pm_state(plan_id)`), or the workspace scope with its `maintain_lessons` link (`pm_state(NO_PLAN)`), which enters the call `setup.maintain-lessons`.
+|`start.ready`, `start.launch` (`created`); `start.resolve` (`live`), `start.choose` and `start.ready` (`resume`); `start.choose` (`maintain:lessons`); `abandon` links, `start.source-lesson` (`done`, retired), `start.resolve` (`launch_refused`), `start.source-epic-row` (`stepped_out`), and `start.launch` (`refused`).
+|`links[0]`. Declared `terminal committed success`, `terminal resumed success`, `terminal handed_over success`, `terminal abandoned failure`. `facts` name the scope to continue with: the new or resumed plan, which the session views (`pm_state(plan_id)`) while the server drives it, or the workspace scope with its `maintain_lessons` link (`pm_state(NO_PLAN)`), which enters the call `setup.maintain-lessons`.
 |—
 |link:../workflow-dsl/02-units-jobs-decisions.adoc#workflow-definition-units[Workflow DSL Specification, Workflow Definition Units]
 |===
@@ -70,7 +78,7 @@ Every scope is created by the bootstrap of its kind; there is no creation tool. 
 [#state-catalogue-source]
 === Source Units
 
-A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and checks one source before any scope exists; its exit contract is `done {source record}` or `stepped_out` (the model's `step_out` of a resting link state, which the bootstrap routes back to its choice). External text (issue and pull request title and body) passes the deterministic level-1 validator of the server first and then the level-2 screener, one `batch-v1` batch per firing (link:../dispatch-and-effort/06-untrusted-text-screening.adoc#two-level-guard[Model Jobs & Effort Specification, Two-Level Guard for External Text]); lesson, recipe, local-changes, and epic-row content is the project's own and is validated only. A new way to start is one more source unit and one more `start.choose` link.
+A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and checks one source before any scope exists; its exit contract is `done {source record}` or `stepped_out` (the model's `step_out` of a resting link state, which the bootstrap routes back to its choice; for `source-epic-row`, which the server runs without a session, the server step-out of `source-epic-row.refused`). External text (issue and pull request title and body) passes the deterministic level-1 validator of the server first and then the level-2 screener, one `batch-v1` batch per firing (link:../model-work/07-untrusted-text-screening.adoc#two-level-guard[Model Work Specification, Two-Level Guard for External Text]); lesson, recipe, local-changes, and epic-row content is the project's own and is validated only. A new way to start is one more source unit and one more `start.choose` link.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -80,7 +88,7 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 |inherit
 |`composite_job`
 |`call` (start state, `issue_number`); `source-issue.failed` (`retry`).
-|A bounded `ci.issue-view` through the project's provider module; title and body cleaned by the level-1 validator (every change reported) and stored in the pending record as the firing's batch. Implicit `wait:` / `cancel:` links.
+|A bounded `ci.issue-view` through the project's provider module; title and body cleaned by the level-1 validator (every change reported) and stored in the pending record as the firing's batch.
 |`fetched` -> `source-issue.screen`; `not_found`, `not_readable`, `provider_unavailable`, `cancelled` -> `source-issue.failed`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts (`issue`)]
 
@@ -88,7 +96,7 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 |inherit
 |`composite_job`
 |`call` (start state, `pr_number`); `source-pr.failed` (`retry`).
-|A bounded `ci.pr-view`: the pull request must be open and its head branch writable; title and body cleaned by the level-1 validator and stored as the firing's batch. The head is observed again by `create`. Implicit `wait:` / `cancel:` links.
+|A bounded `ci.pr-view`: the pull request must be open and its head branch writable; title and body cleaned by the level-1 validator and stored as the firing's batch. The head is observed again by `create`.
 |`observed` -> `source-pr.screen`; `pr_not_open`, `head_not_writable`, `not_found`, `provider_unavailable`, `cancelled` -> `source-pr.failed`.
 |link:../phase-workflows/01-planning-phases-1-2.adoc#_plan_source_contracts[Phase Workflows Specification, Plan Source Contracts (`pr`)]
 
@@ -135,34 +143,42 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 |[[state-source-epic-row.read]]`source-epic-row.read`
 |inherit
 |`auto`
-|`call` (start state, `plan_id`, `from_epic`); `source-epic-row.failed` (`retry`).
-|Reads the queue row under the epic lock: it must exist in that epic with status `launched` and a re-grounding verdict that is not `stale`; its staged spec section (claim sections parsed) becomes `request.md`, and the row's `plan_id` is the plan's (no slug). `origin.epic_id` and `origin.source = epic_row` are recorded for the creation, which sets the row `running`.
-|`bound` -> `source-epic-row.done`; `row_unknown`, `row_not_launched`, `spec_unreadable` -> `source-epic-row.failed`.
-|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Plan Emission]
+|`call` (start state, `plan_id`, `from_epic`).
+|Reads the queue row under the epic lock: it must exist in that epic and be launchable (prerequisites shipped, re-grounded at the current `HEAD`, not `stale`, no `unreadable` claim section); its staged spec section (claim sections parsed) becomes `request.md`, and the row's `plan_id` is the plan's (no slug). `origin.epic_id` and `origin.source = epic_row` are recorded for the creation, which sets the row `running`.
+|`bound` -> `source-epic-row.done`; `row_unknown`, `row_not_launchable`, `spec_unreadable` -> `source-epic-row.refused`.
+|link:../model-work/08-epic-coordination.adoc#server-started-plans[Model Work Specification, Server-Started Plans]
 
 |[[state-source.screen]]`source-<kind>.screen` (`source-issue`, `source-pr`)
 |inherit
 |`job`
 |The unit's fetch or observation (`fetched`, `observed`).
-|`job llm screen role screen.effort each screen.batch-parts` over the batch's items without a cached verdict (a fan-out with one screener job per batch part, one part unless the batch exceeds the screening split bound; a fully cached batch settles at once), zero tools, in the empty `cwd/` subdirectory of its job-private directory; fail-closed. A harness that cannot run it raises `precondition_unmet` (`harness_capability_missing`, `harness_unsupported`), whose `retry` stays offered.
-|`clean` -> `source-<kind>.done`; `suspicious` -> `source-<kind>.flagged`.
-|link:../dispatch-and-effort/06-untrusted-text-screening.adoc#screener[Model Jobs & Effort Specification, Screener Job]
+|`job llm screen role screener each screen.batch-parts` over the batch's items without a cached verdict (a fan-out with one screener task per batch part, one part unless the batch exceeds the screening split bound; a fully cached batch settles at once), zero tools, in the empty `cwd/` subdirectory of its job-private directory; fail-closed. A harness that cannot run it raises `precondition_unmet` (`harness_capability_missing`, `harness_unsupported`), whose `retry` stays offered to the entry session.
+|`clean` -> `source-<kind>.done`; `suspicious`, `lost` (every item counts as flagged) -> `source-<kind>.flagged`.
+|link:../model-work/07-untrusted-text-screening.adoc#screener[Model Work Specification, Screener Job]
 
 |[[state-source.flagged]]`source-<kind>.flagged` (`source-issue`, `source-pr`)
 |inherit
 |`link`
-|`source-<kind>.screen` (`suspicious`).
+|`source-<kind>.screen` (`suspicious`, `lost`).
 |`facts`: the flagged spans with their reasons. `accept` (`submit`, `reason: text[1..2000]`: the text is used, still delivered marked untrusted, and the acceptance is audited); implicit `step_out` (back to the choice). Skill `pm/source/flagged-text`.
 |`accept` -> `source-<kind>.done`.
-|link:../dispatch-and-effort/06-untrusted-text-screening.adoc#two-level-guard[Model Jobs & Effort Specification, Two-Level Guard for External Text]
+|link:../model-work/07-untrusted-text-screening.adoc#two-level-guard[Model Work Specification, Two-Level Guard for External Text]
 
 |[[state-source.failed]]`source-<kind>.failed`
 |inherit
 |`link`
-|The unit's gathering state (a failure outcome).
-|`facts.reason`: `not_found`, `not_readable`, `provider_unavailable`, `pr_not_open`, `head_not_writable`, `no_local_changes`, `lesson_unavailable`, `recipe_unknown`, `row_unknown`, `row_not_launched`, `spec_unreadable`, or `cancelled`. `retry` (rel `retry`, `noop`), bounded by the compiled condition budget (not offered for `recipe_unknown`); implicit `step_out`. Skill `pm/source/failure`.
+|The unit's gathering state (a failure outcome); not in `source-epic-row`.
+|`facts.reason`: `not_found`, `not_readable`, `provider_unavailable`, `pr_not_open`, `head_not_writable`, `no_local_changes`, `lesson_unavailable`, `recipe_unknown`, or `cancelled`. `retry` (rel `retry`, `noop`), bounded by the compiled condition budget (not offered for `recipe_unknown`); implicit `step_out`. Skill `pm/source/failure`.
 |`retry` -> the unit's gathering state.
 |link:../timeouts/01-job-budgets-and-waits.adoc#condition-budget[Timeouts & Budgets Specification, Condition Budget]
+
+|[[state-source-epic-row.refused]]`source-epic-row.refused`
+|inherit
+|`terminal`
+|`source-epic-row.read` (`row_unknown`, `row_not_launchable`, `spec_unreadable`).
+|Returns the control outcome `stepped_out {by: server, cause, reason}` with the refusal as `cause`; the unit runs without a session and offers no link.
+|The caller's `stepped_out` transition (`start.source-epic-row` -> `start.abandoned`).
+|link:../model-work/08-epic-coordination.adoc#server-started-plans[Model Work Specification, Server-Started Plans]
 
 |[[state-source.done]]`source-<kind>.done`
 |inherit
@@ -175,9 +191,9 @@ A source unit (`scope subworkflow`, compiled only, `phase inherit`) gathers and 
 
 [#state-catalogue-bootstrap-epic]
 == Bootstrap of an Epic: `bootstrap-epic`
-_Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#PM-WATCH-DISP-38[PM-WATCH-DISP-38]_
+_Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-38[PM-WATCH-DISP-38]_
 
-`pm-mcp enter … epic [<epic_id>]` records a pending entry of kind `epic`. The unit gathers the epic's header and vision; its `create` link creates the epic scope in one transaction: the machine store `epics/<epic_id>/`, the session row, `status.json` at `epic.decompose`, `epic.json` (title, `parallelization_scope`, lifecycle), the ledger directory in the shared epic worktree, and the vision section of `spec.md`. An epic whose git-tracked ledger exists (`.marshall/orchestrator/<epic_id>/` with `epic.json`, read through the Epic Ledger Resolution Seam, link:../filesystem-layout.adoc#shared-epic-worktree[Filesystem Layout Specification, Shared Epic Worktree]) but has no machine scope (`epics/<epic_id>/` absent, for example after a clone on another machine) is adopted instead: the ledger is the durable truth, and the adoption creates only the machine scope from it and never rewrites it.
+`pm-mcp enter … epic [<epic_id>]` records a pending entry of kind `epic`. The unit gathers the epic's header and vision; its `create` link creates the epic scope in one transaction: the machine store `epics/<epic_id>/`, the session row, `status.json` at `epic.decompose`, `epic.json` (title, `parallelization_scope`, lifecycle), the ledger directory in the shared epic worktree, and the vision section of `spec.md`. An epic whose git-tracked ledger exists (`.marshall/orchestrator/<epic_id>/` with `epic.json`, read through the Epic Ledger Resolution Seam, link:../filesystem-layout/01-repository-workspace.adoc#shared-epic-worktree[Filesystem Layout Specification, Shared Epic Worktree]) but has no machine scope (`epics/<epic_id>/` absent, for example after a clone on another machine) is adopted instead: the ledger is the durable truth, and the adoption creates only the machine scope from it and never rewrites it.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -189,7 +205,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |The pending entry record of kind `epic` (the unit's start state); `start-epic.setup-required` (`recheck`).
 |`auto start-epic.resolve`: the setup predicates of `start.resolve`, then the requested id: a live epic, an adoptable ledger (a git-tracked ledger without machine scope), an archived epic (fact `archived`), or an unknown id (the slug proposal).
 |`setup_required` -> `start-epic.setup-required`; `live` -> `start-epic.resumed`; `adopt` (the one requested id names an adoptable ledger) -> `start-epic.adopt`; `define` -> `start-epic.define`.
-|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+|link:../model-work/08-epic-coordination.adoc#epic-workflow[Model Work Specification, Epic Workflow]
 
 |[[state-start-epic.setup-required]]`start-epic.setup-required`
 |inherit (`workspace`)
@@ -205,7 +221,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |`start-epic.resolve` (`define`); `start-epic.source-issue` (`done`, `stepped_out`); `start-epic.ready` (`back`); `start-epic.adopt-failed` (`back`).
 |`facts`: the hint, the slug proposal, the live epics (count and at most ten, full list `pm_epics`), the adoptable ledgers (count and at most ten: `epic_id`, title), a fetched and screened issue. Links: `define` (`submit`: `epic_slug`, `title: text[1..200]`, `vision: text[1..32768]`, `parallelization_scope?`, compiled default `1`); `from_issue` (`submit`, `issue_number`); `adopt_epic:<epic_id>` per adoptable ledger; `abandon`.
 |`define` -> `start-epic.ready`; `from_issue` -> `start-epic.source-issue`; `adopt_epic` -> `start-epic.adopt`; `abandon` -> `start-epic.abandoned`.
-|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+|link:../model-work/08-epic-coordination.adoc#epic-workflow[Model Work Specification, Epic Workflow]
 
 |[[state-start-epic.source-issue]]`start-epic.source-issue`
 |inherit (`workspace`)
@@ -221,7 +237,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |`start-epic.define` (`define`); itself (`set_slug`, a refused `create`).
 |`facts`: the header and the derived `epic_id` and whether it is free. `create` (`next`, `noop`); `set_slug` (`submit`, `epic_slug`); `back`; `abandon`.
 |`create` (`start.create-scope`, re-checking the identifier, the lifecycle gate or the project's pilot enrolment, and the configuration state): `created` -> `start-epic.committed`; `refused{reason}` -> this state. `set_slug` -> this state; `back` -> `start-epic.define`; `abandon` -> `start-epic.abandoned`.
-|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+|link:../model-work/08-epic-coordination.adoc#epic-workflow[Model Work Specification, Epic Workflow]
 
 |[[state-start-epic.adopt]]`start-epic.adopt`
 |inherit (`workspace`)
@@ -229,7 +245,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |`start-epic.resolve` (`adopt`); `start-epic.define` (`adopt_epic`); `start-epic.adopt-failed` (`retry`).
 |`auto start-epic.adopt`: reads the ledger through the seam and validates `epic.json` and every queue row against their schemas (link:../store-schemas/04-epic-and-change-ledger.adoc#epic-ledger-records[Store Schemas Specification, Epic Ledger Records]); a `terminal` header is not adoptable. Its transaction (`start.create-scope`, re-checking that `epics/<epic_id>/` is still absent, the lifecycle gate or the project's pilot enrolment, and the configuration state) creates only the machine scope: `epics/<epic_id>/` with the session row and `status.json` at `epic.decompose` when the ledger has no queue row, otherwise at `epic.active`. It writes nothing under `.marshall/orchestrator/`: the header's `lifecycle` and the rows stay as read.
 |`adopted` -> `start-epic.committed`; `adopt_failed{reason}` (`ledger_unreadable` with the failing file, `ledger_invalid`, `ledger_terminal`, or a refused re-check) -> `start-epic.adopt-failed`.
-|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+|link:../model-work/08-epic-coordination.adoc#epic-workflow[Model Work Specification, Epic Workflow]
 
 |[[state-start-epic.adopt-failed]]`start-epic.adopt-failed`
 |inherit (`workspace`)
@@ -237,7 +253,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 |`start-epic.adopt` (`adopt_failed`).
 |`facts.reason` and `facts.detail` (the file and the failure). Links: `retry` (`noop`, after the ledger was repaired through git); `back`; `abandon`.
 |`retry` -> `start-epic.adopt`; `back` -> `start-epic.define`; `abandon` -> `start-epic.abandoned`.
-|link:../dispatch-and-effort/04-epic-coordination.adoc#epic-workflow[Model Jobs & Effort Specification, Epic Workflow]
+|link:../model-work/08-epic-coordination.adoc#epic-workflow[Model Work Specification, Epic Workflow]
 
 |[[state-start-epic.committed]][[state-start-epic.resumed]][[state-start-epic.abandoned]]`start-epic.committed`, `start-epic.resumed`, `start-epic.abandoned`
 |inherit (`workspace`)
@@ -251,7 +267,7 @@ _Implementation watch: link:../../implementation-watch/dispatch-and-effort.adoc#
 [#state-catalogue-lessons]
 == Lesson Maintenance: `lessons` (sub-workflow)
 
-Declared in `lessons.pmwf` (`scope subworkflow`, compiled only, `phase inherit`, no parameters; exit contract `done` or `stepped_out`) and called by the workspace scope's call state `setup.maintain-lessons` (xref:06-setup-epic-other.adoc#state-setup.maintain-lessons[Project Setup]), which the resting state `setup.completed` enters through `maintain_lessons` and whose `done` and `stepped_out` both return to `setup.completed`; the bootstrap's `maintain:lessons` hands the session over to the workspace scope at that call. The server computes the candidates, a model job judges them, and the server writes every change under the lesson lock. No plan is created.
+Declared in `lessons.pmwf` (`scope subworkflow`, compiled only, `phase inherit`, no parameters; exit contract `done` or `stepped_out`) and called by the workspace scope's call state `setup.maintain-lessons` (xref:06-setup-epic-other.adoc#state-setup.maintain-lessons[Project Setup]), which the resting state `setup.completed` enters through `maintain_lessons` and whose `done` and `stepped_out` both return to `setup.completed`; the bootstrap's `maintain:lessons` hands the session over to the workspace scope at that call. The server computes the candidates, a task of the role `lessons` judges them, and the server writes every change under the lesson lock. No plan is created.
 
 [cols="2,1,1,2,3,2,2"]
 |===
@@ -269,8 +285,8 @@ Declared in `lessons.pmwf` (`scope subworkflow`, compiled only, `phase inherit`,
 |inherit (`workspace`)
 |`job`
 |`lessons.analyze` (`groups`).
-|`job llm lessons-review role lessons.effort.review` (read-only class), one job over the candidate groups: its entity runs the multi-submit entity unit (xref:10-entity-units-migrated.adoc#state-entity-multi.active[`entity-multi.active`]) with the repeatable submits `merge` (`ids`, `into`), `retire` (`id`, `verdict`), and `supersede` (`id`, `by`), each validated and written under the lesson lock with its provenance (a claimed lesson is refused), and the closing `submit:review`.
-|`reviewed` -> `lessons.done`; a job that ended without the closing `submit:review` -> the `job_incomplete` condition (its `resume` stays offered on the workspace scope, and the relaunched job continues from what is persisted).
+|`job llm lessons-review role lessons`, one task over the candidate groups: its entity runs the multi-submit entity unit (xref:10-entity-units.adoc#state-entity-multi.active[`entity-multi.active`]) with the repeatable submits `merge` (`ids`, `into`), `retire` (`id`, `verdict`), and `supersede` (`id`, `by`), each validated and written under the lesson lock with its provenance (a claimed lesson is refused), and the closing `submit:review`.
+|`reviewed` -> `lessons.done`; `infeasible`, `lost` -> `lessons.done` (what the repeatable submits persisted stays; the groups left are named in `facts`). A re-offered attempt continues from what is persisted.
 |link:../store-schemas/10-job-and-lesson-records.adoc#lesson-record[Store Schemas Specification, Lesson Record]
 
 |[[state-lessons.done]]`lessons.done`

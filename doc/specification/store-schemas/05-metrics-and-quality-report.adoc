@@ -12,23 +12,22 @@ link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store
 == Metrics Store (`metrics.json`)
 _Implementation watch: link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-26[PM-WATCH-STORE-26], link:../../implementation-watch/store-schemas.adoc#PM-WATCH-STORE-35[PM-WATCH-STORE-35]_
 
-The plan's `metrics.json` holds the model-job and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:../dispatch-and-effort.adoc[Model Jobs & Effort Specification], Post-Return Integrity Invariants). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
+The plan's `metrics.json` holds the task and phase measurements that `default:record-metrics` aggregates (`PM-WF-14`, link:../model-work/09-completion-usage-and-spend.adoc#job-result-schema[Model Work Specification, Worker Result & Usage Parsing], which defines which row each worker and task yields). It extends the rule "unmeasured is never `0`" from token usage to every figure it publishes.
 
-* *Scope*: One `metrics.json` exists per scope that runs model jobs: `plans/<plan_id>/metrics.json`, `epics/<epic_id>/metrics.json`, and `workspace/metrics.json` of the project's machine store (link:../filesystem-layout.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]). The epic and workspace files hold only the model-job rows and served-read rows of their scope, with `phase: null`; wait rows and phase-close rows exist only in a plan's file. Each file is written under its scope's lock and covered by the scope's digest sidecar.
-
-* *Rows*: One row per model job (kind `llm`: `job_id`, `role`, `harness`, `model`, `effort`, `phase`, `step_id` or null, `envelope_id` or null with its summed `predicted_cost_tokens` and their basis (`uncalibrated` or `calibrated`), `fate` (the job record's fate) or `job_incomplete`, `cause_class`, `spend_class`, `population`, the usage columns parsed from the harness output through the client profile's `headless.usage` declaration (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`, `cost_usd`) and the derived `total_tokens` (Usage Columns below), each a measured value or `"unmeasured"` (with `not_reported_by_harness` where the harness does not report the field, `output_unparsed` where its output could not be parsed), and the server-measured `duration_ms` with its `duration_basis` and the slot-queue time `queued_ms`), one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:../job-runtime.adoc[Job Runtime Specification], Wait Attribution), one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `boundary` (`closed`, `re_entered`, or `provisional` with `measured_until` and `excluded_steps`), `step_firings` as a map from step id to firing count), and one row per served document read (Served-Content Ledger below). Work the main session does inline (for example Phase 4 authoring or `create-pr`) has no model-job row; its measurements, where the host reports them, carry the population `main_context`.
-* *Usage Columns*: Which pointer of `headless.usage` fills which column is stated once, in link:../client-profiles/01-profile-schema.adoc#headless-usage[Client Profiles Specification, Usage Pointers]. `headless.usage` has no pointer for the total: for a model-job row `total_tokens` is the sum of the four token components (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) when all four are measured, otherwise `"unmeasured"`; a partial sum is never recorded, and a derived total of `0` (all four components measured `0`) is recorded `"unmeasured"`, because the total keeps its lower bound of `1`. This is the one exception to "a column is never derived from another" (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc[Model Jobs & Effort Specification], Per-Column Usage Persistence), because the components are the harness's complete breakdown.
-* *Served-Content Ledger*: Every `pm_skill`, `pm_skill_file`, and skill `resources/read` served in a plan, epic, or workspace scope appends `{uri, section?, bytes, plan_id, phase, job_id?, served_at}` to the `metrics.json` of that scope (`plan_id` and `phase` null outside a plan); `bytes` is the rendered size served, `0` for an empty section. Every skill document or section the server renders in-band into a model job's prompt file is recorded the same way when the job is spawned. `job_id` is set for a read over a job connection and for an in-band rendering, and is otherwise null. A read without a scope is attributed to no plan. `record-metrics` publishes from these rows the per-document consumption (reads per URI and section, bytes, repeat reads within one job). It measures only what the server serves; a harness's own reads of project files are not observable.
-* *Aggregates*: Every sum (per phase, per cause class, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total; Phase 6, which `record-metrics` measures from inside, is recorded `boundary: provisional` with `measured_until` and its `excluded_steps`.
-* *Populations*: Every token figure carries a `population` stamp (`model_job` or `main_context`); an absent stamp reads `model_job`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
+* *Scope*: One `metrics.json` exists per scope that runs model work: `plans/<plan_id>/metrics.json`, `epics/<epic_id>/metrics.json`, and `workspace/metrics.json` of the project's machine store (link:../filesystem-layout/03-project-store.adoc#machine-store[Filesystem Layout Specification, Per-Project Machine Store]). The epic and workspace files hold only the task rows and served-read rows of their scope, with `phase: null`; the workspace file also holds the `worker_idle` rows of the project's warm workers, which serve every scope of the project; wait rows and phase-close rows exist only in a plan's file. Each file is written under its scope's lock and covered by the scope's digest sidecar.
+* *Rows*: Task rows (kind `task`: `queue_task_id`, `attempt`, `role`, the worker's `job_id` and `generation_id`, `harness`, `model`, `effort`, `form`, `phase`, `step_id` or null, `envelope_id` or null with its summed `predicted_cost_tokens` and their basis (`uncalibrated` or `calibrated`), the task's `outcome`, `cause_class`, `spend_class`, `population`, the usage columns (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `tool_uses`, `cost_usd`) and the derived `total_tokens` (Usage Columns below), each a measured value or `"unmeasured"` (with `not_reported_by_harness` where the harness does not report the field, `output_unparsed` where its output could not be parsed, `session_task` for a task a session took whose host reports no per-turn usage, `terminated` for a run its worker did not finish), the server-measured `duration_ms` with its `duration_basis`, and the slot-queue time `queued_ms`): one per fresh worker's job (population `model_job`, the whole run) and one per task a warm worker or a session served (population `model_task`, the turns from the offer to the task's end); worker idle rows (kind `worker_idle`, population `worker_idle`): one per warm worker's job, holding the turns that served no task (its start and its idle wake-ups); one row per wait slice (`phase`, `wait_reason`, `deliberate`, duration; link:../job-runtime.adoc[Job Runtime Specification], Wait Attribution), one row per phase close (`start_time`, `end_time`, `duration_ms`, `duration_clamped`, `boundary` (`closed`, `re_entered`, or `provisional` with `measured_until` and `excluded_steps`), `step_firings` as a map from step id to firing count), and one row per served document read (Served-Content Ledger below). A task that is offered again after a lost attempt yields one task row per attempt that ran, all keyed by its `queue_task_id`; a task closed without an attempt (its role undefined, unqualified, or unavailable) yields one task row with every usage column `"unmeasured"` and `cause_class: refused`. A worker's protocol state stays in its job record and is never a row.
+* *Usage Columns*: Which pointer of `headless.usage` fills which column is stated once, in link:../client-profiles/01-profile-schema.adoc#headless-usage[Client Profiles Specification, Usage Pointers]. `headless.usage` has no pointer for the total: `total_tokens` is the sum of the four token components (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) when all four are measured, otherwise `"unmeasured"`; a partial sum is never recorded, and a derived total of `0` (all four components measured `0`) is recorded `"unmeasured"`, because the total keeps its lower bound of `1`. This is the one exception to "a column is never derived from another", because the components are the harness's complete breakdown.
+* *Consultations*: The usage of a consultation is the row of the consulted role's task, which names the asking task in `consultation_of` (`PM-WORK-4`); it is never added to the asker's row.
+* *Served-Content Ledger*: Every `pm_skill`, `pm_skill_file`, and skill `resources/read` served in a plan, epic, or workspace scope appends `{uri, section?, bytes, plan_id, phase, queue_task_id?, served_at}` to the `metrics.json` of that scope (`plan_id` and `phase` null outside a plan); `bytes` is the rendered size served, `0` for an empty section. Every skill document or section the server renders in-band into a worker's launch prompt or into an offer is recorded the same way, against the offered task. `queue_task_id` is set for a read over a worker's connection while it holds the task and for an in-band rendering, and is otherwise null. A read without a scope is attributed to no plan. `record-metrics` publishes from these rows the per-document consumption (reads per URI and section, bytes, repeat reads within one task). It measures only what the server serves; a harness's own reads of project files are not observable.
+* *Aggregates*: Every sum (per phase, per cause class, per role, per plan) is published as `{value?, rows, rows_unmeasured, population_count, excluded{<class>: count}}` with `rows = measured + Σ excluded`. `value` is omitted when `population_count == 0`. A phase that is still open is reported as a floor, never as a total; Phase 6, which `record-metrics` measures from inside, is recorded `boundary: provisional` with `measured_until` and its `excluded_steps`.
+* *Populations*: Every token figure carries its `population` stamp: `model_job`, `model_task`, or `worker_idle`. Relations (`=`, `<`, `>`) and sums are formed only between figures of one population. A derived ratio whose denominator population is empty is `not_derivable`, never `0`.
 * *Re-Entry*: Re-entry is derived from observables (rows timestamped after the phase's recorded `end_time`), never from a close counter. A re-entered phase is labelled `re_entered` and accumulates across closes.
-* *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`) is a total function over the job fate enum plus `job_incomplete` (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#cause-class[Model Jobs & Effort Specification, Cause Classes]); the server observes every end of a model job, so no unconfirmed class exists. The per-class populations sum to the total model-job population with an asserted residual of `0`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
-* *Spend Classes*: `spend_class` (`submitted`, `findings_only`, `no_product`, `unmeasured`) is derived by the server from what the model job produced (link:../dispatch-and-effort/02-dispatch-observability-and-spend.adoc#spend-accounting-budget-anchors[Model Jobs & Effort Specification, Spend Classes]); it is a separate dimension from `fate` and `cause_class`, and waste is read only from `no_product`.
-* *Stall Rate*: A termination with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
-* *Ledger Divergence*: Where two ledgers can diverge (model-job rows vs job records and audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
+* *Cause Classes*: `cause_class` (`terminal_error`, `retryable`, `returned_with_findings`, `benign`, `stall`, `refused`) is a total function over the task's outcome and its worker's fate (link:../model-work/09-completion-usage-and-spend.adoc#cause-class[Model Work Specification, Cause Classes]); the server observes every end of a worker, so no unconfirmed class exists. The per-class populations sum to the total task population with an asserted residual of `0`; the build-time exhaustiveness check (`PM-IMPL-5`) fails on an unclassified member. A spend decomposition sums to the phase total, with an explicit `unbucketed` class.
+* *Spend Classes*: `spend_class` (`submitted`, `findings_only`, `no_product`, `unmeasured`) is derived by the server from what the task produced (link:../model-work/09-completion-usage-and-spend.adoc#spend-accounting-budget-anchors[Model Work Specification, Spend Accounting]); it is a separate dimension from `outcome` and `cause_class`, and waste is read only from `no_product`.
+* *Stall Rate*: An envelope task that ends with `tasks_remaining > 0` and no blocked cause is `stall`. The stall rate and the `yield_reason` counts are published per plan.
+* *Ledger Divergence*: Where two ledgers can diverge (task rows vs queue task records and audit rows), `record-metrics` publishes `union_rows` and a non-blocking `reconciliation{findings_count}` warning. Each ledger states its counting unit.
 * *One Writer per Name*: Every metric name has exactly one writer. A second producer over another population uses a different name.
 * *Raw Components Only*: Rows persist measured token components, their plain sum `total_tokens`, and the harness-reported `cost_usd`, never a weighted or priced figure of the server's own. `priced_units` is derived in views from the rows and one named constant table (link:../phase-workflows/05-finalize-review-metrics-descriptor.adoc#post-run-metrics-and-landing[Phase Workflows Specification, Metric Aggregates]); a change of the weights re-derives every figure, including legacy baselines, from the persisted components.
-* *Session Attribution*: A model-job row references the host session whose call entered the job state by its `client_session_id` (the row of the scope's session log, xref:01-format-and-session-log.adoc#scope-session-log[Scope Session Log (`sessions.jsonl`)]; `null` when the host provides none), never by a copy of the client or model identity; the job's own harness, model, and effort are its launch contract, recorded in the job record.
 
 Aggregates are never persisted; they are derived in views from `rows[]`.
 
@@ -47,7 +46,8 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
       "type": "array",
       "items": {
         "oneOf": [
-          { "$ref": "#/$defs/modelJobRow" },
+          { "$ref": "#/$defs/taskRow" },
+          { "$ref": "#/$defs/workerIdleRow" },
           { "$ref": "#/$defs/waitRow" },
           { "$ref": "#/$defs/phaseCloseRow" },
           { "$ref": "#/$defs/servedReadRow" }
@@ -64,18 +64,22 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
       ]
     },
     "phase": { "type": "string", "enum": ["phase-1-init", "phase-2-refine", "phase-3-outline", "phase-4-plan", "phase-5-execute", "phase-6-finalize"] },
-    "modelJobRow": {
+    "taskRow": {
       "type": "object",
-      "required": ["kind", "job_id", "role", "harness", "model", "effort", "phase", "step_id", "envelope_id", "predicted_cost", "fate", "cause_class", "spend_class", "population", "total_tokens", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "tool_uses", "cost_usd", "unmeasured_reason", "duration_ms", "duration_basis", "queued_ms", "client_session_id", "recorded_at"],
+      "required": ["kind", "queue_task_id", "attempt", "role", "job_id", "generation_id", "harness", "model", "effort", "form", "phase", "step_id", "envelope_id", "predicted_cost", "outcome", "cause_class", "spend_class", "population", "total_tokens", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "tool_uses", "cost_usd", "unmeasured_reason", "duration_ms", "duration_basis", "queued_ms", "consultation_of", "recorded_at"],
       "additionalProperties": false,
       "properties": {
-        "kind": { "const": "model_job" },
-        "job_id": { "type": "string", "pattern": "^l-[0-9a-f]{16}$" },
-        "role": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,63}$", "description": "Role key of the job (dispatch-and-effort.adoc, Role Registry)." },
-        "harness": { "type": "string", "enum": ["claude", "opencode", "codex"] },
-        "model": { "type": ["string", "null"], "description": "Model passed to the harness; null when the job ran on the harness's own default." },
+        "kind": { "const": "task" },
+        "queue_task_id": { "type": "string", "pattern": "^qt-[0-9a-f]{16}$" },
+        "attempt": { "type": "integer", "minimum": 1, "description": "The attempt of the queue task this row measures (Queue Task Record, attempts[])." },
+        "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$", "description": "Role of the task (identifiers.adoc, role name)." },
+        "job_id": { "type": ["string", "null"], "pattern": "^l-[0-9a-f]{16}$", "description": "The worker that served the attempt; null for a task an interactive session took." },
+        "generation_id": { "type": "string", "pattern": "^(l-[0-9a-f]{16}|sg-[0-9a-f]{16})$" },
+        "harness": { "type": "string", "enum": ["claude", "opencode", "antigravity", "codex", "neutral"] },
+        "model": { "type": ["string", "null"], "description": "Model passed to the harness; null when the worker ran on the harness's own default or the session's model is unknown." },
         "effort": { "type": ["string", "null"], "description": "Effort passed to the harness after narrowing; null when none was passed." },
-        "phase": { "anyOf": [ { "$ref": "#/$defs/phase" }, { "type": "null" } ], "description": "null for a job of the epic or workspace scope." },
+        "form": { "type": ["string", "null"], "enum": ["warm", "fresh", null], "description": "The worker's form; null for a session task." },
+        "phase": { "anyOf": [ { "$ref": "#/$defs/phase" }, { "type": "null" } ], "description": "null for a task of the epic or workspace scope." },
         "step_id": { "type": ["string", "null"] },
         "envelope_id": { "type": ["string", "null"], "pattern": "^envelope-[0-9]+$" },
         "predicted_cost": {
@@ -87,10 +91,10 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
             "basis": { "type": "string", "enum": ["uncalibrated", "calibrated"] }
           }
         },
-        "fate": { "type": "string", "enum": ["succeeded", "failed", "failed_unparsed", "timed_out", "cancelled", "killed", "indeterminate", "refused", "job_incomplete"], "description": "The job record's fate; job_incomplete when the job succeeded without its required submit (dispatch-and-effort.adoc)." },
+        "outcome": { "type": "string", "enum": ["submitted", "asked", "infeasible", "lost"], "description": "The task's outcome, or lost for an attempt that was offered again (Queue Task Record)." },
         "cause_class": { "type": "string", "enum": ["terminal_error", "retryable", "returned_with_findings", "benign", "stall", "refused"] },
         "spend_class": { "type": "string", "enum": ["submitted", "findings_only", "no_product", "unmeasured"] },
-        "population": { "type": "string", "const": "model_job" },
+        "population": { "type": "string", "enum": ["model_job", "model_task"], "description": "model_job: a fresh worker's whole run; model_task: a task a warm worker or a session served." },
         "total_tokens": { "oneOf": [ { "type": "integer", "minimum": 1 }, { "type": "string", "const": "unmeasured" } ], "description": "Derived: the sum of the four token components when all four are measured, otherwise unmeasured; a derived sum of 0 is recorded unmeasured (lower bound 1); never parsed from the harness output." },
         "input_tokens": { "$ref": "#/$defs/measure" },
         "output_tokens": { "$ref": "#/$defs/measure" },
@@ -98,11 +102,34 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
         "cache_creation_input_tokens": { "$ref": "#/$defs/measure" },
         "tool_uses": { "$ref": "#/$defs/measure" },
         "cost_usd": { "oneOf": [ { "type": "number", "minimum": 0 }, { "type": "string", "const": "unmeasured" } ], "description": "Harness-reported cost; unmeasured where the harness reports none." },
-        "unmeasured_reason": { "type": ["string", "null"], "enum": ["not_reported_by_harness", "output_unparsed", null] },
+        "unmeasured_reason": { "type": ["string", "null"], "enum": ["not_reported_by_harness", "output_unparsed", "session_task", "terminated", null] },
         "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
-        "duration_basis": { "type": "string", "const": "process", "description": "Measured by the server from spawn to exit of the job's process; queued time is excluded." },
-        "queued_ms": { "type": ["integer", "null"], "minimum": 0, "description": "Time the job waited for a model slot before spawn (dispatch-and-effort.adoc, Per-Column Usage Persistence); null when it never waited." },
-        "client_session_id": { "type": ["string", "null"], "pattern": "^[\\x21-\\x7E]{1,128}$", "description": "Session row of the scope's sessions.jsonl whose call entered the job state." },
+        "duration_basis": { "type": "string", "enum": ["process", "task"], "description": "process: spawn to exit of a fresh worker's job; task: offer to the attempt's end for a warm worker or a session." },
+        "queued_ms": { "type": ["integer", "null"], "minimum": 0, "description": "Time the task waited queued before its offer; null when it never waited." },
+        "consultation_of": { "type": ["string", "null"], "pattern": "^qt-[0-9a-f]{16}$", "description": "A consultation's row: the asking task (PM-WORK-4); null otherwise." },
+        "recorded_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "workerIdleRow": {
+      "type": "object",
+      "required": ["kind", "job_id", "role", "harness", "model", "population", "total_tokens", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "tool_uses", "cost_usd", "unmeasured_reason", "idle_wakeups", "recorded_at"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "worker_idle" },
+        "job_id": { "type": "string", "pattern": "^l-[0-9a-f]{16}$", "description": "The warm worker." },
+        "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,31}$" },
+        "harness": { "type": "string", "enum": ["claude", "opencode", "antigravity", "codex"] },
+        "model": { "type": ["string", "null"] },
+        "population": { "type": "string", "const": "worker_idle" },
+        "total_tokens": { "oneOf": [ { "type": "integer", "minimum": 1 }, { "type": "string", "const": "unmeasured" } ] },
+        "input_tokens": { "$ref": "#/$defs/measure" },
+        "output_tokens": { "$ref": "#/$defs/measure" },
+        "cache_read_input_tokens": { "$ref": "#/$defs/measure" },
+        "cache_creation_input_tokens": { "$ref": "#/$defs/measure" },
+        "tool_uses": { "$ref": "#/$defs/measure" },
+        "cost_usd": { "oneOf": [ { "type": "number", "minimum": 0 }, { "type": "string", "const": "unmeasured" } ] },
+        "unmeasured_reason": { "type": ["string", "null"], "enum": ["not_reported_by_harness", "output_unparsed", "terminated", null] },
+        "idle_wakeups": { "type": "integer", "minimum": 0, "description": "Wake-ups without a task over the worker's generation." },
         "recorded_at": { "type": "string", "format": "date-time" }
       }
     },
@@ -138,7 +165,7 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
     },
     "servedReadRow": {
       "type": "object",
-      "required": ["kind", "uri", "bytes", "plan_id", "phase", "job_id", "served_at"],
+      "required": ["kind", "uri", "bytes", "plan_id", "phase", "queue_task_id", "served_at"],
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "served_read" },
@@ -147,7 +174,7 @@ Aggregates are never persisted; they are derived in views from `rows[]`.
         "bytes": { "type": "integer", "minimum": 0 },
         "plan_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", "description": "null in the metrics.json of an epic or the workspace scope." },
         "phase": { "anyOf": [ { "$ref": "#/$defs/phase" }, { "type": "null" } ] },
-        "job_id": { "type": ["string", "null"], "pattern": "^l-[0-9a-f]{16}$" },
+        "queue_task_id": { "type": ["string", "null"], "pattern": "^qt-[0-9a-f]{16}$" },
         "served_at": { "type": "string", "format": "date-time" }
       }
     }
