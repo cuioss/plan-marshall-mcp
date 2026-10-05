@@ -22,6 +22,8 @@ import java.util.function.Supplier;
 
 
 import de.cuioss.pm.mcp.server.PmMcpLogMessages;
+import de.cuioss.pm.mcp.server.security.IdentityAttributes;
+import de.cuioss.pm.mcp.server.security.RequestIdentity;
 import de.cuioss.pm.mcp.spike.SpikeEngine.Pull;
 import de.cuioss.pm.mcp.spike.SpikeQueue.Caller;
 import de.cuioss.pm.mcp.spike.SpikeScenario.Ack;
@@ -53,8 +55,10 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
  * "done"), {@code pull_submit}, {@code pull_info} (a distractor that a correct loop never calls) and
  * {@code pull_escalate}, which appears only after the configured number of deliveries.
  * <p>
- * A caller is identified by the tool argument {@code worker} when it passes one, otherwise by its MCP
- * connection. The argument is needed for hosts that call without a session: every request of such a host
+ * A caller that authenticated with a job token of {@link SpikeJobs} (the worker relay {@code pm-mcp serve --job})
+ * is identified by its security identity: worker, generation and role come from the job, never from an
+ * argument. Otherwise a caller is identified by the tool argument {@code worker} when it passes one, else by its
+ * MCP connection. The argument is needed for hosts that call without a session: every request of such a host
  * arrives on a transient connection of its own, so the connection cannot bind a task to its worker.
  * <p>
  * The switches of the scenario add the tools of the supervised protocol: {@code pull_ack} and
@@ -113,6 +117,8 @@ public class SpikeTools implements McpTrafficListener {
     private final SpikeEventLog log;
     private final SpikeSkills skills;
     private final SpikeEngine engine;
+    private final RequestIdentity identity;
+    private final SpikeJobs jobs;
 
     /**
      * @param toolManager     the tool registry of the MCP server
@@ -121,10 +127,15 @@ public class SpikeTools implements McpTrafficListener {
      * @param vertx           timers for the blocking wait
      * @param scenarioFile    the scenario file; the stub stays inactive without it
      * @param runDir          the directory of the event log
+     * @param identity        the security identity of the current request
+     * @param jobs            the job tokens of the harness drivers
      */
     SpikeTools(ToolManager toolManager, ResourceManager resourceManager, ResourceTemplateManager templateManager,
             Vertx vertx, @ConfigProperty(name = "pm.spike.scenario") Optional<String> scenarioFile,
-            @ConfigProperty(name = "pm.spike.run-dir") Optional<String> runDir) {
+            @ConfigProperty(name = "pm.spike.run-dir") Optional<String> runDir, RequestIdentity identity,
+            SpikeJobs jobs) {
+        this.identity = identity;
+        this.jobs = jobs;
         this.toolManager = toolManager;
         this.resourceManager = resourceManager;
         this.templateManager = templateManager;
@@ -506,7 +517,25 @@ public class SpikeTools implements McpTrafficListener {
         }
     }
 
+    /**
+     * Fences a worker generation for the driver's job revocation.
+     *
+     * @param worker     the worker
+     * @param generation the highest replaced generation
+     * @return the tasks given back
+     */
+    JsonObject fence(String worker, int generation) {
+        return engine.fence(worker, generation);
+    }
+
     private Caller identify(ToolArguments args) {
+        var job = identity.current()
+                .map(current -> current.attributes().get(IdentityAttributes.JOB_ID))
+                .flatMap(jobId -> jobs.job(String.valueOf(jobId)));
+        if (job.isPresent()) {
+            var found = job.get();
+            return new Caller(found.worker(), found.generation(), found.role());
+        }
         var connection = args.connection();
         var worker = args.args().get(WORKER) instanceof String named && !named.isBlank() ? named : connection.id();
         if (!connection.isTransient()) {

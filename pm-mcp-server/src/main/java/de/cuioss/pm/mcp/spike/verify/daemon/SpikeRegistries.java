@@ -15,6 +15,7 @@ import java.util.Optional;
 import de.cuioss.pm.mcp.server.security.DeviceRegistry;
 import de.cuioss.pm.mcp.server.security.JobTokenRegistry;
 import de.cuioss.pm.mcp.server.security.Secrets;
+import de.cuioss.pm.mcp.spike.SpikeJobs;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
@@ -22,7 +23,8 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 /**
  * Fixed spike registries for the verification of gates 1, 10 and 15: one job token
  * ({@code pm.spike.job-token}, job {@value #JOB_ID}) and one device secret ({@code pm.spike.device-secret},
- * device {@value #DEVICE_ID}). Without the properties nothing resolves. They replace the empty default
+ * device {@value #DEVICE_ID}). Without the properties nothing resolves. Beside the fixed job token, every token
+ * the harness drivers minted per worker generation ({@link SpikeJobs}) resolves. They replace the empty default
  * registries until the job records and the web device store exist.
  */
 @ApplicationScoped
@@ -33,9 +35,11 @@ public class SpikeRegistries {
 
     private final Optional<byte[]> jobTokenHash;
     private final Optional<byte[]> deviceSecretHash;
+    private final SpikeJobs jobs;
 
     SpikeRegistries(@ConfigProperty(name = "pm.spike.job-token") Optional<String> jobToken,
-            @ConfigProperty(name = "pm.spike.device-secret") Optional<String> deviceSecret) {
+            @ConfigProperty(name = "pm.spike.device-secret") Optional<String> deviceSecret, SpikeJobs jobs) {
+        this.jobs = jobs;
         jobTokenHash = jobToken.map(Secrets::sha256);
         deviceSecretHash = deviceSecret.map(Secrets::sha256);
     }
@@ -44,7 +48,8 @@ public class SpikeRegistries {
     @ApplicationScoped
     JobTokenRegistry jobTokens() {
         return hash -> jobTokenHash.filter(expected -> Secrets.constantTimeEquals(expected, hash))
-                .map(_ -> new JobTokenRegistry.JobBinding(JOB_ID));
+                .map(_ -> new JobTokenRegistry.JobBinding(JOB_ID))
+                .or(() -> jobs.resolve(hash).map(job -> new JobTokenRegistry.JobBinding(job.jobId())));
     }
 
     @Produces
