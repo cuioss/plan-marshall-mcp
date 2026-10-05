@@ -366,7 +366,7 @@ $PM_MCP_HOME/bin/pm-operator status
 
 *Verifies*: the `quarkus-mcp-server-test` STDIO client (`McpAssured.newStdioClient()`) against the relay `pm-mcp serve`, in front of the runner JAR and in front of the native daemon.
 
-*Pass criterion*: the STDIO harness test of `pm-e2e` (<<e2e-its>>) passes in both modes: `initialize` (or `server/discover`), `tools/list`, and a `tools/call` of `hello`.
+*Pass criterion*: `StdioHarnessIT` (<<e2e-its>>) passes in both layouts: `initialize` (or `server/discover`), `tools/list`, and a `tools/call` of `hello`.
 
 *Procedure*: `./mvnw verify -Pintegration-tests -pl pm-modules/pm-e2e -am` for the JAR, then the same with `-Pnative` added.
 
@@ -510,7 +510,10 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 . Its session residue (files left after the worker ends) is recorded.
 . The largest task input that completes is recorded, against the provisional size limits.
 
-*Procedure*: the harness ITs in `de.cuioss.pm.e2e.spike` (<<e2e-its>>), with `-Dspike.harness=claude` and `-Dspike.harness=opencode`.
+*Procedure*:
+
+. Run `JobChainIT` natively (socket connect under Landlock).
+. Then `Gate13HeadlessIT` (<<e2e-its>>), with `-Dspike.item=gate13 -Dspike.layout=native` and once each `-Dspike.harness=claude` and `-Dspike.harness=opencode`.
 
 *Fallback (gate 13)*: a harness that fails a capability runs no worker of the roles that need it, and the operator assigns those roles to another eligible harness (`PM-WORK-1`).
 
@@ -549,7 +552,7 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 * every late call of a replaced generation is refused;
 * no stalled-but-alive worker is replaced before its deadline.
 
-*Procedure*: the fault-matrix IT in `de.cuioss.pm.e2e.spike` (<<e2e-its>>), with `-Dspike.harness=claude|opencode -Dspike.faults=all -Dspike.trials=10`. Expect a long run: Part A took about an hour per harness and fault.
+*Procedure*: `Gate16FaultMatrixIT` (<<e2e-its>>), with `-Dspike.item=gate16 -Dspike.layout=native -Dspike.faults=all -Dspike.trials=10`, once each for `-Dspike.harness=claude` and `opencode`. Expect a long run. Record the exit-detection figure against Part A's 1025 ms; the IT's limit is 1500 ms.
 
 *Fallback (gate 16)*: the harness is not eligible as a worker host.
 
@@ -574,7 +577,7 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 
 *Pass criterion*: as L10. In addition, the idle timeout is measured to ±10 s, and whether a progress notification resets it is recorded.
 
-*Procedure*: the harness ITs with `-Dspike.harness=codex`. Run this item only if Codex is installed and logged in; otherwise record "not run".
+*Procedure*: `Gate13HeadlessIT` and `Gate9IdleTimeoutIT` with `-Dspike.harness=codex` (<<e2e-its>>). Run this item only if Codex is installed and logged in; otherwise record "not run".
 
 *Fallback (gates 13, 9)*: as L10. For the idle timeout there is none; the measured value goes into the client profile.
 
@@ -626,9 +629,57 @@ Each IT starts the packaged daemon as its own process: the native runner after `
 [#e2e-its]
 === End-to-End and Harness ITs (`pm-e2e`)
 
-*Filled in when the harness drivers land; see <<open-before-run>>.*
+`pm-e2e` stages the binaries in a temporary `PM_MCP_HOME/bin`, with a base below `/tmp`:
+
+* *native layout*: the four native binaries, with the Netty library beside `pm-mcpd`, when all four are built and newer than the JARs;
+* *JVM layout*: launcher scripts around the JARs.
+
+Each run uses one layout and skips the other with a message.
+
+[cols="1,3", options="header"]
+|===
+|IT |Verifies
+|`ReleaseLayoutIT` |`pm-operator runtime start` starts the daemon on demand; `status --json`; a `pm-mcp serve --client neutral` round trip over real `stdio` (`initialize`, `tools/list` with the ten core tools, `hello`); `runtime stop`
+|`StdioHarnessIT` |Gate 6: `McpAssured.newStdioClient()` drives `pm-mcp serve` in front of the staged daemon (L7). The client waits at most 10 s per response, so the daemon is started first.
+|`JobChainIT` |`pm-exec -- pm-mcp serve --job --socket <socket>` with a job token: the worker relay reaches the daemon from inside `pm-exec`, under Landlock on Linux (gate 13, socket connect; L10)
+|===
+
+The harness drivers live in `de.cuioss.pm.e2e.spike`. They run real harness CLIs and spend model tokens, so they run only when both `spike.harness` and `spike.item` are set. Build the binaries first (`./mvnw package -Pnative -DskipTests`), then:
+
+[source,bash]
+----
+./mvnw verify -Pintegration-tests -pl pm-modules/pm-e2e -am -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Dit.test=<IT> -Dspike.harness=<claude|opencode|codex> -Dspike.item=<gate13|gate9|gate16> [options]
+----
+
+[cols="1,1,3", options="header"]
+|===
+|IT |`spike.item` |Options and output
+|`Gate13HeadlessIT` |`gate13` |`-Dspike.sizes=8000,32000,128000` (task input sizes). Output: `gate13-<harness>.json`: socket connect, launch report, files written by the harness, structured output, usage, `SIGTERM` exit, session residue, largest input completed (L10, L12)
+|`Gate9IdleTimeoutIT` |`gate9` |`-Dspike.idle-max-s=<bound>` (claude 2400, others 900), `-Dspike.progress-s=5`. Output: `gate9-<harness>.json`: idle timeout with and without progress (L12)
+|`Gate16FaultMatrixIT` |`gate16` |`-Dspike.faults=all` or a list of `kill-offer,kill-exec,stop-short,stop-long,turn-end,relay-kill`, `-Dspike.trials=10`, `-Dspike.workers=2`, `-Dspike.deadline-s=3600`. Output: `gate16-<harness>.json` with the evaluation of every pass criterion per trial (L11)
+|===
+
+Options for all three:
+
+* `-Dspike.model=<model>` (for example `claude-haiku-4-5`; for OpenCode the model of Part A's setup record or a current free model);
+* `-Dspike.layout=auto|native|jvm`;
+* `-Dspike.wait-s=20`, `-Dspike.grace-s=30`, `-Dspike.stop-short-s=16`, `-Dspike.stop-long-s=70`, `-Dspike.exit-detect-max-ms=1500`;
+* `-Dspike.write-extra=<paths>` (extra writable paths for the harness under Landlock).
+
+The logs of every run (`events.jsonl`, `supervisor.jsonl`, `harness-*.jsonl`, `daemon.log`, `trials.json`, `result.json`) go to `pm-modules/pm-e2e/target/spike-runs/<name>-<stamp>/`. Keep them for the result.
+
+Known points to watch on the first Linux run:
+
+* Claude Code rewrites `~/.claude.json` atomically, which may need write access to `$HOME` itself. Record what is needed and widen it with `-Dspike.write-extra` (this is the writable-paths finding of L10).
+* The Codex flags (`codex exec --json`, `-c mcp_servers.…`, `--output-schema`) are taken from documentation and have not been run. Expect adjustments, which are allowed in `de.cuioss.pm.e2e.spike`.
+* That OpenCode passes its environment on to the `stdio` MCP server (job token) is unverified.
+* The turn-end prompt is new; Part A's was not archived.
 
 [#open-before-run]
-== Open Before the Run
+== Order of the Run
 
-Items L1 to L9 and L13 can run as soon as this document is on `main`. L10 to L12 and L7 need the harness drivers and the STDIO test of `pm-e2e`. These arrive with a follow-up merge to `main`. Pull `main` and rebase the branch before starting those items.
+. <<native-transport-linux>> (the native daemon depends on it).
+. L1 to L9 and L13 (the build and ITs).
+. L10 and L12 (one task per harness, minutes).
+. L11 last (hours: six faults × ten trials × two harnesses).
