@@ -362,7 +362,17 @@ Antigravity's headless capabilities are recorded as input to PM-WATCH-CLIENT-11.
 * Plain JGit with our own reachability metadata replaces the `quarkus-jgit` extension that `PM-TECH-2` names (correction candidate).
 * Linked worktrees written natively are read correctly by `git worktree list --porcelain`.
 
-*Status*: `[~]` (footprint figure; providers against the real services in M17 to M21)
+*Against the real remote* (2026-10-06, JVM, `FixtureGitHubIT`, two runs with identical results). The steps run against `cuioss/pm-mcp-fixture` over https with App installation tokens:
+
+* fetch with a `contents:read` token;
+* a linked worktree on a new branch, then commit and push;
+* a push with a stale lease is rejected (`REJECTED_LEASE`); the push with the right lease succeeds;
+* fetch, log, `worktree-sha`, worktree list and remove;
+* a push to a gitlab.com remote is refused (`REMOTE_ORIGIN_MISMATCH`).
+
+Timings of run 2: fetch 808 ms, push 1 406 ms, lease push 1 286 ms, `worktree-sha` 7 ms. The contract has no clone operation; init, a configured remote, and fetch serve instead.
+
+*Status*: `[~]` (the real-remote run in the native daemon and the footprint figure are open)
 
 === M17 to M21: GitHub App and GitLab against Real Services
 
@@ -380,9 +390,50 @@ Antigravity's headless capabilities are recorded as input to PM-WATCH-CLIENT-11.
 * GitHub App: `pm-mcp-fixture-agent` (App ID 5208102), installed on that repository only with the seven repository permissions of the specification: `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `actions: read`, `statuses: read`, `metadata: read`. Its key and identifiers are in the operator's `~/.config/pm-mcp-fixture/`, outside the repository.
 * GitLab: the project `cuioss/pm-mcp-fixture` (public), with a trivial pipeline. The token is taken from the operator's `glab` login.
 
-*Result*:
+*Result* (2026-10-06, `FixtureGitHubIT` and `FixtureGitLabIT`, opt-in with `-Dspike.fixture`, each run twice with identical results; evidence in `target/verification-results/m16`–`m21*.json`):
 
-*Status*: `[ ]`
+*M17: fail.* The App opened the pull requests (`pm-mcp-fixture-agent[bot]`) and posted `@coderabbitai review` under its own identity; the wait was bounded at 15 min.
+
+* CodeRabbit answered only with a skip notice ("Review skipped … Bot user detected"), within 9 s of the pull request opening, and never answered the App's trigger.
+* Sourcery reviewed on its own about 40 s after opening, which is review on push.
+* `cuioss-review-bot` stayed silent.
+
+*Finding*: CodeRabbit reviews neither App-authored pull requests nor App-identity triggers. Registering it `auto_on_push` gives no review either, because the pull request itself is App-authored. This contradicts the review-bot assumptions of `phase-workflows/05` and is an intent-level correction candidate: who authors a pull request, and how a bot that ignores bot users is served.
+
+*M18: pass.* The pushes and the pull request made with the installation token triggered the `ci` workflow: push runs 37437708313 and 37437712482, `pull_request` run 37437718300, all with actor `pm-mcp-fixture-agent[bot]`.
+
+*M19: pass.* The installation holds exactly the seven permissions. A token that asks for `administration:read` is refused (422). With narrowed tokens per operation, every operation succeeds:
+
+* push (`contents:write`);
+* pull-request create and pull-request comment (`pull_requests:write`; `issues:write` alone gets `403`);
+* review comment, GraphQL review-thread list and resolve;
+* checks, statuses and actions reads;
+* branch delete.
+
+The merge-queue enqueue is refused with "No merge queue found for branch 'main'", which is expected: the fixture has no queue, and this is not a permission error.
+
+*Findings*:
+
+* A comment on a pull request needs `pull_requests:write`, so the operation-class mapping must not use `issues:write` for it.
+* GitHub downloads App keys in PKCS#1, but `GitHubAppJwt` accepts only PKCS#8. The product must read PKCS#1 or the installer must convert the key.
+
+*M20: fail (token identity only).*
+
+* These operations succeed on the GitLab project: discussions list, reply and resolve; job trace (6 558 characters); merge with `sha`.
+* Merge train add answers `400` "Merge trains are not enabled for this project" (free plan).
+* `personal_access_tokens/self` refuses the OAuth token of a `glab` login with `400` "requires token type to be a personal access token".
+
+*Findings*:
+
+* The token-identity operation needs a fallback for OAuth tokens (`GET /user` or `oauth/token/info`).
+* `CiResult` maps a `400` refusal to `FAILED`; a provider refusal must map to `REJECTED`.
+* `glab` 1.120.0 has no `auth token` command; the token is read with `glab config get token`.
+
+*M21: pass.* `glab api … --input -` reads the body from `stdin` for merge-request create, note reply, and merge: a wrong `sha` on `stdin` gets `409`, the right one merges. The answer for merge train add does not depend on the body, so it decides nothing about `stdin`. Every form without a body works.
+
+*Cleanup*: GitHub pull requests #1 and #2 are closed and their branches deleted. GitLab merge requests !1 to !4 were merged as part of the test, so GitLab `main` carries four trivial `fixture-runs/*.txt` commits.
+
+*Status*: `[~]` (M18, M19 and M21 pass; M17 and M20 are failed findings for consolidation)
 
 === M22: Migration Inventory (`PM-TEST-1`)
 
