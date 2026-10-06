@@ -17,7 +17,7 @@ The document is self-contained. A Claude Code session on the Linux machine can r
 === Rules
 
 * *Pass criteria are fixed.* Every item states its pass criterion below, set before the first run. Never edit a pass criterion after a run. If a criterion turns out to be wrong, record that as a finding in the item's result.
-* *Branch.* Work on `feature/m0-part-b-linux`, created from `main`. Write results only into this document, in the item's *Result* block, its *Status* line, and <<setup-record>>.
+* *Branch.* Work on `feature/m0-part-b-linux`, created from `main`. Write results only into this document, in the item's *Result* block, its *Status* line, and <<setup-record>>. A procedure step that proves unusable is corrected in place after the run and named as a finding in the item's result.
 * *Code changes.* Code may change only in the Linux-specific classes, and every change comes with a test:
 ** `pm-modules/pm-exec` (Landlock), `pm-mcp-server/.../credentials/dbus` and `SecretServiceStore` (Secret Service);
 ** the Linux branches of `pm-modules/pm-api/.../posix` (spawn);
@@ -110,12 +110,14 @@ Each harness is logged in once interactively. The workers of L10 to L12 use the 
 
 === Keyring Session (gate 5)
 
-On a desktop session the keyring already runs; record which one it is. On a headless machine, start a session bus and an unlocked keyring for the run:
+On a desktop session the keyring already runs; record which one it is. On a headless machine, start a session bus and an unlocked keyring for the run. Isolate it first: set a private, short `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` *before* `dbus-run-session`, so that the bus and the D-Bus-activated keyring never open the user's own keyrings with the test password. Keep the directory short: the keyring's control socket `<XDG_RUNTIME_DIR>/keyring/control` must fit the 108-byte `sun_path`.
 
 [source,bash]
 ----
+mkdir -p ~/.pmkr/data ~/.pmkr/run && chmod 700 ~/.pmkr/run
+export XDG_DATA_HOME=~/.pmkr/data XDG_RUNTIME_DIR=~/.pmkr/run
 dbus-run-session -- bash        # every gate-5 step runs inside this shell
-echo -n "pm-test-keyring" | gnome-keyring-daemon --unlock --components=secrets
+echo -n "pm-test-keyring" | gnome-keyring-daemon --daemonize --unlock --components=secrets
 echo "$DBUS_SESSION_BUS_ADDRESS"   # must be unix:path=..., an abstract address is not usable (L8)
 secret-tool store --label=probe service probe key probe <<< "x" && secret-tool lookup service probe key probe
 ----
@@ -130,15 +132,19 @@ Fill in before the first item.
 [cols="2,3", options="header"]
 |===
 |Component |Version / value
-|Ubuntu, kernel, architecture |
-|Landlock ABI (`pm-exec --probe`) |
-|GraalVM (`native-image --version`) |
-|Docker, Compose |
-|Gradle, mvnd |
-|Desktop keyring or headless `gnome-keyring-daemon` |
-|Claude Code, OpenCode, Codex (`--version`) |
-|Models used by the workers |
-|Commit of `main` the run started from |
+|Ubuntu, kernel, architecture |Ubuntu 26.04.1 LTS (not the 24.04 this runbook assumes), kernel `7.0.0-34-generic`, `x86_64`; LSM list `lockdown,capability,landlock,yama,apparmor,ima,evm`
+|Hardware |Intel Core i5-1340P (16 logical CPUs), 30 GB RAM
+|glibc (L4: `POSIX_SPAWN_SETSID` ≥ 2.26, `addclosefrom_np` ≥ 2.34) |2.43
+|Landlock ABI (`pm-exec --probe`) |8 (`no_new_privs` true, `confinement` `confined`)
+|GraalVM (`native-image --version`) |GraalVM CE 25.4.4.1.1+1.1, `native-image 25.0.4.1.1` (SDKMAN `25.4.4.1+1-graalce`; `JAVA_HOME`/`GRAALVM_HOME` set per build, the user's default JDK stays Temurin 25+36)
+|Maven (wrapper) |Apache Maven 3.9.16
+|Docker, Compose |Docker Engine 29.8.2 (`docker-ce`, containerd.io 2.3.6), Compose v5.6.0, buildx 0.37.1; user in group `docker`
+|Gradle, mvnd |Gradle 9.6.1, mvnd 1.0.6 (embedded Maven 3.9.16)
+|Desktop keyring or headless `gnome-keyring-daemon` |Headless: the run uses an SSH session (`tty`, remote), no desktop session of the user. `gnome-keyring` 50.0, `libsecret-tools` 0.21.7, D-Bus 1.16.2. The user session bus is a path address (`unix:path=/run/user/1000/bus`); no keyring daemon of the user runs, `org.freedesktop.secrets` is only activatable. Gate 5 therefore runs in the `dbus-run-session` keyring session of <<_keyring_session_gate_5>>
+|Claude Code, OpenCode, Codex (`--version`) |Claude Code 2.1.291, OpenCode 1.18.34 (logins: OpenCode Zen, OpenCode Go), Codex not installed (L12 not run); Node.js 22.22.1
+|GitHub CLI |`gh` 2.102.0
+|Models used by the workers |Claude Code: `claude-haiku-4-5`; OpenCode: `opencode-go/muse-spark-1.3-contributor` (OpenCode Go)
+|Commit of `main` the run started from |`aa77be0`
 |===
 
 [#build]
@@ -207,16 +213,18 @@ Every item has the same blocks: what it verifies, the fixed pass criterion, the 
 [cols="3,2,1", options="header"]
 |===
 |Check |Figure / evidence |Pass
-|Socket and directory modes | |
-|401 without / with wrong token | |
-|Unbuffered SSE | |
-|Second runtime exits 0, base unchanged | |
-|Stale socket after `kill -9` | |
-|Exit 77 at 108+ bytes, nothing written | |
-|`commonmark` / `cui-http` in native | |
+|Socket and directory modes |socket `rw-------`, `run/` `rwx------`, token `rw-------` (`gate1-socket-listener.json`) |yes
+|401 without / with wrong token |`DaemonStartupIT` native, passed |yes
+|Unbuffered SSE |first event after 314 ms, before the stream ends (`gate1-sse-unbuffered.json`) |yes
+|Second runtime exits 0, base unchanged |`DaemonStartupIT` native, passed |yes
+|Stale socket after `kill -9` |`DaemonStartupIT` native, passed |yes
+|Exit 77 at 108+ bytes, nothing written |143-byte socket path, exit `77` (`gate1-sun-path-refusal.json`) |yes
+|`commonmark` / `cui-http` in native |validator findings `html_block`, `link_rejected` (`gate1-ingestion-libraries.json`, `McpSurfaceIT` native 4/4) |yes
 |===
 
-*Status*: `[ ]`
+The native daemon needed the epoll metadata of <<native-transport-linux>> (generated with the tracing agent of GraalVM CE 25.4.4.1.1). With it, `DaemonStartupIT` passed natively on the first build; no further iteration was needed.
+
+*Status*: `[x]`
 
 === L2: PM-TECH-3 Bounds on Linux (gate 1)
 
@@ -238,14 +246,20 @@ Every item has the same blocks: what it verifies, the fixed pass criterion, the 
 [cols="3,2,1", options="header"]
 |===
 |Figure |Value (median / max) |Pass
-|`pm-mcpd` cold start | |
-|`pm-mcpd` idle RSS | |
-|Relay `initialize` forwarded | |
-|`pm-operator` first request | |
-|Binary sizes (four) and native build durations | |—
+|`pm-mcpd` cold start |26.9 ms median (min 21.1, max 33.6; 20 starts); repeat run 27.1 ms (min 20.7, max 38.6) (`gate1-pm-tech-3-figures.json`) |yes
+|`pm-mcpd` idle RSS |49.3 MB; repeat run 49.2 MB |yes
+|Relay `initialize` forwarded |6.98 ms median (min 5.51, max 7.98; 15 runs) (`pm-tech-3-relay-first-forward-native.json`) |yes
+|`pm-operator` first request |14.36 ms median (min 11.76, max 22.50; 15 runs) (`pm-tech-3-operator-first-request-native.json`) |yes
+|Binary sizes (four) and native build durations |`pm-mcpd` 62.3 MiB, 3 m 28 s in the full reactor build (1 m 23 s when built alone); `pm-mcp` 17.2 MiB, 34.3 s; `pm-operator` 17.3 MiB, 46.7 s; `pm-exec` 12.4 MiB, 27.0 s. Full `verify -Pnative,integration-tests`: 7 m 12 s |—
 |===
 
-*Status*: `[ ]`
+Measurement conditions: the machine is a shared workstation with other long-lived agent sessions (OpenCode, Claude Code, a Gradle daemon). The figures above were taken with those sessions idle, each run directly after a native rebuild of `pm-mcpd`. The first run of the full reactor build, at a load average of about 30 on 16 logical CPUs, gave a cold-start median of 55.2 ms (min 39.6, max 96.1) and 49.2 MB idle RSS. That run shows that the bound is load-sensitive on this machine; it is not the result.
+
+Finding on the procedure: a run with `-Dquarkus.native.reuse-existing=true` repackages `quarkus-run.jar` but keeps the older native runner, and `DaemonProcess` then selects the JVM runner because the JAR is newer (figures of about 900 ms and 171 MB, labelled `"runner": "jvm"`). Re-measuring therefore needs a full native build of `pm-mcp-server`.
+
+Netty library beside `pm-mcpd` (the question of <<native-transport-linux>>), 15 starts each from the staged installation, time to the first `200` of `GET /api/v1/status` measured by a shell loop (which adds curl polling to the figure): with `libnetty_transport_native_epoll_x86_64.so` beside the binary the daemon maps it from `bin/`, median 72 ms (min 62, max 78). Without it Netty extracts the library into `/tmp` and maps it from there, unlinked after loading (`/tmp/libnetty_transport_native_epoll_x86_64<random>.so (deleted)` in `/proc/<pid>/maps`), median 68 ms (min 61, max 80). On Linux the extraction puts executed native code in `/tmp` as on macOS, but its start-time cost is within the noise of this measurement, unlike the about 250 ms on macOS.
+
+*Status*: `[x]`
 
 === L3: Client Stack under Native Image (gate 1)
 
@@ -268,11 +282,11 @@ Every item has the same blocks: what it verifies, the fixed pass criterion, the 
 [cols="3,2,1", options="header"]
 |===
 |Check |Evidence |Pass
-|`PmMcpProcessIT` (native) | |
-|`PmOperatorProcessIT` (native) | |
+|`PmMcpProcessIT` (native) |4/4 passed; `stdout` 3 JSON-RPC lines, exit 0 ms after `stdin` EOF (`pm-mcp-stdio-hygiene-native.json`) |yes
+|`PmOperatorProcessIT` (native) |4/4 passed; `spike events` latency after the first event ≤ 1 ms at a 250 ms interval (`sse-unbuffered-pm-operator-native.json`) |yes
 |===
 
-*Status*: `[ ]`
+*Status*: `[x]`
 
 === L4: Detached On-Demand Start (gate 8)
 
@@ -292,11 +306,18 @@ Every item has the same blocks: what it verifies, the fixed pass criterion, the 
 +
 [source,bash]
 ----
-setsid bash -c 'echo "" | $PM_MCP_HOME/bin/pm-mcp serve --client neutral & echo $! > /tmp/relay.pid; wait' &
-sleep 2; pid=$(jq .pid $PM_MCP_BASE/state/runtime.json)
-ps -o pid,pgid,sid,stat,cmd -p $pid
-kill -HUP -- -$(ps -o pgid= -p $(cat /tmp/relay.pid) | tr -d ' ') 2>/dev/null; sleep 1
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"l4","version":"1"}}}'
+relay() {   # a relay in its own session; the initialize request starts the runtime, the open stdin keeps the relay alive
+  setsid bash -c "(echo '$INIT'; sleep 60) | \$PM_MCP_HOME/bin/pm-mcp serve --client neutral" > /dev/null 2>&1 &
+  sleep 2; pgrep -n -f "pm-mcp serve --client neutral"
+}
+r=$(relay); pid=$(jq .pid $PM_MCP_BASE/state/runtime.json)
+ps -o pid,ppid,pgid,sid,stat,cmd -p $pid,$r
+ls -l /proc/$pid/fd/0 /proc/$pid/fd/1 /proc/$pid/fd/2; grep flags /proc/$pid/fdinfo/1
+kill -9 $r; sleep 1; $PM_MCP_HOME/bin/pm-operator status
+r=$(relay); kill -HUP -- -$(ps -o pgid= -p $r | tr -d ' '); sleep 1
 $PM_MCP_HOME/bin/pm-operator status
+ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/'   # no zombie
 ----
 
 *Fallback (gate 8)*: on a failing platform the starting binary reports the failure and names `pm-operator runtime install`, and the per-user `systemd --user` service serves that platform. On-demand start stays the default wherever it works.
@@ -306,12 +327,14 @@ $PM_MCP_HOME/bin/pm-operator status
 [cols="3,2,1", options="header"]
 |===
 |Check |Evidence |Pass
-|pid = pgid = sid of the daemon | |
-|`stdin` / `daemon.log` | |
-|Survives relay `kill -9` and group `SIGHUP` | |
+|pid = pgid = sid of the daemon |manual: daemon pid = pgid = sid `4017689`, relay in its own session `4017681`; after the relay's end the daemon's parent is pid 1. ITs: `gate8-detached-start-pm-mcp-native.json`, `gate8-detached-start-pm-operator-native.json` (pid = pgid, survived) |yes
+|`stdin` / `daemon.log` |fd 0 `/dev/null`; fd 1 and 2 `logs/daemon.log`, flags `0102001` (`O_WRONLY`, `O_APPEND`) |yes
+|Survives relay `kill -9` and group `SIGHUP` |`pm-operator status` `running` with the same pid after `kill -9` of the relay and after `SIGHUP` to a second relay's process group; no zombie |yes
 |===
 
-*Status*: `[ ]`
+Finding on the procedure (corrected above after the run): the sequence first given, `setsid bash -c 'echo "" | $PM_MCP_HOME/bin/pm-mcp serve --client neutral & …'`, starts no runtime. The relay starts the runtime on demand with its first request, and `echo ""` sends only a blank line, which the relay ignores before it ends on `stdin` EOF. The run used the sequence now in the procedure: an `initialize` request with `stdin` held open, which starts the runtime and keeps the relay alive for the `kill -9` and the group `SIGHUP`.
+
+*Status*: `[x]`
 
 === L5: Web Listener at Runtime (gate 15)
 
@@ -334,12 +357,12 @@ $PM_MCP_HOME/bin/pm-operator status
 [cols="3,2,1", options="header"]
 |===
 |Check |Evidence |Pass
-|Open/close without disturbing the socket stream | |
-|`/mcp` 404, runtime token 401 on the web listener | |
-|LAN TLS certificate (P-256) | |
+|Open/close without disturbing the socket stream |IT: open 4 ms, close 2 ms, socket stream survived (`gate15-web-listener.json`, `WebListenerIT` native 2/2). Manual: `spike events --count 30` received all 30 events, `seq` 0 to 29 without gap, at 1 s spacing, across `web enable`, `web disable`, `web enable --lan` and `web disable` |yes
+|`/mcp` 404, runtime token 401 on the web listener |`/mcp` `404`; `/api/v1/status` with the runtime token `401`, without token `401`; `/` (web app) `200`. Loopback mode listens on `127.0.0.1:7420` only |yes
+|LAN TLS certificate (P-256) |`openssl s_client`: `id-ecPublicKey`, `prime256v1` (NIST P-256), `ecdsa-with-SHA256` (`gate15-web-tls.json`: `SHA256withECDSA`); LAN mode listens on `*:7420`; after `web disable` the port is closed |yes
 |===
 
-*Status*: `[ ]`
+*Status*: `[x]`
 
 === L6: LSP4J and JGit under Native Image (gate 2, `PM-TECH-2`)
 
@@ -356,11 +379,11 @@ $PM_MCP_HOME/bin/pm-operator status
 [cols="3,2,1", options="header"]
 |===
 |Check |Figure |Pass
-|LSP `initialize` / `definition` (ms) | |
-|JGit scenario (ms, all steps) | |
+|LSP `initialize` / `definition` (ms) |1145 / 20 (`gate2-lsp4j-native.json`, `LspAndGitInDaemonIT` native 2/2) |yes
+|JGit scenario (ms, all steps) |61 ms; all 11 steps `OK`, `commit-with-hook` `CAPABILITY_MISSING` (`jgit-native.json`) |yes
 |===
 
-*Status*: `[ ]`
+*Status*: `[x]`
 
 === L7: McpAssured STDIO Harness (gate 6)
 
@@ -377,11 +400,11 @@ $PM_MCP_HOME/bin/pm-operator status
 [cols="3,2,1", options="header"]
 |===
 |Mode |Evidence |Pass
-|Runner JAR | |
-|Native `pm-mcpd` | |
+|Runner JAR |`StdioHarnessIT` JVM layout passed: protocol `2025-11-25`, connect 348 ms, `tools/list` + `hello` 470 ms, 10 core tools, no relay `stderr` (`gate6-stdio-harness-jvm.json`) |yes
+|Native `pm-mcpd` |`StdioHarnessIT` native layout passed: protocol `2025-11-25`, connect 181 ms, `tools/list` + `hello` 174 ms, 10 core tools, no relay `stderr` (`gate6-stdio-harness-native.json`) |yes
 |===
 
-*Status*: `[ ]`
+*Status*: `[x]`
 
 === L8: Secret Service over D-Bus (gate 5)
 
@@ -414,15 +437,19 @@ $PM_MCP_HOME/bin/pm-operator spike keyring delete probe-key
 [cols="3,2,1", options="header"]
 |===
 |Check |Figure / evidence |Pass
-|`SecretServiceIT` (JVM) | |
-|`KeyringIT` (native): put / get / delete ms | |
-|Visible to `secret-tool` with the attributes | |
-|Locked collection: file store, no hang | |
-|No session bus: file store | |
-|Bus address form (path or abstract) | |
+|`SecretServiceIT` (JVM) |passed; direct round trip put 22.0 ms, get 3.8 ms (`gate5-secret-service-jvm-direct.json`); `KeyringIT` (JVM) store `secret-service`, put 19.7 / get 2.1 / delete 5.0 ms (`gate5-secret-service-jvm.json`) |yes
+|`KeyringIT` (native): put / get / delete ms |store `secret-service`, put 16.5 / get 1.7 / delete 4.7 ms (`gate5-secret-service-native.json`) |yes
+|Visible to `secret-tool` with the attributes |`secret-tool search --all service de.cuioss.pm-mcp/58cf68c52b709069`: one item, label `de.cuioss.pm-mcp/58cf68c52b709069 probe-key`, schema `org.freedesktop.Secret.Generic`, attributes `service` and `credential_key` (no `project`: the spike verb writes a runtime-scoped key); `get` returned the value from store `secret-service`; after `delete` the search finds 0 items |yes
+|Locked collection: file store, no hang |after `secret-tool lock --collection=login`: `runtime start` returned in 92 ms, `PM_MCP-130` logged, `PM_MCP-30` store `file`; `put` 25 ms into `credentials/locked-key.json` (`0600` in `0700`); no prompt |yes
+|No session bus: file store |`env -u DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` without `bus`: start in 97 ms, `PM_MCP-130: No OS keyring usable, the file credential store serves: Secret Service: not reachable, or no unlocked default collection on <XDG_RUNTIME_DIR>/bus`; `credentials/` `drwx------`, `nobus-key.json` `-rw-------`; get returned the value from store `file` |yes
+|Bus address form (path or abstract) |path in both cases: the user session bus `unix:path=/run/user/1000/bus`, and `dbus-run-session` (D-Bus 1.16.2) `unix:path=/tmp/dbus-<random>` |yes
 |===
 
-*Status*: `[ ]`
+Keyring session used: the machine has the user's own `login.keyring` (from desktop logins), which the run must not open with a test password. Every gate-5 step therefore ran in a session bus started with `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` pointing to a private directory (`~/.pmkr`), set *before* `dbus-run-session` so that the D-Bus-activated `gnome-keyring-daemon` inherits them, with `echo -n pm-test-keyring | gnome-keyring-daemon --daemonize --unlock --components=secrets` inside. Two findings on the procedure, both corrected in <<_keyring_session_gate_5>> after the run: (1) set without that, `org.freedesktop.secrets` is activated with the user's real data directory; (2) the directory must be short, because the keyring's control socket `<XDG_RUNTIME_DIR>/keyring/control` is subject to the 108-byte `sun_path` limit like the runtime socket (a deep path fails with `couldn't bind to control socket … address already in use` and a `StartServiceByName` timeout).
+
+On the user session bus of this headless machine, `org.freedesktop.secrets` is D-Bus-activatable and starts a `gnome-keyring-daemon` whose `login` collection stays locked (no login session unlocks it). The first native `KeyringIT` of the full build ran there and fell back to the file store with `fallback_reason` `Secret Service: not reachable, or no unlocked default collection on /run/user/1000/bus`, without a hang: the locked case of this item, as found on a real machine.
+
+*Status*: `[x]`
 
 === L9: Landlock Confinement in `pm-exec` (gate 3)
 
@@ -462,7 +489,7 @@ E="$PM_MCP_HOME/bin/pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev"
 ** *Maven wrapper* (this repository; write set: repository, `~/.m2`): `$E --write $PWD --write $HOME/.m2 -- $PWD/mvnw -q -l /tmp/l9-mvn.log verify -pl pm-modules/pm-core -am`
 ** *mvnd* (write set: repository, `~/.m2`, `~/.m2/mvnd`): `$E --write $PWD --write $HOME/.m2 -- $(command -v mvnd) -q verify -pl pm-modules/pm-core -am`. Then run it a second time while the daemon is still up, and record whether the daemon started under confinement keeps its ruleset.
 ** *Gradle daemon*: create the fixture with `mkdir -p ~/pmfix/gradle && cd ~/pmfix/gradle && gradle init --type java-application --dsl kotlin --test-framework junit-jupiter --project-name fix --package fix --no-split-project --java-version 25`. Then run `$E --write $HOME/pmfix/gradle --write $HOME/.gradle -- $HOME/pmfix/gradle/gradlew build`, twice (the second run uses the warm daemon).
-** *Testcontainers*: create `~/pmfix/tc` as a minimal Maven project, one JUnit 5 test that starts `GenericContainer("alpine:3")` with `withCommand("true")`, using the dependencies `org.testcontainers:testcontainers` and `org.testcontainers:junit-jupiter`. These dependencies are for this fixture only, outside the repository. Run `$E --write $HOME/pmfix/tc --write $HOME/.m2 -- $PWD/mvnw -f $HOME/pmfix/tc/pom.xml -q test`. Record whether the Docker socket `/var/run/docker.sock` is reachable under Landlock.
+** *Testcontainers*: create `~/pmfix/tc` as a minimal Maven project, one JUnit 5 test that starts `GenericContainer("alpine:3")` with `withCommand("sleep", "30")` (a container that exits at once fails the running-state wait of `GenericContainer`), using the dependencies `org.testcontainers:testcontainers` and `org.testcontainers:testcontainers-junit-jupiter` (Testcontainers 2.x; up to 1.21.x the module was `org.testcontainers:junit-jupiter`). These dependencies are for this fixture only, outside the repository. Run `$E --write $HOME/pmfix/tc --write $HOME/.m2 -- $PWD/mvnw -f $HOME/pmfix/tc/pom.xml -q test`. Record whether the Docker socket `/var/run/docker.sock` is reachable under Landlock.
 ** *Docker Compose*: create `~/pmfix/compose/compose.yaml` with one service `hello` (`image: alpine:3`, `command: ["echo","ok"]`). Run `$E --write $HOME/pmfix/compose --write $HOME/.docker -- /usr/bin/docker compose -f $HOME/pmfix/compose/compose.yaml up --abort-on-container-exit`.
 . Adversarial check: `$E --write $PWD -- /usr/bin/touch $PM_MCP_BASE/x` must fail, and `$E --write $PWD -- /usr/bin/cat $PM_MCP_BASE/run/runtime.token` must fail.
 . Side effect of the read set: the directories on the path from `/` to `<PM_MCP_BASE>` get no rule of their own. Record whether `$E --write /tmp -- /usr/bin/ls /` and `… ls $HOME` are denied, and whether any build above needed such a listing.
@@ -477,19 +504,27 @@ E="$PM_MCP_HOME/bin/pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev"
 [cols="3,2,1", options="header"]
 |===
 |Check |Evidence / extra write paths needed |Pass
-|Probe (ABI, confinement) | |
-|`PmExecIT` native (incl. Landlock group) | |
-|Maven wrapper | |
-|mvnd (cold, warm daemon) | |
-|Gradle (cold, warm daemon) | |
-|Testcontainers (Docker socket) | |
-|Docker Compose | |
-|Adversarial writes/reads denied | |
-|Ancestor directory listing | |
-|WSL2 | |
+|Probe (ABI, confinement) |ABI 8, `confined`, `no_new_privs`; probe 5 ms |yes
+|`PmExecIT` native (incl. Landlock group) |11/11 passed: base write/read denied, other project write denied, own project write allowed, sibling readable, job-private dir read-only, missing program `127` (`gate3-pm-exec-linux-native.json`) |yes
+|Maven wrapper |`verify -pl pm-modules/pm-core -am` passed in 12.8 s with the listed write set (repository, `~/.m2`, `/tmp`, `/dev`); no extra path |yes
+|mvnd (cold, warm daemon) |mvnd 1.0.6: cold 14 s, warm 10 s (the warm run reused the daemon started by the cold run); no extra path. The daemon started under confinement keeps the ruleset (`NoNewPrivs: 1`, Landlock domain inherited); see findings F1 and F2 |yes
+|Gradle (cold, warm daemon) |Gradle 9.6.1 wrapper: cold 15.5 s (new daemon), warm 0.67 s (same daemon, `NoNewPrivs: 1`); write set fixture + `~/.gradle`, no extra path; see findings F1 and F2 |yes
+|Testcontainers (Docker socket) |1/1 test passed in 9 s; `/var/run/docker.sock` (`root:docker`, `0660`) is reachable under Landlock, which does not govern `connect` on a pathname socket; see finding F3 |yes
+|Docker Compose |`up --abort-on-container-exit` exit 0, service `hello` exited 0; no extra path |yes
+|Adversarial writes/reads denied |`touch $PM_MCP_BASE/x`: `Permission denied`, nothing created; `cat …/run/runtime.token`: `Permission denied` |yes
+|Ancestor directory listing |`ls /` and `ls $HOME` denied (`Permission denied`, exit 2); `ls $HOME/git` (a sibling subtree of the base's parent) allowed; `stat` of the base itself allowed, listing it denied. No build above needed such a listing |—
+|WSL2 |not run (no Windows machine with WSL2 available) |—
 |===
 
-*Status*: `[ ]`
+Deviations from the procedure as first given (corrected above after the run): the Testcontainers fixture uses Testcontainers 2.0.5, in which the JUnit 5 module is `org.testcontainers:testcontainers-junit-jupiter` (`org.testcontainers:junit-jupiter` ends at 1.21.x), with JUnit Jupiter 6.1.3. The container runs `sleep 30` instead of `true`: a container that exits at once fails the default running-state wait of `GenericContainer`, a failure unrelated to confinement.
+
+Findings (the pass criterion above is met; it does not cover delegation of work to a process outside the job's Landlock domain):
+
+* *F1, unconfined build daemon escapes the write set.* A Landlock domain confines a process and its descendants, not the processes it talks to. An mvnd or Gradle daemon started outside confinement (`NoNewPrivs: 0`) serves a later confined client over its loopback TCP connection and writes wherever the client asks. Reproduced for both: with the daemon started by an unconfined build, `pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev --write ~/.m2 -- mvnd package` in `~/pmfix/mvndprobe` (project *not* in the write set) exited 0 and created `target/classes`, and the same with `--write ~/.gradle -- gradlew build` created `app/build`; the control `pm-exec … -- touch ~/pmfix/mvndprobe/x` was denied. Candidate countermeasures for the macOS-side decision: restrict TCP connect for the job (Landlock `LANDLOCK_ACCESS_NET_CONNECT_TCP`, ABI ≥ 4, here 8), or give each job its own daemon store (`MVND_DAEMON_STORAGE`, `GRADLE_USER_HOME`) so a job only reaches daemons started inside its own domain.
+* *F2, confined build daemon carries the first job's ruleset.* The reverse direction: a daemon started under confinement inherits the starting job's domain for its lifetime. A later client with a different write set that reuses it (shown with an unconfined `mvnd package` of `~/pmfix/mvndprobe`, which had copied the repository's `.mvn/jvm.config` so that mvnd judged the daemon compatible) fails with `could not create parent directories`. A daemon shared across jobs therefore needs the same per-job daemon store as F1.
+* *F3, the Docker socket bypasses the read set.* Under `--deny-read $PM_MCP_BASE`, `cat $PM_MCP_BASE/run/runtime.token` is denied, but `docker run -v $PM_MCP_BASE/run:/b:ro alpine:3 wc -c /b/runtime.token` through the same `pm-exec` printed `43` (the token length; the token itself was not printed). The Docker daemon runs as root outside the domain, so a job that can reach `/var/run/docker.sock` holds the authority of the Docker group, which includes the runtime token, the credential store, and any host path. Testcontainers and Compose (gate 3) need that socket; whether such jobs are admitted, and under which enrolment, is a decision for the macOS side.
+
+*Status*: `[x]` (criterion met; findings F1 to F3)
 
 === L10: Claude Code and OpenCode Headless, Confined (gate 13)
 
@@ -524,16 +559,20 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 [cols="3,2,2,1", options="header"]
 |===
 |Capability |Claude Code |OpenCode |Pass
-|Socket connect under Landlock | | |
-|Own login | | |
-|Writable paths needed | | |
-|Resource tools | | |
-|Structured output | | |
-|Session residue | | |
-|Largest input that completes | | |
+|Socket connect under Landlock |yes: every worker launched `confined`, Landlock ABI 8, `no_new_privs`, and reached the runtime through `pm-mcp serve --job` (`JobChainIT` native: `socket_connect` true, `initialize` 459 ms, 11 tools) |yes |yes
+|Own login |yes, no credential variable in the environment (`credential_env_present` empty) |yes, same |yes
+|Writable paths needed |`~/.claude`, `~/.claude.json` (a file rule; `$HOME` itself was not needed), `~/.cache/claude`, `~/.cache/claude-cli-nodejs`, `~/.local/state/claude`, `~/.local/share/claude`, workspace, `/tmp`, `/dev`; written: `~/.claude.json`, 5 files under `~/.claude` (session transcript, synced plugin/skill manifests), 1 MCP log under `~/.cache/claude-cli-nodejs`, the workspace `mcp-config.json`. No `-Dspike.write-extra` was needed |`~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode`, `~/.config/opencode`, workspace, `/tmp`, `/dev`; written: `opencode.db` (+ `-shm`, `-wal`), `log/opencode.log`, `~/.cache/opencode/models.json`, a native library `/tmp/.<hash>-00000000.so` (executed native code in `/tmp`), the workspace `opencode.json` |yes
+|Resource tools |not covered: `Gate13HeadlessIT` has no resource step; the tool list seen by the worker holds the 15 tools of the runtime (`hello`, `pm_*`, `pull_*`) and no resource tool |same |—
+|Structured output |parses: final text `{"status":"done","task_id":…,"decision":…}`, 0 non-JSON lines, usage fields present (`input_tokens`, `output_tokens`, cache fields, `cost_usd`) |parses, 0 non-JSON lines, usage fields `input`, `output`, `cache_read`, `cache_write`, `reasoning` |yes
+|Session residue |`~/.claude/projects/<workspace-slug>/<session>.jsonl` and the workspace `mcp-config.json`; `SIGTERM` during a held wait: exit after 601 ms, no orphaned relay |the workspace `opencode.json` (the session lives in `opencode.db`); `SIGTERM` during a held wait: exit after 43 ms, no orphaned relay |yes
+|Largest input that completes |128 000 characters (of 8 000 / 32 000 / 128 000); task 17.8 s, sizes 18.2 / 17.0 / 25.4 s; 4 tasks cost 0.28 USD |32 000 characters; 128 000 failed, see below; task 7.4 s, sizes 10.1 / 14.9 s |see below
 |===
 
-*Status*: `[ ]`
+Setup: Claude Code 2.1.291 with model `claude-haiku-4-5` (passed, so the fallback to a Sonnet model was not needed); OpenCode 1.18.34 with model `opencode-go/muse-spark-1.3-contributor`; native layout. Results `gate13-claude.json`, `gate13-opencode.json` (`pm-modules/pm-e2e/target/verification-results/`), logs `spike-runs/gate13-claude-1006-104411/` and `spike-runs/gate13-opencode-1006-104619/`; both kept beside the run in `~/pm-linux-spike-runs/`.
+
+Finding, OpenCode at 128 000 characters: OpenCode truncates a large MCP tool result before the model sees it (`The tool call succeeded but the output was truncated. Full output saved to: ~/.local/share/opencode/tool-output/tool_…`). The `pull_wait` answer carrying the 128 000-character task lost its task id in the truncated part; the model's attempt to read the saved file failed (`read` with an empty argument), and its `pull_ack` calls with guessed ids (`h128000`, `128000`, `gate13`, …) were all refused, as was a `pull_submit` with `task_id` `test`. The worker ended with `{"task_id":"unknown"}`; no task was acknowledged or submitted wrongly. The input limit of an OpenCode worker is therefore set by the harness's tool-output truncation, between 32 000 and 128 000 characters, not by the model. Inputs for the provisional link:../specification/timeouts/03-retention-host-config.adoc#size-limits[Worker Input Size Limits]: an OpenCode limit at or below that truncation, or a `pull_wait` answer that places `task_id` and the other identifiers before the task text so that a truncated answer still names its task.
+
+*Status*: `[x]` (OpenCode: largest input 32 000 characters, see finding)
 
 === L11: E2 Fault Matrix under Target Conditions (gate 16)
 
@@ -563,15 +602,19 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 [cols="2,2,2,1", options="header"]
 |===
 |Fault |Claude Code (detection, exactly-once, fencing) |OpenCode |Pass
-|`kill-offer` | | |
-|`kill-exec` | | |
-|`stop-short` | | |
-|`stop-long` | | |
-|`turn-end` | | |
-|`relay-kill` | | |
+|`kill-offer` |10/10, all criteria; detected by exit after 301 to 302 ms |10/10, all criteria; exit, 300 to 302 ms |yes / yes
+|`kill-exec` |10/10, all criteria; exit, 300 to 301 ms |10/10, all criteria; exit, 300 to 301 ms |yes / yes
+|`stop-short` |10/10, all criteria; no replacement before the deadline; 1 late call refused |10/10, all criteria; 4 late calls refused |yes / yes
+|`stop-long` |10/10, all criteria; detected by silence after 50 017 to 50 094 ms (wait 20 s + grace 30 s), never earlier; 20 late calls of replaced generations refused |aborted after 7 trials: 6 passed (silence, 50 064 to 50 097 ms); trial 7 failed `exactly_once` and `detection`, see finding |yes / *no*
+|`turn-end` |10/10, all criteria; exit, 205 to 297 ms |10/10, all criteria; exit, 236 to 298 ms |yes / yes
+|`relay-kill` |10/10, all criteria; 18 late calls refused |10/10, all criteria; 6 detected by exit (from 208 ms), 4 by silence (up to 50 091 ms); 1 late call refused |yes / yes
 |===
 
-*Status*: `[ ]`
+Setup: models as in L10, native layout, 2 workers, `-Dspike.trials=10`, defaults `wait-s=20`, `grace-s=30`, `stop-short-s=16`, `stop-long-s=70`, `exit-detect-max-ms=1500`. Claude Code: `Gate16FaultMatrixIT` passed in 28 min (`gate16-claude.json`, no global violation). OpenCode: failed after 30 min (`gate16-opencode.json`). Exit detection on Linux is at most 302 ms against Part A's 1025 ms (IT limit 1500 ms). Logs: `spike-runs/gate16-<harness>-<fault>-<stamp>/`, kept in `~/pm-linux-spike-runs/`.
+
+Finding, OpenCode `stop-long`: the cell was aborted by the IT's start-failure guard (`3 generations in a row exited before their first call`). The `stop-long` fault stopped worker `w2` generation 4 directly after its `pull_wait` returned task `f038-bui-15`, in the middle of an OpenCode step. The next three generations of the *other* worker (`w1` generations 5 to 7) each exited at start with `Error: Unexpected error … Failed query: insert into "project" … on conflict ("project"."id") do update …` on OpenCode's per-user database `~/.local/share/opencode/opencode.db`. The guard ended the cell 39 s after the injection, before the stalled worker's silence deadline (50 s), so the trial records the task as never submitted and the worker as never detected; lease release, late-call refusal and no early replacement held. The failure pattern fits a stopped OpenCode process that holds the write lock of the shared SQLite database, which blocks every other OpenCode process of the same user (the lock itself was not captured). For the worker model this means a stalled OpenCode worker can stop all OpenCode workers of the user, and the user's own interactive OpenCode sessions, until it is killed. Candidate countermeasure for the macOS-side decision: a per-worker OpenCode data directory (`XDG_DATA_HOME` per job, with the login supplied to it), which also changes the writable paths of L10. By the item's fallback (gate 16), OpenCode as configured here is not eligible as a worker host.
+
+*Status*: `[x]` (Claude Code passed; OpenCode failed `stop-long`, see finding)
 
 === L12: Codex Confined (gates 13, 9; optional)
 
@@ -583,9 +626,9 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 
 *Fallback (gates 13, 9)*: as L10. For the idle timeout there is none; the measured value goes into the client profile.
 
-*Result*: (as L10, one column)
+*Result*: not run. Codex is not installed on this machine (Setup Record); the item is optional.
 
-*Status*: `[ ]`
+*Status*: `[-]` (not run)
 
 === L13: Native Git Path on Linux (`PM-TECH-2`)
 
@@ -593,7 +636,7 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 
 *Pass criterion*: `LspAndGitInDaemonIT` (the JGit part) passes natively. The difference in idle RSS with and without one JGit scenario run is recorded.
 
-*Procedure*: part of L6. For the RSS figure, compare `ps -o rss= -p <pid>` before and 10 s after one `POST /api/v1/spike/git` with `{"op":"scenario"}`, sent with the runtime token through `curl --unix-socket`.
+*Procedure*: part of L6. For the RSS figure, compare `ps -o rss= -p <pid>` before and 10 s after one `POST /api/v1/spike/git` with `{"op":"scenario","repo":"<empty or absent directory>"}`, sent with the runtime token through `curl --unix-socket`.
 
 *Fallback (`PM-TECH-2`)*: the `git` CLI variant (`PM-EXEC-5`).
 
@@ -602,11 +645,15 @@ V4, V7 and E9 of Part A already answered the `SIGTERM` exit, the usage fields an
 [cols="3,2,1", options="header"]
 |===
 |Check |Figure |Pass
-|JGit scenario native | |
-|Idle RSS before / after | |
+|JGit scenario native |see L6 (61 ms, all steps) |yes
+|Idle RSS before / after |fresh native daemon from the staged installation, 10 s after ready: 52 084 kB (50.9 MB); 10 s after one scenario (64 ms, all steps as in L6): 64 020 kB (62.5 MB), +11.7 MB; 10 s after a second scenario (34 ms): 69 076 kB (67.5 MB) |—
 |===
 
-*Status*: `[ ]`
+The JGit variant costs about 12 MB of resident memory after its first use, and the RSS keeps growing after a second scenario (Serial GC, no maximum heap set). After git use the daemon is above the 64 MB of `PM-TECH-3`, which is defined for the clean idle state (L2: 49.2 MB); whether the bound or a heap limit (`-Xmx`, `-XX:MaxHeapSize` at native build time) covers the daemon after work is a decision for the macOS side.
+
+Finding on the procedure (corrected above after the run): `POST /api/v1/spike/git` requires `repo` besides `op`; the body `{"op":"scenario"}` first given is answered with `400` `op and repo required`.
+
+*Status*: `[x]`
 
 == Test Reference
 
