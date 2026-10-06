@@ -195,7 +195,7 @@ public final class GitLabClient {
      * personal access token (the OAuth token of a {@code glab} login, which GitLab refuses there with
      * {@code 400} "requires token type to be a personal access token") {@code GET /user}.
      *
-     * @return the identity; {@code UNAUTHORIZED} for an invalid token
+     * @return the identity; {@code AUTH_FAILED} for an invalid token
      */
     public CiResult<TokenIdentity> tokenIdentity() {
         CiResponse response = http.get("personal_access_tokens/self");

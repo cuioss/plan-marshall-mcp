@@ -137,7 +137,7 @@ public final class InstallationTokens implements AutoCloseable {
             response = http.send("POST", "app/installations/" + key.installationId() + "/access_tokens",
                     Optional.of(Json.write(body)), Optional.empty());
         } catch (GitHubAppJwt.JwtSigningException e) {
-            return CiResult.of(CiResult.Outcome.UNAUTHORIZED, e.getMessage());
+            return CiResult.of(CiResult.Outcome.AUTH_FAILED, e.getMessage());
         }
         if (!response.isOk()) {
             return CiResult.failed(response);

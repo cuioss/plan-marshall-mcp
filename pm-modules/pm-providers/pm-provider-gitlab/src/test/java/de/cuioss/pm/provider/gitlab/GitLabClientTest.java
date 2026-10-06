@@ -246,7 +246,7 @@ class GitLabClientTest {
 
             assertFalse(blocked.value().orElseThrow().active());
             assertEquals(CiResult.Outcome.FAILED, unreadable.outcome());
-            assertEquals(CiResult.Outcome.UNAUTHORIZED, refused.outcome());
+            assertEquals(CiResult.Outcome.AUTH_FAILED, refused.outcome());
         }
 
         @Test
@@ -259,11 +259,11 @@ class GitLabClientTest {
         }
 
         @Test
-        @DisplayName("reports an invalid token as unauthorized")
+        @DisplayName("reports an invalid token as an authentication failure")
         void unauthorized() {
             server.on("GET", SELF, Response.json(401, "{\"message\":\"401 Unauthorized\"}"));
 
-            assertEquals(CiResult.Outcome.UNAUTHORIZED, client.tokenIdentity().outcome());
+            assertEquals(CiResult.Outcome.AUTH_FAILED, client.tokenIdentity().outcome());
         }
     }
 }

@@ -326,13 +326,13 @@ class FixtureGitHubIT {
         Optional<CiHttpClient> issuesWrite = client("comment_issues_write", ISSUES_WRITE);
         CiResult<String> comment = issuesWrite.map(c -> new GitHubClient(c, GitHubClient.GRAPHQL_PATH)
                 .postComment(settings.owner(), settings.repository(), number, TRIGGER))
-                .orElse(CiResult.of(CiResult.Outcome.UNAUTHORIZED, "no token"));
+                .orElse(CiResult.of(CiResult.Outcome.AUTH_FAILED, "no token"));
         m19ops("comment_issues_write", ISSUES_WRITE, comment.outcome().name(), comment.detail());
         if (!comment.isOk()) {
             Optional<CiHttpClient> prWrite = client("comment_pull_requests_write", PR_WRITE);
             comment = prWrite.map(c -> new GitHubClient(c, GitHubClient.GRAPHQL_PATH)
                     .postComment(settings.owner(), settings.repository(), number, TRIGGER))
-                    .orElse(CiResult.of(CiResult.Outcome.UNAUTHORIZED, "no token"));
+                    .orElse(CiResult.of(CiResult.Outcome.AUTH_FAILED, "no token"));
             m19ops("comment_pull_requests_write", PR_WRITE, comment.outcome().name(), comment.detail());
         }
         if (!comment.isOk()) {
@@ -569,7 +569,7 @@ class FixtureGitHubIT {
         boolean comment = "OK".equals(outcomeOf(operations.get("comment_issues_write")))
                 || "OK".equals(outcomeOf(operations.get("comment_pull_requests_write")));
         String queue = String.valueOf(operations.get("merge_queue_enqueue"));
-        boolean queueNotPermission = !queue.contains("not accessible by integration") && !queue.contains("UNAUTHORIZED");
+        boolean queueNotPermission = !queue.contains("not accessible by integration") && !queue.contains("PERMISSION_DENIED");
         return ok && comment && queueNotPermission;
     }
 

@@ -161,13 +161,13 @@ class InstallationTokensTest {
         server.on("POST", "/app/installations/8/access_tokens",
                 Response.json(201, "{\"token\":\"t\",\"expires_at\":\"tomorrow\"}"));
 
-        assertEquals(CiResult.Outcome.UNAUTHORIZED, tokens.token(42, "repo", PERMISSIONS).outcome());
+        assertEquals(CiResult.Outcome.AUTH_FAILED, tokens.token(42, "repo", PERMISSIONS).outcome());
         assertEquals(CiResult.Outcome.FAILED, tokens.token(7, "repo", PERMISSIONS).outcome());
         assertEquals(CiResult.Outcome.FAILED, tokens.token(8, "repo", PERMISSIONS).outcome());
         assertTrue(tokens.tokenSource(42, "repo", PERMISSIONS).token().isEmpty());
         try (var broken = new InstallationTokens(CiEndpoint.of(server.base()), "id", () -> "garbage", redacted::add,
                      clock)) {
-            assertEquals(CiResult.Outcome.UNAUTHORIZED, broken.token(42, "repo", PERMISSIONS).outcome());
+            assertEquals(CiResult.Outcome.AUTH_FAILED, broken.token(42, "repo", PERMISSIONS).outcome());
         }
         assertTrue(redacted.isEmpty());
     }

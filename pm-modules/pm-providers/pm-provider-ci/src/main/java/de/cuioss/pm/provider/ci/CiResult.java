@@ -37,11 +37,13 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
         /**
          * The provider answered and refused the operation itself for a stated reason (e.g. not mergeable, head
          * moved, validation failure, a feature that is not enabled); a credential refusal is
-         * {@link #UNAUTHORIZED}.
+         * {@link #AUTH_FAILED} or {@link #PERMISSION_DENIED}.
          */
         REJECTED,
-        /** The credential is missing, invalid or lacks the permission. */
-        UNAUTHORIZED,
+        /** The provider does not accept the credential: missing, invalid, expired or revoked ({@code 401}). */
+        AUTH_FAILED,
+        /** The provider accepts the credential, which lacks the permission for the operation ({@code 403}). */
+        PERMISSION_DENIED,
         /** The provider's rate limit applies until {@code resetAt}; neither a failure nor a timeout. */
         RATE_LIMITED,
         /**
@@ -97,8 +99,9 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
     /**
      * Maps a response that is not {@link CiResponse.Outcome#OK} to the contract outcome.
      * <p>
-     * An HTTP error maps by its status: {@code 401} and {@code 403} to {@link Outcome#UNAUTHORIZED} (the
-     * credential is refused, never the operation), {@code 404} to {@link Outcome#NOT_FOUND}, and every other
+     * An HTTP error maps by its status: {@code 401} to {@link Outcome#AUTH_FAILED} and {@code 403} to
+     * {@link Outcome#PERMISSION_DENIED} (the credential is refused, never the operation), {@code 404} to
+     * {@link Outcome#NOT_FOUND}, and every other
      * {@code 4xx} to {@link Outcome#REJECTED} when the provider refuses the operation itself: always for
      * {@code 405}, {@code 406}, {@code 409} and {@code 422}, and for the remaining ones (such as {@code 400})
      * when the body carries the provider's reason ({@code message} or {@code error}). A {@code 4xx} without a
@@ -123,7 +126,8 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
 
     private static Outcome byStatus(int status, boolean reasoned) {
         return switch (status) {
-            case 401, 403 -> Outcome.UNAUTHORIZED;
+            case 401 -> Outcome.AUTH_FAILED;
+            case 403 -> Outcome.PERMISSION_DENIED;
             case 404 -> Outcome.NOT_FOUND;
             case 405, 406, 409, 422 -> Outcome.REJECTED;
             default -> status >= 400 && status < 500 && reasoned ? Outcome.REJECTED : Outcome.FAILED;

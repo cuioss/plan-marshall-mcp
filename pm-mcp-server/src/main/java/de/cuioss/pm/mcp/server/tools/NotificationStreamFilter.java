@@ -37,14 +37,18 @@ import jakarta.enterprise.event.Observes;
  * <p>
  * The runtime serves every request on a transient connection and sends no list-change notifications, while
  * quarkus-mcp-server 2.0.2 announces {@code listChanged: true} for programmatically managed tools and accepts the
- * MCP {@code 2026-07-28} method {@code subscriptions/listen} with a stream it never feeds. For a request in the
- * relay's form, recognised by its {@code Mcp-Method} header, this filter therefore
+ * MCP {@code 2026-07-28} method {@code subscriptions/listen} with a stream it never feeds. For every {@code POST}
+ * to {@code /mcp} this filter therefore
  * <ul>
  * <li>answers {@code subscriptions/listen} itself with the JSON-RPC error {@code -32601} (method not found), and</li>
  * <li>rewrites the {@code capabilities} of the {@code initialize} and {@code server/discover} results so that
  * {@code listChanged} of {@code tools}, {@code resources} and {@code prompts} is {@code false} wherever the server
  * declares it.</li>
  * </ul>
+ * The method is taken from the {@code Mcp-Method} header of the relay's form. The transport demands that header
+ * only of a {@code 2026-07-28} request, so for a request without it the filter reads the method from the JSON-RPC
+ * body: no request reaches the MCP server past this filter.
+ * <p>
  * The filter runs after authentication, so an unauthenticated request is refused with {@code 401} before it.
  *
  * @since 0.1
@@ -78,28 +82,43 @@ public class NotificationStreamFilter {
     }
 
     private void filter(RoutingContext context) {
-        var method = context.request().getHeader(METHOD_HEADER);
-        if (method == null || context.request().method() != HttpMethod.POST || !"/mcp".equals(context.normalizedPath())
-                || !(context instanceof RoutingContextInternal internal)) {
+        var header = context.request().getHeader(METHOD_HEADER);
+        if (context.request().method() != HttpMethod.POST || !"/mcp".equals(context.normalizedPath())
+                || !(context instanceof RoutingContextInternal internal)
+                || header != null && !LISTEN.equals(header) && !CAPABILITY_METHODS.contains(header)) {
             context.next();
-        } else if (LISTEN.equals(method)) {
-            withBody(context, body -> context.response().putHeader("Content-Type", "application/json")
-                    .end(refusal(idOf(body)).encode()));
-        } else if (CAPABILITY_METHODS.contains(method)) {
-            withBody(context, body -> {
+            return;
+        }
+        withBody(context, body -> {
+            var method = header != null ? header : methodOf(body);
+            if (LISTEN.equals(method)) {
+                context.response().putHeader("Content-Type", "application/json").end(refusal(idOf(body)).encode());
+            } else {
                 internal.setBody(body);
                 context.put(SERVER_NAME_KEY, McpServer.DEFAULT);
-                handler.handle(new CapabilityRewriting(context.currentRoute(), internal));
-            });
-        } else {
-            context.next();
-        }
+                handler.handle(method != null && CAPABILITY_METHODS.contains(method)
+                        ? new CapabilityRewriting(context.currentRoute(), internal)
+                        : context);
+            }
+        });
     }
 
     /** Reads the request body, which Quarkus keeps paused until a route reads it. */
     private static void withBody(RoutingContext context, Consumer<Buffer> action) {
         context.request().resume();
         context.request().body().onSuccess(action::accept).onFailure(context::fail);
+    }
+
+    /**
+     * @param body the request body
+     * @return the JSON-RPC method of a body that is one JSON object with a string {@code method}, else {@code null}
+     */
+    static String methodOf(Buffer body) {
+        try {
+            return new JsonObject(body).getValue("method") instanceof String method ? method : null;
+        } catch (DecodeException | ClassCastException _) {
+            return null;
+        }
     }
 
     private static Object idOf(Buffer body) {

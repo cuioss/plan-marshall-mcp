@@ -72,7 +72,8 @@ class JsonTest {
     @Test
     @DisplayName("maps failed responses to contract outcomes")
     void mapsOutcomes() {
-        assertEquals(CiResult.Outcome.UNAUTHORIZED, failed(401, "").outcome());
+        assertEquals(CiResult.Outcome.AUTH_FAILED, failed(401, "").outcome());
+        assertEquals(CiResult.Outcome.PERMISSION_DENIED, failed(403, "").outcome());
         assertEquals(CiResult.Outcome.NOT_FOUND, failed(404, "").outcome());
         assertEquals(CiResult.Outcome.REJECTED, failed(409, "{\"message\":\"SHA does not match\"}").outcome());
         assertEquals("HTTP 409: SHA does not match", failed(409, "{\"message\":\"SHA does not match\"}").detail());
@@ -103,8 +104,8 @@ class JsonTest {
             "400|<html>bad gateway page</html>|FAILED|HTTP 400",
             "400|{\"message\":\" \"}|FAILED|HTTP 400",
             "400|{\"message\":null}|FAILED|HTTP 400",
-            "401|{\"message\":\"Bad credentials\"}|UNAUTHORIZED|HTTP 401: Bad credentials",
-            "403|{\"message\":\"Resource not accessible by integration\"}|UNAUTHORIZED|HTTP 403: Resource not accessible by integration",
+            "401|{\"message\":\"Bad credentials\"}|AUTH_FAILED|HTTP 401: Bad credentials",
+            "403|{\"message\":\"Resource not accessible by integration\"}|PERMISSION_DENIED|HTTP 403: Resource not accessible by integration",
             "404|{\"message\":\"Not Found\"}|NOT_FOUND|HTTP 404: Not Found",
             "502|{\"message\":\"Bad Gateway\"}|FAILED|HTTP 502: Bad Gateway",
             "302|{\"message\":\"moved\"}|FAILED|HTTP 302: moved"

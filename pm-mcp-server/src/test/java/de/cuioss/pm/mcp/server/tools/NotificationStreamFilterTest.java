@@ -14,6 +14,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
+import java.io.IOException;
+import java.util.HashMap;
 import java.util.Map;
 
 
@@ -35,6 +37,22 @@ class NotificationStreamFilterTest {
 
     private static Map<String, String> runtime() {
         return TestRuntime.bearer(TestRuntime.token());
+    }
+
+    private static final String LISTEN = "subscriptions/listen";
+    private static final JsonObject INITIALIZE_PARAMS = new JsonObject().put("protocolVersion", "2025-11-25")
+            .put("capabilities", new JsonObject())
+            .put("clientInfo", new JsonObject().put("name", "claude-code").put("version", "1"));
+
+    /** A request of a session-opening host: no protocol data in {@code _meta}. */
+    private static JsonObject legacy(int id, String method, JsonObject params) {
+        return new JsonObject().put("jsonrpc", "2.0").put("id", id).put("method", method).put("params", params);
+    }
+
+    private static UdsHttp.Response withoutMethodHeader(JsonObject message) throws IOException {
+        var headers = new HashMap<>(TestRuntime.mcpHeaders(runtime(), message));
+        headers.remove(NotificationStreamFilter.METHOD_HEADER);
+        return UdsHttp.request(TestRuntime.paths().socket(), "POST", "/mcp", headers, message.encode());
     }
 
     private static JsonObject capabilities(UdsHttp.Response response) {
@@ -100,6 +118,60 @@ class NotificationStreamFilterTest {
             assertNull(response.headers().get("mcp-session-id"));
         }
 
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"server/discover", "initialize", "tools/list"})
+        @DisplayName("leaves the refusal of a 2026-07-28 request without the Mcp-Method header to the transport")
+        void shouldLeaveStatelessRequestWithoutMethodHeaderToTransport(String method) throws Exception {
+            var message = TestRuntime.statelessMessage(7, method, new JsonObject());
+
+            var response = withoutMethodHeader(message);
+
+            assertEquals(400, response.status(), response.body());
+        }
+
+        @ParameterizedTest(name = "protocol data in _meta: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("answers subscriptions/listen without the Mcp-Method header with JSON-RPC error -32601")
+        void shouldRefuseListenWithoutMethodHeader(boolean stateless) throws Exception {
+            var params = new JsonObject().put("notifications", new JsonObject().put("toolsListChanged", true));
+            var message = stateless ? TestRuntime.statelessMessage(8, LISTEN, params) : legacy(8, LISTEN, params);
+
+            var response = withoutMethodHeader(message);
+
+            assertEquals(200, response.status(), response.body());
+            var answer = new JsonObject(response.body());
+            assertEquals(8, answer.getInteger("id"));
+            assertEquals(-32601, answer.getJsonObject("error").getInteger("code"));
+        }
+
+        @Test
+        @DisplayName("announces tools without listChanged in an initialize without the Mcp-Method header")
+        void shouldInitializeWithoutListChangedWithoutMethodHeader() throws Exception {
+            var response = withoutMethodHeader(legacy(9, "initialize", INITIALIZE_PARAMS));
+
+            assertEquals(Boolean.FALSE, capabilities(response).getJsonObject("tools").getValue("listChanged"));
+        }
+
+        @Test
+        @DisplayName("leaves other methods without the Mcp-Method header to the MCP server")
+        void shouldPassOtherMethodsWithoutMethodHeader() throws Exception {
+            var response = withoutMethodHeader(legacy(10, "tools/list", new JsonObject()));
+
+            assertEquals(200, response.status(), response.body());
+            assertFalse(TestRuntime.result(response.body()).getJsonObject("result").getJsonArray("tools").isEmpty());
+        }
+
+        @Test
+        @DisplayName("leaves a body that is no JSON-RPC request to the MCP server")
+        void shouldPassUnreadableBodyWithoutMethodHeader() throws Exception {
+            var headers = new HashMap<>(TestRuntime.mcpHeaders(runtime(), legacy(11, "tools/list", new JsonObject())));
+            headers.remove(NotificationStreamFilter.METHOD_HEADER);
+
+            var response = UdsHttp.request(TestRuntime.paths().socket(), "POST", "/mcp", headers, "{\"method\": 5}");
+
+            assertFalse(response.status() == 200 && response.body().contains("\"result\""), response.body());
+        }
+
         @Test
         @DisplayName("leaves other methods to the MCP server")
         void shouldPassOtherMethods() throws Exception {
@@ -156,6 +228,19 @@ class NotificationStreamFilterTest {
         @DisplayName("leaves other events unchanged")
         void shouldKeepOtherEvents(String event) {
             assertSame(event, NotificationStreamFilter.rewriteEvent(event));
+        }
+
+        @Test
+        @DisplayName("reads the method of a JSON-RPC request body")
+        void shouldReadMethodOfBody() {
+            assertEquals("initialize", NotificationStreamFilter.methodOf(legacy(1, "initialize", new JsonObject()).toBuffer()));
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"not json", "[{\"method\":\"initialize\"}]", "{\"method\":5}", "{\"id\":1}", ""})
+        @DisplayName("reads no method from a body that is no JSON-RPC request")
+        void shouldReadNoMethod(String body) {
+            assertNull(NotificationStreamFilter.methodOf(Buffer.buffer(body)));
         }
 
         @Test
