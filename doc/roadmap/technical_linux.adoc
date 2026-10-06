@@ -17,7 +17,7 @@ The document is self-contained. A Claude Code session on the Linux machine can r
 === Rules
 
 * *Pass criteria are fixed.* Every item states its pass criterion below, set before the first run. Never edit a pass criterion after a run. If a criterion turns out to be wrong, record that as a finding in the item's result.
-* *Branch.* Work on `feature/m0-part-b-linux`, created from `main`. Write results only into this document, in the item's *Result* block, its *Status* line, and <<setup-record>>.
+* *Branch.* Work on `feature/m0-part-b-linux`, created from `main`. Write results only into this document, in the item's *Result* block, its *Status* line, and <<setup-record>>. A procedure step that proves unusable is corrected in place after the run and named as a finding in the item's result.
 * *Code changes.* Code may change only in the Linux-specific classes, and every change comes with a test:
 ** `pm-modules/pm-exec` (Landlock), `pm-mcp-server/.../credentials/dbus` and `SecretServiceStore` (Secret Service);
 ** the Linux branches of `pm-modules/pm-api/.../posix` (spawn);
@@ -110,12 +110,14 @@ Each harness is logged in once interactively. The workers of L10 to L12 use the 
 
 === Keyring Session (gate 5)
 
-On a desktop session the keyring already runs; record which one it is. On a headless machine, start a session bus and an unlocked keyring for the run:
+On a desktop session the keyring already runs; record which one it is. On a headless machine, start a session bus and an unlocked keyring for the run. Isolate it first: set a private, short `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` *before* `dbus-run-session`, so that the bus and the D-Bus-activated keyring never open the user's own keyrings with the test password. Keep the directory short: the keyring's control socket `<XDG_RUNTIME_DIR>/keyring/control` must fit the 108-byte `sun_path`.
 
 [source,bash]
 ----
+mkdir -p ~/.pmkr/data ~/.pmkr/run && chmod 700 ~/.pmkr/run
+export XDG_DATA_HOME=~/.pmkr/data XDG_RUNTIME_DIR=~/.pmkr/run
 dbus-run-session -- bash        # every gate-5 step runs inside this shell
-echo -n "pm-test-keyring" | gnome-keyring-daemon --unlock --components=secrets
+echo -n "pm-test-keyring" | gnome-keyring-daemon --daemonize --unlock --components=secrets
 echo "$DBUS_SESSION_BUS_ADDRESS"   # must be unix:path=..., an abstract address is not usable (L8)
 secret-tool store --label=probe service probe key probe <<< "x" && secret-tool lookup service probe key probe
 ----
@@ -304,11 +306,18 @@ Netty library beside `pm-mcpd` (the question of <<native-transport-linux>>), 15 
 +
 [source,bash]
 ----
-setsid bash -c 'echo "" | $PM_MCP_HOME/bin/pm-mcp serve --client neutral & echo $! > /tmp/relay.pid; wait' &
-sleep 2; pid=$(jq .pid $PM_MCP_BASE/state/runtime.json)
-ps -o pid,pgid,sid,stat,cmd -p $pid
-kill -HUP -- -$(ps -o pgid= -p $(cat /tmp/relay.pid) | tr -d ' ') 2>/dev/null; sleep 1
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"l4","version":"1"}}}'
+relay() {   # a relay in its own session; the initialize request starts the runtime, the open stdin keeps the relay alive
+  setsid bash -c "(echo '$INIT'; sleep 60) | \$PM_MCP_HOME/bin/pm-mcp serve --client neutral" > /dev/null 2>&1 &
+  sleep 2; pgrep -n -f "pm-mcp serve --client neutral"
+}
+r=$(relay); pid=$(jq .pid $PM_MCP_BASE/state/runtime.json)
+ps -o pid,ppid,pgid,sid,stat,cmd -p $pid,$r
+ls -l /proc/$pid/fd/0 /proc/$pid/fd/1 /proc/$pid/fd/2; grep flags /proc/$pid/fdinfo/1
+kill -9 $r; sleep 1; $PM_MCP_HOME/bin/pm-operator status
+r=$(relay); kill -HUP -- -$(ps -o pgid= -p $r | tr -d ' '); sleep 1
 $PM_MCP_HOME/bin/pm-operator status
+ps -eo pid,ppid,stat,cmd | awk '$3 ~ /^Z/'   # no zombie
 ----
 
 *Fallback (gate 8)*: on a failing platform the starting binary reports the failure and names `pm-operator runtime install`, and the per-user `systemd --user` service serves that platform. On-demand start stays the default wherever it works.
@@ -323,7 +332,7 @@ $PM_MCP_HOME/bin/pm-operator status
 |Survives relay `kill -9` and group `SIGHUP` |`pm-operator status` `running` with the same pid after `kill -9` of the relay and after `SIGHUP` to a second relay's process group; no zombie |yes
 |===
 
-Finding on the procedure: the shell sequence above starts no runtime. The relay starts the runtime on demand with its first request, and `echo ""` sends only a blank line, which the relay ignores before it ends on `stdin` EOF. The run used instead, per relay, `setsid bash -c "(echo '<initialize request>'; sleep 60) | $PM_MCP_HOME/bin/pm-mcp serve --client neutral" &`, which starts the runtime and keeps the relay alive for the `kill -9` and the group `SIGHUP`.
+Finding on the procedure (corrected above after the run): the sequence first given, `setsid bash -c 'echo "" | $PM_MCP_HOME/bin/pm-mcp serve --client neutral & …'`, starts no runtime. The relay starts the runtime on demand with its first request, and `echo ""` sends only a blank line, which the relay ignores before it ends on `stdin` EOF. The run used the sequence now in the procedure: an `initialize` request with `stdin` held open, which starts the runtime and keeps the relay alive for the `kill -9` and the group `SIGHUP`.
 
 *Status*: `[x]`
 
@@ -436,7 +445,7 @@ $PM_MCP_HOME/bin/pm-operator spike keyring delete probe-key
 |Bus address form (path or abstract) |path in both cases: the user session bus `unix:path=/run/user/1000/bus`, and `dbus-run-session` (D-Bus 1.16.2) `unix:path=/tmp/dbus-<random>` |yes
 |===
 
-Keyring session used: the machine has the user's own `login.keyring` (from desktop logins), which the run must not open with a test password. Every gate-5 step therefore ran in a session bus started with `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` pointing to a private directory (`~/.pmkr`), set *before* `dbus-run-session` so that the D-Bus-activated `gnome-keyring-daemon` inherits them, with `echo -n pm-test-keyring | gnome-keyring-daemon --daemonize --unlock --components=secrets` inside. Two findings on the procedure: (1) set without that, `org.freedesktop.secrets` is activated with the user's real data directory; (2) the directory must be short, because the keyring's control socket `<XDG_RUNTIME_DIR>/keyring/control` is subject to the 108-byte `sun_path` limit like the runtime socket (a deep path fails with `couldn't bind to control socket … address already in use` and a `StartServiceByName` timeout).
+Keyring session used: the machine has the user's own `login.keyring` (from desktop logins), which the run must not open with a test password. Every gate-5 step therefore ran in a session bus started with `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` pointing to a private directory (`~/.pmkr`), set *before* `dbus-run-session` so that the D-Bus-activated `gnome-keyring-daemon` inherits them, with `echo -n pm-test-keyring | gnome-keyring-daemon --daemonize --unlock --components=secrets` inside. Two findings on the procedure, both corrected in <<_keyring_session_gate_5>> after the run: (1) set without that, `org.freedesktop.secrets` is activated with the user's real data directory; (2) the directory must be short, because the keyring's control socket `<XDG_RUNTIME_DIR>/keyring/control` is subject to the 108-byte `sun_path` limit like the runtime socket (a deep path fails with `couldn't bind to control socket … address already in use` and a `StartServiceByName` timeout).
 
 On the user session bus of this headless machine, `org.freedesktop.secrets` is D-Bus-activatable and starts a `gnome-keyring-daemon` whose `login` collection stays locked (no login session unlocks it). The first native `KeyringIT` of the full build ran there and fell back to the file store with `fallback_reason` `Secret Service: not reachable, or no unlocked default collection on /run/user/1000/bus`, without a hang: the locked case of this item, as found on a real machine.
 
@@ -480,7 +489,7 @@ E="$PM_MCP_HOME/bin/pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev"
 ** *Maven wrapper* (this repository; write set: repository, `~/.m2`): `$E --write $PWD --write $HOME/.m2 -- $PWD/mvnw -q -l /tmp/l9-mvn.log verify -pl pm-modules/pm-core -am`
 ** *mvnd* (write set: repository, `~/.m2`, `~/.m2/mvnd`): `$E --write $PWD --write $HOME/.m2 -- $(command -v mvnd) -q verify -pl pm-modules/pm-core -am`. Then run it a second time while the daemon is still up, and record whether the daemon started under confinement keeps its ruleset.
 ** *Gradle daemon*: create the fixture with `mkdir -p ~/pmfix/gradle && cd ~/pmfix/gradle && gradle init --type java-application --dsl kotlin --test-framework junit-jupiter --project-name fix --package fix --no-split-project --java-version 25`. Then run `$E --write $HOME/pmfix/gradle --write $HOME/.gradle -- $HOME/pmfix/gradle/gradlew build`, twice (the second run uses the warm daemon).
-** *Testcontainers*: create `~/pmfix/tc` as a minimal Maven project, one JUnit 5 test that starts `GenericContainer("alpine:3")` with `withCommand("true")`, using the dependencies `org.testcontainers:testcontainers` and `org.testcontainers:junit-jupiter`. These dependencies are for this fixture only, outside the repository. Run `$E --write $HOME/pmfix/tc --write $HOME/.m2 -- $PWD/mvnw -f $HOME/pmfix/tc/pom.xml -q test`. Record whether the Docker socket `/var/run/docker.sock` is reachable under Landlock.
+** *Testcontainers*: create `~/pmfix/tc` as a minimal Maven project, one JUnit 5 test that starts `GenericContainer("alpine:3")` with `withCommand("sleep", "30")` (a container that exits at once fails the running-state wait of `GenericContainer`), using the dependencies `org.testcontainers:testcontainers` and `org.testcontainers:testcontainers-junit-jupiter` (Testcontainers 2.x; up to 1.21.x the module was `org.testcontainers:junit-jupiter`). These dependencies are for this fixture only, outside the repository. Run `$E --write $HOME/pmfix/tc --write $HOME/.m2 -- $PWD/mvnw -f $HOME/pmfix/tc/pom.xml -q test`. Record whether the Docker socket `/var/run/docker.sock` is reachable under Landlock.
 ** *Docker Compose*: create `~/pmfix/compose/compose.yaml` with one service `hello` (`image: alpine:3`, `command: ["echo","ok"]`). Run `$E --write $HOME/pmfix/compose --write $HOME/.docker -- /usr/bin/docker compose -f $HOME/pmfix/compose/compose.yaml up --abort-on-container-exit`.
 . Adversarial check: `$E --write $PWD -- /usr/bin/touch $PM_MCP_BASE/x` must fail, and `$E --write $PWD -- /usr/bin/cat $PM_MCP_BASE/run/runtime.token` must fail.
 . Side effect of the read set: the directories on the path from `/` to `<PM_MCP_BASE>` get no rule of their own. Record whether `$E --write /tmp -- /usr/bin/ls /` and `… ls $HOME` are denied, and whether any build above needed such a listing.
@@ -507,7 +516,7 @@ E="$PM_MCP_HOME/bin/pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev"
 |WSL2 |not run (no Windows machine with WSL2 available) |—
 |===
 
-Deviations from the procedure: the Testcontainers fixture uses Testcontainers 2.0.5, in which the JUnit 5 module is `org.testcontainers:testcontainers-junit-jupiter` (`org.testcontainers:junit-jupiter` ends at 1.21.x), with JUnit Jupiter 6.1.3. The container runs `sleep 30` instead of `true`: a container that exits at once fails the default running-state wait of `GenericContainer`, a failure unrelated to confinement.
+Deviations from the procedure as first given (corrected above after the run): the Testcontainers fixture uses Testcontainers 2.0.5, in which the JUnit 5 module is `org.testcontainers:testcontainers-junit-jupiter` (`org.testcontainers:junit-jupiter` ends at 1.21.x), with JUnit Jupiter 6.1.3. The container runs `sleep 30` instead of `true`: a container that exits at once fails the default running-state wait of `GenericContainer`, a failure unrelated to confinement.
 
 Findings (the pass criterion above is met; it does not cover delegation of work to a process outside the job's Landlock domain):
 
@@ -627,7 +636,7 @@ Finding, OpenCode `stop-long`: the cell was aborted by the IT's start-failure gu
 
 *Pass criterion*: `LspAndGitInDaemonIT` (the JGit part) passes natively. The difference in idle RSS with and without one JGit scenario run is recorded.
 
-*Procedure*: part of L6. For the RSS figure, compare `ps -o rss= -p <pid>` before and 10 s after one `POST /api/v1/spike/git` with `{"op":"scenario"}`, sent with the runtime token through `curl --unix-socket`.
+*Procedure*: part of L6. For the RSS figure, compare `ps -o rss= -p <pid>` before and 10 s after one `POST /api/v1/spike/git` with `{"op":"scenario","repo":"<empty or absent directory>"}`, sent with the runtime token through `curl --unix-socket`.
 
 *Fallback (`PM-TECH-2`)*: the `git` CLI variant (`PM-EXEC-5`).
 
@@ -642,7 +651,7 @@ Finding, OpenCode `stop-long`: the cell was aborted by the IT's start-failure gu
 
 The JGit variant costs about 12 MB of resident memory after its first use, and the RSS keeps growing after a second scenario (Serial GC, no maximum heap set). After git use the daemon is above the 64 MB of `PM-TECH-3`, which is defined for the clean idle state (L2: 49.2 MB); whether the bound or a heap limit (`-Xmx`, `-XX:MaxHeapSize` at native build time) covers the daemon after work is a decision for the macOS side.
 
-Finding on the procedure: `POST /api/v1/spike/git` requires `repo` besides `op` (`{"op":"scenario","repo":"<empty or absent directory>"}`); the body `{"op":"scenario"}` given above is answered with `400` `op and repo required`.
+Finding on the procedure (corrected above after the run): `POST /api/v1/spike/git` requires `repo` besides `op`; the body `{"op":"scenario"}` first given is answered with `400` `op and repo required`.
 
 *Status*: `[x]`
 
