@@ -331,7 +331,7 @@ class PmExecIT {
             var job = jobEnvironment(session);
 
             try (var _ = listen(bus); var _ = listen(relaySocket);
-                    var _ = listen(projectSocket)) {
+                 var _ = listen(projectSocket)) {
                 var busRun = run(List.of("--deny-read", runtimeDir.toString(), "--write", project.toString(),
                         "--write", "/dev"), job, probeCommand(bus));
                 var relayRun = run(confinedOptions("--read", relaySocket.toString()), job,

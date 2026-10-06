@@ -13,12 +13,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
+
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -62,7 +62,7 @@ class OpencodeDataTest {
 
         @Test
         @DisplayName("copies the login with mode 0600 into a 0700 data directory, and removes it again")
-        void copyAndRemove() throws IOException {
+        void copyAndRemove() throws Exception {
             var login = Files.writeString(temp.resolve("auth.json"), "{\"zen\":\"secret\"}");
             var workerDir = Files.createDirectories(temp.resolve("w1-g1"));
 
@@ -81,7 +81,7 @@ class OpencodeDataTest {
 
         @Test
         @DisplayName("a second prepare replaces the copy")
-        void again() throws IOException {
+        void again() throws Exception {
             var login = Files.writeString(temp.resolve("auth.json"), "old");
             var workerDir = Files.createDirectories(temp.resolve("w1-g2"));
             OpencodeData.prepare(workerDir, login);
@@ -94,7 +94,7 @@ class OpencodeDataTest {
 
         @Test
         @DisplayName("without an operator login the data directory is created empty")
-        void noLogin() throws IOException {
+        void noLogin() throws Exception {
             var workerDir = Files.createDirectories(temp.resolve("w2-g1"));
 
             var dataHome = OpencodeData.prepare(workerDir, temp.resolve("missing.json"));
@@ -105,7 +105,7 @@ class OpencodeDataTest {
 
         @Test
         @DisplayName("a failing removal reports false")
-        void removalFails() throws IOException {
+        void removalFails() throws Exception {
             var dataHome = temp.resolve("xdg-data");
             Files.createDirectories(dataHome.resolve("opencode/auth.json/occupied"));
 
