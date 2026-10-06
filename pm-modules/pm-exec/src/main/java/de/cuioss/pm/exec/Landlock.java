@@ -54,15 +54,25 @@ class Landlock {
     static final long TRUNCATE = 1L << 14;
     /** {@code LANDLOCK_ACCESS_FS_IOCTL_DEV}, ABI 5. */
     static final long IOCTL_DEV = 1L << 15;
+    /**
+     * {@code LANDLOCK_ACCESS_FS_RESOLVE_UNIX}, ABI 9: {@code connect(2)} to (and {@code sendmsg(2)} with an
+     * explicit address of) a pathname Unix socket created outside the job's Landlock domain. Below ABI 9
+     * Landlock does not govern pathname socket connects at all.
+     */
+    static final long RESOLVE_UNIX = 1L << 16;
 
     /** The 13 rights of ABI 1: {@code EXECUTE} up to {@code MAKE_SYM}. */
     static final long ABI1_RIGHTS = (1L << 13) - 1;
 
     /** Rights a rule on a non-directory may carry (the kernel's {@code ACCESS_FILE}). */
-    static final long FILE_RIGHTS = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
+    static final long FILE_RIGHTS = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV | RESOLVE_UNIX;
 
-    /** Rights of the read set: read and execute. */
-    static final long READ_RIGHTS = EXECUTE | READ_FILE | READ_DIR;
+    /**
+     * Rights of the read set: read, execute and, from ABI 9, connecting to the pathname Unix sockets in it. A
+     * socket outside the read and write sets (below {@code <PM_MCP_BASE>}) is then unreachable unless a
+     * {@code --read} rule names it.
+     */
+    static final long READ_RIGHTS = EXECUTE | READ_FILE | READ_DIR | RESOLVE_UNIX;
 
     /** Lowest ABI that confines a job (ABI 1 lacks {@code REFER}, so cross-directory renames fail). */
     static final int MIN_CONFINING_ABI = 2;
@@ -95,6 +105,9 @@ class Landlock {
         }
         if (abi >= 5) {
             rights |= IOCTL_DEV;
+        }
+        if (abi >= 9) {
+            rights |= RESOLVE_UNIX;
         }
         return rights;
     }

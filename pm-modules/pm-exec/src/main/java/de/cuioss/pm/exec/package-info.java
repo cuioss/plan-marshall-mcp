@@ -29,7 +29,10 @@
  * {@code 0}; {@code landlock_abi} is {@code 0} where Landlock is unavailable.</li>
  * <li>{@code --write} adds a path to the Landlock write set (all rights the applied ABI handles).</li>
  * <li>{@code --read} adds a path to the read set beyond the enumerated one: the job-private directory
- * of a worker below {@code <PM_MCP_BASE>/run/jobs/}.</li>
+ * of a worker below {@code <PM_MCP_BASE>/run/jobs/}, or the runtime socket {@code <PM_MCP_BASE>/run/runtime.sock}
+ * of a job relay. From Landlock ABI 9 the read set also governs {@code connect(2)} to pathname Unix sockets
+ * ({@code LANDLOCK_ACCESS_FS_RESOLVE_UNIX}): a socket outside the read and write sets is unreachable, so the
+ * runtime socket needs its own {@code --read} rule. Below ABI 9 every pathname socket stays reachable.</li>
  * <li>{@code --deny-read} names {@code <PM_MCP_BASE>}; the read set is everything except it, built by
  * sibling enumeration ({@link de.cuioss.pm.exec.ReadSet}). It is mandatory on Linux.</li>
  * <li>{@code --} ends the options; the next argument is the absolute path of the program, never

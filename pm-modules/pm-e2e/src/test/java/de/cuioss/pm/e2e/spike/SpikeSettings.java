@@ -34,11 +34,13 @@ import java.util.Locale;
  * @param idleMaxSeconds   {@code spike.idle-max-s}: upper bound of the idle-timeout measurement (gate 9)
  * @param progressSeconds  {@code spike.progress-s}: progress interval of the progress variant (gate 9), default 5
  * @param extraWrites      {@code spike.write-extra}: comma-separated paths added to the Landlock write set
+ * @param opencodeSharedData {@code spike.opencode.shared-data}: OpenCode workers share the operator's
+ *                         {@code ~/.local/share/opencode} instead of a per-worker data directory, default false
  */
 record SpikeSettings(Harness harness, String model, String layout, int trials, List<Fault> faults, int workers,
 int waitSeconds, int graceSeconds, int stopShortSeconds, int stopLongSeconds, long exitDetectMaxMs,
 int cellDeadlineSeconds, int trialTimeoutSeconds, List<Integer> sizes, int idleMaxSeconds, int progressSeconds,
-List<Path> extraWrites) {
+List<Path> extraWrites, boolean opencodeSharedData) {
 
     /** System property naming the harness; every driver IT requires it. */
     static final String HARNESS = "spike.harness";
@@ -58,7 +60,8 @@ List<Path> extraWrites) {
                 integer("spike.deadline-s", 3600), integer("spike.trial-timeout-s", 300),
                 integers(System.getProperty("spike.sizes", "8000,32000,128000")),
                 integer("spike.idle-max-s", harness.idleMaxSeconds()), integer("spike.progress-s", 5),
-                paths(System.getProperty("spike.write-extra", "")));
+                paths(System.getProperty("spike.write-extra", "")),
+                Boolean.parseBoolean(System.getProperty("spike.opencode.shared-data", "false")));
     }
 
     /** @return bounded wait plus grace in milliseconds */
