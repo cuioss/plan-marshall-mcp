@@ -136,4 +136,46 @@ class OpencodeDataTest {
             assertEquals(expected, OpencodeData.applies(Harness.of(harness), shared));
         }
     }
+
+    @Nested
+    @DisplayName("stale logins")
+    class StaleLogins {
+
+        private Path copy(String workspace, String worker) throws Exception {
+            var login = Files.writeString(temp.resolve("auth.json"), "secret");
+            var workerDir = Files.createDirectories(temp.resolve("root").resolve(workspace).resolve(worker));
+            return OpencodeData.prepare(workerDir, login).resolve("opencode/auth.json");
+        }
+
+        @Test
+        @DisplayName("deletes the copies of a workspace whose driver no longer runs, or is not recorded")
+        void deletesOrphans() throws Exception {
+            var dead = copy("dead", "w1-g1");
+            var deadToo = copy("dead", "w2-g4");
+            var unmarked = copy("unmarked", "w1-g1");
+            var garbled = copy("garbled", "w1-g1");
+            var live = copy("live", "w1-g1");
+            OpencodeData.markOwner(temp.resolve("root/dead"), 41);
+            OpencodeData.markOwner(temp.resolve("root/live"), 42);
+            Files.writeString(temp.resolve("root/garbled").resolve(OpencodeData.OWNER), "no pid");
+
+            int removed = OpencodeData.removeStaleLogins(temp.resolve("root"), pid -> pid == 42);
+
+            assertEquals(4, removed);
+            assertFalse(Files.exists(dead));
+            assertFalse(Files.exists(deadToo));
+            assertFalse(Files.exists(unmarked));
+            assertFalse(Files.exists(garbled));
+            assertTrue(Files.exists(live));
+            assertTrue(Files.isDirectory(dead.getParent()), "only the login is deleted");
+        }
+
+        @Test
+        @DisplayName("a workspace without login copies is left alone")
+        void nothingToDelete() throws Exception {
+            Files.createDirectories(temp.resolve("root/empty/w1-g1"));
+
+            assertEquals(0, OpencodeData.removeStaleLogins(temp.resolve("root"), _ -> false));
+        }
+    }
 }

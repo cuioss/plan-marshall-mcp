@@ -35,8 +35,12 @@ class TrialEvaluatorTest {
     private static final Limits LIMITS = new Limits(50_000, 1_500, 5_000);
 
     private static List<StubEvent> fixture(String cell, String kind) {
+        return fixture("partA", cell, kind);
+    }
+
+    private static List<StubEvent> fixture(String run, String cell, String kind) {
         try {
-            var url = TrialEvaluatorTest.class.getResource("/spike/partA/" + cell + "-" + kind + ".jsonl");
+            var url = TrialEvaluatorTest.class.getResource("/spike/" + run + "/" + cell + "-" + kind + ".jsonl");
             return StubEvent.readAll(Path.of(url.toURI()));
         } catch (URISyntaxException e) {
             throw new IllegalStateException(e);
@@ -105,6 +109,27 @@ class TrialEvaluatorTest {
     }
 
     @Nested
+    @DisplayName("on the Linux run of L14 (OpenCode)")
+    class LinuxL14 {
+
+        @Test
+        @DisplayName("passes a short stall whose worker never continued and was replaced at the silence limit")
+        void shouldPassShortStallReplacedAtTheLimit() {
+            var evaluation = TrialEvaluator.evaluate(fixture("linuxL14", "stop-short", "events"),
+                    fixture("linuxL14", "stop-short", "supervisor"), LIMITS);
+
+            var hung = evaluation.trials().stream().filter(trial -> "f015-bui-16".equals(trial.taskId())).findFirst()
+                    .orElseThrow();
+            assertEquals(10, evaluation.trials().size());
+            assertEquals("silence", hung.detectReason());
+            assertEquals(50_029L, hung.detectLatencyMs());
+            assertEquals(1, hung.submits());
+            assertTrue(hung.pass(), hung.failures().toString());
+            assertTrue(evaluation.pass(), evaluation.global().toString());
+        }
+    }
+
+    @Nested
     @DisplayName("on violations")
     class Violations {
 
@@ -160,7 +185,7 @@ class TrialEvaluatorTest {
         }
 
         @Test
-        @DisplayName("fails no-early-replacement when a short stall is replaced")
+        @DisplayName("fails no-early-replacement when a short stall is replaced before the silence limit")
         void shouldFailReplacedShortStall() {
             var supervisor = withLine(fixture("stop-short", "supervisor"), """
                     {"t_ms":1791029560000,"event":"detect","worker":"w1","generation":1,"reason":"silence","silent_ms":5867}""");

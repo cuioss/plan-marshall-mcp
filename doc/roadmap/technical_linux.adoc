@@ -707,19 +707,29 @@ Finding on the procedure (corrected above after the run): `POST /api/v1/spike/gi
 [cols="3,2,1", options="header"]
 |===
 |Check |Evidence |Pass
-|Gate 13 criteria, confined, native |  |
-|Write set and paths written |  |
-|`auth.json` removed (gate 13, gate 16) |  |
-|Operator's `opencode.db` untouched |  |
-|`kill-offer` |  |
-|`kill-exec` |  |
-|`stop-short` |  |
-|`stop-long` |  |
-|`turn-end` |  |
-|`relay-kill` |  |
+|Gate 13 criteria, confined, native |`Gate13HeadlessIT` passed (`gate13-opencode.json`, `layout` `native`, `confined` true): `socket_connect`, `task_completed`, `structured_output`, `usage_fields`, `sigterm_exit` all true; launch report `confined`, `landlock_abi` 8, `no_new_privs`. Base task 9.3 s, 8 000 characters 8.0 s, 32 000 characters 10.8 s; 0 non-JSON lines; exit 36 ms after `SIGTERM` during a held wait, no orphaned relay; own login (`credential_env_present` empty) |yes
+|Write set and paths written |`write_set` exactly the worker directory (`/tmp/pm-spike-ws/gate13-opencode-<id>/h1-g1`), `~/.local/state/opencode`, `~/.cache/opencode`, `/tmp`, `/dev`; no `-Dspike.write-extra` was needed. Written (6 files): the workspace `opencode.json`; `opencode.db` (+ `-shm`, `-wal`) and `log/opencode.log` in `<worker dir>/xdg-data/opencode/`; the native library `/tmp/.<hash>-00000000.so`. Nothing below `~/.local/share/opencode` or `~/.config/opencode`, and nothing below `~/.cache/opencode` or `~/.local/state/opencode` either: of the write set only the worker directory and `/tmp` were actually written |yes
+|`auth.json` removed (gate 13, gate 16) |`find /tmp/pm-spike-ws -name auth.json` printed nothing after gate 13 and nothing after the complete matrix (run 2), in which 73 worker generations were killed, stopped, fenced or ended. Exception outside the criterion: a supervisor killed from outside leaves the copies of its live workers (run 1, see finding) |yes
+|Operator's `opencode.db` untouched |`stat -c '%Y %s'` before and after gate 13 identical (`1791303440 48519163904`); `files_written` of gate 13, which observes `~/.local/share/opencode`, lists nothing there. Across the matrix the stat changed (`1791305871 48520364032` to `1791307349 48526544896`), which is not attributable: four interactive OpenCode sessions of the user ran and wrote that database during the whole item (the item asks for none). `~/.local/share/opencode` is outside the workers' write set |yes (gate 13); matrix not attributable
+|`kill-offer` |10/10, all criteria; detected by exit after 300 to 304 ms (run 1: 10/10, 300 to 301 ms) |yes
+|`kill-exec` |10/10, all criteria; exit, 300 to 301 ms (run 1: 10/10, 300 to 302 ms) |yes
+|`stop-short` |In the IT run *9/10*: trial 6 failed `no_early_replacement` (`a stall of 16000 ms was replaced (silence)`); `exactly_once`, `detection`, `lease_released`, `late_calls_refused` held in all ten. The worker of trial 6 was replaced at its silence deadline, not before it; with the evaluator corrected to the criterion as written, the logs of this cell evaluate to 10/10, all criteria. See finding (run 1: 10/10, all criteria, 6 late calls refused) |yes (re-evaluated; IT run: no)
+|`stop-long` |10/10, all criteria; detected by silence after 50 001 to 50 064 ms (wait 20 s + grace 30 s), never earlier; every task submitted exactly once; 19 late calls of replaced generations refused. No start failure of another worker and no `Failed query` in any harness log: the L11 failure did not recur (run 1: 10/10, 50 006 to 50 096 ms, 19 late calls refused) |yes
+|`turn-end` |10/10, all criteria; exit, 205 to 296 ms (run 1: 10/10, 213 to 282 ms) |yes
+|`relay-kill` |10/10, all criteria; 9 detected by exit (207 to 290 ms), 1 by silence (50 001 ms); 3 late calls refused (run 1: not completed) |yes
 |===
 
-*Status*: `[ ]`
+Setup: OpenCode 1.18.34, model `opencode-go/muse-spark-1.3-contributor`, native layout from the full native build of commit `423914b` (`./mvnw verify`, then `./mvnw verify -Pnative,integration-tests`, both passed), 2 workers, `-Dspike.trials=10`, defaults `wait-s=20`, `grace-s=30`, `stop-short-s=16`, `stop-long-s=70`, `exit-detect-max-ms=1500`. Gate 13 ran 42 s. No class needed a fix to run; three fixes followed the run (findings below). The matrix ran twice. Run 1 (18:22) was stopped from outside in its sixth cell and is not the result; its five completed cells are given in brackets. Run 2 (18:59 to 19:34, 35 min) is complete and is the result: `Gate16FaultMatrixIT` *failed* (`gate16-opencode.json`, top-level `pass` false) on the one `stop-short` trial; no global violation. Exit detection is at most 304 ms (IT limit 1500 ms). Logs: `spike-runs/gate13-opencode-1006-182148/`, run 1 `spike-runs/gate16-opencode-<fault>-1006-18*/`, run 2 `spike-runs/gate16-opencode-<fault>-1006-185912` to `-192846`; all kept in `~/pm-linux-spike-runs/` with `gate13-opencode-l14.json`, `gate16-opencode-l14.json` (run 2) and `gate16-opencode-l14-partial.json` (run 1).
+
+Finding, `stop-short` trial 6 (run 2), OpenCode does not resume after a short stop: the fault stopped worker `w2` generation 1 for 16 s directly after its `pull_ack` of task `f015-bui-16`; by the worker's own `opencode.log`, 50 ms after OpenCode had opened the next model request (`message=stream providerID=opencode-go`, 17:07:01.312 UTC; `SIGSTOP` at 17:07:01.362). After `SIGCONT` at 16 s the process wrote no further output, log line or MCP call. The supervisor replaced it by silence 50 029 ms after its last call (wait 20 s + grace 30 s), fenced it, released the lease, and generation 2 submitted the task exactly once 8 s later; the hung process was still alive 90 s after the fence and was reaped with `SIGKILL`. The supervisor therefore acted at the silence deadline and not before it; what the IT counts as a failure is that a worker stalled for less than its limit was replaced at all. The cause lies in the harness: an OpenCode process stopped while a model request is open may never continue after it is resumed (1 of 20 `stop-short` trials over both runs; the other 19 resumed and submitted). The per-worker data directory is not involved, and no other worker was affected: `w1` kept working throughout. The gate 16 criterion reads "no stalled-but-alive worker is replaced before its deadline", and this worker was replaced at it. `TrialEvaluator` was stricter than the criterion: in a `stop-short` trial it failed every replacement up to injection + stop + silence limit. Fixed after the run, on the operator's decision: a `stop-short` trial now fails `no_early_replacement` only when the worker's silence had not reached the limit, the same check as for `stop-long`. `TrialEvaluatorTest` evaluates the archived logs of this cell (`src/test/resources/spike/linuxL14/`): ten trials, all criteria, the trial of `f015-bui-16` detected by silence after 50 029 ms with one submit. The matrix was not run again; the `stop-short` verdict above is this re-evaluation of the recorded run, and `gate16-opencode.json` still holds the IT's verdict. What remains is the harness behaviour itself, as an input for the worker model: an OpenCode worker that hangs after a short stop costs the silence limit (50 s) before its task is given to a replacement; a request timeout for OpenCode's model calls would let it fail fast.
+
+Finding, run 1 stopped from outside: about 2 minutes into `relay-kill` the agent session's background-task guard stopped the Maven process because the machine was critically low on memory (30 GB RAM, 28 GB used, 8 GB swap full; the large consumers were other sessions on this shared workstation: four interactive OpenCode processes of about 0.9 GB each, two VS Code language servers, and a parallel Python test run of another project). The stop says nothing about the test.
+
+Finding, login copy after a killed supervisor: the copy of `auth.json` is removed when the worker process ends, by the launching JVM. When that JVM itself is killed (run 1), the copies of its live workers stay in `/tmp/pm-spike-ws/` (two, `w1-g1` and `w2-g4` of the `relay-kill` cell, mode `0600`; deleted by hand). Fixed in the harness driver after the run: every workspace records its driver's process id (`.owner`), and the next driver deletes the login copies of the workspaces whose driver no longer runs (`OpencodeData.removeStaleLogins`, called by `SpikeResults.workspace`; `OpencodeDataTest`). For the product this is the case of a runtime that dies while workers run; the copies need the same removal at the next start, or a location that does not outlive the runtime.
+
+Finding, a unit test outside this item fails under load: the first attempt to start run 2 ended after 12 s, before the matrix, in the `pm-api` unit test `DetachedStartTest.startsDetached` (`InsecureRuntimeFile Refusing …/b/run: has mode 0775, expected 0700`), at a load average above 50 caused by the other sessions. The test fixture `RuntimeFixture.writeToken` creates `run/` with the default mode and narrows it to `0700` in a second call; the polling client of the test saw the directory in between. The same test passed in the five other builds of this item, and the unchanged command passed it when repeated. A race in the test fixture, not in the product (`OnDemandStart.createPrivateDirectory` creates the directory with the mode). Fixed after the run, on the operator's decision although it is no Linux-specific class: the fixture creates `run/` with mode `0700` (`RuntimeFixtureTest`).
+
+*Status*: `[x]` (gate 13 passed; fault matrix: five faults passed in the IT run, `stop-long` included; `stop-short` 9/10 in the IT run and 10/10 re-evaluated with the corrected evaluator, see finding)
 
 === L15: Session Bus under Confinement (gate 5, `PM-SEC-5`)
 
@@ -759,14 +769,18 @@ Step a shows whether the client finds the bus through `$XDG_RUNTIME_DIR/bus` wit
 [cols="3,2,1", options="header"]
 |===
 |Check |Evidence |Pass
-|Landlock ABI (`pm-exec --probe`) |  |
-|`PmExecIT` native, session-bus check |  |
-|a: unconfined, variable dropped |  |
-|b: confined, read set denies the bus |  |
-|c: as b, `XDG_RUNTIME_DIR` dropped |  |
+|Landlock ABI (`pm-exec --probe`) |8 (`no_new_privs` true, `confinement` `confined`), kernel `7.0.0-34-generic`; below 9, so Landlock does not govern the connect to a pathname socket here |—
+|`PmExecIT` native, session-bus check |12/12 of the `Landlock` group passed in the full native build (`gate3-pm-exec-linux-native.json`, `mode` `native`): `session_bus_landlock_abi` 8, `session_bus_connect_denied` false (the connect to the socket in the denied runtime directory succeeds, as the criterion states below ABI 9), `session_bus_env_dropped` true, `runtime_socket_read_rule_connect` true |yes
+|a: unconfined, variable dropped |`a reachable`, exit 0: without `DBUS_SESSION_BUS_ADDRESS`, `dbus-send` finds the bus through `$XDG_RUNTIME_DIR/bus` (`/run/user/1000/bus`, `srw-rw-rw-`) |recorded
+|b: confined, read set denies the bus |`b reachable`, exit 0 (launch report `confined`, `landlock_abi` 8); `ListNames` answered with 22 names. The connect to the bus socket is *not* denied, although the same launcher denies `ls /run/user/1000` (`Permission denied`, exit 2) |recorded (not refused, ABI 8)
+|c: as b, `XDG_RUNTIME_DIR` dropped |not reachable, exit 1: `Failed to open connection to "session" message bus: Unable to autolaunch a dbus-daemon without a $DISPLAY for X11`. The client no longer finds the bus; the socket itself stays connectable (step b, and the IT's connect by path) |recorded
 |===
 
-*Status*: `[ ]`
+Run: staged installation from the full native build of commit `423914b`, in the SSH session of the Setup Record (no tty, `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`, `XDG_RUNTIME_DIR=/run/user/1000`). No class needed a fix.
+
+Outcome under ABI 8: criterion 1 is met, and criterion 2 demands a refusal only from ABI 9, which this kernel does not offer; the outcomes of a to c are recorded above. Landlock does not cut a confined job off from the session bus on this machine, so the item's fallback applies: the cut-off rests on the job environment alone. Step c shows that this needs both variables dropped: without `DBUS_SESSION_BUS_ADDRESS` alone, libdbus falls back to `$XDG_RUNTIME_DIR/bus` (steps a and b); without `XDG_RUNTIME_DIR` as well, it does not find the bus. That stops a client that looks the bus up, not a job that names the path: `/run/user/<uid>/bus` is predictable, and a connect by path succeeds under ABI 8 (the IT's check). This remaining exposure is the residual risk under `PM-SEC-5` the fallback names. The refusal from ABI 9 remains unverified on Linux hardware; no kernel with ABI 9 was available.
+
+*Status*: `[x]` (criterion met at ABI 8; no Landlock cut-off below ABI 9, the fallback applies)
 
 == Test Reference
 

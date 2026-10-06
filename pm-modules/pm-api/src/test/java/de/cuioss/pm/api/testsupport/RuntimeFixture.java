@@ -76,9 +76,11 @@ public final class RuntimeFixture implements AutoCloseable {
      * @throws IOException on a write failure
      */
     public void writeToken(String value) throws IOException {
-        Files.createDirectories(paths.runDir());
-        Files.setPosixFilePermissions(base, PosixFilePermissions.fromString("rwx------"));
-        Files.setPosixFilePermissions(paths.runDir(), PosixFilePermissions.fromString("rwx------"));
+        // created with the mode: a client polling for the runtime never sees a broader run/
+        var mode = PosixFilePermissions.fromString("rwx------");
+        Files.createDirectories(paths.runDir(), PosixFilePermissions.asFileAttribute(mode));
+        Files.setPosixFilePermissions(base, mode);
+        Files.setPosixFilePermissions(paths.runDir(), mode);
         var temp = paths.runDir().resolve("runtime.token.tmp");
         Files.writeString(temp, value);
         Files.setPosixFilePermissions(temp, PosixFilePermissions.fromString("rw-------"));

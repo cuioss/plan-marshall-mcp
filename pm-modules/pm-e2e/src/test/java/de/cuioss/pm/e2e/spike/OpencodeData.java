@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
+import java.util.function.LongPredicate;
 
 /**
  * The per-worker OpenCode data directory: every OpenCode worker gets its own {@code XDG_DATA_HOME} inside its
@@ -23,7 +24,9 @@ import java.util.Map;
  * lock, not the one every OpenCode process of the user shares.
  * <p>
  * OpenCode reads its login from {@code <XDG_DATA_HOME>/opencode/auth.json}. At launch the operator's login file is
- * copied there with mode {@code 0600} (directories {@code 0700}); when the worker ends the copy is deleted.
+ * copied there with mode {@code 0600} (directories {@code 0700}); when the worker ends the copy is deleted. A driver
+ * that is killed cannot delete the copies of its live workers: every workspace names its driver process in
+ * {@code .owner}, and the next driver deletes the copies of the workspaces whose driver no longer runs.
  * OpenCode's other paths keep their defaults. Two stay in the Landlock write set: {@code ~/.cache/opencode} (the
  * model catalogue {@code models.json}, refreshed when stale) and {@code ~/.local/state/opencode} (the lock
  * directory {@code locks/}, prompt history, model choice). {@code ~/.config/opencode} leaves the write set: a worker
@@ -42,6 +45,8 @@ final class OpencodeData {
     static final String CONFIG = ".config/opencode";
     /** The per-worker {@code XDG_DATA_HOME}, relative to the worker directory. */
     static final String DATA_HOME = "xdg-data";
+    /** The marker of a workspace that holds the process id of its driver. */
+    static final String OWNER = ".owner";
 
     private OpencodeData() {
     }
@@ -99,6 +104,54 @@ final class OpencodeData {
         try {
             return Files.deleteIfExists(dataHome.resolve("opencode").resolve(AUTH));
         } catch (IOException _) {
+            return false;
+        }
+    }
+
+    /**
+     * Records the driver process that owns a workspace.
+     *
+     * @param workspace the parent of the worker directories of one run
+     * @param pid       the driver's process id
+     * @throws IOException if the marker cannot be written
+     */
+    static void markOwner(Path workspace, long pid) throws IOException {
+        Files.writeString(workspace.resolve(OWNER), Long.toString(pid));
+    }
+
+    /**
+     * Deletes the login copies a killed driver left behind: those of every workspace below the root whose owner
+     * is not recorded or no longer runs. A process id reused by another process keeps a stale copy until the
+     * next start.
+     *
+     * @param root  the parent of the workspaces
+     * @param alive whether a process id belongs to a running process
+     * @return the number of copies deleted
+     * @throws IOException if the root cannot be listed
+     */
+    static int removeStaleLogins(Path root, LongPredicate alive) throws IOException {
+        int removed = 0;
+        try (var workspaces = Files.newDirectoryStream(root, Files::isDirectory)) {
+            for (var workspace : workspaces) {
+                if (ownerAlive(workspace, alive)) {
+                    continue;
+                }
+                try (var workers = Files.newDirectoryStream(workspace, Files::isDirectory)) {
+                    for (var worker : workers) {
+                        if (removeLogin(worker.resolve(DATA_HOME))) {
+                            removed++;
+                        }
+                    }
+                }
+            }
+        }
+        return removed;
+    }
+
+    private static boolean ownerAlive(Path workspace, LongPredicate alive) {
+        try {
+            return alive.test(Long.parseLong(Files.readString(workspace.resolve(OWNER)).strip()));
+        } catch (IOException | NumberFormatException _) {
             return false;
         }
     }
