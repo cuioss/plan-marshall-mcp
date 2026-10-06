@@ -59,18 +59,6 @@ class SpikeTrafficRecordTest {
         assertEquals("not json", new JsonObject(lines.get(1)).getString("message"));
     }
 
-    @Test
-    @DisplayName("refuses subscriptions/listen with method not found, or ends it with an empty result")
-    void shouldAnswerListen() {
-        var refused = SpikeListenFilter.answer(SpikeListenFilter.REFUSE, "listen:0");
-        var ignored = SpikeListenFilter.answer(SpikeListenFilter.IGNORE, 7);
-
-        assertEquals(-32601, refused.getJsonObject("error").getInteger("code"));
-        assertEquals("listen:0", refused.getValue("id"));
-        assertEquals(new JsonObject(), ignored.getJsonObject("result"));
-        assertFalse(ignored.containsKey("error"));
-    }
-
     private static RawMessage message(String text) {
         return new RawMessage() {
             @Override

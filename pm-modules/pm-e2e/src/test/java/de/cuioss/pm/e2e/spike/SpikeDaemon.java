@@ -39,11 +39,6 @@ final class SpikeDaemon implements AutoCloseable {
 
     /** The MCP traffic record of the daemon ({@code pm.spike.traffic-file}) in the run directory. */
     static final String TRAFFIC_FILE = "traffic.jsonl";
-    /**
-     * {@code spike.listen=refuse|ignore}: the daemon answers {@code subscriptions/listen} itself (M8 experiment,
-     * {@code pm.spike.listen}).
-     */
-    static final String LISTEN_PROPERTY = "spike.listen";
 
     private final Process process;
     private final Path base;
@@ -77,10 +72,6 @@ final class SpikeDaemon implements AutoCloseable {
         }
         properties.add("-Dpm.spike.run-dir=" + runDir.toAbsolutePath());
         properties.add("-Dpm.spike.traffic-file=" + runDir.resolve(TRAFFIC_FILE).toAbsolutePath());
-        var listen = System.getProperty(LISTEN_PROPERTY);
-        if (listen != null && !listen.isBlank()) {
-            properties.add("-Dpm.spike.listen=" + listen.strip());
-        }
         var builder = new ProcessBuilder(stage.daemonCommand(properties)).redirectErrorStream(true)
                 .redirectOutput(log.toFile());
         builder.environment().put("PM_MCP_BASE", base.toString());
