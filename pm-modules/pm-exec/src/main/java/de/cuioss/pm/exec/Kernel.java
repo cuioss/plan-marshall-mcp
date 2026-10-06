@@ -14,8 +14,8 @@ import java.util.List;
 import java.util.OptionalInt;
 
 /**
- * The native calls of the launcher. {@link NativeKernel} implements them through FFM; the launch
- * logic depends only on this interface.
+ * The native calls of the launcher. {@link NativeKernel} implements them through FFM, the Linux-only
+ * ones in {@link LinuxCalls}; the launch logic depends only on this interface.
  */
 interface Kernel {
 

@@ -91,8 +91,11 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - OS-specific behaviour (Landlock, Secret Service, Keychain) is tested with `@EnabledOnOs`; verification
   ITs write their measured figures to `target/verification-results/<item>.json`.
 - Test data: cui-test-generator; log assertions: cui-test-juli-logger (`@EnableTestLogger`).
-- Minimum 80% instruction and branch coverage, enforced by the JaCoCo `check` of the parent's
-  `-Pcoverage` profile (merged Maven and `quarkus-jacoco` data) and by the SonarCloud quality gate.
+- Minimum 80% instruction and branch coverage per module. Locally, a `-Pcoverage` run enforces it through
+  the JaCoCo `check` of the parent's profile (merged Maven and `quarkus-jacoco` data). CI never runs that
+  check: it runs `verify -Psonar`, and the bar there is the SonarCloud quality gate on new code.
+- pm-exec's Linux-only kernel class `LinuxCalls` is excluded from the JaCoCo report and check on macOS only
+  (profile `macos-coverage` in its pom); on Linux it counts in full.
 - Keep a `@QuarkusMain` entry point thin and unit-test its logic in separate classes.
 - Behaviour of the packaged binaries belongs in `*IT` tests (run with `-Pintegration-tests`; they start the
   packaged daemon and the client binaries as processes, natively with `-Pnative`), not in unit tests. A test that
