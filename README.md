@@ -6,7 +6,6 @@
 
 [![Java CI with Maven](https://github.com/cuioss/plan-marshall-mcp/actions/workflows/maven.yml/badge.svg)](https://github.com/cuioss/plan-marshall-mcp/actions/workflows/maven.yml)
 [![License: proprietary](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE.md)
-[![Maven Central](https://img.shields.io/maven-central/v/de.cuioss/plan-marshall-mcp.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/de.cuioss/plan-marshall-mcp)
 
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=cuioss_plan-marshall-mcp&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=cuioss_plan-marshall-mcp)
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=cuioss_plan-marshall-mcp&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=cuioss_plan-marshall-mcp)
