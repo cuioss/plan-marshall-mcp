@@ -13,17 +13,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import de.cuioss.pm.mcp.server.test.DaemonProcess;
 import de.cuioss.pm.mcp.server.test.TestBases;
+import de.cuioss.pm.mcp.server.test.TestRuntime;
+import de.cuioss.pm.mcp.server.test.UdsHttp;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -31,23 +31,21 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Gates 4 and 5 from the packaged daemon (runner JAR or native {@code pm-mcpd}, started as a process with its own
- * short {@code PM_MCP_BASE}): the spike hook {@code de.cuioss.pm.mcp.spike.keyring} runs a put, get, replace and
- * delete through the backend selected for a non-default machine root at start and writes its outcome; this test
- * checks it and records {@code target/verification-results/gate4-keychain-<mode>.json} (macOS) or
- * {@code gate5-secret-service-<mode>.json} (Linux).
+ * short {@code PM_MCP_BASE}, so the entries live under an instance-qualified service name): a put, get, replace
+ * and delete of one credential through the credential resource of the local API, served by the backend the
+ * daemon selected at start. Records {@code target/verification-results/gate4-keychain-<mode>.json} (macOS) or
+ * {@code gate5-secret-service-<mode>.json} (Linux); the times include the request over the socket.
  */
 @DisplayName("OS keyring from the packaged daemon")
 class KeyringIT {
 
-    static final Path RESULT = Path.of("target", "keyring-it", "result.json").toAbsolutePath();
-    static final Path KEYRING_BASE = Path.of("target", "keyring-it", "base").toAbsolutePath();
+    private static final String KEY = "pm-mcp-keyring-it";
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private Path base;
 
     @BeforeEach
-    void prepare() throws IOException {
-        Files.createDirectories(KEYRING_BASE);
-        Files.deleteIfExists(RESULT);
+    void prepare() {
         base = TestBases.create("pmk");
     }
 
@@ -56,38 +54,56 @@ class KeyringIT {
         TestBases.delete(base);
     }
 
+    private static UdsHttp.Response credential(DaemonProcess daemon, String method, String value) throws IOException {
+        var headers = TestRuntime.bearer(daemon.token());
+        headers.put("Content-Type", "application/json");
+        return UdsHttp.request(daemon.paths().socket(), method, "/api/v1/credentials/" + KEY, headers,
+                value == null ? null : JSON.writeValueAsString(JSON.createObjectNode().put("value", value)));
+    }
+
     @Test
     @DisplayName("put, get, replace and delete through the selected backend")
     void roundTrip() throws Exception {
-        try (var daemon = DaemonProcess.start(base, List.of("-Dpm.spike.keyring.result=" + RESULT,
-                     "-Dpm.spike.keyring.base=" + KEYRING_BASE))) {
-            daemon.awaitReady(Duration.ofSeconds(30));
-            for (int i = 0; i < 100 && !Files.exists(RESULT); i++) {
-                Thread.sleep(100);
-            }
-            assertTrue(Files.exists(RESULT), daemon.output());
-        }
-        var outcome = new ObjectMapper().readTree(RESULT.toFile());
         var macos = System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac");
-        var expectedStore = macos ? SecretStore.KEYCHAIN : SecretStore.SECRET_SERVICE;
+        var secret = UUID.randomUUID().toString();
         var values = new LinkedHashMap<String, Object>();
         values.put("mode", DaemonProcess.isNative() ? "native" : "jvm");
-        values.put("store", outcome.path("store").asText());
-        values.put("service", outcome.path("service").asText());
-        values.put("fallback_reason", outcome.path("fallback_reason").asText(null));
-        values.put("round_trip", outcome.path("round_trip").asBoolean());
-        values.put("put_us", outcome.path("put_us").asLong());
-        values.put("get_us", outcome.path("get_us").asLong());
-        values.put("delete_us", outcome.path("delete_us").asLong());
-        values.put("error", outcome.path("error").asText(null));
-        boolean pass = outcome.path("round_trip").asBoolean() && expectedStore.equals(outcome.path("store").asText());
-        VerificationResults.write((macos ? "gate4-keychain-" : "gate5-secret-service-") + values.get("mode"), values,
-                pass);
+        try (var daemon = DaemonProcess.startReady(base)) {
+            try {
+                long start = System.nanoTime();
+                var put = credential(daemon, "PUT", secret);
+                values.put("put_us", (System.nanoTime() - start) / 1000);
+                start = System.nanoTime();
+                var read = credential(daemon, "GET", null);
+                values.put("get_us", (System.nanoTime() - start) / 1000);
+                var replace = credential(daemon, "PUT", secret + "-2");
+                var replaced = credential(daemon, "GET", null);
+                start = System.nanoTime();
+                var delete = credential(daemon, "DELETE", null);
+                values.put("delete_us", (System.nanoTime() - start) / 1000);
+                var gone = credential(daemon, "GET", null);
 
-        assertTrue(outcome.path("round_trip").asBoolean(), outcome.toString());
-        assertTrue(outcome.path("service").asText().startsWith(ServiceName.DEFAULT + "/"), outcome.toString());
-        if (macos) {
-            assertEquals(SecretStore.KEYCHAIN, outcome.path("store").asText(), outcome.toString());
+                assertEquals(204, put.status(), put.body() + daemon.output());
+                assertEquals(200, read.status(), read.body() + daemon.output());
+                var entry = JSON.readTree(read.body());
+                var store = entry.path("store").asText();
+                values.put("store", store);
+                boolean roundTrip = secret.equals(entry.path("value").asText()) && replace.status() == 204
+                        && (secret + "-2").equals(JSON.readTree(replaced.body()).path("value").asText())
+                        && delete.status() == 204 && gone.status() == 404;
+                values.put("round_trip", roundTrip);
+                var expectedStore = macos ? SecretStore.KEYCHAIN : SecretStore.SECRET_SERVICE;
+                VerificationResults.write((macos ? "gate4-keychain-" : "gate5-secret-service-") + values.get("mode"),
+                        values, roundTrip && expectedStore.equals(store));
+
+                assertTrue(roundTrip, values + " " + replaced.body() + " " + gone.status());
+                assertTrue(daemon.output().contains("service name '" + ServiceName.DEFAULT + "/"), daemon.output());
+                if (macos) {
+                    assertEquals(SecretStore.KEYCHAIN, store, daemon.output());
+                }
+            } finally {
+                credential(daemon, "DELETE", null);
+            }
         }
     }
 }

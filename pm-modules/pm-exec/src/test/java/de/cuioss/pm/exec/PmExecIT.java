@@ -315,7 +315,7 @@ class PmExecIT {
         }
 
         @Test
-        @DisplayName("the session bus in a denied runtime directory (L15): denied from ABI 9, reachable below")
+        @DisplayName("the session bus in a denied runtime directory: denied from ABI 9, reachable below")
         void sessionBus() throws Exception {
             var probe = run(List.of("--probe"));
             var abiMatcher = PROBE_ABI.matcher(probe.out());

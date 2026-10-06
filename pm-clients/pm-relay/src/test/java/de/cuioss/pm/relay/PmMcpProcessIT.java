@@ -105,14 +105,17 @@ class PmMcpProcessIT {
     void hygieneAndTermination() throws Exception {
         fixture.start(mcp());
         try (var process = relay(environment())) {
-            process.send(INITIALIZE);
-            process.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
-            process.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
             var lines = new ArrayList<String>();
+            process.send(INITIALIZE);
+            // The relay forwards requests concurrently: the answer to initialize is awaited before the next request.
             for (var i = 0; i < 3; i++) {
                 var line = process.nextLine(WAIT);
                 assertNotNull(line, "stdout line " + i + "; stderr: " + process.stderr());
                 lines.add(line.text());
+                if (i == 0) {
+                    process.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+                    process.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
+                }
             }
             var eofNanos = System.nanoTime();
             process.closeStdin();

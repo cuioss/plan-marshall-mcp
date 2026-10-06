@@ -26,6 +26,8 @@ import java.util.Optional;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 @DisplayName("Json")
 class JsonTest {
@@ -70,11 +72,15 @@ class JsonTest {
     @Test
     @DisplayName("maps failed responses to contract outcomes")
     void mapsOutcomes() {
-        assertEquals(CiResult.Outcome.UNAUTHORIZED, failed(401, "").outcome());
+        assertEquals(CiResult.Outcome.AUTH_FAILED, failed(401, "").outcome());
+        assertEquals(CiResult.Outcome.PERMISSION_DENIED, failed(403, "").outcome());
         assertEquals(CiResult.Outcome.NOT_FOUND, failed(404, "").outcome());
         assertEquals(CiResult.Outcome.REJECTED, failed(409, "{\"message\":\"SHA does not match\"}").outcome());
         assertEquals("HTTP 409: SHA does not match", failed(409, "{\"message\":\"SHA does not match\"}").detail());
         assertEquals(CiResult.Outcome.FAILED, failed(500, "oops").outcome());
+        assertEquals(CiResult.Outcome.FAILED, failed(500, "{\"message\":\"500 Internal Server Error\"}").outcome());
+        assertEquals(CiResult.Outcome.FAILED,
+                CiResult.failed(CiResponse.failure(CiResponse.Outcome.REFUSED, "outside the origin")).outcome());
         assertEquals(CiResult.Outcome.FAILED,
                 CiResult.failed(CiResponse.failure(CiResponse.Outcome.TRANSPORT_FAILED, "IOException")).outcome());
         var limited = CiResult.failed(new CiResponse(CiResponse.Outcome.RATE_LIMITED, 429, "", Optional.empty(),
@@ -85,8 +91,36 @@ class JsonTest {
         assertTrue(CiResult.ok("v", false).isOk());
     }
 
+    @ParameterizedTest(name = "{0} {1}")
+    @CsvSource(delimiter = '|', value = {
+            "400|{\"message\":\"Merge trains are not enabled for this project\"}|REJECTED|HTTP 400: Merge trains are not enabled for this project",
+            "400|{\"error\":\"sha is missing\"}|REJECTED|HTTP 400: sha is missing",
+            "409|{\"message\":\"SHA does not match\"}|REJECTED|HTTP 409: SHA does not match",
+            "409|''|REJECTED|HTTP 409",
+            "422|{\"message\":\"Validation Failed\"}|REJECTED|HTTP 422: Validation Failed",
+            "405|{\"message\":\"Method Not Allowed\"}|REJECTED|HTTP 405: Method Not Allowed",
+            "410|{\"message\":\"Gone\"}|REJECTED|HTTP 410: Gone",
+            "400|''|FAILED|HTTP 400",
+            "400|<html>bad gateway page</html>|FAILED|HTTP 400",
+            "400|{\"message\":\" \"}|FAILED|HTTP 400",
+            "400|{\"message\":null}|FAILED|HTTP 400",
+            "401|{\"message\":\"Bad credentials\"}|AUTH_FAILED|HTTP 401: Bad credentials",
+            "403|{\"message\":\"Resource not accessible by integration\"}|PERMISSION_DENIED|HTTP 403: Resource not accessible by integration",
+            "404|{\"message\":\"Not Found\"}|NOT_FOUND|HTTP 404: Not Found",
+            "502|{\"message\":\"Bad Gateway\"}|FAILED|HTTP 502: Bad Gateway",
+            "302|{\"message\":\"moved\"}|FAILED|HTTP 302: moved"
+    })
+    @DisplayName("keeps a provider refusal (REJECTED) apart from a credential refusal and from a failure")
+    void separatesRefusals(int status, String body, CiResult.Outcome outcome, String detail) {
+        var result = failed(status, body);
+
+        assertEquals(outcome, result.outcome());
+        assertEquals(detail, result.detail());
+        assertTrue(result.value().isEmpty());
+    }
+
     private static CiResult<Object> failed(int status, String body) {
         return CiResult.failed(new CiResponse(CiResponse.Outcome.HTTP_ERROR, status, body, Optional.empty(),
-                Optional.empty(), Optional.empty(), ""));
+                Optional.empty(), Optional.empty(), "HTTP " + status));
     }
 }

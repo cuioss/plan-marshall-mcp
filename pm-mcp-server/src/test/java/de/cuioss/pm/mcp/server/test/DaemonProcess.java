@@ -31,10 +31,6 @@ import de.cuioss.pm.api.MachinePaths;
  */
 public final class DaemonProcess implements AutoCloseable {
 
-    /** System properties every IT daemon gets: the spike verification tools and registries. */
-    public static final List<String> SPIKE_PROPERTIES = List.of("-Dpm.spike.verify=true",
-            "-Dpm.spike.job-token=" + TestSecrets.JOB_TOKEN, "-Dpm.spike.device-secret=" + TestSecrets.DEVICE_SECRET);
-
     private static final Path TARGET = Path.of("target");
 
     private final Process process;
@@ -129,14 +125,14 @@ public final class DaemonProcess implements AutoCloseable {
     }
 
     /**
-     * Starts the daemon with the spike properties and waits until it is ready.
+     * Starts the daemon and waits until it is ready.
      *
      * @param base the machine root
      * @return the ready daemon
      * @throws IOException if it does not become ready
      */
     public static DaemonProcess startReady(Path base) throws IOException {
-        var daemon = start(base, SPIKE_PROPERTIES);
+        var daemon = start(base, List.of());
         daemon.awaitReady(Duration.ofSeconds(30));
         return daemon;
     }

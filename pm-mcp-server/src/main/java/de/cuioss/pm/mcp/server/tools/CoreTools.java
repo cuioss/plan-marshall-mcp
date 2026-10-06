@@ -59,8 +59,8 @@ public class CoreTools {
     }
 
     /**
-     * Registers the core tools after the components that may have registered a name already (the pull-mechanism
-     * stub of Part A brings its own {@code pm_skill*}).
+     * Registers the core tools after every other startup observer; a name another component registered already is
+     * left alone and reported.
      *
      * @param event the startup event
      */

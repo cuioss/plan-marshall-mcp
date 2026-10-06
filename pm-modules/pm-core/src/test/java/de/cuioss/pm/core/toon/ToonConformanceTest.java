@@ -10,8 +10,8 @@
 package de.cuioss.pm.core.toon;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.core.JsonFactory;
@@ -42,9 +42,9 @@ import org.junit.jupiter.params.provider.MethodSource;
 /**
  * Runs the vendored encode fixtures of the pinned official TOON specification (gate 12).
  * <p>
- * Every fixture either passes byte-exact, or is listed in {@code skipped.txt} with the reason it lies
- * outside the PM-MCP subset; a skipped fixture whose reason is a form the encoder refuses must be
- * refused with exactly that reason, so a skip never hides a wrong encoding.
+ * Every fixture passes byte-exact, unless it is listed in {@code skipped.txt} because it needs an
+ * encoder option PM-MCP does not offer (a delimiter other than comma, an indentation other than two
+ * spaces); a listed fixture must carry such an option, so a skip never hides a wrong encoding.
  */
 @DisplayName("TOON conformance fixtures (encode)")
 class ToonConformanceTest {
@@ -53,8 +53,8 @@ class ToonConformanceTest {
     private static final List<String> FILES = List.of("primitives", "objects", "objects-keyed", "arrays-primitive",
             "arrays-tabular", "arrays-nested", "arrays-objects", "delimiters", "whitespace");
     private static final JsonFactory JSON = new JsonFactory();
-    /** Options equal to the encoder defaults (comma delimiter); every other option lies outside the subset. */
-    private static final Set<String> DEFAULT_OPTIONS = Set.of("{}", "{\"delimiter\":\",\"}");
+    /** Options equal to the canonical encoder options (comma delimiter, indent 2); PM-MCP offers no others. */
+    private static final Set<String> CANONICAL_OPTIONS = Set.of("{}", "{\"delimiter\":\",\"}");
 
     record Fixture(String id, String name, ToonValue input, String expected, String options, String skipReason) {
 
@@ -74,7 +74,6 @@ class ToonConformanceTest {
     }
 
     private static final AtomicInteger PASSED = new AtomicInteger();
-    private static final AtomicInteger REFUSED = new AtomicInteger();
     private static final AtomicInteger OPTION_SKIPPED = new AtomicInteger();
 
     /** Records the gate 12 figures in {@code target/verification-results/gate12-toon-conformance.json}. */
@@ -82,7 +81,7 @@ class ToonConformanceTest {
     static void recordVerificationResult() throws IOException {
         Path file = Path.of("target", "verification-results", "gate12-toon-conformance.json");
         Files.createDirectories(file.getParent());
-        int total = PASSED.get() + REFUSED.get() + OPTION_SKIPPED.get();
+        int total = PASSED.get() + OPTION_SKIPPED.get();
         Files.writeString(file, """
                 {
                   "item": "gate12-toon-conformance",
@@ -94,35 +93,29 @@ class ToonConformanceTest {
                     "spec_commit": "a6b801a3326980ab2cb615b0ffe44457e091f7b6",
                     "encode_fixtures": %d,
                     "passed": %d,
-                    "skipped_outside_subset_refused": %d,
                     "skipped_encoder_option": %d
                   },
                   "pass": %s
                 }
                 """.formatted(System.getProperty("os.name"), System.getProperty("os.arch"), ToonEncoder.SPEC_VERSION,
-                ToonEncoder.SPEC_RELEASE, total, PASSED.get(), REFUSED.get(), OPTION_SKIPPED.get(),
-                PASSED.get() > 0), StandardCharsets.UTF_8);
+                ToonEncoder.SPEC_RELEASE, total, PASSED.get(), OPTION_SKIPPED.get(),
+                PASSED.get() > 0 && PASSED.get() + OPTION_SKIPPED.get() == total), StandardCharsets.UTF_8);
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("fixtures")
-    @DisplayName("encodes the fixture or refuses it for its listed reason")
+    @DisplayName("encodes the fixture byte-exact unless it needs an unoffered option")
     void conforms(Fixture fixture) {
         if (fixture.skipReason() == null) {
-            assertTrue(DEFAULT_OPTIONS.contains(fixture.options()), "fixture with options must be listed as skipped");
+            assertTrue(CANONICAL_OPTIONS.contains(fixture.options()), "fixture with options must be listed as skipped");
             assertEquals(fixture.expected(), ToonEncoder.encode(fixture.input()));
             PASSED.incrementAndGet();
             return;
         }
-        if (fixture.skipReason().startsWith("option")) {
-            OPTION_SKIPPED.incrementAndGet();
-        } else {
-            var refusal = assertThrows(ToonEncodingException.class, () -> ToonEncoder.encode(fixture.input()));
-            assertTrue(fixture.skipReason().startsWith(refusal.getReason().name()),
-                    () -> "refused with " + refusal.getReason() + " but listed as " + fixture.skipReason());
-            REFUSED.incrementAndGet();
-        }
-        Assumptions.abort("outside the PM-MCP subset: " + fixture.skipReason());
+        assertTrue(fixture.skipReason().startsWith("option"), () -> "only unoffered options are skipped: " + fixture);
+        assertFalse(CANONICAL_OPTIONS.contains(fixture.options()), () -> "skipped fixture uses canonical options: " + fixture);
+        OPTION_SKIPPED.incrementAndGet();
+        Assumptions.abort("needs an encoder option PM-MCP does not offer: " + fixture.skipReason());
     }
 
     @Test

@@ -26,42 +26,47 @@ implementation blueprints in [Specification](doc/Specification.adoc), and the de
 [Roadmap](doc/roadmap.adoc).
 
 > [!NOTE]
-> The project is at its very beginning: the build currently produces a Quarkus application with a
-> single `hello` MCP tool, verified by unit tests and by integration tests against the packaged
-> application.
+> The project is at its beginning: roadmap Milestone 0 (verification first) is complete. Each verified technique
+> exists in its target module in a first, minimal form; the workflow engine and the job runtime are not built
+> yet. The measurements are recorded in the [Evaluation Reference](doc/specification/evaluation.adoc).
 
 ## Modules
 
-| Module | Content |
-|---|---|
-| `plan-marshall-mcp` | The Quarkus application: MCP server (Quarkiverse Quarkus MCP Server, Streamable HTTP at `/mcp`), health checks on the management port (`9000`, `/q/health`). Its `*IT` tests run against the packaged application (`@QuarkusIntegrationTest`). |
+`pm-mcp-server` (the Quarkus daemon `pm-mcpd`) beside the aggregators `pm-modules` (library modules, with the
+nested `pm-providers`, the job launcher `pm-exec`, and the end-to-end tests `pm-e2e`) and `pm-clients` (the
+STDIO relay `pm-mcp` and the operator CLI `pm-operator`). The listing of the modules, their dependencies, and
+the specification each implements is the
+[Module Structure Specification](doc/specification/module-structure.adoc).
 
 ## Technology
 
 Java 25, Quarkus (via `de.cuioss:cui-quarkus-parent`),
 [Quarkus MCP Server](https://github.com/quarkiverse/quarkus-mcp-server),
-[cui-http](https://github.com/cuioss/cui-http) and [TokenSheriff](https://github.com/cuioss/TokenSheriff).
+[cui-http](https://github.com/cuioss/cui-http), picocli, and GraalVM native image for the four binaries.
 See [Technology Requirements](doc/requirements/09-technology.adoc).
 
 ## Build
 
 ```bash
 # Build and unit tests
-./mvnw clean install
+./mvnw clean verify
 
-# Integration tests against the packaged application
-./mvnw clean verify -Pintegration-tests -pl plan-marshall-mcp -am
+# Integration tests against the packaged daemon and the client JARs
+./mvnw clean verify -Pintegration-tests
+
+# Native binaries and the integration tests against them (GRAALVM_HOME and JAVA_HOME point to GraalVM 25)
+./mvnw clean verify -Pnative,integration-tests
 
 # Pre-commit: license headers and OpenRewrite recipes - review and commit the resulting diff
 ./mvnw -Ppre-commit clean verify -DskipTests
 ```
 
-Run the application manually:
+The daemon listens only on a Unix domain socket below `PM_MCP_BASE` (default `~/.plan-marshall-mcp`); the clients
+start it on demand:
 
 ```bash
-./mvnw package -pl plan-marshall-mcp -am -DskipTests
-java -jar plan-marshall-mcp/target/quarkus-app/quarkus-run.jar
-curl http://localhost:9000/q/health
+pm-operator runtime start
+pm-operator status
 ```
 
 ## Credentials

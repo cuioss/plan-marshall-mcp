@@ -12,11 +12,10 @@
  * <p>
  * {@link de.cuioss.pm.core.toon.ToonEncoder} encodes a small immutable value tree
  * ({@link de.cuioss.pm.core.toon.ToonValue}) to TOON text conforming to the official TOON
- * specification version {@value de.cuioss.pm.core.toon.ToonEncoder#SPEC_VERSION} for the subset
- * PM-MCP emits: objects, tabular object arrays with primitive columns, length-prefixed inline
- * primitive arrays and minimal string quoting with the official escapes. A value whose shape the
- * official specification would render in a form outside that subset (list form, keyed tabular form,
- * nested field groups) is refused with a {@link de.cuioss.pm.core.toon.ToonEncodingException}
- * instead of being rendered non-conformantly.
+ * specification version {@value de.cuioss.pm.core.toon.ToonEncoder#SPEC_VERSION}: every form of the
+ * specification (inline, tabular with nested field groups, list and keyed tabular form) with the
+ * canonical options only, the comma delimiter and an indentation of two spaces. A value TOON cannot
+ * represent (an unpaired surrogate, a duplicate key) is refused with a
+ * {@link de.cuioss.pm.core.toon.ToonEncodingException}.
  */
 package de.cuioss.pm.core.toon;

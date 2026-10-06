@@ -195,7 +195,22 @@ Client profiles are declarative JSON documents compiled into `pm-core` under `cl
         "writable_paths": {
           "type": "array",
           "items": { "type": "string", "pattern": "^~/[A-Za-z0-9_./-]+$" },
-          "description": "Home-relative sub-paths a headless harness must write to run (its login or credential file, caches, the session directory), added to the write set of a worker. Never a harness home as a whole and never a settings, skill, or command file that the bundle manifest manages; profile validation refuses such an entry."
+          "description": "Home-relative sub-paths a headless harness must write to run (its login or credential file, caches, the session directory, its own state file), added to the write set of a worker. Never a harness home as a whole and never a settings, skill, or command file that the bundle manifest manages; profile validation refuses such an entry. Empty for a harness whose writes all go to its per-worker data home."
+        },
+        "data_home": {
+          "type": ["object", "null"],
+          "description": "Per-worker data home, for a harness whose local state is one per-user store shared by all its processes; null: the harness needs none. The runtime points variable at the worker's own data directory below its job-private directory and copies login_file into it (job-runtime, Per-Worker Data Home).",
+          "properties": {
+            "variable": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$", "description": "The environment variable that relocates the harness's data directory (opencode: XDG_DATA_HOME); never a credential-pattern name." },
+            "login_file": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$", "description": "The harness's own login file, relative to the data directory the variable relocates (opencode: opencode/auth.json); copied byte for byte with mode 0600, never parsed, stored, or logged." }
+          },
+          "required": ["variable", "login_file"],
+          "additionalProperties": false
+        },
+        "tool_result_limit_chars": {
+          "type": ["integer", "null"],
+          "minimum": 4000,
+          "description": "The largest tool result, in characters, the harness passes to its model whole; null: no limit known. The server returns no larger tool result to a worker of this harness: it sends identifiers and links first and the rest as parts read as resources (model-work, Offer). A non-null value requires a non-empty resource_tools."
         },
         "resource_tools": {
           "type": "array",
@@ -214,7 +229,7 @@ Client profiles are declarative JSON documents compiled into `pm-core` under `cl
           "description": "Harness fallback of the context budget of a worker, used only for a role artifact that does not set context_budget_tokens (Model Work, Role Artifact Schema); the per-envelope packing budget is derived from the effective value (Model Work, Envelopes), compiled fallback 400000 when neither sets it, operator override envelope_budget_tokens in local-config.json."
         }
       },
-      "required": ["executable", "supported_versions", "agent_mode", "argv", "class_args", "env", "capabilities", "output", "usage", "writable_paths", "resource_tools", "session_residue"],
+      "required": ["executable", "supported_versions", "agent_mode", "argv", "class_args", "env", "capabilities", "output", "usage", "writable_paths", "data_home", "tool_result_limit_chars", "resource_tools", "session_residue"],
       "additionalProperties": false
     },
     "commands": {
@@ -270,11 +285,11 @@ Client profiles are declarative JSON documents compiled into `pm-core` under `cl
     },
     "worker": {
       "type": "object",
-      "description": "Worker parameters and eligibility of the host (Worker Block below). Every value other than eligible, session_tasks, and host_markers is null while eligible is false.",
+      "description": "Worker parameters and eligibility of the host (Worker Block below). While eligible is false, every value other than eligible, session_tasks, and host_markers is null or a value measured on the host, and none of them has an effect.",
       "properties": {
         "eligible": {
           "type": "boolean",
-          "description": "Whether the harness may host workers; true only after its worker behaviour has been measured on it and only with a non-null headless block."
+          "description": "Whether the harness may host workers; true only after its worker behaviour has been measured on it under the target conditions with every fault of the fault matrix passed, and only with a non-null headless block."
         },
         "session_tasks": {
           "type": "boolean",
@@ -360,13 +375,36 @@ Client profiles are declarative JSON documents compiled into `pm-core` under `cl
 ----
 
 [#headless-block]
-`headless` is the harness's launch contract for workers; the host never starts a sub-agent. How the server composes a worker's launch from the role artifact and this block, which capabilities each role class (`writer`, `read_only`, `zero_tool`) needs, the composition per `agent_mode`, the harness enrolment, and the working directory are specified in link:../model-work/04-worker-launch.adoc[Model Work Specification, Worker Launch]. A role artifact whose harness lacks a capability its class needs is invalid on load and counts as undefined (link:../model-work/01-roles-and-configuration.adoc[Model Work Specification, Roles & Configuration]). `antigravity` (one global MCP entry, no per-call MCP configuration) and `neutral` declare `headless: null`. Values the evaluation did not measure stay _(provisional)_ like the other host facts.
+`headless` is the harness's launch contract for workers; the host never starts a sub-agent. How the server composes a worker's launch from the role artifact and this block, which capabilities each role class (`writer`, `read_only`, `zero_tool`) needs, the composition per `agent_mode`, the harness enrolment, and the working directory are specified in link:../model-work/04-worker-launch.adoc[Model Work Specification, Worker Launch]. A role artifact whose harness lacks a capability its class needs is invalid on load and counts as undefined (link:../model-work/01-roles-and-configuration.adoc[Model Work Specification, Roles & Configuration]). `antigravity` (no per-call MCP configuration) and `neutral` declare `headless: null`. Values the evaluation did not measure stay _(provisional)_ like the other host facts.
 
 [#headless-usage]
 *Usage pointers*: Usage and cost are read from the harness output through `headless.usage`, never asked from a model. Each pointer fills the column of the same name in the task's metrics row (link:../store-schemas/05-metrics-and-quality-report.adoc#metrics-store[Store Schemas Specification, Metrics Store]), with two exceptions: `cache_read` fills `cache_read_input_tokens` and `cache_creation` fills `cache_creation_input_tokens`. `headless.usage` has no pointer for the total: `total_tokens` is derived from the four token components. The same per-turn figures give the supervisor a warm worker's context size for its token budget (link:../model-work/03-supervision-and-recycling.adoc[Model Work Specification, Supervision & Recycling]).
 
 [#headless-writable-paths]
-*Writable paths*: `headless.writable_paths` extends only the Landlock write set of workers. It lists the sub-paths a headless harness must write to run: its login or credential file, its caches, and its session directory (for example `~/.claude/.credentials.json` and `~/.claude/projects` for `claude`, `~/.codex/auth.json` and `~/.codex/sessions` for `codex`; _(provisional)_ until verified with writer workers in confinement). Profile validation refuses an entry that equals, contains, or lies inside a file or directory the client's bundle manifest manages (settings, command, skill, and MCP registration files, xref:03-bundle-manifest.adoc[Bundle Manifest]), so a harness home as a whole (`~/.claude`) is never an entry and a worker cannot rewrite the host's deny rules or the shim skill. The operator's own session and the bundle installer, which runs in `pm-mcpd`, are not restricted by it.
+*Writable paths*: `headless.writable_paths` extends only the Landlock write set of workers. It lists the sub-paths a headless harness must write to run: its login or credential file, its caches, its session directory, and its own state file. Profile validation refuses an entry that equals, contains, or lies inside a settings, command, or skill file or directory the client's bundle manifest manages, and any shared configuration file in which the bundle owns an `enforcement` element (xref:03-bundle-manifest.adoc[Bundle Manifest]), so a harness home as a whole (`~/.claude`) is never an entry and a worker cannot rewrite the host's deny rules, the entry commands, or the shim skill. The operator's own session and the bundle installer, which runs in `pm-mcpd`, are not restricted by it. The compiled entries:
+
+[cols="1,4,2"]
+|===
+|Profile |`headless.writable_paths` |Basis
+
+|`claude`
+|`~/.claude.json`, `~/.claude/backups`, `~/.claude/.credentials.json`, `~/.claude/projects`, `~/.claude/sessions`, `~/.cache/claude`, `~/.cache/claude-cli-nodejs`, `~/.local/state/claude`, `~/.local/share/claude`
+|`~/.claude.json` (a file rule; the home directory itself is not needed) and the cache and state directories are measured with confined writer workers. The sub-paths below `~/.claude` are _(provisional)_ (the backups of `~/.claude.json` were observed in an unconfined run): the measured run granted `~/.claude` as a whole and observed writes of the session transcript and of synced plugin and skill manifests, so the set is confirmed only by a confined run with exactly these entries.
+
+|`opencode`
+|`~/.cache/opencode`, `~/.local/state/opencode`
+|Every write of the harness's data directory goes to its per-worker data home (<<headless-data-home>>), so no path of `~/.local/share/opencode` and none of `~/.config/opencode` is writable. The cache (the model catalogue) and state (locks, prompt history, model choice) directories are declared and not exercised: the measured confined runs wrote only the per-worker data home and `/tmp`.
+
+|`codex`
+|`~/.codex/auth.json`, `~/.codex/sessions` _(provisional)_
+|Not measured.
+|===
+
+[[claude-state-file]]*The `claude` state file*: `~/.claude.json` holds the harness's own state, which a headless run rewrites, together with the user-scope MCP registration the bundle owns as one key (`mcpServers.plan-marshall`). It is the one shared configuration file among the writable paths: the bundle owns no `enforcement` element in it, a worker's own MCP configuration is the per-call one of its launch (`--strict-mcp-config`), and a change of the owned key is reported as `bundle_modified` by the bundle drift check at the next `pm-mcp enter` and by `pm-operator client status` (xref:03-bundle-manifest.adoc[Bundle Manifest], Drift Checks). That a worker can change this one key until the drift check reports it is accepted: the file stays in the write set, because the harness cannot run headless without rewriting it. _Implementation watch: link:../../implementation-watch/client-profiles.adoc#PM-WATCH-CLIENT-8[PM-WATCH-CLIENT-8]_
+
+[[headless-data-home]]*Per-worker data home*: `headless.data_home` is declared for a harness whose local state is one per-user store that all its processes share, so that a stalled worker cannot hold that store's lock against every other worker and against the operator's own sessions. `opencode` declares `{"variable": "XDG_DATA_HOME", "login_file": "opencode/auth.json"}`: every worker gets its own data directory below its job-private directory, with the harness's login file copied in, and the directory is removed when the job settles (link:../job-runtime/02-confinement-and-environment.adoc#worker-data-home[Job Runtime Specification, Per-Worker Data Home]). Profile validation refuses a `variable` that matches a credential pattern or that the job environment already sets. `claude` and `codex` declare `null`. _Implementation watch: link:../../implementation-watch/model-work.adoc#PM-WATCH-DISP-60[PM-WATCH-DISP-60]_
+
+[[headless-tool-result-limit]]*Tool-result limit*: `headless.tool_result_limit_chars` is the largest tool result the harness passes to its model whole. A harness that cuts a larger result keeps the full text where a worker restricted to the server's tools cannot read it, so the worker would lose the task's identifiers. The server therefore returns no tool result above the limit to a worker of that harness: identifiers and links come first, and the remaining content is named as parts below the limit, read through the harness's resource tools (link:../model-work/02-task-protocol.adoc#offer[Model Work Specification, Offer]; value and basis: link:../timeouts/03-retention-host-config.adoc#tool-result-limit[Timeouts & Budgets Specification, Harness Tool-Result Limit]). `opencode` declares the provisional `32000`, `claude` `null`. Profile validation refuses a non-null limit on a profile without `resource_tools`. _Implementation watch: link:../../implementation-watch/client-profiles.adoc#PM-WATCH-CLIENT-12[PM-WATCH-CLIENT-12]_
 
 *No harness credentials*: `PM-MCP` never stores or exports a harness's authentication, and a profile declares no authentication variable. The harness CLI must already be logged in by its own login, cached under its home; a harness that is not logged in fails its worker's start (link:../model-work/03-supervision-and-recycling.adoc[Model Work Specification, start failures]).
 
@@ -391,7 +429,7 @@ The `worker` block holds the per-host values of the task protocol and of supervi
 
 |`worker.eligible` |`true` |`true` |`false` |`false` |`false`
 |`worker.session_tasks` |`true` |`false` |`false` |`false` |`false`
-|`worker.restricted_models` |`["*"]` |`["space-bunny-free", "opencode-go/muse-spark-1.3-contributor"]` |`null` |`null` |`null`
+|`worker.restricted_models` |`["*"]` |`["opencode-go/muse-spark-1.3-contributor"]` |`null` |`null` |`null`
 |`worker.ack_deadline_seconds` |`15` |`270` |`null` |`null` |`null`
 |`worker.ack_informational` |`false` |`true` |`null` |`null` |`null`
 |`worker.silence_grace_seconds` |`30` |`30` |`null` |`null` |`null`
@@ -404,13 +442,14 @@ The `worker` block holds the per-host values of the task protocol and of supervi
 
 Rules of the block, checked by profile validation:
 
-* *Eligibility*: `eligible: true` requires a non-null `headless` block. A host is eligible only after its worker behaviour has been measured on it: Antigravity (measured only in part), Codex (not measured), and `neutral` are not eligible, and the operator assigns their roles to an eligible harness. A role artifact naming a harness that is not eligible is invalid (link:../model-work/01-roles-and-configuration.adoc[Model Work Specification, Roles & Configuration]).
+* *Eligibility*: `eligible: true` requires a non-null `headless` block. A host is eligible only after its worker behaviour has been measured on it under the target conditions (the real relay, confined writer workers) and every fault of the fault matrix passed (link:../../Requirements.adoc#PM-TEST-4[PM-TEST-4]; exit detection within the link:../timeouts/01-job-budgets-and-waits.adoc#exit-detection-bound[exit detection bound]). `claude` is eligible. `opencode` is eligible with its per-worker data home (<<headless-data-home>>), without which a stalled worker blocks every other process of the harness, and with its tool-result limit (<<headless-tool-result-limit>>); Antigravity (measured only in part), Codex (not measured), and `neutral` are not eligible. The operator assigns the roles of an ineligible host to an eligible harness. A role artifact naming a harness that is not eligible is invalid (link:../model-work/01-roles-and-configuration.adoc[Model Work Specification, Roles & Configuration]).
 * *Session tasks*: `session_tasks: true` requires `eligible: true`. `opencode` declares `false`: its session keeps the whole task loop in one turn, answers the operator only after the loop, and keeps an earlier loop running after `/new` (link:../evaluation.adoc#limits[Evaluation Reference, Limits]); the two loops share one relay and cannot be told apart (link:../runtime-model/03-relay.adoc[Runtime & Interaction Model Specification, Relay]).
-* *Restricted models*: a worker always runs with a restricted tool set, so a model that refuses a restricted agent cannot host one. An entry `*` stands for every model of the harness, an entry `<provider>/*` for every model of that provider. The free OpenCode models other than `space-bunny-free` refuse a restricted agent and are not listed; of the OpenCode Go models only the measured `opencode-go/muse-spark-1.3-contributor` is listed (link:../evaluation.adoc[Evaluation Reference]), and another one is listed once it is measured.
-* *Informational acknowledgement*: with `ack_informational: true`, `ack_deadline_seconds` equals the silence limit, `connection.bounded_wait_seconds` plus `silence_grace_seconds` (`240 + 30 = 270` on `opencode`, where a provider stall of 120.8 s left a live worker's task unacknowledged), and a missing acknowledgement ends no worker: silence alone decides. The supervisor applies the silence limit of the effective connection values, so an operator override of the bounded wait moves both.
+* *Restricted models*: a worker always runs with a restricted tool set, so a model that refuses a restricted agent cannot host one. An entry `*` stands for every model of the harness, an entry `<provider>/*` for every model of that provider. The free OpenCode models refuse a restricted agent and are not listed; of the OpenCode Go models only the measured `opencode-go/muse-spark-1.3-contributor` is listed (link:../evaluation.adoc[Evaluation Reference]), and another one is listed once it is measured.
+* *Informational acknowledgement*: with `ack_informational: true`, `ack_deadline_seconds` equals the silence limit, `connection.bounded_wait_seconds` plus `silence_grace_seconds` (`240 + 30 = 270` measured on `opencode`, where a provider stall of 120.8 s left a live worker's task unacknowledged), and a missing acknowledgement ends no worker: silence alone decides. The supervisor applies the silence limit of the effective connection values, so an operator override of the bounded wait moves both.
 * *Bounded wait and idle timeout*: on a host whose progress resets its timeout, a worker's `pm_wait` is always held with progress frames, so its bounded wait may exceed the host idle timeout (`opencode`: `240` against `60`); on any other host the bounded wait stays below the idle timeout by the margin of link:../timeouts/01-job-budgets-and-waits.adoc#bounded-wait[Timeouts & Budgets Specification, Bounded Wait Window].
 * *Host markers*: `host_markers` lists only marker kinds verified on the host; every shipped profile has none yet, so a clear or compaction stays invisible to the runtime and the shim covers it (link:../runtime-model/03-relay.adoc[Runtime & Interaction Model Specification, Relay]).
-* *Values of an ineligible host*: while `eligible` is `false`, every other value of the block except `session_tasks` and `host_markers` is `null`; the extrapolated Antigravity values of the evaluation are entered only once they are measured.
+* *Values of an ineligible host*: while `eligible` is `false`, no other value of the block has an effect, and each except `session_tasks` and `host_markers` is `null` unless it was measured on the host; the extrapolated Antigravity values of the evaluation are entered only once they are measured.
+* *A worker that does not continue*: an `opencode` process stopped while a model request is open may never continue after it is resumed, and the harness sets no timeout on that request. The supervisor ends such a worker by silence at its silence limit and never earlier (link:../model-work/03-supervision-and-recycling.adoc#detection[Model Work Specification, Detection]), so the limitation costs one silence limit before the task is offered again; it does not affect eligibility.
 
 The relay and the server need no other host value for workers: identity, role, and generation travel in the worker's environment, never in the profile (link:../runtime-model.adoc[Runtime & Interaction Model Specification, Relay]).
 

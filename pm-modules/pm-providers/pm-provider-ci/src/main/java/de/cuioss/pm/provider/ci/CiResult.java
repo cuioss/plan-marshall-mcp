@@ -34,13 +34,22 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
         OK,
         /** The addressed entity does not exist or is not visible to the credential. */
         NOT_FOUND,
-        /** The provider refused the operation (e.g. not mergeable, head moved, validation failure). */
+        /**
+         * The provider answered and refused the operation itself for a stated reason (e.g. not mergeable, head
+         * moved, validation failure, a feature that is not enabled); a credential refusal is
+         * {@link #AUTH_FAILED} or {@link #PERMISSION_DENIED}.
+         */
         REJECTED,
-        /** The credential is missing, invalid or lacks the permission. */
-        UNAUTHORIZED,
+        /** The provider does not accept the credential: missing, invalid, expired or revoked ({@code 401}). */
+        AUTH_FAILED,
+        /** The provider accepts the credential, which lacks the permission for the operation ({@code 403}). */
+        PERMISSION_DENIED,
         /** The provider's rate limit applies until {@code resetAt}; neither a failure nor a timeout. */
         RATE_LIMITED,
-        /** Transport failure, refused request, unexpected status or unreadable response. */
+        /**
+         * No usable answer: transport failure, a request refused before sending, a server error, an unexpected
+         * status or an unreadable response.
+         */
         FAILED
     }
 
@@ -89,6 +98,15 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
 
     /**
      * Maps a response that is not {@link CiResponse.Outcome#OK} to the contract outcome.
+     * <p>
+     * An HTTP error maps by its status: {@code 401} to {@link Outcome#AUTH_FAILED} and {@code 403} to
+     * {@link Outcome#PERMISSION_DENIED} (the credential is refused, never the operation), {@code 404} to
+     * {@link Outcome#NOT_FOUND}, and every other
+     * {@code 4xx} to {@link Outcome#REJECTED} when the provider refuses the operation itself: always for
+     * {@code 405}, {@code 406}, {@code 409} and {@code 422}, and for the remaining ones (such as {@code 400})
+     * when the body carries the provider's reason ({@code message} or {@code error}). A {@code 4xx} without a
+     * reason, a {@code 5xx}, a transport failure and a request refused before sending map to
+     * {@link Outcome#FAILED}.
      *
      * @param response the failed response
      * @param <V>      the value type
@@ -98,24 +116,31 @@ public record CiResult<V>(Outcome outcome, Optional<V> value, boolean complete, 
         String detail = response.detail().isEmpty() ? "HTTP " + response.status() : response.detail();
         return switch (response.outcome()) {
             case RATE_LIMITED -> new CiResult<>(Outcome.RATE_LIMITED, Optional.empty(), true, response.resetAt(), detail);
-            case HTTP_ERROR -> of(byStatus(response.status()), detail + messageOf(response.body()));
+            case HTTP_ERROR -> {
+                Optional<String> reason = reasonOf(response.body());
+                yield of(byStatus(response.status(), reason.isPresent()), detail + reason.map(r -> ": " + r).orElse(""));
+            }
             default -> of(Outcome.FAILED, detail);
         };
     }
 
-    private static Outcome byStatus(int status) {
+    private static Outcome byStatus(int status, boolean reasoned) {
         return switch (status) {
-            case 401, 403 -> Outcome.UNAUTHORIZED;
+            case 401 -> Outcome.AUTH_FAILED;
+            case 403 -> Outcome.PERMISSION_DENIED;
             case 404 -> Outcome.NOT_FOUND;
             case 405, 406, 409, 422 -> Outcome.REJECTED;
-            default -> Outcome.FAILED;
+            default -> status >= 400 && status < 500 && reasoned ? Outcome.REJECTED : Outcome.FAILED;
         };
     }
 
-    private static String messageOf(String body) {
-        return Json.parseOrNull(body) instanceof Map<?, ?> map && map.get("message") != null
-                ? ": " + map.get("message")
-                : "";
+    /** The provider's reason in an error body: {@code message} (GitHub, GitLab) or {@code error} (GitLab). */
+    private static Optional<String> reasonOf(String body) {
+        if (!(Json.parseOrNull(body) instanceof Map<?, ?> map)) {
+            return Optional.empty();
+        }
+        Object reason = map.get("message") != null ? map.get("message") : map.get("error");
+        return Optional.ofNullable(reason).map(String::valueOf).filter(r -> !r.isBlank());
     }
 
     /**

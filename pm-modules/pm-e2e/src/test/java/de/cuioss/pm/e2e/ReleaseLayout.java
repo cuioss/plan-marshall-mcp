@@ -47,8 +47,6 @@ import org.junit.jupiter.api.Assumptions;
  * their JARs (staged by the {@code maven-dependency-plugin} into {@code target/e2e-jvm-lib}). Used when the runner
  * JAR is the current build output.</li>
  * </ul>
- * The daemon gets the spike job token through the environment ({@code PM_SPIKE_JOB_TOKEN}, the Quarkus name of
- * {@code pm.spike.job-token}), which the clients pass on when they start it on demand.
  */
 final class ReleaseLayout implements AutoCloseable {
 
@@ -64,10 +62,10 @@ final class ReleaseLayout implements AutoCloseable {
         }
     }
 
-    /** The job token the spike registry of the staged daemon accepts. */
+    /** A job token no job of the staged daemon is bound to. */
     static final String JOB_TOKEN = "job-token-for-e2e-0123456789abcdef01";
-    /** The job id the spike registry binds the token to. */
-    static final String JOB_ID = "j-spike0001";
+    /** The job id a worker relay is started with. */
+    static final String JOB_ID = "j-e2e0001";
 
     static final Duration WAIT = Duration.ofSeconds(60);
 
@@ -271,7 +269,6 @@ final class ReleaseLayout implements AutoCloseable {
         environment.put("PATH", "/usr/bin:/bin");
         environment.put("HOME", System.getProperty("user.home"));
         environment.put("PM_MCP_BASE", base.toString());
-        environment.put("PM_SPIKE_JOB_TOKEN", JOB_TOKEN);
         var tmp = System.getenv("TMPDIR");
         if (tmp != null) {
             environment.put("TMPDIR", tmp);

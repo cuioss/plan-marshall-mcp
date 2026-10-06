@@ -24,17 +24,27 @@ The relay is the only way a host session or a worker reaches the runtime's MCP e
 * *Build*: The relay is the `serve` command of the relay binary `pm-mcp` (module `pm-relay`: plain native image, no Quarkus, no MCP server); the session relay starts `pm-mcpd` on demand (link:01-processes-and-transport.adoc#_start_modes[Start Modes]). Its startup budget is defined in `PM-TECH-3`.
 
 === Host Protocol Forms
+_Implementation watch: link:../../implementation-watch/runtime-model.adoc#PM-WATCH-RUN-16[PM-WATCH-RUN-16]_
 
 Hosts reach a server in two forms, and the relay serves both while it always talks to the runtime without an MCP session:
 
-* *Sessionless hosts* (MCP `2026-07-28`; Claude Code and Antigravity): the host first sends `server/discover` and then every request on its own, with the protocol version, `clientInfo`, and capabilities in `params._meta` of each request. Claude Code falls back to `initialize` when discovery fails.
+* *Sessionless hosts* (MCP `2026-07-28`; Claude Code and Antigravity): the host first sends `server/discover` and then every request on its own, with the protocol data in `params._meta` of each request under the keys `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo`, and `io.modelcontextprotocol/clientCapabilities`. Claude Code falls back to `initialize` when discovery fails.
 * *Session-opening hosts* (MCP `2025-11-25`; OpenCode): the host sends `initialize` and `notifications/initialized` once and then its requests.
 
-The runtime answers `server/discover` and `initialize` itself, issues no `Mcp-Session-Id`, and keeps nothing per connection (`PM-ARCH-4`). The relay records the protocol data of the host's `initialize`, or takes it from each request's `params._meta`, and sends it with every forwarded request (<<_connection_metadata,Connection Metadata>>), so every request is self-describing and a runtime restart loses only the requests in flight. Milestone 0 verifies that the pinned MCP version and the Quarkus MCP server support sessionless Streamable HTTP for both forms. If they do not, the documented fallback is a session-holding runtime whose relay replays the recorded `initialize` and `notifications/initialized` when the runtime answers an unknown session or reports a new instance, suppresses the duplicate response to the host, and fails the old session's open server requests.
+The runtime answers `server/discover` and `initialize` itself and keeps nothing per connection (`PM-ARCH-4`):
+
+* *`server/discover`*: A request without `params._meta` carrying the three protocol keys above is refused with HTTP `400`; the relay forwards the host's `_meta` unchanged.
+* *`initialize`*: The runtime issues no session. The Quarkus MCP server attaches an `Mcp-Session-Id` to every `initialize` response; a response filter of the runtime removes the header before the response leaves the runtime, and every later request, which arrives without a session, is served through the server's automatic initialization (`quarkus.mcp.server.http.streamable.auto-init`).
+* *Capabilities*: The capabilities the runtime declares, in the `server/discover` result and the `initialize` result alike, set `listChanged: false` for tools, resources, and prompts, and declare no resource subscriptions, because the runtime sends no message unrelated to a pending call (<<_messages_from_runtime_to_host,Messages from Runtime to Host>>). The Quarkus MCP server declares `listChanged: true` and has no setting for it; a response filter of the runtime rewrites the declared capabilities.
+* *`subscriptions/listen`*: The runtime answers a host's `subscriptions/listen` at once with the JSON-RPC error `-32601` (method not found), before the Quarkus MCP server sees it. Acknowledged and held open instead, the listen stream stays open for the whole session without a final response; unanswered, it blocks Claude Code's start for 27 s. After the refusal a host continues with `tools/list` at once (Claude Code retries the listen three times, then stops).
+
+The relay records the protocol data of the host's `initialize`, or takes it from each request's `params._meta`, and sends it with every forwarded request (<<_connection_metadata,Connection Metadata>>), so every request is self-describing and a runtime restart loses only the requests in flight.
 
 === Connection Metadata
 
-The relay sends the following HTTP headers on every request it forwards. The runtime evaluates them per request in its authentication mechanism, which turns them into the request's security identity; tool and resource handlers read that identity and never an HTTP header, because headers do not reach a handler of the Quarkus MCP server. Milestone 0, Part B verifies that the security identity reaches every handler; the fallback is that the relay carries the same values in `params._meta` under the key prefix `de.cuioss.pm-mcp/`.
+The relay sends the following HTTP headers on every request it forwards. The runtime evaluates them per request in its authentication mechanism (the `quarkus-security` extension, without which the mechanism and the identity providers stay inert), which turns them into the request's security identity; tool and resource handlers read that identity through the current request (`CurrentVertxRequest`) and never an HTTP header, because headers do not reach a handler of the Quarkus MCP server. The connection metadata never travels in `params._meta`.
+
+*Header encoding*: Every header value is ASCII. `PM-MCP-Workspace` carries the path as UTF-8 percent-encoded: every byte outside the unreserved characters of RFC 3986 and `/` is written as `%HH` with uppercase hexadecimal digits, so an ASCII path travels unchanged; the runtime decodes it and refuses a malformed value (an invalid escape or a byte sequence that is not UTF-8) with HTTP `400`. The JSON-valued headers (`PM-MCP-Client-Info`, `PM-MCP-Client-Capabilities`) carry compact JSON with every non-ASCII character escaped as `\uXXXX`.
 
 [cols="1,1,3"]
 |===
@@ -46,7 +56,7 @@ The relay sends the following HTTP headers on every request it forwards. The run
 
 |`Mcp-Method`, `Mcp-Name`
 |both
-|The JSON-RPC method of the message and, for a call by name (`tools/call`), the tool name, derived by the relay from each message, because the runtime's transport refuses a request without them and a sessionless host does not send them.
+|The JSON-RPC method of the message and, for a call by name (`tools/call`), the tool name, derived by the relay from each message, because the runtime's transport refuses a `2026-07-28` request without them and a sessionless host does not send them. The runtime's protocol filters (<<_host_protocol_forms,Host Protocol Forms>>) take the method from `Mcp-Method` and, for a request that arrives without the header, from the JSON-RPC body, so no request passes them unseen.
 
 |`PM-MCP-Relay-Version`
 |both
@@ -126,9 +136,9 @@ Each host request receives exactly one response with its own `id`.
 
 === Messages from Runtime to Host
 
-* *Progress notifications* (`notifications/progress`) and *server requests* related to a pending call (`elicitation/create`, only on a session connection and only for the choices of the project setup and the bootstraps, link:04-sessions-and-workers.adoc#_connection_scoped_rendering[Connection-Scoped Rendering]) arrive on that call's SSE response stream. The relay writes them to `stdout` in arrival order.
-* The host's answer to a server request arrives on `stdin`. The relay posts it to the runtime, which routes it to the waiting call.
-* There are no messages unrelated to a pending call: without sessions the runtime opens no standalone SSE stream (`GET /mcp`) and offers no resource subscriptions or `list_changed` notifications. Clients detect changed skills through their content digest (link:../mcp-tools/02-service-and-skill-tools.adoc[MCP Tools Specification, Skill Tools]). A task reaches a worker only as the answer to its pending `pm_wait` (link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, `pm_wait`]).
+* *Progress notifications* (`notifications/progress`) related to a pending call arrive on that call's SSE response stream. The relay writes them to `stdout` in arrival order.
+* *Elicitation* is no server request: under MCP `2026-07-28` the runtime answers the call itself with an `input_required` result that carries the elicitation request, and the call ends. The host answers by sending the same request again with `inputResponses`, which the relay forwards like every request. The runtime holds nothing between the two requests: the retry is validated against the scope's current state like any call, and a retry whose choice the state no longer offers is refused like a stale link. Elicitation is used only on a session connection and only for the choices of the project setup and the bootstraps (link:04-sessions-and-workers.adoc#_connection_scoped_rendering[Connection-Scoped Rendering]); a session-opening host (MCP `2025-11-25`) is offered those choices as links.
+* There are no messages unrelated to a pending call: without sessions the runtime opens no standalone SSE stream (`GET /mcp`), refuses `subscriptions/listen`, and offers no resource subscriptions or `list_changed` notifications (<<_host_protocol_forms,Host Protocol Forms>>). Clients detect changed skills through their content digest (link:../mcp-tools/02-service-and-skill-tools.adoc[MCP Tools Specification, Skill Tools]). A task reaches a worker only as the answer to its pending `pm_wait` (link:../mcp-tools/01-core-workflow-tools.adoc[MCP Tools Specification, `pm_wait`]).
 
 === Cancellation
 

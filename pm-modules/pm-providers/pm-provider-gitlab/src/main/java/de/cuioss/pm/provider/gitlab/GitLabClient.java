@@ -37,6 +37,8 @@ public final class GitLabClient {
     /** Page cap of paginated reads (100 entries per page). */
     private static final String MERGE_REQUESTS = "/merge_requests/";
     static final int MAX_PAGES = 50;
+    /** The status with which {@code personal_access_tokens/self} refuses a token of another type. */
+    private static final int NOT_A_PERSONAL_ACCESS_TOKEN = 400;
 
     private final CiHttpClient http;
     private final String project;
@@ -70,14 +72,15 @@ public final class GitLabClient {
     }
 
     /**
-     * The identity behind the token.
+     * The identity behind the token. A token that is no personal access token has no token record: its
+     * {@code id}, {@code name} and {@code scopes} are empty, and {@code active} is the state of its user.
      *
-     * @param id        the token id
-     * @param name      the token name
+     * @param id        the token id, empty when the token is no personal access token
+     * @param name      the token name, empty when the token is no personal access token
      * @param userId    the user the token acts as
-     * @param scopes    the scopes
-     * @param active    whether the token is active
-     * @param expiresAt the expiry date, empty when none
+     * @param scopes    the scopes, empty when GitLab does not report them
+     * @param active    whether the token (or, without a token record, its user) is active
+     * @param expiresAt the expiry date, empty when none or unknown
      */
     public record TokenIdentity(String id, String name, String userId, List<String> scopes, boolean active,
                                 Optional<String> expiresAt) {
@@ -188,12 +191,17 @@ public final class GitLabClient {
     }
 
     /**
-     * Reads the identity of the token ({@code GET /personal_access_tokens/self}).
+     * Reads the identity of the token: {@code GET /personal_access_tokens/self}, and for a token that is no
+     * personal access token (the OAuth token of a {@code glab} login, which GitLab refuses there with
+     * {@code 400} "requires token type to be a personal access token") {@code GET /user}.
      *
-     * @return the identity
+     * @return the identity; {@code AUTH_FAILED} for an invalid token
      */
     public CiResult<TokenIdentity> tokenIdentity() {
         CiResponse response = http.get("personal_access_tokens/self");
+        if (response.outcome() == CiResponse.Outcome.HTTP_ERROR && response.status() == NOT_A_PERSONAL_ACCESS_TOKEN) {
+            return userIdentity();
+        }
         if (!response.isOk()) {
             return CiResult.failed(response);
         }
@@ -202,6 +210,19 @@ public final class GitLabClient {
         return CiResult.ok(new TokenIdentity(Json.string(json, "id").orElse(""), Json.string(json, "name").orElse(""),
                 Json.string(json, "user_id").orElse(""), scopes, Json.bool(json, "active"),
                 Json.string(json, "expires_at")));
+    }
+
+    /** The identity of a token without a token record: the user it acts as ({@code GET /user}). */
+    private CiResult<TokenIdentity> userIdentity() {
+        CiResponse response = http.get("user");
+        if (!response.isOk()) {
+            return CiResult.failed(response);
+        }
+        Object json = Json.parseOrNull(response.body());
+        return Json.string(json, "id")
+                .map(userId -> CiResult.ok(new TokenIdentity("", "", userId, List.of(),
+                        "active".equals(Json.string(json, "state").orElse("")), Optional.empty())))
+                .orElseGet(() -> CiResult.of(CiResult.Outcome.FAILED, "user response without id"));
     }
 
     private String discussionPath(long iid, String discussionId) {

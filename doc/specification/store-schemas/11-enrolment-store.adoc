@@ -11,7 +11,7 @@ link:../../Specification.adoc[Specification] » link:../store-schemas.adoc[Store
 [#enrolment-store]
 == Project Enrolment Store (`<PM_MCP_BASE>/enrolments/<project_id>.json`)
 
-One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, holding the operator-authorized project root, build wrappers with their pinned files, pinned host tools, the canonical and discovery command templates, provider verification overrides, language servers, approved out-of-process project scripts, operator budgets, the Landlock write paths, and the captured build environment (`PM-EXEC-2`, `PM-EXEC-3`, `PM-EXT-5`, `PM-EXT-6`). Written exclusively via the operator channel (`pm-operator enrol`, link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). The set of enrolled projects is the directory listing; the operator-owned `enrolments/` directory is separate from the server-owned `projects/`.
+One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, holding the operator-authorized project root, build wrappers with their pinned files, pinned host tools, the canonical and discovery command templates, provider verification overrides, language servers, approved out-of-process project scripts, operator budgets, the Landlock write paths, the captured build environment, and the container-engine opt-in (`PM-EXEC-2`, `PM-EXEC-4`, `PM-EXEC-3`, `PM-EXT-5`, `PM-EXT-6`). Written exclusively via the operator channel (`pm-operator enrol`, link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-lifecycle-release[CLI, Coordination & Security Specification]). The set of enrolled projects is the directory listing; the operator-owned `enrolments/` directory is separate from the server-owned `projects/`.
 
 * *Integrity*: Every write of an enrolment file (an operator verb, executed by the runtime on the request of `pm-operator`, which writes no store) runs under its own lock `<PM_MCP_BASE>/locks/enrolments/<project_id>.lock`, and the runtime also writes its sidecar `<PM_MCP_BASE>/enrolments/<project_id>.json.hmac`, the lowercase-hex HMAC-SHA-256 over the exact bytes of the canonical file the runtime wrote, keyed with the operator-lane secret from the OS keyring (service `de.cuioss.pm-mcp`; on hosts without a keyring `<PM_MCP_BASE>/state/enrolment-hmac.key`, mode `0600`), which only `pm-mcpd` reads; the key never leaves the runtime. The runtime verifies a project's file before serving the project for the first time after start and before every verify-not-resolve check, and refuses with `enrolment_tampered` on mismatch (link:../cli-and-security/02-credentials-and-operator.adoc#enrolment-integrity[CLI, Coordination & Security Specification, Enrolment Integrity]). The re-baseline verb is `pm-operator accept-edit enrolment <project_id>`, which shows the recorded and current size and SHA-256 before confirmation and rewrites the sidecar (link:../cli-and-security/02-credentials-and-operator.adoc#operator-accept-edit[CLI, Coordination & Security Specification, Accept-Edit]).
 * *Isolation*: A tampered, unreadable, or schema-invalid enrolment file blocks only its own project; every other project is served. `project_root` is unique across all enrolment files; the operator CLI checks it at every enrolment write and the runtime at start, and a duplicate root blocks both projects with `enrolment_root_conflict` until the operator resolves it.
@@ -47,6 +47,7 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
     "project_root": { "type": "string", "minLength": 1, "description": "Canonical absolute path of the repository main checkout; unique across all enrolment files." },
     "enrolled_at": { "type": "string", "format": "date-time" },
     "pilot": { "type": "boolean", "default": false, "description": "Set and cleared only by re-running pm-operator enrol with or without --pilot; clearing it affects only later start.create-scope calls, live plans and epics continue. While the compiled lifecycle gate of the release is closed, plans and epics are created only in a project with pilot true (lifecycle_closed otherwise); without effect once the gate is open (cli-and-security.adoc, Lifecycle gate)." },
+    "container_engine": { "type": ["string", "null"], "enum": ["docker", null], "default": null, "description": "Opt-in to the host's container engine, set only by pm-operator enrol --container-engine docker after the operator confirmed that the project's jobs then hold the authority of the Docker group (audited container_engine_enabled) and cleared by re-running enrol without the option (container_engine_disabled). null: no job receives DOCKER_HOST, DOCKER_CONFIG, or TESTCONTAINERS_*, and the engine's socket paths are outside the read set. docker: build jobs receive the captured container variables and every process job of the project records confinement partial(container_engine) (job-runtime.adoc, Container Engine)." },
     "released_at": { "type": ["string", "null"], "format": "date-time", "default": null, "description": "The release instant, written by pm-operator release-project (audited) and cleared by pm-operator enrol on a released project (audited). While set, start.create-scope refuses with lifecycle_closed and pm-mcp enter refuses the plan and epic kinds (cli-and-security.adoc, release-project)." },
     "wrappers": {
       "type": "array",
@@ -82,9 +83,10 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
         "required": ["name", "executable_path", "sha256", "version"],
         "additionalProperties": false,
         "properties": {
-          "name": { "type": "string", "enum": ["git", "gh", "glab", "python3", "npm", "npx"] },
+          "name": { "type": "string", "enum": ["git", "gh", "glab", "python3", "ruby", "npm", "npx", "asciidoctor"] },
           "executable_path": { "type": "string", "minLength": 1, "description": "Resolved absolute path (no PATH lookup at runtime)." },
           "sha256": { "$ref": "#/$defs/sha256" },
+          "interpreter": { "type": ["string", "null"], "enum": ["ruby", null], "default": null, "description": "For a host tool that is a script: the enrolled host tool that runs it (ruby for asciidoctor); the job starts the interpreter with the script as its first argument, never the script's shebang. null for a binary." },
           "version": { "type": ["string", "null"], "description": "Version printed at enrolment; informational." }
         }
       }
@@ -184,7 +186,7 @@ One file per enrolled project, `<PM_MCP_BASE>/enrolments/<project_id>.json`, hol
     },
     "build_environment": {
       "type": "object",
-      "description": "Environment values captured by the operator CLI at enrolment (job-runtime.adoc, Job Environment); credential-pattern variable names are refused.",
+      "description": "Environment values captured by the operator CLI at enrolment (job-runtime.adoc, Job Environment); credential-pattern variable names, DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, and MVND_DAEMON_STORAGE are refused; the container variables are passed only while container_engine is docker.",
       "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" },
       "additionalProperties": { "type": "string" }
     }

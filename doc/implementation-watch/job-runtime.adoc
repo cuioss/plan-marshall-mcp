@@ -212,6 +212,21 @@ recovery rule, no `kill()` call is made (asserted at the lowest signalling primi
 matched control: a subprocess record left `running` with a live process group is probed and terminated.
 Source:: design review.
 
+[#PM-WATCH-JOB-37]
+=== PM-WATCH-JOB-37: The launcher's report line never reaches a parser or a log reader
+
+Anchor:: link:../specification/job-runtime/01-pipeline-and-subprocesses.adoc#launch-report[Job Runtime § Process-Group Creation via the `pm-exec` Launcher] (Launch report)
+Hazard:: The launcher has no channel of its own: its report (PID, start instant, applied confinement, Landlock ABI)
+is the first line of the job's `stderr`. Left in the job log it is parsed as build output, shown in a log excerpt
+to a model, or counted as a non-JSON line of a harness's structured output; a job whose own first line looks like
+a report is taken for one.
+Guard:: Table test over the job kinds: the job record takes `pid`, `process_started_at`, `confinement`, and
+`landlock_abi` from the report, and the stored job log, every log resource, and every evidence excerpt start with
+the job's own first line; a job that prints a report-shaped JSON line as its own first output keeps that line in
+its log (exactly one line is stripped, the first); a launcher that exits `64`, `126`, or `127` before `execve`
+leaves no report, and the job's fate is derived from that exit, never from a missing report alone.
+Source:: link:../specification/evaluation.adoc#results[Evaluation Reference], Gates 3 and 13 (launch report).
+
 == Linux Filesystem Confinement (Landlock)
 
 [#PM-WATCH-JOB-20]
@@ -229,7 +244,8 @@ in its parent directory, and a sibling of each directory on the path from `/` (r
 enumeration); control: an entry created on that path after job start is not readable by the job, which is the
 accepted limitation, and an entry created elsewhere stays readable; the one exception: a worker (kind `llm`)
 reads its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` and fails to read that of another job and
-every other entry of `<PM_MCP_BASE>`.
+every other entry of `<PM_MCP_BASE>`; the jobs that run build tools read and write their project's daemon store and
+no other project's.
 Source:: design review.
 
 [#PM-WATCH-JOB-21]
@@ -244,8 +260,10 @@ Guard:: On Linux with Landlock, a job fixture of project A writes into the enrol
 control: the same job writes into its own project root, one of its worktrees, `.marshall/local/temp/`, a declared
 toolchain cache, and `/tmp`, and each write succeeds; for a worker (kind `llm`) additionally the harness sub-paths
 its client profile declares (`headless.writable_paths`: login or credential file, caches, session directory)
-succeed, while its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (which it can only read), a settings,
-command, or skill file of its harness, the home of another harness, and the rest of `<PM_MCP_BASE>` fail.
+succeed, while its own job-private directory `<PM_MCP_BASE>/run/jobs/<job_id>/` (which it can only read, apart from
+its `data/` subdirectory where its harness declares a per-worker data home), a settings, command, or skill file of
+its harness, the home of another harness, the data directory of another worker, and the rest of `<PM_MCP_BASE>`
+fail; a `build` job writes its project's daemon store and fails to write that of another project.
 Source:: design review.
 
 [#PM-WATCH-JOB-28]
@@ -263,6 +281,72 @@ or write that of another job; a `PM_MCP_BASE` long enough to push `run/runtime.s
 limit refuses the start and creates no file or directory in the system temporary directory; positive control: a
 default-length base binds the socket and a worker starts from its job-private directory.
 Source:: design review.
+
+[#PM-WATCH-JOB-34]
+=== PM-WATCH-JOB-34: A build daemon outside the job's Landlock domain
+
+Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#build-daemons[Job Runtime § Build Daemons],
+link:../Requirements.adoc#PM-EXEC-4[PM-EXEC-4]
+Hazard:: A Landlock domain confines a process and its descendants, not the processes it talks to. A Gradle daemon
+or `mvnd` started outside confinement serves a later confined client over loopback and writes wherever that client
+asks, so the write set does not hold; a daemon started under one write set carries it for its lifetime and fails
+the writes of a client with another.
+Guard:: Linux test with a daemon started outside confinement and found through the default registry: a confined
+`mvnd` and a confined Gradle build of a project outside the write set, started with the job environment the runtime
+composes, each start their own daemon in the project's daemon store and fail the foreign write, and the outside
+daemon serves no job; control: without the daemon store variables the same build writes outside the write set
+(the hazard reproduces); two jobs of one project with the same write set share one daemon, and a job after an
+enrolment change of `write_paths` gets a new store directory and a daemon with the new ruleset; the Gradle
+registry option is verified with a confined Gradle build before its _(provisional)_ marker is removed.
+Fixture:: mvnd 1.0.6 and Gradle 9.6.1 on Linux, Landlock ABI 8: with the daemon started by an unconfined build,
+`pm-exec … --write ~/.m2 -- mvnd package` in a project outside the write set exited 0 and created `target/classes`,
+and `gradlew build` created `app/build`, while `touch` into the same project was denied; an unconfined `mvnd` reusing
+a daemon started under confinement failed with `could not create parent directories`.
+Source:: link:../specification/evaluation.adoc#results[Evaluation Reference], Gate 3 (build daemons).
+
+[#PM-WATCH-JOB-35]
+=== PM-WATCH-JOB-35: The container engine socket bypasses the read set
+
+Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#container-engine[Job Runtime § Container Engine],
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5]
+Hazard:: The container daemon runs with root authority outside every job's domain. A job that reaches its socket
+mounts any host path into a container and reads the runtime token, the credential store, and every enrolment,
+whatever the read set denies; a job record that says `confined` for such a job claims a boundary that does not
+exist.
+Guard:: For a project without the opt-in: the job environment carries no `DOCKER_HOST`, `DOCKER_CONFIG`, or
+`TESTCONTAINERS_*` variable even when the operator's environment had them at enrolment, and a Testcontainers build
+fails with the tool's error naming the enrolment option; for a project with `container_engine: "docker"`: the
+enrolment write happened only after the interactive confirmation that names the Docker-group authority, the audit
+log holds `container_engine_enabled`, and every process job record of the project states
+`confinement: partial(container_engine)`, never `confined`; re-enrolling without the option clears it and audits
+`container_engine_disabled`.
+Fixture:: under `--deny-read $PM_MCP_BASE`, `cat $PM_MCP_BASE/run/runtime.token` was denied, while
+`docker run -v $PM_MCP_BASE/run:/b:ro alpine:3 wc -c /b/runtime.token` through the same `pm-exec` printed `43`.
+Source:: link:../specification/evaluation.adoc#results[Evaluation Reference], Gate 3 (container socket).
+
+[#PM-WATCH-JOB-36]
+=== PM-WATCH-JOB-36: A socket outside the read set is refused only from Landlock ABI 9
+
+Anchor:: link:../specification/job-runtime/02-confinement-and-environment.adoc#pathname-sockets[Job Runtime § Linux Filesystem Confinement] (Unix sockets),
+link:../specification/job-runtime/02-confinement-and-environment.adoc#session-bus[Job Runtime § Session Bus],
+link:../specification/job-runtime/02-confinement-and-environment.adoc#container-engine[Job Runtime § Container Engine],
+link:../Requirements.adoc#PM-SEC-5[PM-SEC-5]
+Hazard:: Up to Landlock ABI 8 the filesystem rules do not govern `connect(2)` on a pathname socket: a job that names
+the session bus socket or the container engine's socket by its path reaches the Secret Service or the container
+daemon although its read set omits the path, and only the withheld environment variables stand in its way. ABI 9
+adds `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`. A launcher that does not handle the right leaves the sockets reachable on a
+kernel that could refuse them; one that handles it without a rule for the runtime socket cuts every confined worker
+off from the runtime; and a job record that says `confined` without its ABI claims a socket guard that may not exist.
+Guard:: Linux test of `pm-exec` per applied ABI: a confined job connects by path, without any variable naming it, to
+a socket outside its read set (the session bus socket, the container engine's socket for a project without the
+opt-in); from ABI 9 the connect is refused, below it the connect succeeds and the test asserts exactly that, so a
+kernel upgrade turns the assertion over by itself; a worker's job relay reaches the runtime socket on every ABI
+through its own read rule, and a job that is no worker does not; the launch report and the job record carry the
+applied `landlock_abi`; the job environment holds neither `DBUS_SESSION_BUS_ADDRESS` nor `XDG_RUNTIME_DIR` on any ABI.
+Fixture:: Landlock ABI 8 (kernel 7.0): the container socket was reachable under confinement, and a confined worker's
+relay connected to the runtime socket inside `<PM_MCP_BASE>`, which its read set omits; no ABI up to 8 restricts the
+connect.
+Source:: link:../specification/evaluation.adoc#results[Evaluation Reference], Gate 3.
 
 == Native Build Output Parsers
 

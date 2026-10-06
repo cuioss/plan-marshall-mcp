@@ -75,7 +75,7 @@ public final class InstallationTokens implements AutoCloseable {
     /**
      * @param apiEndpoint   the API endpoint ({@code https://api.github.com} or the Enterprise API)
      * @param clientId      the App's client id
-     * @param privateKeyPem reads the PKCS#8 private key per mint
+     * @param privateKeyPem reads the PEM private key (PKCS#8 or PKCS#1) per mint
      * @param redaction     the redaction registry receiving every minted token
      * @param clock         the clock
      */
@@ -107,6 +107,18 @@ public final class InstallationTokens implements AutoCloseable {
     }
 
     /**
+     * Returns a reusable token or mints a new one, narrowed to the permission set of the operation class.
+     *
+     * @param installationId the installation
+     * @param repository     the repository name the token is narrowed to
+     * @param operation      the operation class
+     * @return the token, or the outcome of the failed mint
+     */
+    public CiResult<InstallationToken> token(long installationId, String repository, GitHubOperation operation) {
+        return token(installationId, repository, operation.permissions());
+    }
+
+    /**
      * @param installationId the installation
      * @param repository     the repository
      * @param permissions    the permission set
@@ -125,7 +137,7 @@ public final class InstallationTokens implements AutoCloseable {
             response = http.send("POST", "app/installations/" + key.installationId() + "/access_tokens",
                     Optional.of(Json.write(body)), Optional.empty());
         } catch (GitHubAppJwt.JwtSigningException e) {
-            return CiResult.of(CiResult.Outcome.UNAUTHORIZED, e.getMessage());
+            return CiResult.of(CiResult.Outcome.AUTH_FAILED, e.getMessage());
         }
         if (!response.isOk()) {
             return CiResult.failed(response);

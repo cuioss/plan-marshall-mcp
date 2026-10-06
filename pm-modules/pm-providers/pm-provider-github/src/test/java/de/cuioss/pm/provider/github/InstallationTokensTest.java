@@ -106,6 +106,23 @@ class InstallationTokensTest {
     }
 
     @Test
+    @DisplayName("mints the token of a pull-request comment with pull_requests:write, signed with a PKCS#1 key")
+    void mintsForOperationClass() throws Exception {
+        server.on("POST", PATH, minted("ghs_comment", NOW.plusSeconds(3600)));
+        try (var pkcs1 = new InstallationTokens(CiEndpoint.of(server.base()), "Iv23liClient", () -> TestKeys.PKCS1_PEM,
+                     redacted::add, Clock.fixed(NOW, ZoneOffset.UTC))) {
+
+            var result = pkcs1.token(42, "plan-marshall-mcp", GitHubOperation.PULL_REQUEST_COMMENT);
+
+            assertTrue(result.isOk());
+        }
+        var request = server.requests().getFirst();
+        TestKeys.verifiedClaims(request.header("Authorization").substring(7), TestKeys.PAIR.getPublic());
+        assertEquals("{\"repositories\":[\"plan-marshall-mcp\"],\"permissions\":{\"pull_requests\":\"write\"}}",
+                request.body());
+    }
+
+    @Test
     @DisplayName("reuses a token until the reuse margin, then mints with a fresh JWT")
     void reusesUntilMargin() {
         server.on("POST", PATH, minted("ghs_one", NOW.plusSeconds(3600)));
@@ -144,13 +161,13 @@ class InstallationTokensTest {
         server.on("POST", "/app/installations/8/access_tokens",
                 Response.json(201, "{\"token\":\"t\",\"expires_at\":\"tomorrow\"}"));
 
-        assertEquals(CiResult.Outcome.UNAUTHORIZED, tokens.token(42, "repo", PERMISSIONS).outcome());
+        assertEquals(CiResult.Outcome.AUTH_FAILED, tokens.token(42, "repo", PERMISSIONS).outcome());
         assertEquals(CiResult.Outcome.FAILED, tokens.token(7, "repo", PERMISSIONS).outcome());
         assertEquals(CiResult.Outcome.FAILED, tokens.token(8, "repo", PERMISSIONS).outcome());
         assertTrue(tokens.tokenSource(42, "repo", PERMISSIONS).token().isEmpty());
         try (var broken = new InstallationTokens(CiEndpoint.of(server.base()), "id", () -> "garbage", redacted::add,
                      clock)) {
-            assertEquals(CiResult.Outcome.UNAUTHORIZED, broken.token(42, "repo", PERMISSIONS).outcome());
+            assertEquals(CiResult.Outcome.AUTH_FAILED, broken.token(42, "repo", PERMISSIONS).outcome());
         }
         assertTrue(redacted.isEmpty());
     }

@@ -27,22 +27,26 @@ import de.cuioss.pm.core.toon.ToonValue.ToonObject;
 import de.cuioss.pm.core.toon.ToonValue.ToonString;
 
 /**
- * Deterministic, reflection-free TOON encoder for the subset PM-MCP emits.
+ * Deterministic, reflection-free encoder of the official TOON specification version
+ * {@value #SPEC_VERSION} (release {@value #SPEC_RELEASE}).
  * <p>
- * Conforms to the official TOON specification version {@value #SPEC_VERSION} (release
- * {@value #SPEC_RELEASE}) with its defaults: comma document delimiter and two spaces per
- * indentation level, LF line separators, no trailing spaces and no trailing newline (§ 12).
- * The subset covers:
+ * The encoder implements every form of the specification and offers its canonical options only:
+ * the comma document delimiter and two spaces per indentation level (§ 13), LF line separators, no
+ * trailing spaces and no trailing newline (§ 12). The form of a value follows from its shape and
+ * position (§ 1.4):
  * <ul>
  *   <li>objects (§ 8), including empty objects as {@code key:};</li>
  *   <li>inline primitive arrays {@code key[N]: v1,v2} and empty arrays {@code key: []} (§ 9.1);</li>
- *   <li>tabular arrays of uniform objects with primitive columns {@code key[N]{a,b}:} (§ 9.3);</li>
+ *   <li>tabular arrays of uniform objects {@code key[N]{a,b{c,d}}:}, with nested field groups for
+ *       nested-uniform columns (§ 9.3);</li>
+ *   <li>list form for arrays of arrays and for mixed or non-uniform arrays, with objects as list
+ *       items (§ 9.2, § 9.4, § 10);</li>
+ *   <li>keyed tabular form {@code key[N:]{a,b}:} for objects of uniform objects (§ 9.5);</li>
  *   <li>primitives with canonical numbers (§ 2) and minimal quoting with the official escapes
- *       (§ 7.1, § 7.2, § 7.3); no block literals.</li>
+ *       (§ 7.1, § 7.2, § 7.3).</li>
  * </ul>
- * The form of a value follows from its shape (§ 1.4). A shape the specification renders in another
- * form (list form, keyed tabular form, nested field groups) is refused with
- * {@link ToonEncodingException} rather than rendered in a non-conformant way.
+ * The output depends on the value alone: no locale, platform line separator or default charset is
+ * consulted, so the bytes are identical on every platform, under JVM and under native image.
  *
  * @since 0.1
  */
@@ -56,7 +60,9 @@ public final class ToonEncoder {
     public static final String SPEC_RELEASE = "v4.1.3";
 
     private static final String INDENT = "  ";
+    private static final String LIST_MARKER = "- ";
     private static final char DELIMITER = ',';
+    private static final String JOIN = String.valueOf(DELIMITER);
     private static final Pattern NUMERIC_LIKE = Pattern.compile("^[+-]?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$");
     private static final Pattern UNQUOTED_KEY = Pattern.compile("^[A-Za-z_][A-Za-z0-9_.]*$");
     private static final BigDecimal PLAIN_MIN = new BigDecimal("1e-6");
@@ -68,7 +74,7 @@ public final class ToonEncoder {
      *
      * @param value the root value
      * @return the document, without trailing newline
-     * @throws ToonEncodingException if the value is outside the subset or holds an unpaired surrogate
+     * @throws ToonEncodingException if a string or key holds an unpaired surrogate
      */
     public static String encode(ToonValue value) {
         var lines = new ArrayList<String>();
@@ -92,9 +98,10 @@ public final class ToonEncoder {
 
     private static void encodeRootObject(ToonObject object, List<String> lines) {
         if (isKeyedEligible(object)) {
-            throw new ToonEncodingException(Reason.KEYED_TABULAR_FORM, "root object of uniform objects");
+            encodeKeyed(null, object, 0, lines);
+        } else {
+            encodeFields(object, 0, lines);
         }
-        encodeFields(object, 0, lines);
     }
 
     private static void encodeFields(ToonObject object, int depth, List<String> lines) {
@@ -103,23 +110,37 @@ public final class ToonEncoder {
         }
     }
 
+    /** One object field at {@code depth} (§ 8, § 9.5). */
     private static void encodeField(String key, ToonValue value, int depth, List<String> lines) {
         String indent = INDENT.repeat(depth);
         switch (value) {
             case ToonObject object -> {
                 if (isKeyedEligible(object)) {
-                    throw new ToonEncodingException(Reason.KEYED_TABULAR_FORM, "field '" + key + "'");
+                    encodeKeyed(key, object, depth, lines);
+                } else {
+                    lines.add(indent + key(key) + ":");
+                    encodeFields(object, depth + 1, lines);
                 }
-                lines.add(indent + key(key) + ":");
-                encodeFields(object, depth + 1, lines);
             }
             case ToonArray array -> encodeArray(key, array, depth, lines);
             default -> lines.add(indent + key(key) + ": " + primitive(value, false));
         }
     }
 
+    /** Keyed tabular form of § 9.5; {@code key == null} at the root. */
+    private static void encodeKeyed(String key, ToonObject object, int depth, List<String> lines) {
+        List<ToonValue> values = entryValues(object);
+        var first = (ToonObject) values.getFirst();
+        lines.add(INDENT.repeat(depth) + (key == null ? "" : key(key)) + "[" + values.size() + ":]"
+                + fieldList(first, values) + ":");
+        String rowIndent = INDENT.repeat(depth + 1);
+        for (ToonObject.Field entry : object.fields()) {
+            lines.add(rowIndent + key(entry.key()) + ": " + row(first, values, (ToonObject) entry.value()));
+        }
+    }
+
     /**
-     * Encodes an array in field position ({@code key != null}) or at the root.
+     * An array in field position ({@code key != null}) or at the root (§ 9.1, § 9.3, § 9.4).
      */
     private static void encodeArray(String key, ToonArray array, int depth, List<String> lines) {
         String indent = INDENT.repeat(depth);
@@ -130,45 +151,108 @@ public final class ToonEncoder {
             return;
         }
         String header = indent + prefix + "[" + elements.size() + "]";
-        if (elements.stream().allMatch(ToonValue::isPrimitive)) {
-            var values = new ArrayList<String>(elements.size());
+        if (allPrimitive(elements)) {
+            lines.add(header + ": " + inline(elements));
+        } else if (isUniformObjects(elements)) {
+            var first = (ToonObject) elements.getFirst();
+            lines.add(header + fieldList(first, elements) + ":");
+            String rowIndent = INDENT.repeat(depth + 1);
             for (ToonValue element : elements) {
-                values.add(cell(element));
+                lines.add(rowIndent + row(first, elements, (ToonObject) element));
             }
-            lines.add(header + ": " + String.join(String.valueOf(DELIMITER), values));
-            return;
+        } else {
+            lines.add(header + ":");
+            encodeListItems(elements, depth + 1, lines);
         }
-        List<String> fields = tabularFields(elements, prefix);
-        var names = new ArrayList<String>(fields.size());
-        for (String field : fields) {
-            names.add(key(field));
-        }
-        lines.add(header + "{" + String.join(String.valueOf(DELIMITER), names) + "}:");
-        String rowIndent = INDENT.repeat(depth + 1);
+    }
+
+    /** The list items of an array in list form, each at {@code depth} (§ 9.2, § 9.4, § 10). */
+    private static void encodeListItems(List<ToonValue> elements, int depth, List<String> lines) {
+        String indent = INDENT.repeat(depth);
         for (ToonValue element : elements) {
-            var object = (ToonObject) element;
-            var cells = new ArrayList<String>(fields.size());
-            for (String field : fields) {
-                cells.add(cell(object.get(field).orElseThrow()));
+            switch (element) {
+                case ToonArray inner -> encodeListArray(inner, depth, lines);
+                case ToonObject object -> encodeListObject(object, depth, lines);
+                default -> lines.add(indent + LIST_MARKER + primitive(element, false));
             }
-            lines.add(rowIndent + String.join(String.valueOf(DELIMITER), cells));
         }
     }
 
     /**
-     * Returns the field list of a tabular array with primitive columns, or refuses the array.
+     * An array as a list item: inline when primitive (an empty one as {@code - [0]:}), otherwise in
+     * list form, since a keyless tabular header is valid only at the root (§ 9.2, § 9.4).
      */
-    private static List<String> tabularFields(List<ToonValue> elements, String key) {
-        if (!isUniformObjects(elements)) {
-            throw new ToonEncodingException(Reason.LIST_FORM, "array '" + key + "'");
+    private static void encodeListArray(ToonArray array, int depth, List<String> lines) {
+        List<ToonValue> elements = array.elements();
+        String header = INDENT.repeat(depth) + LIST_MARKER + "[" + elements.size() + "]:";
+        if (elements.isEmpty()) {
+            lines.add(header);
+        } else if (allPrimitive(elements)) {
+            lines.add(header + " " + inline(elements));
+        } else {
+            lines.add(header);
+            encodeListItems(elements, depth + 1, lines);
         }
-        var first = (ToonObject) elements.getFirst();
+    }
+
+    /**
+     * An object as a list item (§ 10): a bare hyphen when empty, otherwise its fields at
+     * {@code depth + 1} with the first one carried on the hyphen line. The hyphen marker is exactly
+     * one indentation unit wide, so the first field keeps depth {@code depth + 1} and its scope (nested
+     * fields, list items, rows or entry rows) stays at {@code depth + 2}, the placement § 10 prescribes
+     * for every kind of first field.
+     */
+    private static void encodeListObject(ToonObject object, int depth, List<String> lines) {
+        String indent = INDENT.repeat(depth);
+        if (object.fields().isEmpty()) {
+            lines.add(indent + "-");
+            return;
+        }
+        int firstLine = lines.size();
+        encodeFields(object, depth + 1, lines);
+        lines.set(firstLine, indent + LIST_MARKER + lines.get(firstLine).substring(indent.length() + INDENT.length()));
+    }
+
+    /**
+     * The field list of a tabular or keyed header: the first object's keys in encounter order, a
+     * nested-uniform column as a nested field group, applied recursively (§ 9.3).
+     */
+    private static String fieldList(ToonObject first, List<ToonValue> objects) {
+        var entries = new ArrayList<String>(first.fields().size());
         for (String field : first.keys()) {
-            if (!column(elements, field).stream().allMatch(ToonValue::isPrimitive)) {
-                throw new ToonEncodingException(Reason.NESTED_FIELD_GROUP, "array '" + key + "' column '" + field + "'");
+            List<ToonValue> column = column(objects, field);
+            String name = key(field);
+            entries.add(allPrimitive(column) ? name : name + fieldList((ToonObject) column.getFirst(), column));
+        }
+        return "{" + String.join(JOIN, entries) + "}";
+    }
+
+    /** The cells of one row: leaf values in depth-first pre-order of the field list (§ 9.3). */
+    private static String row(ToonObject first, List<ToonValue> objects, ToonObject object) {
+        var cells = new ArrayList<String>();
+        collectCells(first, objects, object, cells);
+        return String.join(JOIN, cells);
+    }
+
+    private static void collectCells(ToonObject first, List<ToonValue> objects, ToonObject object,
+            List<String> cells) {
+        for (String field : first.keys()) {
+            List<ToonValue> column = column(objects, field);
+            ToonValue value = value(object, field);
+            if (allPrimitive(column)) {
+                cells.add(primitive(value, false));
+            } else {
+                collectCells((ToonObject) column.getFirst(), column, (ToonObject) value, cells);
             }
         }
-        return first.keys();
+    }
+
+    private static String inline(List<ToonValue> elements) {
+        var values = new ArrayList<String>(elements.size());
+        for (ToonValue element : elements) {
+            values.add(primitive(element, false));
+        }
+        return String.join(JOIN, values);
     }
 
     /**
@@ -176,9 +260,6 @@ public final class ToonEncoder {
      * uniform-primitive or nested-uniform.
      */
     private static boolean isUniformObjects(List<ToonValue> values) {
-        if (values.isEmpty()) {
-            return false;
-        }
         Set<String> keySet = null;
         for (ToonValue value : values) {
             if (!(value instanceof ToonObject object) || object.fields().isEmpty()) {
@@ -191,9 +272,12 @@ public final class ToonEncoder {
                 return false;
             }
         }
+        if (keySet == null) {
+            return false;
+        }
         for (String field : keySet) {
             List<ToonValue> column = column(values, field);
-            if (!column.stream().allMatch(ToonValue::isPrimitive) && !isUniformObjects(column)) {
+            if (!allPrimitive(column) && !isUniformObjects(column)) {
                 return false;
             }
         }
@@ -202,18 +286,23 @@ public final class ToonEncoder {
 
     /** Keyed tabular detection of § 9.5: at least two entries whose values are uniform objects. */
     private static boolean isKeyedEligible(ToonObject object) {
-        if (object.fields().size() < 2) {
-            return false;
-        }
-        return isUniformObjects(object.fields().stream().map(ToonObject.Field::value).toList());
+        return object.fields().size() >= 2 && isUniformObjects(entryValues(object));
+    }
+
+    private static List<ToonValue> entryValues(ToonObject object) {
+        return object.fields().stream().map(ToonObject.Field::value).toList();
+    }
+
+    private static boolean allPrimitive(List<ToonValue> values) {
+        return values.stream().allMatch(ToonValue::isPrimitive);
     }
 
     private static List<ToonValue> column(List<ToonValue> objects, String field) {
-        return objects.stream().map(o -> ((ToonObject) o).get(field).orElseThrow()).toList();
+        return objects.stream().map(o -> value((ToonObject) o, field)).toList();
     }
 
-    private static String cell(ToonValue value) {
-        return primitive(value, false);
+    private static ToonValue value(ToonObject object, String field) {
+        return object.get(field).orElseThrow();
     }
 
     private static String primitive(ToonValue value, boolean root) {
@@ -254,7 +343,7 @@ public final class ToonEncoder {
         }
         char first = value.charAt(0);
         char last = value.charAt(value.length() - 1);
-        if (isPadding(first) || isPadding(last) || first == '-' || first == '#' || root && first == '\uFEFF') {
+        if (isPadding(first) || isPadding(last) || first == '-' || first == '#' || root && first == '﻿') {
             return true;
         }
         if (NUMERIC_LIKE.matcher(value).matches()) {
@@ -279,7 +368,7 @@ public final class ToonEncoder {
         return UNQUOTED_KEY.matcher(key).matches() ? key : quote(key);
     }
 
-    /** Escaping of § 7.1. */
+    /** Escaping of § 7.1: the named escapes, a lowercase-hex unicode escape for other controls, else literal. */
     private static String quote(String value) {
         var out = new StringBuilder(value.length() + 2).append('"');
         for (int i = 0; i < value.length(); i++) {

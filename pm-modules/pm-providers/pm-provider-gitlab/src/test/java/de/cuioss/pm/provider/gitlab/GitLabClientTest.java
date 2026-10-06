@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 @DisplayName("GitLabClient")
 class GitLabClientTest {
 
+    private static final String SELF = "/api/v4/personal_access_tokens/self";
     private static final String MR = "/api/v4/projects/group%2Fproject/merge_requests/12";
 
     private FakeServer server;
@@ -84,6 +85,21 @@ class GitLabClientTest {
             assertEquals(CiResult.Outcome.REJECTED, moved.outcome());
             assertTrue(moved.detail().contains("SHA does not match"));
             assertEquals(CiResult.Outcome.FAILED, client.merge(13, "x").outcome());
+        }
+
+        @Test
+        @DisplayName("reports a merge train that is not enabled as rejected, not as failed")
+        void mergeTrainNotEnabled() {
+            server.on("POST", "/api/v4/projects/group%2Fproject/merge_trains/merge_requests/12",
+                    Response.json(400, "{\"message\":\"Merge trains are not enabled for this project\"}"));
+            server.on("POST", "/api/v4/projects/group%2Fproject/merge_trains/merge_requests/13",
+                    Response.json(502, "<html>Bad Gateway</html>"));
+
+            var refused = client.mergeTrainAdd(12, "abc");
+
+            assertEquals(CiResult.Outcome.REJECTED, refused.outcome());
+            assertEquals("HTTP 400: Merge trains are not enabled for this project", refused.detail());
+            assertEquals(CiResult.Outcome.FAILED, client.mergeTrainAdd(13, "abc").outcome());
         }
 
         @Test
@@ -180,7 +196,7 @@ class GitLabClientTest {
         @Test
         @DisplayName("reads the token identity")
         void identity() {
-            server.on("GET", "/api/v4/personal_access_tokens/self", Response.json(200, "{\"id\":4,\"name\":\"pm-mcp\","
+            server.on("GET", SELF, Response.json(200, "{\"id\":4,\"name\":\"pm-mcp\","
                     + "\"user_id\":17,\"scopes\":[\"api\",\"read_repository\"],\"active\":true,\"expires_at\":null}"));
 
             var identity = client.tokenIdentity().value().orElseThrow();
@@ -193,11 +209,61 @@ class GitLabClientTest {
         }
 
         @Test
-        @DisplayName("reports an invalid token as unauthorized")
-        void unauthorized() {
-            server.on("GET", "/api/v4/personal_access_tokens/self", Response.json(401, "{\"message\":\"401 Unauthorized\"}"));
+        @DisplayName("resolves the identity of a token that is no personal access token through GET /user")
+        void identityOfOAuthToken() {
+            server.on("GET", SELF, Response.json(400,
+                    "{\"message\":\"400 Bad request - requires token type to be a personal access token\"}"));
+            server.on("GET", "/api/v4/user", Response.json(200,
+                    "{\"id\":17,\"username\":\"oliver\",\"state\":\"active\"}"));
 
-            assertEquals(CiResult.Outcome.UNAUTHORIZED, client.tokenIdentity().outcome());
+            var result = client.tokenIdentity();
+
+            var identity = result.value().orElseThrow();
+            assertEquals(CiResult.Outcome.OK, result.outcome());
+            assertEquals("17", identity.userId());
+            assertTrue(identity.active());
+            assertEquals("", identity.id());
+            assertEquals("", identity.name());
+            assertEquals(List.of(), identity.scopes());
+            assertTrue(identity.expiresAt().isEmpty());
+            assertEquals(List.of("GET " + SELF, "GET /api/v4/user"), server.requests().stream()
+                    .map(r -> r.method() + " " + r.pathAndQuery()).toList());
+            assertEquals("Bearer glpat-secret", server.requests().getLast().header("Authorization"));
+        }
+
+        @Test
+        @DisplayName("reports a blocked user and the failures of GET /user for a token of another type")
+        void identityFallbackFailures() {
+            server.on("GET", SELF, Response.json(400,
+                    "{\"message\":\"400 Bad request - requires token type to be a personal access token\"}"));
+            server.on("GET", "/api/v4/user", Response.json(200, "{\"id\":18,\"state\":\"blocked\"}"));
+            server.on("GET", "/api/v4/user", Response.json(200, "{}"));
+            server.on("GET", "/api/v4/user", Response.json(401, "{\"message\":\"401 Unauthorized\"}"));
+
+            var blocked = client.tokenIdentity();
+            var unreadable = client.tokenIdentity();
+            var refused = client.tokenIdentity();
+
+            assertFalse(blocked.value().orElseThrow().active());
+            assertEquals(CiResult.Outcome.FAILED, unreadable.outcome());
+            assertEquals(CiResult.Outcome.AUTH_FAILED, refused.outcome());
+        }
+
+        @Test
+        @DisplayName("does not ask GET /user when the token read fails otherwise")
+        void identityWithoutFallback() {
+            server.on("GET", SELF, Response.json(500, "{\"message\":\"500 Internal Server Error\"}"));
+
+            assertEquals(CiResult.Outcome.FAILED, client.tokenIdentity().outcome());
+            assertEquals(1, server.requests().size());
+        }
+
+        @Test
+        @DisplayName("reports an invalid token as an authentication failure")
+        void unauthorized() {
+            server.on("GET", SELF, Response.json(401, "{\"message\":\"401 Unauthorized\"}"));
+
+            assertEquals(CiResult.Outcome.AUTH_FAILED, client.tokenIdentity().outcome());
         }
     }
 }

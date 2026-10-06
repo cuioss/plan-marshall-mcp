@@ -22,7 +22,7 @@ import lombok.experimental.UtilityClass;
  * session ID variable, and its version probe. It is the single source of these values for both
  * client binaries and the client profiles; profile overrides never touch it.
  * <p>
- * Most values are <em>provisional</em> until the host-behaviour spikes verify them (verification gate
+ * Most values are <em>provisional</em> until they are verified against a live host (verification gate
  * 14); each entry records whether it carries a provisional value.
  */
 @UtilityClass

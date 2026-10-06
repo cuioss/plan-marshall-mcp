@@ -9,6 +9,7 @@
  */
 package de.cuioss.pm.provider.github;
 
+import java.io.ByteArrayOutputStream;
 import java.io.Serial;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
@@ -29,7 +30,9 @@ import de.cuioss.pm.provider.ci.Json;
  * The window follows the GitHub App JWT validity window of the timeouts specification: {@code iat}
  * back-dated {@value #IAT_BACKDATE_SECONDS} s against clock skew and {@code exp}
  * {@value #EXP_AFTER_SECONDS} s after signing (GitHub's maximum); {@code iss} is the App's client id.
- * A JWT is signed per mint and never reused.
+ * A JWT is signed per mint and never reused. The App's private key is accepted in both PEM forms: PKCS#8
+ * ({@code BEGIN PRIVATE KEY}) and PKCS#1 ({@code BEGIN RSA PRIVATE KEY}, the form GitHub delivers); a PKCS#1 key
+ * is wrapped in a PKCS#8 {@code PrivateKeyInfo} structure in memory.
  *
  * @since 0.1
  */
@@ -43,14 +46,24 @@ public final class GitHubAppJwt {
 
     private static final String PKCS8_BEGIN = "-----BEGIN PRIVATE KEY-----";
     private static final String PKCS8_END = "-----END PRIVATE KEY-----";
+    private static final String PKCS1_BEGIN = "-----BEGIN RSA PRIVATE KEY-----";
+    private static final String PKCS1_END = "-----END RSA PRIVATE KEY-----";
+    /** {@code version 0} of a PKCS#8 {@code PrivateKeyInfo}. */
+    private static final byte[] VERSION_0 = {0x02, 0x01, 0x00};
+    /** {@code AlgorithmIdentifier} rsaEncryption (1.2.840.113549.1.1.1) with NULL parameters. */
+    private static final byte[] RSA_ALGORITHM = {0x30, 0x0d, 0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86,
+            (byte) 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00};
+    private static final int TAG_SEQUENCE = 0x30;
+    private static final int TAG_OCTET_STRING = 0x04;
     private static final Base64.Encoder URL = Base64.getUrlEncoder().withoutPadding();
 
     /**
      * @param clientId      the App's client id ({@code iss})
-     * @param privateKeyPem the App's private key, PEM-encoded PKCS#8 ({@code BEGIN PRIVATE KEY})
+     * @param privateKeyPem the App's private key, PEM-encoded PKCS#8 ({@code BEGIN PRIVATE KEY}) or PKCS#1
+     *                      ({@code BEGIN RSA PRIVATE KEY})
      * @param now           the signing instant
      * @return the compact JWT
-     * @throws JwtSigningException if the key is not a PKCS#8 RSA key or signing fails
+     * @throws JwtSigningException if the key is no PEM-encoded RSA key or signing fails
      */
     public static String sign(String clientId, String privateKeyPem, Instant now) {
         var header = new LinkedHashMap<String, Object>();
@@ -73,18 +86,56 @@ public final class GitHubAppJwt {
 
     static PrivateKey privateKey(String pem) throws GeneralSecurityException {
         String trimmed = pem.strip();
-        if (!trimmed.startsWith(PKCS8_BEGIN) || !trimmed.endsWith(PKCS8_END)) {
-            throw new JwtSigningException("the private key must be PEM-encoded PKCS#8 (BEGIN PRIVATE KEY)", null);
+        byte[] pkcs8;
+        if (trimmed.startsWith(PKCS8_BEGIN) && trimmed.endsWith(PKCS8_END)) {
+            pkcs8 = base64(trimmed, PKCS8_BEGIN, PKCS8_END);
+        } else if (trimmed.startsWith(PKCS1_BEGIN) && trimmed.endsWith(PKCS1_END)) {
+            pkcs8 = wrapPkcs1(base64(trimmed, PKCS1_BEGIN, PKCS1_END));
+        } else {
+            throw new JwtSigningException(
+                    "the private key must be PEM-encoded PKCS#8 (BEGIN PRIVATE KEY) or PKCS#1 (BEGIN RSA PRIVATE KEY)",
+                    null);
         }
-        String base64 = trimmed.substring(PKCS8_BEGIN.length(), trimmed.length() - PKCS8_END.length())
-                .replaceAll("\\s", "");
-        byte[] der;
+        return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
+    }
+
+    private static byte[] base64(String pem, String begin, String end) {
+        String base64 = pem.substring(begin.length(), pem.length() - end.length()).replaceAll("\\s", "");
         try {
-            der = Base64.getDecoder().decode(base64);
+            return Base64.getDecoder().decode(base64);
         } catch (IllegalArgumentException e) {
             throw new JwtSigningException("the private key is not valid base64", e);
         }
-        return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(der));
+    }
+
+    /**
+     * Wraps a PKCS#1 {@code RSAPrivateKey} in a PKCS#8 {@code PrivateKeyInfo}:
+     * {@code SEQUENCE { version 0, rsaEncryption, OCTET STRING rsaPrivateKey }}.
+     */
+    static byte[] wrapPkcs1(byte[] pkcs1) {
+        var content = new ByteArrayOutputStream();
+        content.writeBytes(VERSION_0);
+        content.writeBytes(RSA_ALGORITHM);
+        content.writeBytes(tlv(TAG_OCTET_STRING, pkcs1));
+        return tlv(TAG_SEQUENCE, content.toByteArray());
+    }
+
+    /** One DER tag-length-value with a definite length in short or long form. */
+    static byte[] tlv(int tag, byte[] value) {
+        var out = new ByteArrayOutputStream();
+        out.write(tag);
+        int length = value.length;
+        if (length < 0x80) {
+            out.write(length);
+        } else {
+            int octets = (Integer.SIZE - Integer.numberOfLeadingZeros(length) + 7) / 8;
+            out.write(0x80 | octets);
+            for (int shift = (octets - 1) * 8; shift >= 0; shift -= 8) {
+                out.write((length >> shift) & 0xff);
+            }
+        }
+        out.writeBytes(value);
+        return out.toByteArray();
     }
 
     private static String encode(String json) {

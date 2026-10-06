@@ -107,7 +107,7 @@ class DaemonStartupIT {
             }
             var before = BaseSnapshot.of(base);
 
-            try (var second = DaemonProcess.start(base, DaemonProcess.SPIKE_PROPERTIES)) {
+            try (var second = DaemonProcess.start(base, List.of())) {
                 assertEquals(0, second.awaitExit(READY), second.output());
             }
 
