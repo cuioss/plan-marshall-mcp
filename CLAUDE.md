@@ -12,24 +12,21 @@ most of which is not implemented yet: requirements in `doc/Requirements.adoc` (m
 `doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
 `doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification that has watch items, plus `cross-cutting.adoc`).
 
-Current state: roadmap Milestone 0 Part B (technical verifications) is in progress. It builds each verified
-technique in its target module, and the modules it needs exist: the always-on daemon `pm-mcpd`
-(`pm-mcp-server`), reached through the `pm-mcp serve` STDIO relay (`pm-relay`), the operator CLI
-`pm-operator`, and the job launcher `pm-exec`, all four built as native binaries on the host (no
-container image; PM-TECH-1/3, `doc/specification/runtime-model.adoc`). Pass criteria and results are
-recorded in `doc/roadmap/technical_macos.adoc` and `doc/roadmap/technical_linux.adoc`.
-
-Roadmap Milestone 0, Part A (the harness as worker) is complete: the concept is `doc/concepts/harness-as-worker/`
-(index `doc/Concepts.adoc`), the measurements are the reference specification `doc/specification/evaluation.adoc`.
-Packages named `spike` (`de.cuioss.pm.mcp.spike` with the Part A stub, active only with `pm.spike.scenario`,
-and the verification endpoints, verbs, and harness drivers of Part B) are experiment-only code and are
-deleted at the Part B exit.
+Current state: roadmap Milestone 0 is complete; Milestone 1 is next. Part A established the harness as worker
+(concept `doc/concepts/harness-as-worker/`, index `doc/Concepts.adoc`). Part B built each verified technique in
+its target module, minimal and real: the always-on daemon `pm-mcpd` (`pm-mcp-server`), reached through the
+`pm-mcp serve` STDIO relay (`pm-relay`), the operator CLI `pm-operator`, and the job launcher `pm-exec`, all four
+built as native binaries on the host (no container image; PM-TECH-1/3, `doc/specification/runtime-model.adoc`),
+beside the library modules of `pm-modules`. The measurements of both parts, on macOS and Linux, are the reference
+specification `doc/specification/evaluation.adoc`. The code is a first form of each technique: the specifications
+stay the target, the workflow engine and the job runtime do not exist yet (the core tools answer as stubs, the
+job-token and device registries are empty), and there is no experiment-only code in the tree.
 
 ## Modules
 
 The target module structure (PM-IMPL-1 in `doc/requirements/14-implementation.adoc`): `pm-mcp-server`
 (Quarkus daemon assembly) beside the aggregators `pm-modules` (library modules, with the nested
-`pm-providers`) and `pm-clients`. Milestone 0 Part B created the modules it fills; Milestone 1 adds the
+`pm-providers`) and `pm-clients`. Milestone 0 created the modules its techniques live in; Milestone 1 adds the
 rest. The only listing of the modules, their dependencies and the specification each implements is
 `doc/specification/module-structure.adoc`; name modules from there and never repeat the listing
 elsewhere. Every module gets minimal real code and tests, never an empty shell.
@@ -64,8 +61,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Parent `de.cuioss:cui-quarkus-parent` supplies Quarkus (`version.quarkus`), cui-http and
   cui-java-tools versions. Never declare `version.quarkus` locally.
 - Root `pom.xml` imports `quarkus-bom` **first** (smallrye-config convergence; the org
-  `quarkus-alignment` CI job fails on a split Quarkus line), then `token-sheriff-bom` and
-  `quarkus-mcp-server-bom`.
+  `quarkus-alignment` CI job fails on a split Quarkus line), then `quarkus-mcp-server-bom`.
 - Never add dependencies without asking the user first.
 - Pre-1.0: no deprecation cycles, no backward-compatibility shims.
 
@@ -98,8 +94,10 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Minimum 80% instruction and branch coverage, enforced by the JaCoCo `check` of the parent's
   `-Pcoverage` profile (merged Maven and `quarkus-jacoco` data) and by the SonarCloud quality gate.
 - Keep a `@QuarkusMain` entry point thin and unit-test its logic in separate classes.
-- Behaviour of the packaged application belongs in `*IT` tests (`@QuarkusIntegrationTest`, run with
-  `-Pintegration-tests`), not in unit tests.
+- Behaviour of the packaged binaries belongs in `*IT` tests (run with `-Pintegration-tests`; they start the
+  packaged daemon and the client binaries as processes, natively with `-Pnative`), not in unit tests. A test that
+  needs a job token, a device secret, or a probe tool gets it from test scope (`TestRegistries`, `ProbeTools` in
+  `pm-mcp-server`), never from production code.
 
 ## Documentation
 
