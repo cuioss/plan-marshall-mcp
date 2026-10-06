@@ -37,6 +37,14 @@ final class SpikeDaemon implements AutoCloseable {
     record Job(String jobId, String token) {
     }
 
+    /** The MCP traffic record of the daemon ({@code pm.spike.traffic-file}) in the run directory. */
+    static final String TRAFFIC_FILE = "traffic.jsonl";
+    /**
+     * {@code spike.listen=refuse|ignore}: the daemon answers {@code subscriptions/listen} itself (M8 experiment,
+     * {@code pm.spike.listen}).
+     */
+    static final String LISTEN_PROPERTY = "spike.listen";
+
     private final Process process;
     private final Path base;
     private final Path log;
@@ -53,8 +61,8 @@ final class SpikeDaemon implements AutoCloseable {
      *
      * @param stage    the staged installation
      * @param base     {@code PM_MCP_BASE}, short enough for {@code sun_path}
-     * @param scenario the scenario file
-     * @param runDir   the directory of the stub's event log
+     * @param scenario the scenario file, {@code null} for the product tool set without the stub
+     * @param runDir   the directory of the stub's event log and of the MCP traffic record
      * @return the ready daemon
      * @throws IOException if it does not become ready
      */
@@ -64,8 +72,15 @@ final class SpikeDaemon implements AutoCloseable {
         Files.createDirectories(runDir);
         var log = runDir.resolve("daemon.log");
         var properties = new ArrayList<String>();
-        properties.add("-Dpm.spike.scenario=" + scenario.toAbsolutePath());
+        if (scenario != null) {
+            properties.add("-Dpm.spike.scenario=" + scenario.toAbsolutePath());
+        }
         properties.add("-Dpm.spike.run-dir=" + runDir.toAbsolutePath());
+        properties.add("-Dpm.spike.traffic-file=" + runDir.resolve(TRAFFIC_FILE).toAbsolutePath());
+        var listen = System.getProperty(LISTEN_PROPERTY);
+        if (listen != null && !listen.isBlank()) {
+            properties.add("-Dpm.spike.listen=" + listen.strip());
+        }
         var builder = new ProcessBuilder(stage.daemonCommand(properties)).redirectErrorStream(true)
                 .redirectOutput(log.toFile());
         builder.environment().put("PM_MCP_BASE", base.toString());
@@ -98,6 +113,20 @@ final class SpikeDaemon implements AutoCloseable {
     /** @return {@code PM_MCP_BASE} */
     Path base() {
         return base;
+    }
+
+    /** @return whether the daemon process runs */
+    boolean alive() {
+        return process.isAlive();
+    }
+
+    /** @return the HTTP status of {@code GET /api/v1/status}, {@code -1} if the socket does not answer */
+    int status() {
+        try {
+            return client.send("GET", "/api/v1/status", null).status();
+        } catch (IOException _) {
+            return -1;
+        }
     }
 
     /** @return the daemon's pid */

@@ -14,7 +14,9 @@
  * The tools are registered only when {@code pm.spike.scenario} is configured. In Part B the stub runs behind the
  * real worker relay {@code pm-mcp serve --job}: the harness drivers of {@code pm-e2e} mint and revoke one job token
  * per worker generation ({@link de.cuioss.pm.mcp.spike.SpikeJobResource}), and the stub takes the worker identity
- * from the request's security identity. The package is removed when
+ * from the request's security identity. Independent of the stub, {@code pm.spike.traffic-file} records every MCP
+ * message ({@link de.cuioss.pm.mcp.spike.SpikeTrafficRecord}) and {@code pm.spike.listen} lets the daemon refuse or
+ * end {@code subscriptions/listen} ({@link de.cuioss.pm.mcp.spike.SpikeListenFilter}). The package is removed when
  * Milestone 1 creates the target module structure.
  */
 package de.cuioss.pm.mcp.spike;

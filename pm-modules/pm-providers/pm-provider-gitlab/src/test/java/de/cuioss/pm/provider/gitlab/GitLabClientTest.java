@@ -18,12 +18,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+
 import de.cuioss.pm.provider.ci.CiEndpoint;
 import de.cuioss.pm.provider.ci.CiHttpClient;
 import de.cuioss.pm.provider.ci.CiResult;
 import de.cuioss.pm.provider.ci.Json;
 import de.cuioss.pm.provider.gitlab.FakeServer.Response;
-
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
