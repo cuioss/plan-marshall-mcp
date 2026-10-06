@@ -155,15 +155,46 @@ Items marked _(measured during implementation)_ ran while the technique was bein
 * Progress notifications arrive on the call's SSE stream.
 * Elicitation in `2026-07-28` is no server-initiated request: it is an `input_required` result answered by a retry with `inputResponses`. This contradicts `runtime-model/03-relay.adoc` (messages from runtime to host) and is a correction candidate.
 
-*Status*: `[~]` (repeat through the real relay and real hosts in M9 and M13)
+*Host run* (2026-10-06): `McpSurfaceIT` passes against the native runner (4 of 4).
+
+*How the daemon answers `subscriptions/listen`*, recorded from real host traffic:
+
+* `server/discover` advertises `capabilities.tools.listChanged: true`.
+* `subscriptions/listen` (from Claude Code and Antigravity) is acknowledged at once with `notifications/subscriptions/acknowledged`. The stream then stays open for the whole session without a final response.
+* This contradicts `runtime-model/03-relay.adoc` (no `list_changed`, no messages unrelated to a pending call) and `PM-SKILL-2`.
+* `quarkus-mcp-server` 2.0.2 has no setting to turn either off.
+
+*What Claude Code does with the alternatives* (spike filter `pm.spike.listen`):
+
+* Unanswered: Claude Code blocks its startup for 27 s, then cancels the listen request and continues.
+* Refused with `-32601`, or ended at once with an empty result: `tools/list` follows immediately. Claude Code retries the listen three times (+1, +3, +7 s), then stops. All tools work.
+
+*Correction candidate*: the runtime refuses `subscriptions/listen` with `-32601` and does not advertise `tools.listChanged`. Whether hosts then skip the listen entirely is untested. The refuse and ignore runs used the JVM layout.
+
+*Status*: `[~]` (pass; the `listChanged` correction is open)
 
 === M9: Flat Tool Schemas on Four Hosts (gate 11)
 
 *Pass criterion*: the ten core tools, with their final flat schemas, are registered and each called once successfully on Claude Code, OpenCode, Antigravity and Codex through `pm-mcp serve --client <id>`.
 
-*Result*:
+*Result* (2026-10-06, native layout, `Gate11FlatSchemaIT`, verified from the daemon's traffic record):
 
-*Status*: `[ ]`
+* *Claude Code* (`claude-haiku-4-5`): listed 10 of 10, also in the host's own tool list; called 10 of 10, all successful. Pass.
+* *OpenCode*: listed 10 of 10 by the daemon; called 10 of 10, all successful. Pass.
+* *Antigravity* 1.3.0: pass across two sessions.
+** Gemini Flash was out of quota, so it ran with `gpt-oss-120b-medium`.
+** The first session listed 10 of 10 and called 8 successfully. The model ended without calling `pm_skill` and `pm_skill_file`.
+** A repeat for those two called both successfully, so the gap was a model omission, not a schema refusal.
+* *Codex*: not run (operator decision).
+* No host rejected any schema.
+
+*Further findings*:
+
+* OpenCode uses `initialize` (`2025-11-25`); Claude Code and Antigravity use `server/discover` (`2026-07-28`).
+* Antigravity sends `notifications/roots/list_changed` twice per session.
+* Antigravity's tool calls carry the `_meta` keys `antigravity.google/conversation_id` and `antigravity.google/artifacts_dir`.
+
+*Status*: `[~]` (Codex open; Antigravity on Gemini open)
 
 === M10: MCP Skills Extension (`quarkus-mcp-server` 2.1)
 
@@ -253,9 +284,19 @@ Items marked _(measured during implementation)_ ran while the technique was bein
 * Ending the host session ends the relay, and the runtime survives.
 * For Codex, the MCP call idle timeout is measured to ±10 s, and whether progress resets it is recorded.
 
-*Result*:
+*Result* (2026-10-06, native layout, `Gate9RelayLifecycleIT`): pass on Claude Code, OpenCode and Antigravity. The relay is a child process of the host on all three.
 
-*Status*: `[ ]`
+[cols="2,1,3,3", options="header"]
+|===
+|Host |Relay up after |Normal end |`SIGTERM` to the host
+|Claude Code |1.1 s |relay gone ≤ 54 ms after host exit; runtime answers |host exits after 2 813 ms; relay gone ≤ 51 ms; runtime answers
+|OpenCode |1.5 s |≤ 52 ms; runtime answers |host exits after 21 ms; relay gone ≤ 56 ms; runtime answers
+|Antigravity |0.8 s |≤ 60 ms; runtime answers |host exits after 321 ms (exit 1); relay gone ≤ 54 ms; runtime answers
+|===
+
+Codex, including its idle timeout: not run (operator decision).
+
+*Status*: `[~]` (Codex open)
 
 === M14: Codex Headless Spike (gate 13)
 
@@ -288,11 +329,28 @@ Antigravity's headless capabilities are recorded as input to PM-WATCH-CLIENT-11.
 * `SIGTERM` during a held wait: exit after 2.87 s, no orphaned relay.
 * MCP methods the host used: `server/discover`, `subscriptions/listen`, `tools/list`, `tools/call`.
 * Session residue: `~/.claude/projects/<worker-dir>/<session>.jsonl`.
-* Still open: the input sizes, the native layout, and OpenCode.
+*Full run* (2026-10-06, native layout, `Gate13HeadlessIT`):
 
-*Finding*: Claude Code opens `subscriptions/listen`, a `2026-07-28` method. How the runtime answers it, and the sessionless rule of no server-initiated stream, are to be checked in M8.
+[cols="2,3,3", options="header"]
+|===
+|Capability |Claude Code (`claude-haiku-4-5`) |OpenCode
+|Task through `pm-exec`, `pm-mcp serve --job` and the socket |completed, 70.8 s, exit 0 |completed, 14.3 s, exit 0
+|Own login |yes |yes
+|Structured output |parses |parses
+|Usage of the base task |input 127, cache creation 23 652, cache read 475 100, output 5 505; USD 0.122 |input 1 985, cache read 12 961, output 172; USD 0.00
+|Exit on `SIGTERM` during a held wait |2 604 ms, no orphaned relay |19 ms, no orphaned relay
+|MCP methods used |`server/discover`, `subscriptions/listen`, `tools/list`, `tools/call` |`initialize`, `notifications/initialized`, `tools/list`, `tools/call`
+|Task input 8 000 / 32 000 / 128 000 characters |all completed (15.2 / 19.6 / 29.7 s) |8 000 and 32 000 completed; 128 000 failed
+|Session residue |`~/.claude/projects/<worker-dir>/<session>.jsonl`, `~/.claude/sessions/<pid>.json`, `~/.claude.json` and its backups |`~/.local/share/opencode/opencode.db` (with `-wal`, `-shm`), its log, `~/.cache/opencode/models.json`
+|===
 
-*Status*: `[~]`
+*Findings*:
+
+* *OpenCode tool-result limit*: OpenCode cuts every MCP tool result above its limit ("…128402 bytes truncated…") and stores the full text under `~/.local/share/opencode/tool-output/`. A worker restricted to the server's tools cannot read that file, so it acknowledged with task id `unknown`, which the server refused. The provisional worker input size limit for OpenCode must lie below this threshold, somewhere between 32 000 and 128 000 characters. Correction candidate for the size limits and for `headless.writable_paths`, which must include `tool-output/`.
+* *Writable paths*: Claude Code writes `~/.claude.json` and its backups in `~/.claude/backups/`, besides `~/.claude/`. Unconfined, the file list also contains writes by other processes, so the authoritative list comes from the Linux run (L10).
+* Resource tools were not exercised; that row of L10 stays open.
+
+*Status*: `[~]` (resource tools; the exact OpenCode limit)
 
 === M16: Native Git and Provider Path (`PM-TECH-2`)
 
