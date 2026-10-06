@@ -172,7 +172,7 @@ git ls-remote --exit-code --tags origin "refs/tags/$V"; case $? in
 - On Path B this is the only thing between a re-dispatch and a force-moved tag.
 
 **(v) Check whether the version already exists on Maven Central.**
-Run `curl -s -o /dev/null -w '%{http_code}' https://repo1.maven.org/maven2/de/cuioss/plan-marshall-mcp/$V/`.
+Run `curl -s -o /dev/null -w '%{http_code}' https://repo1.maven.org/maven2/de/cuioss/pm-mcp-server/$V/`.
 It must return `404`; `200` means the version is already published, so stop.
 
 ### Step 4 — Gate on a green `main`, bound to a SHA
