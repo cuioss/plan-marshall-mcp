@@ -21,20 +21,17 @@ import java.util.HashMap;
 import java.util.Map;
 
 
-import de.cuioss.pm.mcp.server.test.SpikeVerifyProfile;
 import de.cuioss.pm.mcp.server.test.TestRuntime;
 import de.cuioss.pm.mcp.server.test.TestSecrets;
 import de.cuioss.pm.mcp.server.test.ToolSchemaRules;
 import de.cuioss.pm.mcp.server.test.UdsHttp;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.TestProfile;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 @QuarkusTest
-@TestProfile(SpikeVerifyProfile.class)
 @DisplayName("MCP over the Unix socket, sessionless")
 class McpSocketTest {
 
@@ -161,7 +158,7 @@ class McpSocketTest {
             credentials.put("PM-MCP-Relay-Version", "0.1.1");
             credentials.put("PM-MCP-Client-Capabilities", "{\"elicitation\":{}}");
 
-            var identity = new JsonObject(text(call(credentials, "spike_identity", new JsonObject())));
+            var identity = new JsonObject(text(call(credentials, "probe_identity", new JsonObject())));
 
             assertEquals("runtime", identity.getString("principal"));
             var attributes = identity.getJsonObject("attributes");
@@ -169,7 +166,7 @@ class McpSocketTest {
             assertEquals("/work/repo", attributes.getString("pm.workspace"));
             assertEquals("sg-0001", attributes.getString("pm.generation"));
             assertEquals("{\"elicitation\":{}}", attributes.getString("pm.client_capabilities"));
-            assertEquals("spike_identity", attributes.getString("pm.mcp_name"));
+            assertEquals("probe_identity", attributes.getString("pm.mcp_name"));
             assertEquals("unix", attributes.getString("pm.listener"));
             assertEquals("runtime", attributes.getString("pm.credential"));
             assertNotNull(identity.getJsonObject("meta").getString("io.modelcontextprotocol/protocolVersion"));
@@ -179,14 +176,14 @@ class McpSocketTest {
         @DisplayName("a worker's job token, with the session headers ignored")
         void shouldBindJobToken() throws Exception {
             var credentials = new HashMap<>(Map.of("PM-MCP-Job-Token", TestSecrets.JOB_TOKEN,
-                    "PM-MCP-Generation", "j-spike0001", "PM-MCP-Client", "claude"));
+                    "PM-MCP-Generation", TestSecrets.JOB_ID, "PM-MCP-Client", "claude"));
 
-            var identity = new JsonObject(text(call(credentials, "spike_identity", new JsonObject())));
+            var identity = new JsonObject(text(call(credentials, "probe_identity", new JsonObject())));
 
-            assertEquals("j-spike0001", identity.getString("principal"));
+            assertEquals(TestSecrets.JOB_ID, identity.getString("principal"));
             var attributes = identity.getJsonObject("attributes");
             assertEquals("job", attributes.getString("pm.credential"));
-            assertEquals("j-spike0001", attributes.getString("pm.job_id"));
+            assertEquals(TestSecrets.JOB_ID, attributes.getString("pm.job_id"));
             assertFalse(attributes.containsKey("pm.client"));
         }
 
@@ -209,7 +206,7 @@ class McpSocketTest {
         @DisplayName("progress notifications precede the result on the SSE response")
         void shouldStreamProgress() throws Exception {
             var message = TestRuntime.statelessMessage(8, "tools/call", new JsonObject().put("name",
-                    "spike_progress").put("arguments", new JsonObject())
+                    "probe_progress").put("arguments", new JsonObject())
                     .put("_meta", new JsonObject().put("progressToken", "p-1")));
 
             var response = TestRuntime.mcp(TestRuntime.paths(), runtime(), message);
@@ -223,14 +220,14 @@ class McpSocketTest {
         @Test
         @DisplayName("elicitation under the stateless protocol is an input_required result answered by a retry")
         void shouldElicitByRoundTrip() throws Exception {
-            var first = call(runtime(), "spike_elicit", new JsonObject());
+            var first = call(runtime(), "probe_elicit", new JsonObject());
 
             var result = first.getJsonObject("result");
             assertEquals("input_required", result.getString("resultType"));
             assertEquals("elicitation/create", result.getJsonObject("inputRequests").getJsonObject("choice")
                     .getString("method"));
 
-            var retry = TestRuntime.statelessMessage(9, "tools/call", new JsonObject().put("name", "spike_elicit")
+            var retry = TestRuntime.statelessMessage(9, "tools/call", new JsonObject().put("name", "probe_elicit")
                     .put("arguments", new JsonObject())
                     .put("inputResponses", new JsonObject().put("choice", new JsonObject().put("action", "accept")
                             .put("content", new JsonObject().put("choice", "issue")))));
@@ -238,15 +235,5 @@ class McpSocketTest {
 
             assertEquals("answer: issue", text(answered));
         }
-    }
-
-    @Test
-    @DisplayName("the ingestion validator runs inside the daemon")
-    void shouldRunIngestionValidator() throws Exception {
-        var report = new JsonObject(text(call(runtime(), "spike_ingest",
-                new JsonObject().put("text", "<div>x</div>\n\n[a](https://example.com/b)"))));
-
-        assertTrue(report.getBoolean("refused"));
-        assertEquals("html_block", report.getJsonArray("findings").getJsonObject(0).getString("kind"));
     }
 }

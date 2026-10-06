@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.AfterEach;
@@ -47,8 +46,7 @@ import picocli.CommandLine;
 /**
  * {@code pm-operator} as a real process (the native image when built, else the packaged JAR) against
  * the fake runtime: the start-up time to the first request (PM-TECH-3), the detached on-demand start
- * of {@code runtime start} (gate 8), a status without a runtime that writes nothing, and the
- * unbuffered arrival of Server-Sent Events ({@code spike events}).
+ * of {@code runtime start} (gate 8), and a status without a runtime that writes nothing.
  */
 @DisplayName("pm-operator as a process")
 @EnabledOnOs({OS.MAC, OS.LINUX})
@@ -152,47 +150,6 @@ class PmOperatorProcessIT {
             } finally {
                 staged.kill();
             }
-        }
-    }
-
-    @Test
-    @DisplayName("spike events prints each heartbeat as it arrives (unbuffered SSE)")
-    void unbufferedEvents() throws Exception {
-        var intervalMs = 250L;
-        var sent = Collections.synchronizedList(new ArrayList<Long>());
-        fixture.start((request, response) -> {
-            try (var events = response.events(200)) {
-                for (var seq = 0; seq < 4; seq++) {
-                    sent.add(System.nanoTime());
-                    events.send("heartbeat", "{\"seq\":" + seq + "}");
-                    Thread.sleep(intervalMs);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
-        try (var process = operator(environment(), "spike", "events", "--count", "4")) {
-            var arrivals = new ArrayList<Long>();
-            for (var i = 0; i < 4; i++) {
-                var line = process.nextLine(WAIT);
-                assertNotNull(line, "event " + i + "; stderr: " + process.stderr());
-                assertTrue(line.text().startsWith("heartbeat {\"seq\":" + i + "}"), line.text());
-                arrivals.add(line.arrivalNanos());
-            }
-            assertEquals(0, process.awaitExit(WAIT));
-            var latencies = new ArrayList<Long>();
-            for (var i = 0; i < 4; i++) {
-                latencies.add((arrivals.get(i) - sent.get(i)) / 1_000_000);
-            }
-            var maxLatency = Collections.max(latencies.subList(1, 4));
-            var pass = maxLatency < intervalMs;
-            var values = new LinkedHashMap<String, Object>();
-            values.put("mode", binary.mode());
-            values.put("interval_ms", intervalMs);
-            values.put("latency_ms", List.copyOf(latencies));
-            values.put("max_latency_after_first_ms", maxLatency);
-            VerificationResults.write("sse-unbuffered-pm-operator-" + binary.mode(), values, pass);
-            assertTrue(pass, "each event arrived before the next was sent: " + latencies);
         }
     }
 }

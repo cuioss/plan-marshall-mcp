@@ -35,18 +35,15 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
 
-import de.cuioss.pm.mcp.server.test.SpikeVerifyProfile;
 import de.cuioss.pm.mcp.server.test.TestRuntime;
 import de.cuioss.pm.mcp.server.test.TestSecrets;
 import de.cuioss.pm.mcp.server.test.UdsHttp;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.TestProfile;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 @QuarkusTest
-@TestProfile(SpikeVerifyProfile.class)
 @DisplayName("Web listener beside the Unix socket (gate 15)")
 class WebListenerTest {
 

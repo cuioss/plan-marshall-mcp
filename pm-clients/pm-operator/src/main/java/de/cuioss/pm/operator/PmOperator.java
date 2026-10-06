@@ -16,7 +16,6 @@ import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 
 import de.cuioss.pm.api.PmVersion;
-import de.cuioss.pm.operator.spike.SpikeCommand;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -26,7 +25,7 @@ import picocli.CommandLine.Command;
  */
 @Command(name = "pm-operator", mixinStandardHelpOptions = true, versionProvider = PmOperator.Version.class,
         description = "Operator command line of PM-MCP.",
-        subcommands = {StatusCommand.class, WebCommand.class, RuntimeCommand.class, SpikeCommand.class})
+        subcommands = {StatusCommand.class, WebCommand.class, RuntimeCommand.class})
 public final class PmOperator {
 
     /** Exit code of a failed verb. */
@@ -82,7 +81,6 @@ public final class PmOperator {
     private record Factory(OperatorContext context) implements CommandLine.IFactory {
         @Override
         public <K> K create(Class<K> type) throws Exception {
-            SpikeCommand.ClientSource clients = () -> context.runtime(true);
             Object command;
             if (type == PmOperator.class) {
                 command = new PmOperator();
@@ -92,10 +90,6 @@ public final class PmOperator {
                 command = new WebCommand(context);
             } else if (type == RuntimeCommand.class) {
                 command = new RuntimeCommand(context);
-            } else if (type == SpikeCommand.class) {
-                command = new SpikeCommand(clients);
-            } else if (type == SpikeCommand.Keyring.class) {
-                command = new SpikeCommand.Keyring(clients);
             } else {
                 return CommandLine.defaultFactory().create(type);
             }

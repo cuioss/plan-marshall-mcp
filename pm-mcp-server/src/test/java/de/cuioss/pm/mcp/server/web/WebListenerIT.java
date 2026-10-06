@@ -49,8 +49,9 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Gate 15 and the event stream against the packaged daemon (JVM runner or native binary): the web listener
- * opened and closed at runtime beside a running SSE stream on the socket, its route restriction and token
- * kinds, and TLS in LAN mode.
+ * opened and closed at runtime beside a running SSE stream on the socket, its route restriction, the refusal of
+ * every credential but an enrolled device secret (the packaged daemon has no device yet, so the test's device
+ * secret is refused too), and TLS in LAN mode.
  */
 @DisplayName("Web listener and event stream of the packaged daemon")
 class WebListenerIT {
@@ -125,7 +126,7 @@ class WebListenerIT {
             assertEquals(200, putWeb("{\"enabled\":true,\"lan\":false,\"port\":" + port + "}").status());
             var openMillis = (System.nanoTime() - openStarted) / 1_000_000;
 
-            assertEquals(200, web(port, "GET", "/api/v1/status", device));
+            assertEquals(401, web(port, "GET", "/api/v1/status", device));
             assertEquals(401, web(port, "GET", "/api/v1/status", Map.of("Authorization",
                     "Bearer " + daemon.token())));
             assertEquals(404, web(port, "POST", "/mcp", Map.of("PM-MCP-Job-Token", TestSecrets.JOB_TOKEN)));
@@ -170,7 +171,7 @@ class WebListenerIT {
             ssl.init(null, factory.getTrustManagers(), null);
             try (var client = HttpClient.newBuilder().sslContext(ssl).build()) {
                 var response = client.send(HttpRequest.newBuilder(URI.create("https://localhost:" + port
-                                + "/api/v1/status")).header("Authorization", "Bearer " + TestSecrets.DEVICE_SECRET).build(),
+                                + "/")).build(),
                         HttpResponse.BodyHandlers.ofString());
 
                 assertEquals(200, response.statusCode(), response.body());

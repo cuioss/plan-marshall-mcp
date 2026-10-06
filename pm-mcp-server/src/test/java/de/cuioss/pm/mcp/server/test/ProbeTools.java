@@ -7,73 +7,56 @@
  * No right to use, copy, modify or distribute this file is granted; see the LICENSE.md file at
  * the root of this repository.
  */
-package de.cuioss.pm.mcp.spike.verify.daemon;
+package de.cuioss.pm.mcp.server.test;
 
 import java.util.Map;
 import java.util.TreeMap;
 
-
-import de.cuioss.pm.mcp.server.ingest.IngestionValidator;
 import de.cuioss.pm.mcp.server.security.RequestIdentity;
 import io.quarkiverse.mcp.server.ElicitationRequest;
 import io.quarkiverse.mcp.server.ToolManager;
 import io.quarkiverse.mcp.server.ToolManager.ToolArguments;
 import io.quarkiverse.mcp.server.ToolResponse;
 import io.quarkus.runtime.StartupEvent;
-import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
- * Verification tools of Milestone 0, Part B, registered only with {@code pm.spike.verify=true}:
+ * Probe tools of the {@code @QuarkusTest} application, through which the tests observe what the MCP surface
+ * hands to a tool handler:
  * <ul>
- * <li>{@code spike_identity} (gate 10): the security identity a tool handler sees, plus the request's
- * {@code _meta}, so a test can tell whether the connection metadata reaches the handler.</li>
- * <li>{@code spike_progress} (gate 10): three progress notifications on the call's own response stream.</li>
- * <li>{@code spike_elicit} (gate 10): an elicitation, as a server request where the connection supports it,
- * otherwise as an {@code input_required} result (multi round-trip request) answered by a retry.</li>
- * <li>{@code spike_ingest} (gate 1): the ingestion validator, so that {@code commonmark} and {@code cui-http}
- * run inside the native image.</li>
+ * <li>{@code probe_identity}: the security identity the handler sees, plus the request's {@code _meta}.</li>
+ * <li>{@code probe_progress}: three progress notifications on the call's own response stream.</li>
+ * <li>{@code probe_elicit}: an elicitation, as a server request where the connection supports it, otherwise as
+ * an {@code input_required} result answered by a retry.</li>
  * </ul>
  */
 @ApplicationScoped
-public class SpikeVerifyTools {
+public class ProbeTools {
 
     static final String CHOICE = "choice";
 
     private final ToolManager toolManager;
     private final RequestIdentity identity;
-    private final boolean active;
-    private final IngestionValidator validator = new IngestionValidator();
 
-    SpikeVerifyTools(ToolManager toolManager, RequestIdentity identity,
-            @ConfigProperty(name = "pm.spike.verify", defaultValue = "false") boolean active) {
+    ProbeTools(ToolManager toolManager, RequestIdentity identity) {
         this.toolManager = toolManager;
         this.identity = identity;
-        this.active = active;
     }
 
     void register(@Observes StartupEvent event) {
-        if (!active) {
-            return;
-        }
-        toolManager.newTool("spike_identity").setDescription("Spike: the caller's security identity.")
-                .setInputSchema(schema(new JsonObject())).setHandler(this::identity).register();
-        toolManager.newTool("spike_progress").setDescription("Spike: three progress notifications.")
-                .setInputSchema(schema(new JsonObject())).setHandler(SpikeVerifyTools::progress).register();
-        toolManager.newTool("spike_elicit").setDescription("Spike: asks one question by elicitation.")
-                .setInputSchema(schema(new JsonObject())).setHandler(SpikeVerifyTools::elicit).register();
-        toolManager.newTool("spike_ingest").setDescription("Spike: runs the ingestion validator.")
-                .setInputSchema(schema(new JsonObject().put("text", new JsonObject().put("type", "string")
-                        .put("description", "Markdown to validate."))).put("required", new JsonArray().add("text")))
-                .setHandler(this::ingest).register();
+        toolManager.newTool("probe_identity").setDescription("Test probe: the caller's security identity.")
+                .setInputSchema(schema()).setHandler(this::identity).register();
+        toolManager.newTool("probe_progress").setDescription("Test probe: three progress notifications.")
+                .setInputSchema(schema()).setHandler(ProbeTools::progress).register();
+        toolManager.newTool("probe_elicit").setDescription("Test probe: asks one question by elicitation.")
+                .setInputSchema(schema()).setHandler(ProbeTools::elicit).register();
     }
 
-    private static JsonObject schema(JsonObject properties) {
-        return new JsonObject().put("type", "object").put("properties", properties).put("additionalProperties",
-                false);
+    private static JsonObject schema() {
+        return new JsonObject().put("type", "object").put("properties", new JsonObject())
+                .put("additionalProperties", false);
     }
 
     private ToolResponse identity(ToolArguments arguments) {
@@ -122,14 +105,5 @@ public class SpikeVerifyTools {
         return builder.setMessage("Pick a bootstrap source")
                 .addSchemaProperty(CHOICE, ElicitationRequest.StringSchema.builder().setRequired(true).build())
                 .build();
-    }
-
-    private ToolResponse ingest(ToolArguments arguments) {
-        var report = validator.validate(String.valueOf(arguments.args().get("text")));
-        var findings = new JsonArray();
-        report.findings().forEach(finding -> findings.add(new JsonObject().put("kind", finding.kind())
-                .put("detail", finding.detail())));
-        return ToolResponse.success(new JsonObject().put("refused", report.refused()).put("findings", findings)
-                .encode());
     }
 }

@@ -19,7 +19,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -32,9 +32,10 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * The job chain as far as it exists before the job runtime: {@code pm-exec} launches the worker relay
- * {@code pm-mcp serve --job --socket <socket>} with the spike job token, the relay connects to the staged daemon
- * from inside the launcher (on Linux inside its Landlock domain, {@code --deny-read <PM_MCP_BASE>}), and initialize
- * and tools/list answer over its {@code stdio}. Writes
+ * {@code pm-mcp serve --job --socket <socket>} with a job token, and the relay connects to the staged daemon from
+ * inside the launcher (on Linux inside its Landlock domain, {@code --deny-read <PM_MCP_BASE>}). No job exists
+ * before the job runtime, so the daemon refuses the token and the relay ends with its diagnostic: the refusal is
+ * the daemon's answer and proves the connect. Writes
  * {@code target/verification-results/gate13-job-chain-socket-connect-<mode>.json}.
  */
 @DisplayName("Job chain: pm-exec, worker relay and daemon")
@@ -45,8 +46,8 @@ class JobChainIT {
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(ReleaseLayout.Mode.class)
-    @DisplayName("relays initialize and tools/list from inside pm-exec to the daemon")
-    void shouldRelayFromInsidePmExec(ReleaseLayout.Mode mode, @TempDir Path scratch) throws Exception {
+    @DisplayName("reaches the daemon from inside pm-exec, which refuses the job token of no job")
+    void shouldReachDaemonFromInsidePmExec(ReleaseLayout.Mode mode, @TempDir Path scratch) throws Exception {
         try (var layout = ReleaseLayout.stage(mode)) {
             var start = layout.operator("runtime", "start");
             assertEquals(0, start.exit(), start.stderr() + layout.daemonLog());
@@ -71,39 +72,42 @@ class JobChainIT {
                 worker.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":"
                         + "\"2025-11-25\",\"clientInfo\":{\"name\":\"e2e-worker\",\"version\":\"1\"},"
                         + "\"capabilities\":{}}}");
-                var initialize = worker.response(1, WAIT);
+                var ended = worker.process().waitFor(WAIT.toMillis(), TimeUnit.MILLISECONDS);
                 var t1 = System.nanoTime();
-                worker.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
-                worker.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
-                var list = worker.response(2, WAIT);
-                var t2 = System.nanoTime();
+                assertTrue(ended, worker.stderr().toString());
                 var exit = worker.closeAndWait(WAIT);
 
+                var refused = refusalReported(worker);
                 var report = launchReport(worker.stderr());
                 values.put("launch_report", report == null ? null : report.toString());
                 values.put("confinement", report == null ? null : report.path("confinement").asText());
                 values.put("landlock_abi", report == null ? null : report.path("landlock_abi").asText());
                 values.put("same_pid_after_execve", report != null
                         && report.path("pid").asLong() == worker.process().pid());
-                var tools = new TreeSet<String>();
-                list.path("result").path("tools").forEach(tool -> tools.add(tool.path("name").asText()));
-                var connected = initialize.has("result") && list.has("result");
-                values.put("socket_connect", connected);
-                values.put("initialize_ms", (t1 - t0) / 1_000_000);
-                values.put("tools_list_ms", (t2 - t1) / 1_000_000);
-                values.put("tools_listed", tools.size());
+                values.put("socket_connect", refused);
+                values.put("refused_ms", (t1 - t0) / 1_000_000);
                 values.put("relay_exit", exit);
-                VerificationResults.write("gate13-job-chain-socket-connect-" + mode.label(), values, connected);
+                VerificationResults.write("gate13-job-chain-socket-connect-" + mode.label(), values, refused);
 
                 assertTrue(report != null && "launched".equals(report.path("pm_exec").asText()),
                         worker.stderr().toString());
-                assertEquals("plan-marshall-mcp", initialize.path("result").path("serverInfo").path("name").asText(),
-                        initialize + " " + worker.stderr());
-                assertTrue(tools.contains("hello"), list.toString());
-                assertFalse(tools.isEmpty());
-                assertEquals(0, exit, worker.stderr().toString());
+                assertTrue(refused, worker.stderr() + layout.daemonLog());
+                assertEquals(1, exit, worker.stderr().toString());
+                assertFalse(worker.stderr().toString().contains(ReleaseLayout.JOB_TOKEN));
             }
         }
+    }
+
+    /** The relay's diagnostic arrives on a reader thread, so it may follow the exit by a moment. */
+    private static boolean refusalReported(StdioPeer worker) throws InterruptedException {
+        var deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (System.nanoTime() < deadline) {
+            if (worker.stderr().stream().anyMatch(line -> line.contains("refused the job token"))) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return false;
     }
 
     private static JsonNode launchReport(List<String> stderr) {

@@ -10,15 +10,12 @@
 package de.cuioss.pm.mcp.server.tools;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 
 
@@ -36,9 +33,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Gates 1, 10 and 11 against the packaged daemon (JVM runner or native binary): sessionless MCP in both host
- * forms, the connection metadata in the tool handler, progress and elicitation on the call's own stream, the
- * flat tool schemas, and the ingestion validator ({@code commonmark}, {@code cui-http}) inside the image.
+ * Gates 10 and 11 against the packaged daemon (JVM runner or native binary): sessionless MCP in both host forms,
+ * the flat tool schemas, a core tool call, and the refusal of a job token while no job exists.
  */
 @DisplayName("MCP surface of the packaged daemon")
 class McpSurfaceIT {
@@ -111,62 +107,12 @@ class McpSurfaceIT {
     }
 
     @Test
-    @DisplayName("hands the connection metadata to the tool handler through the security identity")
-    void shouldCarryIdentity() throws Exception {
-        var session = TestRuntime.bearer(daemon.token());
-        session.put("PM-MCP-Client", "claude");
-        session.put("PM-MCP-Workspace", "/work/repo");
-        var worker = new HashMap<>(Map.of("PM-MCP-Job-Token", TestSecrets.JOB_TOKEN, "PM-MCP-Generation",
-                "j-spike0001"));
+    @DisplayName("refuses a job token no job is bound to")
+    void shouldRefuseUnknownJobToken() throws Exception {
+        var worker = Map.of("PM-MCP-Job-Token", TestSecrets.JOB_TOKEN, "PM-MCP-Generation", TestSecrets.JOB_ID);
 
-        var sessionIdentity = new JsonObject(text(call(session, "spike_identity", new JsonObject())));
-        var workerIdentity = new JsonObject(text(call(worker, "spike_identity", new JsonObject())));
+        var response = send(worker, TestRuntime.statelessMessage(4, "tools/list", new JsonObject()));
 
-        assertEquals("claude", sessionIdentity.getJsonObject("attributes").getString("pm.client"));
-        assertEquals("/work/repo", sessionIdentity.getJsonObject("attributes").getString("pm.workspace"));
-        assertEquals("j-spike0001", workerIdentity.getString("principal"));
-        assertFalse(workerIdentity.getJsonObject("attributes").containsKey("pm.client"));
-        assertEquals(401, send(Map.of("PM-MCP-Job-Token", "unknown"),
-                TestRuntime.statelessMessage(4, "tools/list", new JsonObject())).status());
-        VerificationResults.write("gate10-identity-in-handler", Map.of("session_attributes",
-                sessionIdentity.getJsonObject("attributes").size(), "worker_principal",
-                workerIdentity.getString("principal")), true);
-    }
-
-    @Test
-    @DisplayName("streams progress on the call's response and elicits by an input_required round trip")
-    void shouldStreamProgressAndElicit() throws Exception {
-        var runtime = TestRuntime.bearer(daemon.token());
-        var progress = send(runtime, TestRuntime.statelessMessage(6, "tools/call", new JsonObject()
-                .put("name", "spike_progress").put("arguments", new JsonObject())
-                .put("_meta", new JsonObject().put("progressToken", "p-1"))));
-        var notifications = progress.body().lines().filter(line -> line.contains("notifications/progress")).count();
-
-        var first = call(runtime, "spike_elicit", new JsonObject());
-        var answered = call(runtime, "spike_elicit", new JsonObject().put("inputResponses", new JsonObject()
-                .put("choice", new JsonObject().put("action", "accept")
-                        .put("content", new JsonObject().put("choice", "issue")))));
-
-        assertEquals(3, notifications);
-        assertEquals("input_required", first.getString("resultType"));
-        assertEquals("answer: issue", text(answered));
-        var values = new LinkedHashMap<String, Object>();
-        values.put("progress_notifications", notifications);
-        values.put("elicitation", "input_required round trip (no server-initiated request under 2026-07-28)");
-        VerificationResults.write("gate10-progress-elicitation", values, true);
-    }
-
-    @Test
-    @DisplayName("runs the ingestion validator on commonmark and the cui-http URL pipelines")
-    void shouldRunIngestionValidator() throws Exception {
-        var report = new JsonObject(text(call(TestRuntime.bearer(daemon.token()), "spike_ingest",
-                new JsonObject().put("arguments", new JsonObject().put("text",
-                        "<div>x</div>\n\n[a](https://example.com/%2e%2e/%2e%2e/etc)")))));
-
-        var kinds = report.getJsonArray("findings").stream().map(JsonObject.class::cast)
-                .map(finding -> finding.getString("kind")).toList();
-        assertTrue(kinds.contains("html_block"), kinds.toString());
-        assertTrue(kinds.contains("link_rejected"), kinds.toString());
-        VerificationResults.write("gate1-ingestion-libraries", Map.of("findings", kinds.toString()), true);
+        assertEquals(401, response.status(), response.body());
     }
 }
