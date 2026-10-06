@@ -137,7 +137,7 @@ class FixtureGitHubIT {
         repoPath = "repos/" + settings.owner() + "/" + settings.repository();
         branch = "pm-fixture/m17-" + System.currentTimeMillis();
         file = "fixture-runs/" + branch.substring(branch.lastIndexOf('/') + 1) + ".txt";
-        tokens = new InstallationTokens(CiEndpoint.of(API), settings.clientId(), settings::pkcs8Pem, results::secret,
+        tokens = new InstallationTokens(CiEndpoint.of(API), settings.clientId(), settings::privateKeyPem, results::secret,
                 Clock.systemUTC());
         m19.put("key_format", settings.keyFormat());
         boolean[] pass = new boolean[4];
@@ -167,7 +167,7 @@ class FixtureGitHubIT {
     // --- App installation ---------------------------------------------------------------------------------------
 
     private void installationPermissions() {
-        String pem = settings.pkcs8Pem();
+        String pem = settings.privateKeyPem();
         try (var app = new CiHttpClient(CiEndpoint.of(API),
                      () -> Optional.of(GitHubAppJwt.sign(settings.clientId(), pem, Instant.now())), HEADERS)) {
             CiResponse response = app.get("app/installations/" + settings.installationId());
