@@ -493,17 +493,25 @@ E="$PM_MCP_HOME/bin/pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev"
 |Check |Evidence / extra write paths needed |Pass
 |Probe (ABI, confinement) |ABI 8, `confined`, `no_new_privs`; probe 5 ms |yes
 |`PmExecIT` native (incl. Landlock group) |11/11 passed: base write/read denied, other project write denied, own project write allowed, sibling readable, job-private dir read-only, missing program `127` (`gate3-pm-exec-linux-native.json`) |yes
-|Maven wrapper | |
-|mvnd (cold, warm daemon) | |
-|Gradle (cold, warm daemon) | |
-|Testcontainers (Docker socket) | |
-|Docker Compose | |
-|Adversarial writes/reads denied | |
-|Ancestor directory listing | |
-|WSL2 | |
+|Maven wrapper |`verify -pl pm-modules/pm-core -am` passed in 12.8 s with the listed write set (repository, `~/.m2`, `/tmp`, `/dev`); no extra path |yes
+|mvnd (cold, warm daemon) |mvnd 1.0.6: cold 14 s, warm 10 s (the warm run reused the daemon started by the cold run); no extra path. The daemon started under confinement keeps the ruleset (`NoNewPrivs: 1`, Landlock domain inherited); see findings F1 and F2 |yes
+|Gradle (cold, warm daemon) |Gradle 9.6.1 wrapper: cold 15.5 s (new daemon), warm 0.67 s (same daemon, `NoNewPrivs: 1`); write set fixture + `~/.gradle`, no extra path; see findings F1 and F2 |yes
+|Testcontainers (Docker socket) |1/1 test passed in 9 s; `/var/run/docker.sock` (`root:docker`, `0660`) is reachable under Landlock, which does not govern `connect` on a pathname socket; see finding F3 |yes
+|Docker Compose |`up --abort-on-container-exit` exit 0, service `hello` exited 0; no extra path |yes
+|Adversarial writes/reads denied |`touch $PM_MCP_BASE/x`: `Permission denied`, nothing created; `cat …/run/runtime.token`: `Permission denied` |yes
+|Ancestor directory listing |`ls /` and `ls $HOME` denied (`Permission denied`, exit 2); `ls $HOME/git` (a sibling subtree of the base's parent) allowed; `stat` of the base itself allowed, listing it denied. No build above needed such a listing |—
+|WSL2 |not run (no Windows machine with WSL2 available) |—
 |===
 
-*Status*: `[ ]`
+Deviations from the procedure: the Testcontainers fixture uses Testcontainers 2.0.5, in which the JUnit 5 module is `org.testcontainers:testcontainers-junit-jupiter` (`org.testcontainers:junit-jupiter` ends at 1.21.x), with JUnit Jupiter 6.1.3. The container runs `sleep 30` instead of `true`: a container that exits at once fails the default running-state wait of `GenericContainer`, a failure unrelated to confinement.
+
+Findings (the pass criterion above is met; it does not cover delegation of work to a process outside the job's Landlock domain):
+
+* *F1, unconfined build daemon escapes the write set.* A Landlock domain confines a process and its descendants, not the processes it talks to. An mvnd or Gradle daemon started outside confinement (`NoNewPrivs: 0`) serves a later confined client over its loopback TCP connection and writes wherever the client asks. Reproduced for both: with the daemon started by an unconfined build, `pm-exec --deny-read $PM_MCP_BASE --write /tmp --write /dev --write ~/.m2 -- mvnd package` in `~/pmfix/mvndprobe` (project *not* in the write set) exited 0 and created `target/classes`, and the same with `--write ~/.gradle -- gradlew build` created `app/build`; the control `pm-exec … -- touch ~/pmfix/mvndprobe/x` was denied. Candidate countermeasures for the macOS-side decision: restrict TCP connect for the job (Landlock `LANDLOCK_ACCESS_NET_CONNECT_TCP`, ABI ≥ 4, here 8), or give each job its own daemon store (`MVND_DAEMON_STORAGE`, `GRADLE_USER_HOME`) so a job only reaches daemons started inside its own domain.
+* *F2, confined build daemon carries the first job's ruleset.* The reverse direction: a daemon started under confinement inherits the starting job's domain for its lifetime. A later client with a different write set that reuses it (shown with an unconfined `mvnd package` of `~/pmfix/mvndprobe`, which had copied the repository's `.mvn/jvm.config` so that mvnd judged the daemon compatible) fails with `could not create parent directories`. A daemon shared across jobs therefore needs the same per-job daemon store as F1.
+* *F3, the Docker socket bypasses the read set.* Under `--deny-read $PM_MCP_BASE`, `cat $PM_MCP_BASE/run/runtime.token` is denied, but `docker run -v $PM_MCP_BASE/run:/b:ro alpine:3 wc -c /b/runtime.token` through the same `pm-exec` printed `43` (the token length; the token itself was not printed). The Docker daemon runs as root outside the domain, so a job that can reach `/var/run/docker.sock` holds the authority of the Docker group, which includes the runtime token, the credential store, and any host path. Testcontainers and Compose (gate 3) need that socket; whether such jobs are admitted, and under which enrolment, is a decision for the macOS side.
+
+*Status*: `[x]` (criterion met; findings F1 to F3)
 
 === L10: Claude Code and OpenCode Headless, Confined (gate 13)
 
