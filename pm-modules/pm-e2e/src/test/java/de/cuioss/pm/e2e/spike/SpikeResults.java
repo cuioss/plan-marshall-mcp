@@ -71,12 +71,16 @@ final class SpikeResults {
 
     /**
      * @param name the run name
-     * @return a fresh worker workspace outside every repository ({@code <tmp>/pm-spike-ws/<name>…})
+     * @return a fresh worker workspace outside every repository ({@code <tmp>/pm-spike-ws/<name>…}), marked with
+     *         this process as its owner; the login copies that killed drivers left in other workspaces are deleted
      * @throws IOException if it cannot be created
      */
     static Path workspace(String name) throws IOException {
         var root = Files.createDirectories(Path.of(System.getProperty("java.io.tmpdir"), "pm-spike-ws"));
-        return Files.createTempDirectory(root, name + "-").toRealPath();
+        OpencodeData.removeStaleLogins(root, pid -> ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false));
+        var workspace = Files.createTempDirectory(root, name + "-").toRealPath();
+        OpencodeData.markOwner(workspace, ProcessHandle.current().pid());
+        return workspace;
     }
 
     /**

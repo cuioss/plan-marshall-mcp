@@ -225,13 +225,9 @@ final class TrialEvaluator {
                 lost(detect, "silence", latency, failures);
                 detect.ifPresent(found -> silence(found, failures));
             }
-            case STOP_SHORT -> {
-                var stop = Optional.ofNullable(inject.number("stop_s")).orElse(0L) * 1000;
-                if (detect.isPresent() && detect.get().tMs() <= injected + stop + limits.silenceLimitMs()) {
-                    failures.put(Criterion.NO_EARLY_REPLACEMENT, "a stall of " + stop + " ms was replaced ("
-                            + detect.get().text("reason") + ")");
-                }
-            }
+            // a short stall is no loss: the worker may only be replaced once its own silence reached the limit,
+            // as when it does not continue after the stall
+            case STOP_SHORT -> detect.ifPresent(found -> silence(found, failures));
             case RELAY_KILL -> {
                 if (recovered == null && detect.isEmpty()) {
                     failures.put(Criterion.RECOVERY, "neither a new wait nor a detected exit after the relay kill");
