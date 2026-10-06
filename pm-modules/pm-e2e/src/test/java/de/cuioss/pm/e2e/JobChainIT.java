@@ -53,8 +53,8 @@ class JobChainIT {
             var command = new ArrayList<String>();
             command.add(layout.binary("pm-exec").toString());
             if (LINUX) {
-                command.addAll(List.of("--deny-read", layout.base().toString(), "--write",
-                        scratch.toString()));
+                command.addAll(List.of("--deny-read", layout.base().toString(), "--read",
+                        layout.socket().toString(), "--write", scratch.toString()));
             }
             command.add("--");
             command.addAll(layout.command("pm-mcp", "serve", "--job", "--socket", layout.socket().toString()));

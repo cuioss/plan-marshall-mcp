@@ -655,6 +655,119 @@ Finding on the procedure (corrected above after the run): `POST /api/v1/spike/gi
 
 *Status*: `[x]`
 
+=== L14: OpenCode with a Per-Worker Data Directory, Confined (gates 13, 16)
+
+*Verifies*: the re-run of the OpenCode parts of L10 and L11 with a data directory per worker. In L11, a stopped OpenCode worker blocked every other OpenCode process of the user through the shared SQLite database `~/.local/share/opencode/opencode.db`. The harness driver now gives every OpenCode worker its own `XDG_DATA_HOME`, `<worker dir>/xdg-data`. At launch the operator's login `~/.local/share/opencode/auth.json` is copied to `<worker dir>/xdg-data/opencode/auth.json` (mode `0600`, directories `0700`); the copy is deleted when the worker process ends (`de.cuioss.pm.e2e.spike.OpencodeData`, `WorkerLauncher`). The Landlock write set of an OpenCode worker becomes:
+
+* the worker directory (it holds the data directory: `opencode.db`, `log/`, `repos/`, `tool-output/`);
+* `~/.cache/opencode` (the model catalogue `models.json`, refreshed when stale);
+* `~/.local/state/opencode` (`locks/`, prompt history, model choice);
+* `/tmp` and `/dev`.
+
+`~/.local/share/opencode` and `~/.config/opencode` are no longer writable: a worker only reads its harness configuration. `-Dspike.opencode.shared-data=true` restores the shared data directory and the write set of L10.
+
+*Pass criterion*:
+
+. `Gate13HeadlessIT` for OpenCode passes natively under Landlock: the criteria `socket_connect`, `task_completed`, `structured_output`, `usage_fields` and `sigterm_exit` are all true, the launch report says `confined`, and `write_set` is exactly the worker directory, `~/.local/state/opencode`, `~/.cache/opencode`, `/tmp` and `/dev`, with no `-Dspike.write-extra`.
+. `files_written` of that run lists nothing below `~/.local/share/opencode` or `~/.config/opencode`; the worker's `opencode.db` lies in `<worker dir>/xdg-data/opencode/`.
+. After each run no `auth.json` exists below `/tmp/pm-spike-ws/`.
+. `Gate16FaultMatrixIT` for OpenCode meets every gate 16 criterion of L11 in all six faults with ten trials each, `stop-long` included.
+
+*Procedure*:
+
+. Build the native binaries (`./mvnw package -Pnative -DskipTests`) and note the state of the operator's database: `stat -c '%Y %s' ~/.local/share/opencode/opencode.db`.
+. Run gate 13 for OpenCode (the sizes stay below the truncation limit found in L10):
++
+[source,bash]
+----
+./mvnw verify -Pintegration-tests -pl pm-modules/pm-e2e -am -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Dit.test=Gate13HeadlessIT -Dspike.harness=opencode -Dspike.item=gate13 -Dspike.layout=native \
+  -Dspike.model=opencode-go/muse-spark-1.3-contributor -Dspike.sizes=8000,32000
+----
++
+. Check the result `pm-modules/pm-e2e/target/verification-results/gate13-opencode.json` (`criteria`, `write_set`, `files_written`, `launch_report` of `task`), then `find /tmp/pm-spike-ws -name auth.json` (must print nothing) and `stat -c '%Y %s' ~/.local/share/opencode/opencode.db` again (record whether it changed; another OpenCode session of the user may change it, so run none during the item).
+. If a run fails for a path outside the write set, record the path (an enrolment `headless.writable_paths` candidate), add it with `-Dspike.write-extra=<path>`, and repeat; record the run with the extra path separately.
+. Run the fault matrix for OpenCode (hours):
++
+[source,bash]
+----
+./mvnw verify -Pintegration-tests -pl pm-modules/pm-e2e -am -Dfailsafe.failIfNoSpecifiedTests=false \
+  -Dit.test=Gate16FaultMatrixIT -Dspike.harness=opencode -Dspike.item=gate16 -Dspike.layout=native \
+  -Dspike.model=opencode-go/muse-spark-1.3-contributor -Dspike.faults=all -Dspike.trials=10
+----
++
+. After the matrix, run `find /tmp/pm-spike-ws -name auth.json` again (must print nothing; workers killed by a fault end too).
+
+*Pre-check (macOS host, not the result of this item)*: `Gate13HeadlessIT` for OpenCode 1.18.34 on macOS (unconfined, JVM layout, `-Dspike.sizes=8000`, model `opencode-go/muse-spark-1.3-contributor`) passed all five criteria with the per-worker data directory: base task 12.6 s, 8 000 characters 33.2 s, exit 16 ms after `SIGTERM` during a held wait. The worker's `opencode.db` (with `-shm`, `-wal`) and `log/opencode.log` were written to `<worker dir>/xdg-data/opencode/`; nothing was written below `~/.local/share/opencode`, `~/.config/opencode`, `~/.cache/opencode` or `~/.local/state/opencode` (all four observed by the snapshot), and no `auth.json` was left in any worker directory. Confinement, the native layout and the fault matrix remain for this item.
+
+*Fallback*: gate 13: a path the worker still needs is recorded as a `headless.writable_paths` candidate. Gate 16: OpenCode is not eligible as a worker host.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Evidence |Pass
+|Gate 13 criteria, confined, native |  |
+|Write set and paths written |  |
+|`auth.json` removed (gate 13, gate 16) |  |
+|Operator's `opencode.db` untouched |  |
+|`kill-offer` |  |
+|`kill-exec` |  |
+|`stop-short` |  |
+|`stop-long` |  |
+|`turn-end` |  |
+|`relay-kill` |  |
+|===
+
+*Status*: `[ ]`
+
+=== L15: Session Bus under Confinement (gate 5, `PM-SEC-5`)
+
+*Verifies*: whether a confined job can reach the user's D-Bus session bus, and with it the Secret Service of gate 5. A job is to be cut off from the session bus: its environment carries no `DBUS_SESSION_BUS_ADDRESS`, and its read set does not cover `$XDG_RUNTIME_DIR/bus`. Dropping the variable alone is not enough, because libdbus and GDBus fall back to `$XDG_RUNTIME_DIR/bus` when it is unset. By the kernel documentation (`Documentation/userspace-api/landlock.rst`, § Pathname UNIX sockets), Landlock governs `connect(2)` to a pathname Unix socket only from ABI 9 (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`); ABI 6 scopes abstract sockets only, so up to ABI 8 a confined job reaches every pathname socket whose path it knows, `/var/run/docker.sock` included (L9, finding F3). From ABI 9 `pm-exec` handles that right: the read and write sets grant it, so a socket outside both is refused with `EACCES`. The relay's runtime socket lies below `<PM_MCP_BASE>`, outside the read set, so the launchers (`WorkerLauncher`, `JobChainIT`) grant it with `--read <PM_MCP_BASE>/run/runtime.sock`. `pm-exec` records the applied ABI in its launch report (`landlock_abi`).
+
+*Pass criterion*:
+
+. `PmExecIT` passes natively, the session-bus check of its `Landlock` group included (`gate3-pm-exec-linux-native.json`):
+** `session_bus_env_dropped` is true: the job environment built from an operator environment with `DBUS_SESSION_BUS_ADDRESS` reaches the job without it;
+** `runtime_socket_read_rule_connect` is true: a socket under a `--read` rule below the denied base, and a socket in the write set, accept the job's connect;
+** `session_bus_connect_denied` is true (refused with `Permission denied`) when `session_bus_landlock_abi` is 9 or higher, and false (the connect succeeds) below 9.
+. On the user's real session bus `/run/user/<uid>/bus`, steps b and c below are refused when `pm-exec --probe` reports ABI 9 or higher. Below ABI 9 the outcomes of a to c are recorded.
+
+*Procedure*:
+
+. Run `./mvnw verify -Pnative,integration-tests -pl pm-modules/pm-exec` (as L9) and copy the four `session_bus_*` and `runtime_socket_*` values.
+. With the staged installation, in the normal SSH session (not the gate 5 `dbus-run-session` shell):
++
+[source,bash]
+----
+R=/run/user/$(id -u)
+L="/usr/bin/dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames"
+X="$PM_MCP_HOME/bin/pm-exec --deny-read $R --write /tmp --write /dev --"
+env -u DBUS_SESSION_BUS_ADDRESS $L >/dev/null && echo "a reachable"                                    # a: unconfined, variable dropped
+$X /usr/bin/env -u DBUS_SESSION_BUS_ADDRESS $L >/dev/null && echo "b reachable"                        # b: confined, read set denies $R
+$X /usr/bin/env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR $L >/dev/null && echo "c reachable"     # c: as b, XDG_RUNTIME_DIR dropped too
+----
++
+Step a shows whether the client finds the bus through `$XDG_RUNTIME_DIR/bus` without the variable. The single `--deny-read` of `pm-exec` stands in for a read set that denies the bus; `pm-exec` takes one denied path, so denying the bus beside `<PM_MCP_BASE>` needs a second one, which is not implemented. Record each step's output and exit code.
+
+*Pre-check (macOS host, Linux container, not the result of this item)*: `PmExecIT` in JVM mode in an `eclipse-temurin:25` container on the OrbStack Linux kernel 7.0.14 (`aarch64`, Landlock ABI 8); 12/12 passed. A socket in a directory the read set denies (`--deny-read` on the fake runtime directory holding `bus`) was *not* refused: the connect succeeded (`session_bus_connect_denied` false), as ABI 8 predicts. `DBUS_SESSION_BUS_ADDRESS` did not reach the job (`session_bus_env_dropped` true), and the runtime socket under a `--read` rule and a socket in the write set stayed reachable (`runtime_socket_read_rule_connect` true). The container has no session bus, so the test binds its own sockets. The refusal from ABI 9, the native binary and the real session bus remain for this item.
+
+*Fallback*: below ABI 9 Landlock cannot cut a confined job off from the session bus; the cut-off then rests on the job environment alone (no `DBUS_SESSION_BUS_ADDRESS`, and no `XDG_RUNTIME_DIR` if step c shows that this stops the fallback to `$XDG_RUNTIME_DIR/bus`), and the remaining exposure is recorded as a residual risk under `PM-SEC-5`, as for unconfined jobs.
+
+*Result*:
+
+[cols="3,2,1", options="header"]
+|===
+|Check |Evidence |Pass
+|Landlock ABI (`pm-exec --probe`) |  |
+|`PmExecIT` native, session-bus check |  |
+|a: unconfined, variable dropped |  |
+|b: confined, read set denies the bus |  |
+|c: as b, `XDG_RUNTIME_DIR` dropped |  |
+|===
+
+*Status*: `[ ]`
+
 == Test Reference
 
 [#daemon-its]
@@ -714,7 +827,8 @@ Options for all three:
 * `-Dspike.model=<model>` (for example `claude-haiku-4-5`; for OpenCode the model of Part A's setup record or a current free model);
 * `-Dspike.layout=auto|native|jvm`;
 * `-Dspike.wait-s=20`, `-Dspike.grace-s=30`, `-Dspike.stop-short-s=16`, `-Dspike.stop-long-s=70`, `-Dspike.exit-detect-max-ms=1500`;
-* `-Dspike.write-extra=<paths>` (extra writable paths for the harness under Landlock).
+* `-Dspike.write-extra=<paths>` (extra writable paths for the harness under Landlock);
+* `-Dspike.opencode.shared-data=true` (OpenCode only: the shared `~/.local/share/opencode` and the write set of L10 instead of a data directory per worker, L14).
 
 The logs of every run (`events.jsonl`, `supervisor.jsonl`, `harness-*.jsonl`, `daemon.log`, `trials.json`, `result.json`) go to `pm-modules/pm-e2e/target/spike-runs/<name>-<stamp>/`. Keep them for the result.
 
@@ -728,7 +842,10 @@ Known points to watch on the first Linux run:
 [#open-before-run]
 == Order of the Run
 
+NOTE: L14 and L15 are re-runs after the macOS-side decisions on the Linux findings: the per-worker OpenCode data directory (L11, `stop-long`) and the cut-off of jobs from the session bus (gate 5; pathname sockets, L9 finding F3). They are the only open items; run L15 first (minutes), then L14 (gate 13 in minutes, the fault matrix in hours).
+
 . <<native-transport-linux>> (the native daemon depends on it).
 . L1 to L9 and L13 (the build and ITs).
 . L10 and L12 (one task per harness, minutes).
-. L11 last (hours: six faults × ten trials × two harnesses).
+. L11 (hours: six faults × ten trials × two harnesses).
+. L15, then L14 (re-runs; the L14 fault matrix takes hours: six faults × ten trials, OpenCode only).

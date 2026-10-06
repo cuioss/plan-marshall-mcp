@@ -16,6 +16,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.net.StandardProtocolFamily;
+import java.net.UnixDomainSocketAddress;
+import java.nio.channels.ServerSocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,6 +47,9 @@ import org.junit.jupiter.api.io.TempDir;
 class PmExecIT {
 
     private static final Pattern REPORT_PID = Pattern.compile("\"pid\":(\\d+)");
+    private static final Pattern PROBE_ABI = Pattern.compile("\"landlock_abi\":(\\d+)");
+    /** The first Landlock ABI that governs {@code connect(2)} to pathname Unix sockets. */
+    private static final int RESOLVE_UNIX_ABI = 9;
     private static final Map<String, Object> RESULTS = new LinkedHashMap<>();
     private static boolean pass = true;
 
@@ -90,6 +96,11 @@ class PmExecIT {
     }
 
     private Result run(List<String> options, String... program) throws IOException, InterruptedException {
+        return run(options, null, program);
+    }
+
+    private Result run(List<String> options, Map<String, String> environment, String... program)
+            throws IOException, InterruptedException {
         var command = new ArrayList<>(launcher());
         command.addAll(options);
         if (program.length > 0) {
@@ -97,7 +108,12 @@ class PmExecIT {
             command.addAll(List.of(program));
         }
         long start = System.nanoTime();
-        var process = new ProcessBuilder(command).start();
+        var builder = new ProcessBuilder(command);
+        if (environment != null) {
+            builder.environment().clear();
+            builder.environment().putAll(environment);
+        }
+        var process = builder.start();
         process.getOutputStream().close();
         var out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         var err = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -186,6 +202,31 @@ class PmExecIT {
         assertEquals(64, result.exit());
     }
 
+    /**
+     * The job environment as the runtime builds it from the operator's: without the session bus address.
+     */
+    private static Map<String, String> jobEnvironment(Map<String, String> operator) {
+        var environment = new LinkedHashMap<>(operator);
+        environment.remove("DBUS_SESSION_BUS_ADDRESS");
+        return environment;
+    }
+
+    private static ServerSocketChannel listen(Path socket) throws IOException {
+        var server = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+        server.bind(UnixDomainSocketAddress.of(socket));
+        return server;
+    }
+
+    private static String[] probeCommand(Path... sockets) {
+        var command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-XX:-UsePerfData", "-cp", Path.of("target", "test-classes").toAbsolutePath().toString(),
+                UnixConnectProbe.class.getName()));
+        for (var socket : sockets) {
+            command.add(socket.toString());
+        }
+        return command.toArray(String[]::new);
+    }
+
     @Nested
     @EnabledOnOs(OS.LINUX)
     @DisplayName("Linux Landlock confinement (gate 3, PM-SEC-5)")
@@ -271,6 +312,47 @@ class PmExecIT {
             measured("job_private_read_only", ok, ok);
             assertTrue(ok, read.err() + write.err());
             assertFalse(Files.readString(jobDir.resolve("prompt.md")).contains("x"));
+        }
+
+        @Test
+        @DisplayName("the session bus in a denied runtime directory (L15): denied from ABI 9, reachable below")
+        void sessionBus() throws Exception {
+            var probe = run(List.of("--probe"));
+            var abiMatcher = PROBE_ABI.matcher(probe.out());
+            assertTrue(abiMatcher.find(), probe.out());
+            int abi = Integer.parseInt(abiMatcher.group(1));
+            var runtimeDir = Files.createDirectories(temp.toRealPath().resolve("xdg-run"));
+            var bus = runtimeDir.resolve("bus");
+            var relaySocket = base.resolve("run/runtime.sock");
+            var projectSocket = project.resolve("tool.sock");
+            var session = new LinkedHashMap<>(System.getenv());
+            session.put("XDG_RUNTIME_DIR", runtimeDir.toString());
+            session.put("DBUS_SESSION_BUS_ADDRESS", "unix:path=" + bus);
+            var job = jobEnvironment(session);
+
+            try (var _ = listen(bus); var _ = listen(relaySocket);
+                 var _ = listen(projectSocket)) {
+                var busRun = run(List.of("--deny-read", runtimeDir.toString(), "--write", project.toString(),
+                        "--write", "/dev"), job, probeCommand(bus));
+                var relayRun = run(confinedOptions("--read", relaySocket.toString()), job,
+                        probeCommand(relaySocket, projectSocket));
+
+                boolean busDenied = busRun.out().contains(bus + " refused");
+                boolean expected = abi >= RESOLVE_UNIX_ABI
+                        ? busDenied && busRun.out().contains("Permission denied")
+                        : busRun.out().contains(bus + " connected");
+                boolean dropped = busRun.out().contains("dbus_env absent");
+                boolean relayReachable = relayRun.out().contains(relaySocket + " connected")
+                        && relayRun.out().contains(projectSocket + " connected");
+                measured("session_bus_landlock_abi", abi, true);
+                measured("session_bus_connect_denied", busDenied, expected);
+                measured("session_bus_env_dropped", dropped, dropped);
+                measured("runtime_socket_read_rule_connect", relayReachable, relayReachable);
+                assertEquals(0, busRun.exit(), busRun.err());
+                assertTrue(expected, "ABI " + abi + ": " + busRun.out() + busRun.err());
+                assertTrue(dropped, busRun.out());
+                assertTrue(relayReachable, relayRun.out() + relayRun.err());
+            }
         }
     }
 }
