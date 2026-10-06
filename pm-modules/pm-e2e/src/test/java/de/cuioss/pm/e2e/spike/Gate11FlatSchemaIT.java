@@ -90,8 +90,7 @@ class Gate11FlatSchemaIT {
     @DisplayName("lists and calls each of the ten core tools once through pm-mcp serve --client")
     void shouldListAndCallCoreTools() throws Exception {
         var host = HostSession.fromSystemProperties();
-        var listen = System.getProperty(SpikeDaemon.LISTEN_PROPERTY, "");
-        var name = "gate11-" + host.clientId() + (listen.isBlank() ? "" : "-listen-" + listen.strip())
+        var name = "gate11-" + host.clientId()
                 + (System.getProperty("spike.tools", "").isBlank() ? "" : "-subset");
         var runDir = SpikeResults.runDirectory(name);
         var stage = SpikeStage.stage(runDir.resolve("stage"), System.getProperty("spike.layout", "auto"));
@@ -100,7 +99,7 @@ class Gate11FlatSchemaIT {
         values.put("host_version", host.version());
         values.put("model", host.model());
         values.put("layout", stage.mode());
-        values.put("listen_answer", listen.isBlank() ? "quarkus-mcp-server" : listen.strip());
+        values.put("listen_answer", "refused");
         values.put("run_dir", runDir.toString());
         var pass = false;
         try (var daemon = SpikeDaemon.start(stage, SpikeResults.base(), null, runDir)) {

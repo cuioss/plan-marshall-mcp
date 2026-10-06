@@ -184,27 +184,62 @@ class ToonEncoderTest {
 
             assertEquals(Reason.DUPLICATE_KEY, refusal.getReason());
         }
+    }
+
+    @Nested
+    @DisplayName("Forms")
+    class Forms {
 
         @Test
-        @DisplayName("refuses a nested object of uniform objects (keyed tabular form)")
+        @DisplayName("renders a nested object of uniform objects in keyed tabular form")
         void keyedNested() {
             var value = ToonObject.builder().add("m", ToonObject.builder()
-                    .add("a", ToonObject.builder().add("x", 1).build())
-                    .add("b", ToonObject.builder().add("x", 2).build()).build()).build();
+                    .add("a", ToonObject.builder().add("x", 1).add("y", "p,q").build())
+                    .add("my key", ToonObject.builder().add("y", "r").add("x", 2).build()).build()).build();
 
-            var refusal = assertThrows(ToonEncodingException.class, () -> ToonEncoder.encode(value));
-
-            assertEquals(Reason.KEYED_TABULAR_FORM, refusal.getReason());
+            assertEquals("""
+                    m[2:]{x,y}:
+                      a: 1,"p,q"
+                      "my key": 2,r""", ToonEncoder.encode(value));
         }
 
         @Test
-        @DisplayName("refuses an empty object as tabular element")
-        void emptyObjectElement() {
-            var value = new ToonArray(List.of(ToonObject.builder().build()));
+        @DisplayName("renders a root object of uniform objects with nested field groups as keyless keyed header")
+        void keyedRootWithFieldGroup() {
+            var value = ToonObject.builder()
+                    .add("eu", ToonObject.builder().add("name", "Europe")
+                            .add("geo", ToonObject.builder().add("lat", 50).add("lon", 10).build()).build())
+                    .add("us", ToonObject.builder().add("name", "America")
+                            .add("geo", ToonObject.builder().add("lon", -100).add("lat", 40).build()).build())
+                    .build();
 
-            var refusal = assertThrows(ToonEncodingException.class, () -> ToonEncoder.encode(value));
+            assertEquals("""
+                    [2:]{name,geo{lat,lon}}:
+                      eu: Europe,50,10
+                      us: America,40,-100""", ToonEncoder.encode(value));
+        }
 
-            assertEquals(Reason.LIST_FORM, refusal.getReason());
+        @Test
+        @DisplayName("renders an empty object element and mixed elements in list form")
+        void listForm() {
+            var value = new ToonArray(List.of(ToonObject.builder().build(), ToonValue.of("x"),
+                    new ToonArray(List.of()), ToonValue.ofStrings(List.of("a", "b")),
+                    new ToonArray(List.of(link("self", "s"))),
+                    ToonObject.builder().add("links", new ToonArray(List.of(link("next", "n"))))
+                            .add("done", true).build()));
+
+            assertEquals("""
+                    [6]:
+                      -
+                      - x
+                      - [0]:
+                      - [2]: a,b
+                      - [1]:
+                        - rel: self
+                          href: s
+                      - links[1]{rel,href}:
+                          next,n
+                        done: true""", ToonEncoder.encode(value));
         }
     }
 

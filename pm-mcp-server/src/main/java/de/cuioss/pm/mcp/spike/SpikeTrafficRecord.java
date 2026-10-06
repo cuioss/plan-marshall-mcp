@@ -73,7 +73,7 @@ public class SpikeTrafficRecord implements McpTrafficListener {
     }
 
     /**
-     * Records a message that bypassed the MCP server (an answer of {@link SpikeListenFilter}).
+     * Records one message.
      *
      * @param direction  {@code rx} or {@code tx}
      * @param body       the message

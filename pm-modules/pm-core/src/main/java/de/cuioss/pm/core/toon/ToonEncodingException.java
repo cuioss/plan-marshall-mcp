@@ -13,7 +13,7 @@ import java.io.Serial;
 import lombok.Getter;
 
 /**
- * Thrown when a value cannot be encoded conformantly by the PM-MCP subset encoder.
+ * Thrown when a value cannot be represented in TOON.
  *
  * @since 0.1
  */
@@ -24,12 +24,6 @@ public final class ToonEncodingException extends IllegalArgumentException {
 
     /** Why a value was refused. */
     public enum Reason {
-        /** The official specification requires the list form (§ 9.2, § 9.4, § 10), outside the subset. */
-        LIST_FORM,
-        /** The official specification requires the keyed tabular form (§ 9.5), outside the subset. */
-        KEYED_TABULAR_FORM,
-        /** The official specification requires a nested field group (§ 9.3), outside the subset. */
-        NESTED_FIELD_GROUP,
         /** A string holds an unpaired surrogate, which TOON cannot represent (§ 3). */
         UNPAIRED_SURROGATE,
         /** An object holds two fields with the same key. */

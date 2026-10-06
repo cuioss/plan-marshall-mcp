@@ -169,7 +169,9 @@ public final class GitHubClient {
     }
 
     /**
-     * Posts a comment on a pull request or issue.
+     * Posts a comment on a pull request or issue. The token needs the permission set of
+     * {@link GitHubOperation#PULL_REQUEST_COMMENT} for a pull request ({@code pull_requests: write}) and of
+     * {@link GitHubOperation#ISSUE_COMMENT} for an issue.
      *
      * @param owner  the repository owner
      * @param name   the repository name

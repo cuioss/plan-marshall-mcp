@@ -155,7 +155,7 @@ class FixtureGitHubUserTokenIT {
         refreshToken = Json.string(stored, REFRESH_TOKEN).orElseThrow();
         results.secret(userToken);
         results.secret(refreshToken);
-        tokens = new InstallationTokens(CiEndpoint.of(API), settings.clientId(), settings::pkcs8Pem, results::secret,
+        tokens = new InstallationTokens(CiEndpoint.of(API), settings.clientId(), settings::privateKeyPem, results::secret,
                 Clock.systemUTC());
         String token = userToken;
         user = track(new CiHttpClient(CiEndpoint.of(API), () -> Optional.of(token), HEADERS));

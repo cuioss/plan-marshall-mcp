@@ -75,7 +75,7 @@ public final class InstallationTokens implements AutoCloseable {
     /**
      * @param apiEndpoint   the API endpoint ({@code https://api.github.com} or the Enterprise API)
      * @param clientId      the App's client id
-     * @param privateKeyPem reads the PKCS#8 private key per mint
+     * @param privateKeyPem reads the PEM private key (PKCS#8 or PKCS#1) per mint
      * @param redaction     the redaction registry receiving every minted token
      * @param clock         the clock
      */
@@ -104,6 +104,18 @@ public final class InstallationTokens implements AutoCloseable {
         CiResult<InstallationToken> minted = mint(key);
         minted.value().ifPresent(t -> cache.put(key, t));
         return minted;
+    }
+
+    /**
+     * Returns a reusable token or mints a new one, narrowed to the permission set of the operation class.
+     *
+     * @param installationId the installation
+     * @param repository     the repository name the token is narrowed to
+     * @param operation      the operation class
+     * @return the token, or the outcome of the failed mint
+     */
+    public CiResult<InstallationToken> token(long installationId, String repository, GitHubOperation operation) {
+        return token(installationId, repository, operation.permissions());
     }
 
     /**
