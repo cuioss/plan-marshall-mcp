@@ -30,7 +30,8 @@ class LandlockTest {
     class Masks {
 
         @ParameterizedTest(name = "ABI {0} handles 0x{1}")
-        @CsvSource({"1, 1fff", "2, 3fff", "3, 7fff", "4, 7fff", "5, ffff", "6, ffff", "7, ffff"})
+        @CsvSource({"1, 1fff", "2, 3fff", "3, 7fff", "4, 7fff", "5, ffff", "6, ffff", "7, ffff", "8, ffff",
+                "9, 1ffff"})
         @DisplayName("handled rights per ABI")
         void handled(int abi, String hex) {
             assertEquals(Long.parseLong(hex, 16), Landlock.handledAccess(abi));
@@ -43,7 +44,10 @@ class LandlockTest {
                 "3, true, d, 7fff",
                 "3, false, 5, 4007",
                 "5, true, d, ffff",
-                "5, false, 5, c007"})
+                "5, false, 5, c007",
+                "8, true, d, ffff",
+                "9, true, 1000d, 1ffff",
+                "9, false, 10005, 1c007"})
         @DisplayName("rule rights for directories and files")
         void ruleRights(int abi, boolean directory, String read, String write) {
             assertEquals(Long.parseLong(read, 16), Landlock.readAccess(abi, directory));
@@ -60,6 +64,7 @@ class LandlockTest {
             assertEquals(0x2000L, Landlock.REFER);
             assertEquals(0x4000L, Landlock.TRUNCATE);
             assertEquals(0x8000L, Landlock.IOCTL_DEV);
+            assertEquals(0x10000L, Landlock.RESOLVE_UNIX);
         }
 
         @Test

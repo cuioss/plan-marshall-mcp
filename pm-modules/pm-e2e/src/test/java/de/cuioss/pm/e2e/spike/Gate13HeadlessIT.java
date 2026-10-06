@@ -71,7 +71,9 @@ class Gate13HeadlessIT {
             values.put("own_login", credentials.isEmpty());
             var writeSet = launcher.writeSet(workspace.resolve("h1-g1"));
             values.put("write_set", writeSet.stream().map(Path::toString).toList());
-            var roots = snapshotRoots(writeSet, workspace);
+            var observed = new ArrayList<>(writeSet);
+            observed.addAll(harness.stateDirs(WorkerLauncher.home()));
+            var roots = snapshotRoots(observed, workspace);
             var before = FileSnapshot.of(roots);
 
             var base = runOne(launcher, tail, "h1", BASE_TASK, 0);

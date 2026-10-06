@@ -24,7 +24,9 @@ import java.util.Locale;
  * {@code <PM_MCP_HOME>/bin/pm-mcp serve --job --socket <socket>}, and starts the harness through {@code pm-exec}. On
  * Linux {@code pm-exec} confines it with Landlock: no read of {@code <PM_MCP_BASE>}, writes only to the worker
  * directory, the harness's own state paths, {@code /tmp}, {@code /dev} and {@code -Dspike.write-extra}. macOS jobs
- * run unconfined.
+ * run unconfined. An OpenCode worker gets its own data directory in its worker directory ({@link OpencodeData}), so
+ * the shared {@code ~/.local/share/opencode} and {@code ~/.config/opencode} leave its write set;
+ * {@code -Dspike.opencode.shared-data=true} keeps both.
  */
 final class WorkerLauncher {
 
@@ -74,11 +76,17 @@ final class WorkerLauncher {
     List<Path> writeSet(Path workerDir) {
         var paths = new LinkedHashSet<Path>();
         paths.add(workerDir);
-        paths.addAll(settings.harness().stateDirs(home()));
+        var stateDirs = settings.harness().stateDirs(home());
+        paths.addAll(perWorkerData() ? OpencodeData.perWorkerWriteSet(stateDirs, home()) : stateDirs);
         paths.add(Path.of("/tmp"));
         paths.add(Path.of("/dev"));
         paths.addAll(settings.extraWrites());
         return List.copyOf(paths);
+    }
+
+    /** @return whether the worker gets its own OpenCode data directory */
+    boolean perWorkerData() {
+        return OpencodeData.applies(settings.harness(), settings.opencodeSharedData());
     }
 
     /**
@@ -106,6 +114,8 @@ final class WorkerLauncher {
         if (confined()) {
             command.add("--deny-read");
             command.add(daemon.base().toString());
+            command.add("--read");
+            command.add(daemon.socket().toString());
             for (var path : writeSet(workerDir)) {
                 if (Files.exists(path)) {
                     command.add("--write");
@@ -124,7 +134,24 @@ final class WorkerLauncher {
         environment.put("PM_MCP_HOME", stage.home().toString());
         environment.put("PM_MCP_JOB_TOKEN", job.token());
         environment.put("PM_MCP_JOB_ID", job.jobId());
-        var process = builder.start();
+        Path dataHome = null;
+        if (perWorkerData()) {
+            dataHome = OpencodeData.prepare(workerDir, OpencodeData.operatorLogin(base, home()));
+            environment.put("XDG_DATA_HOME", dataHome.toString());
+        }
+        Process process;
+        try {
+            process = builder.start();
+        } catch (IOException e) {
+            if (dataHome != null) {
+                OpencodeData.removeLogin(dataHome);
+            }
+            throw e;
+        }
+        if (dataHome != null) {
+            var login = dataHome;
+            process.onExit().thenRun(() -> OpencodeData.removeLogin(login));
+        }
         var logFile = runDir.resolve("harness-" + worker + "g" + generation + ".jsonl");
         return new Worker(worker, generation, "worker", promptKind, job, process, workerDir, logFile);
     }
