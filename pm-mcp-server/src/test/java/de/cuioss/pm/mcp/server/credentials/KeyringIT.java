@@ -10,15 +10,20 @@
 package de.cuioss.pm.mcp.server.credentials;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import de.cuioss.pm.mcp.server.test.DaemonProcess;
 import de.cuioss.pm.mcp.server.test.TestBases;
@@ -31,9 +36,10 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Gates 4 and 5 from the packaged daemon (runner JAR or native {@code pm-mcpd}, started as a process with its own
- * short {@code PM_MCP_BASE}, so the entries live under an instance-qualified service name): a put, get, replace
- * and delete of one credential through the credential resource of the local API, served by the backend the
- * daemon selected at start. Records {@code target/verification-results/gate4-keychain-<mode>.json} (macOS) or
+ * short {@code PM_MCP_BASE}, so the entries live under an instance-qualified service name): a put, status,
+ * replace and delete of one credential through the credential resource of the local API, served by the backend
+ * the daemon selected at start. The status read runs the backend's read of the secret and answers
+ * {@code present} or {@code not_found} with the backend; no answer contains the secret. Records {@code target/verification-results/gate4-keychain-<mode>.json} (macOS) or
  * {@code gate5-secret-service-<mode>.json} (Linux); the times include the request over the socket.
  */
 @DisplayName("OS keyring from the packaged daemon")
@@ -54,15 +60,29 @@ class KeyringIT {
         TestBases.delete(base);
     }
 
-    private static UdsHttp.Response credential(DaemonProcess daemon, String method, String value) throws IOException {
+    private static UdsHttp.Response send(DaemonProcess daemon, String method, String body) throws IOException {
         var headers = TestRuntime.bearer(daemon.token());
         headers.put("Content-Type", "application/json");
-        return UdsHttp.request(daemon.paths().socket(), method, "/api/v1/credentials/" + KEY, headers,
+        return UdsHttp.request(daemon.paths().socket(), method, "/api/v1/credentials/" + KEY, headers, body);
+    }
+
+    private static UdsHttp.Response credential(DaemonProcess daemon, String method, String value) throws IOException {
+        return send(daemon, method,
                 value == null ? null : JSON.writeValueAsString(JSON.createObjectNode().put("value", value)));
     }
 
+    private static Set<String> fieldNames(JsonNode node) {
+        var names = new HashSet<String>();
+        node.fieldNames().forEachRemaining(names::add);
+        return names;
+    }
+
+    private static String status(UdsHttp.Response response) throws IOException {
+        return JSON.readTree(response.body()).path("status").asText();
+    }
+
     @Test
-    @DisplayName("put, get, replace and delete through the selected backend")
+    @DisplayName("put, status, replace and delete through the selected backend, no answer with the secret")
     void roundTrip() throws Exception {
         var macos = System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac");
         var secret = UUID.randomUUID().toString();
@@ -82,21 +102,38 @@ class KeyringIT {
                 var delete = credential(daemon, "DELETE", null);
                 values.put("delete_us", (System.nanoTime() - start) / 1000);
                 var gone = credential(daemon, "GET", null);
+                // A body the resource cannot read: the refusal must not repeat it
+                var malformed = send(daemon, "PUT", "{\"value\":\"" + secret + "-3\"");
+                var mistyped = send(daemon, "PUT", "{\"value\":{\"nested\":\"" + secret + "-4\"}}");
+                var untouched = credential(daemon, "GET", null);
 
                 assertEquals(204, put.status(), put.body() + daemon.output());
                 assertEquals(200, read.status(), read.body() + daemon.output());
                 var entry = JSON.readTree(read.body());
                 var store = entry.path("store").asText();
                 values.put("store", store);
-                boolean roundTrip = secret.equals(entry.path("value").asText()) && replace.status() == 204
-                        && (secret + "-2").equals(JSON.readTree(replaced.body()).path("value").asText())
-                        && delete.status() == 204 && gone.status() == 404;
+                assertEquals(Set.of("status", "store"), fieldNames(entry), read.body());
+                boolean roundTrip = "present".equals(status(read)) && replace.status() == 204
+                        && replaced.status() == 200 && "present".equals(status(replaced))
+                        && delete.status() == 204 && gone.status() == 200 && "not_found".equals(status(gone))
+                        && store.equals(JSON.readTree(gone.body()).path("store").asText());
                 values.put("round_trip", roundTrip);
+                boolean secretFree = true;
+                for (var response : List.of(put, read, replace, replaced, delete, gone, malformed, mistyped,
+                        untouched)) {
+                    secretFree &= !response.body().contains(secret);
+                }
+                values.put("secret_free", secretFree);
                 var expectedStore = macos ? SecretStore.KEYCHAIN : SecretStore.SECRET_SERVICE;
                 VerificationResults.write((macos ? "gate4-keychain-" : "gate5-secret-service-") + values.get("mode"),
-                        values, roundTrip && expectedStore.equals(store));
+                        values, roundTrip && secretFree && expectedStore.equals(store));
 
-                assertTrue(roundTrip, values + " " + replaced.body() + " " + gone.status());
+                assertTrue(roundTrip, values + " " + replaced.body() + " " + gone.status() + " " + gone.body());
+                assertTrue(secretFree, "an answer contains the secret");
+                assertEquals(400, malformed.status());
+                assertEquals(400, mistyped.status());
+                assertEquals("not_found", status(untouched), untouched.body());
+                assertFalse(daemon.output().contains(secret), "the daemon output contains the secret");
                 assertTrue(daemon.output().contains("service name '" + ServiceName.DEFAULT + "/"), daemon.output());
                 if (macos) {
                     assertEquals(SecretStore.KEYCHAIN, store, daemon.output());

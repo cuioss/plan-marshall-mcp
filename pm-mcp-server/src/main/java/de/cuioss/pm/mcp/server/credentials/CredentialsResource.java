@@ -28,10 +28,15 @@ import org.jboss.resteasy.reactive.server.ServerExceptionMapper;
 
 /**
  * The credential resource of the local API: {@code PUT} stores the secret of a global entry
- * ({@code 204}), {@code GET} returns it with the serving backend ({@code 200}, or {@code 404}),
+ * ({@code 204}), {@code GET} answers the entry's status ({@code present} or {@code not_found}) with
+ * the serving backend ({@code 200} in both cases: an absent entry is a status, not a refusal),
  * {@code DELETE} removes it ({@code 204}). A key outside {@code [a-zA-Z0-9._-]} is refused with
  * {@code 400}; a backend failure answers {@code 500} (or {@code 423} for a locked keyring) with the
- * error code, never the secret.
+ * error code.
+ * <p>
+ * No answer of this resource contains a secret: a secret enters the runtime through {@code PUT}
+ * and never leaves it through the API, because the runtime token that authenticates a request is
+ * held by every process of the user.
  */
 @Path("/api/v1/credentials/{key}")
 @Authenticated
@@ -51,12 +56,17 @@ public class CredentialsResource {
     }
 
     /**
-     * The response body of {@code GET}.
+     * The response body of {@code GET}: the status of an entry, never its secret.
      *
-     * @param value the secret
-     * @param store the serving backend: {@code keychain}, {@code secret-service} or {@code file}
+     * @param status {@link #PRESENT} or {@link #NOT_FOUND}
+     * @param store  the serving backend: {@code keychain}, {@code secret-service} or {@code file}
      */
-    public record CredentialEntry(String value, String store) {
+    public record CredentialStatus(String status, String store) {
+
+        /** The entry is stored. */
+        public static final String PRESENT = "present";
+        /** No entry is stored under the key. */
+        public static final String NOT_FOUND = "not_found";
     }
 
     private final SecretStore store;
@@ -85,13 +95,14 @@ public class CredentialsResource {
 
     /**
      * @param key the credential key
-     * @return {@code 200} with the secret and the backend, or {@code 404}
+     * @return {@code 200} with the status of the entry and the backend
      */
     @GET
-    public RestResponse<CredentialEntry> get(@PathParam("key") String key) {
-        return store.get(CredentialAccount.global(key))
-                .map(value -> RestResponse.ok(new CredentialEntry(value, store.name())))
-                .orElseGet(RestResponse::notFound);
+    public RestResponse<CredentialStatus> status(@PathParam("key") String key) {
+        // The backend's real read decides the presence; the secret it returns is dropped here
+        boolean present = store.get(CredentialAccount.global(key)).isPresent();
+        return RestResponse.ok(new CredentialStatus(
+                present ? CredentialStatus.PRESENT : CredentialStatus.NOT_FOUND, store.name()));
     }
 
     /**
