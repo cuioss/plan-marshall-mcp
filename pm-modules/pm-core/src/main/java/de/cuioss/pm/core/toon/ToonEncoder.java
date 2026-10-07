@@ -63,6 +63,13 @@ public final class ToonEncoder {
     private static final String LIST_MARKER = "- ";
     private static final char DELIMITER = ',';
     private static final String JOIN = String.valueOf(DELIMITER);
+    /**
+     * U+FEFF. A root string that starts with it is quoted, so that a reader cannot take it for a
+     * byte-order mark and drop it. Written as an escape: the character itself is invisible in the
+     * source.
+     */
+    private static final char BYTE_ORDER_MARK = '\uFEFF';
+
     private static final Pattern NUMERIC_LIKE = Pattern.compile("^[+-]?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$");
     private static final Pattern UNQUOTED_KEY = Pattern.compile("^[A-Za-z_][A-Za-z0-9_.]*$");
     private static final BigDecimal PLAIN_MIN = new BigDecimal("1e-6");
@@ -343,7 +350,7 @@ public final class ToonEncoder {
         }
         char first = value.charAt(0);
         char last = value.charAt(value.length() - 1);
-        if (isPadding(first) || isPadding(last) || first == '-' || first == '#' || root && first == '﻿') {
+        if (isPadding(first) || isPadding(last) || first == '-' || first == '#' || root && first == BYTE_ORDER_MARK) {
             return true;
         }
         if (NUMERIC_LIKE.matcher(value).matches()) {
