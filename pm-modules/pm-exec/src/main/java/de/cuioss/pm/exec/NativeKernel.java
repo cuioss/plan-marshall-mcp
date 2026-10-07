@@ -29,21 +29,18 @@ import java.util.OptionalInt;
 
 /**
  * The launcher's native calls through the Foreign Function &amp; Memory API against the C library
- * of the default lookup. The Landlock calls go through the libc symbol {@code syscall}, since glibc
- * has no wrappers for them. Every downcall descriptor is registered for native image in
- * {@code META-INF/native-image/de.cuioss/pm-exec/reachability-metadata.json}.
+ * of the default lookup. This class holds the downcall plumbing (linking, {@code errno} capture)
+ * and the calls every platform has: {@code close}, {@code setpgid}, {@code execve} and the process
+ * environment. The calls only the Linux kernel has are made by {@link LinuxCalls}, to which the
+ * Linux methods of {@link Kernel} delegate. Every downcall descriptor is registered for native
+ * image in {@code META-INF/native-image/de.cuioss/pm-exec/reachability-metadata.json}.
  */
 final class NativeKernel implements Kernel {
 
-    /** {@code PR_SET_NO_NEW_PRIVS} (linux/prctl.h). */
-    static final int PR_SET_NO_NEW_PRIVS = 38;
-    /** {@code O_PATH} on x86_64 and aarch64. */
-    static final int O_PATH = 0x200000;
-    /** {@code O_CLOEXEC} on x86_64 and aarch64. */
-    static final int O_CLOEXEC = 0x80000;
+    /** The layout of the captured call state; a call linked with {@code errno} capture takes a segment of it. */
+    static final StructLayout CALL_STATE = Linker.Option.captureStateLayout();
 
     private static final Linker LINKER = Linker.nativeLinker();
-    private static final StructLayout CALL_STATE = Linker.Option.captureStateLayout();
     private static final long ERRNO_OFFSET = CALL_STATE.byteOffset(MemoryLayout.PathElement.groupElement("errno"));
     private static final Linker.Option ERRNO = Linker.Option.captureCallState("errno");
 
@@ -70,7 +67,8 @@ final class NativeKernel implements Kernel {
         /** {@code char ***_NSGetEnviron(void)} (macOS). */
         NS_GET_ENVIRON("_NSGetEnviron", FunctionDescriptor.of(ADDRESS));
 
-        private final String symbol;
+        /** The name of the function in the C library. */
+        final String symbol;
         private final FunctionDescriptor descriptor;
         private final Linker.Option[] options;
 
@@ -83,6 +81,7 @@ final class NativeKernel implements Kernel {
 
     private final Os os;
     private final Map<Fn, MethodHandle> handles = new EnumMap<>(Fn.class);
+    private final LinuxCalls linux = new LinuxCalls(this);
 
     /**
      * @param os the operating system
@@ -93,60 +92,32 @@ final class NativeKernel implements Kernel {
 
     @Override
     public void setNoNewPrivs() throws NativeCallException {
-        var handle = handle(Fn.PRCTL);
-        try (var arena = Arena.ofConfined()) {
-            var state = arena.allocate(CALL_STATE);
-            int result = invoke(Fn.PRCTL.symbol,
-                    () -> (int) handle.invokeExact(state, PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L));
-            check(Fn.PRCTL.symbol, result, state, "PR_SET_NO_NEW_PRIVS");
-        }
+        linux.setNoNewPrivs();
     }
 
     @Override
     public int landlockAbi() {
-        try {
-            long abi = syscall(Landlock.SYS_CREATE_RULESET, 0L, 0L, Landlock.CREATE_RULESET_VERSION,
-                    "landlock_create_ruleset");
-            return (int) abi;
-        } catch (NativeCallException _) {
-            // ENOSYS (no Landlock in the kernel) or EOPNOTSUPP (disabled at boot)
-            return 0;
-        }
+        return linux.landlockAbi();
     }
 
     @Override
     public int createRuleset(long handledAccessFs) throws NativeCallException {
-        try (var arena = Arena.ofConfined()) {
-            var attr = Landlock.rulesetAttr(arena, handledAccessFs);
-            return (int) syscall(Landlock.SYS_CREATE_RULESET, attr.address(), Landlock.RULESET_ATTR.byteSize(), 0L,
-                    "landlock_create_ruleset");
-        }
+        return linux.createRuleset(handledAccessFs);
     }
 
     @Override
     public OptionalInt openPath(Path path) {
-        try (var arena = Arena.ofConfined()) {
-            var handle = handle(Fn.OPEN);
-            var state = arena.allocate(CALL_STATE);
-            var cPath = arena.allocateFrom(path.toString());
-            int fd = invoke("open", () -> (int) handle.invokeExact(state, cPath, O_PATH | O_CLOEXEC));
-            return fd < 0 ? OptionalInt.empty() : OptionalInt.of(fd);
-        } catch (NativeCallException _) {
-            return OptionalInt.empty();
-        }
+        return linux.openPath(path);
     }
 
     @Override
     public void addPathBeneath(int rulesetFd, int parentFd, long allowedAccess) throws NativeCallException {
-        try (var arena = Arena.ofConfined()) {
-            var attr = Landlock.pathBeneathAttr(arena, allowedAccess, parentFd);
-            syscall(Landlock.SYS_ADD_RULE, rulesetFd, Landlock.RULE_PATH_BENEATH, attr.address(), "landlock_add_rule");
-        }
+        linux.addPathBeneath(rulesetFd, parentFd, allowedAccess);
     }
 
     @Override
     public void restrictSelf(int rulesetFd) throws NativeCallException {
-        syscall(Landlock.SYS_RESTRICT_SELF, rulesetFd, 0L, 0L, "landlock_restrict_self");
+        linux.restrictSelf(rulesetFd);
     }
 
     @Override
@@ -178,7 +149,7 @@ final class NativeKernel implements Kernel {
             var envp = environment(arena);
             var program = cArgv.getAtIndex(ADDRESS, 0);
             invoke("execve", () -> (int) handle.invokeExact(state, program, cArgv, envp));
-            return state.get(JAVA_INT, ERRNO_OFFSET);
+            return errno(state);
         } catch (NativeCallException e) {
             return e.errno();
         }
@@ -212,31 +183,36 @@ final class NativeKernel implements Kernel {
         return array;
     }
 
-    private long syscall(long number, long a, long b, long c, String stage) throws NativeCallException {
-        return syscall(number, a, b, c, 0L, stage);
+    /**
+     * @param state the call state a downcall captured
+     * @return the {@code errno} of that call
+     */
+    static int errno(MemorySegment state) {
+        return state.get(JAVA_INT, ERRNO_OFFSET);
     }
 
-    private long syscall(long number, long a, long b, long c, long d, String stage) throws NativeCallException {
-        var handle = handle(Fn.SYSCALL);
-        try (var arena = Arena.ofConfined()) {
-            var state = arena.allocate(CALL_STATE);
-            long result = invoke(stage, () -> (long) handle.invokeExact(state, number, a, b, c, d));
-            if (result < 0) {
-                int errno = state.get(JAVA_INT, ERRNO_OFFSET);
-                throw new NativeCallException(stage, errno, stage + " failed with errno " + errno);
-            }
-            return result;
-        }
-    }
-
-    private static void check(String stage, int result, MemorySegment state, String what) throws NativeCallException {
+    /**
+     * Turns a non-zero result into a failed native call.
+     *
+     * @param stage  the function that was called
+     * @param result its return value
+     * @param state  the call state it captured
+     * @param what   the call as the message names it
+     * @throws NativeCallException if {@code result} is not {@code 0}
+     */
+    static void check(String stage, int result, MemorySegment state, String what) throws NativeCallException {
         if (result != 0) {
-            int errno = state.get(JAVA_INT, ERRNO_OFFSET);
+            int errno = errno(state);
             throw new NativeCallException(stage, errno, what + " failed with errno " + errno);
         }
     }
 
-    private MethodHandle handle(Fn fn) throws NativeCallException {
+    /**
+     * @param fn the native function
+     * @return its downcall handle, linked on first use
+     * @throws NativeCallException if the C library has no such symbol
+     */
+    MethodHandle handle(Fn fn) throws NativeCallException {
         var handle = handles.get(fn);
         if (handle == null) {
             var symbol = LINKER.defaultLookup().find(fn.symbol)
@@ -249,12 +225,21 @@ final class NativeKernel implements Kernel {
 
     /** A downcall; {@link MethodHandle#invokeExact} declares {@link Throwable}. */
     @FunctionalInterface
-    private interface Downcall<T> {
+    interface Downcall<T> {
         T call() throws Throwable;
     }
 
+    /**
+     * Runs a downcall.
+     *
+     * @param stage    the function, for the failure
+     * @param downcall the call
+     * @param <T>      its return type
+     * @return its return value
+     * @throws NativeCallException if the call could not be made
+     */
     @SuppressWarnings("java:S1181") // MethodHandle.invokeExact declares Throwable; Errors are rethrown
-    private static <T> T invoke(String stage, Downcall<T> downcall) throws NativeCallException {
+    static <T> T invoke(String stage, Downcall<T> downcall) throws NativeCallException {
         try {
             return downcall.call();
             // cui-rewrite:disable InvalidExceptionUsageRecipe

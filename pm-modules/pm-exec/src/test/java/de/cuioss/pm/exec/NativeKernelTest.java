@@ -9,17 +9,18 @@
  */
 package de.cuioss.pm.exec;
 
+import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemoryLayout.PathElement;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.List;
 
 import org.junit.jupiter.api.DisplayName;
@@ -29,11 +30,12 @@ import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
 /**
- * The FFM calls that are safe inside the test JVM. Calls that change the process for good
- * ({@code setpgid}, {@code landlock_restrict_self}, a successful {@code execve}) run in
- * {@code PmExecIT} against a child process.
+ * The FFM calls of every platform that are safe inside the test JVM, and the downcall plumbing. Calls
+ * that change the process for good ({@code setpgid}, a successful {@code execve}) run in
+ * {@code PmExecIT} against a child process; the Linux-only calls are covered by
+ * {@link LinuxCallsTest}.
  */
-@DisplayName("NativeKernel: FFM calls in the test JVM")
+@DisplayName("NativeKernel: plumbing and the calls of every platform in the test JVM")
 class NativeKernelTest {
 
     private final NativeKernel kernel = new NativeKernel(Os.of(System.getProperty("os.name")));
@@ -64,6 +66,62 @@ class NativeKernelTest {
     }
 
     @Nested
+    @DisplayName("downcall plumbing")
+    class Plumbing {
+
+        @Test
+        @DisplayName("a zero result passes, a non-zero result fails with the captured errno")
+        void check() {
+            try (var arena = Arena.ofConfined()) {
+                var state = arena.allocate(NativeKernel.CALL_STATE);
+                state.set(JAVA_INT, NativeKernel.CALL_STATE.byteOffset(PathElement.groupElement("errno")), 13);
+
+                assertEquals(13, NativeKernel.errno(state));
+                assertDoesNotThrow(() -> NativeKernel.check("setpgid", 0, state, "setpgid(0, 0)"));
+                var e = assertThrows(NativeCallException.class,
+                        () -> NativeKernel.check("setpgid", -1, state, "setpgid(0, 0)"));
+                assertEquals("setpgid", e.stage());
+                assertEquals(13, e.errno());
+                assertEquals("setpgid(0, 0) failed with errno 13", e.getMessage());
+            }
+        }
+
+        @Test
+        @DisplayName("a downcall returns its value")
+        void invokeReturns() throws Exception {
+            assertEquals(7, NativeKernel.<Integer>invoke("close", () -> 7));
+        }
+
+        @Test
+        @DisplayName("a downcall that cannot be made is a failed native call without errno")
+        void invokeFails() {
+            var e = assertThrows(NativeCallException.class, () -> NativeKernel.invoke("close", () -> {
+                throw new IllegalStateException("no handle");
+            }));
+
+            assertEquals("close", e.stage());
+            assertEquals(0, e.errno());
+            assertTrue(e.getMessage().startsWith("close could not be called: "), e.getMessage());
+        }
+
+        @Test
+        @DisplayName("an Error of a downcall is rethrown unchanged")
+        void invokeRethrowsError() {
+            var error = new AssertionError("fatal");
+
+            assertSame(error, assertThrows(AssertionError.class, () -> NativeKernel.invoke("close", () -> {
+                throw error;
+            })));
+        }
+
+        @Test
+        @DisplayName("a handle is linked once and reused")
+        void handleCached() throws Exception {
+            assertSame(kernel.handle(NativeKernel.Fn.CLOSE), kernel.handle(NativeKernel.Fn.CLOSE));
+        }
+    }
+
+    @Nested
     @EnabledOnOs(OS.MAC)
     @DisplayName("macOS")
     class Mac {
@@ -75,45 +133,6 @@ class NativeKernelTest {
 
             assertEquals("prctl", e.stage());
             assertTrue(e.getMessage().contains("symbol not found"));
-        }
-    }
-
-    @Nested
-    @EnabledOnOs(OS.LINUX)
-    @DisplayName("Linux")
-    class Linux {
-
-        @Test
-        @DisplayName("opens an existing path with O_PATH and refuses a missing one")
-        void openPath() {
-            var fd = kernel.openPath(Path.of("/"));
-
-            assertTrue(fd.isPresent());
-            kernel.close(fd.getAsInt());
-            assertTrue(kernel.openPath(Path.of("/nonexistent/pm-exec")).isEmpty());
-        }
-
-        @Test
-        @DisplayName("probes the Landlock ABI and creates a ruleset where ABI >= 2")
-        void ruleset() throws Exception {
-            int abi = kernel.landlockAbi();
-            assumeTrue(abi >= 2, "Landlock ABI >= 2 needed, kernel offers " + abi);
-
-            int fd = kernel.createRuleset(Landlock.handledAccess(abi));
-            assertTrue(fd >= 0);
-            var dir = kernel.openPath(Path.of("/usr"));
-            assertTrue(dir.isPresent());
-            kernel.addPathBeneath(fd, dir.getAsInt(), Landlock.readAccess(abi, true));
-            kernel.close(dir.getAsInt());
-            kernel.close(fd);
-        }
-
-        @Test
-        @DisplayName("sets no-new-privileges")
-        void noNewPrivs() throws Exception {
-            kernel.setNoNewPrivs();
-
-            assertTrue(Files.readAllLines(Path.of("/proc/thread-self/status")).contains("NoNewPrivs:\t1"));
         }
     }
 }
