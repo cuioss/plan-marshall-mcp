@@ -15,8 +15,9 @@
  * (Security.framework through FFM), the Linux Secret Service (D-Bus over the JDK Unix domain socket
  * channel), otherwise the permission-guarded file store below {@code <PM_MCP_BASE>/credentials/}.
  * Every keyring entry lives under one service name ({@link de.cuioss.pm.mcp.server.credentials.ServiceName}).
- * The local API exposes the store at {@code /api/v1/credentials/{key}}
- * ({@link de.cuioss.pm.mcp.server.credentials.CredentialsResource}).
+ * The local API writes, deletes and reports the status of an entry at
+ * {@code /api/v1/credentials/{key}} ({@link de.cuioss.pm.mcp.server.credentials.CredentialsResource});
+ * it never returns a secret.
  *
  * @since 0.1
  */
