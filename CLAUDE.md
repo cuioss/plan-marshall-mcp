@@ -127,7 +127,7 @@ lines).
 
 ## Git Workflow
 
-All cuioss repositories have branch protection on `main`. Direct pushes to `main` are never allowed. Always use this workflow:
+The repository lives in the `plan-marshall` organisation (`plan-marshall/plan-marshall-mcp`). `main` is protected by rulesets and merges go through the merge queue. Direct pushes to `main` are never allowed. Always use this workflow:
 
 1. Create a feature branch: `git checkout -b <branch-name>`
 2. Commit changes: `git add <files> && git commit -m "<message>"`
@@ -148,8 +148,12 @@ credentials, and the root `pom.xml` skips `central-publishing-maven-plugin` and 
 at `target/` — even `mvn deploy` stays local. Never re-enable any of these without the user's explicit decision.
 
 CI: reusable workflows from `cuioss/cuioss-organization`, pinned by full SHA with a version comment;
-configuration in `.github/project.yml`. Required checks: `build / conclusion`,
-`integration-tests / conclusion`.
+configuration in `.github/project.yml`. Releases of `cuioss-organization` and of the cui parent open
+their update PRs here through the App `plan-marshall-release-bot` (labelled `skip-bot-review`, merged by
+auto-merge). SonarCloud analyses the project in the organisation `plan-marshall`; CodeRabbit is
+configured by `.coderabbit.yaml`. The required checks are those of the
+ruleset `main-branch-protection`, which is their only authoritative list: read them with
+`gh api repos/plan-marshall/plan-marshall-mcp/rulesets` and the ruleset's id.
 
 ## IDE Detection
 
