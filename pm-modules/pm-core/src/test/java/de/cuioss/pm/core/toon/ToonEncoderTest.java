@@ -128,6 +128,29 @@ class ToonEncoderTest {
     }
 
     @Nested
+    @DisplayName("A leading U+FEFF")
+    class ByteOrderMark {
+
+        private static final String MARKED = "\uFEFFabc";
+
+        @Test
+        @DisplayName("is quoted in a root string, so that a reader cannot drop it as a byte-order mark")
+        void quotesRootString() {
+            var encoded = ToonEncoder.encode(ToonValue.of(MARKED));
+
+            assertEquals("\"" + MARKED + "\"", encoded);
+        }
+
+        @Test
+        @DisplayName("is left unquoted in a field value, which never starts the document")
+        void leavesFieldValueUnquoted() {
+            var encoded = ToonEncoder.encode(ToonObject.builder().add("k", MARKED).build());
+
+            assertEquals("k: " + MARKED, encoded);
+        }
+    }
+
+    @Nested
     @DisplayName("Numbers")
     class Numbers {
 
