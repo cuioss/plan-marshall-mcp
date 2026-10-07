@@ -132,9 +132,9 @@ All cuioss repositories have branch protection on `main`. Direct pushes to `main
 1. Create a feature branch: `git checkout -b <branch-name>`
 2. Commit changes: `git add <files> && git commit -m "<message>"`
 3. Push the branch: `git push -u origin <branch-name>`
-4. Create a PR: `gh pr create --repo cuioss/plan-marshall-mcp --head <branch-name> --base main --title "<title>" --body "<body>"`
+4. Create a PR: `gh pr create --repo plan-marshall/plan-marshall-mcp --head <branch-name> --base main --title "<title>" --body "<body>"`
 5. Wait for CI + review bots (waits until checks complete): `gh pr checks --watch`
-6. **Handle review comments**: fetch them with `gh api repos/cuioss/plan-marshall-mcp/pulls/<pr-number>/comments`. For each one:
+6. **Handle review comments**: fetch them with `gh api repos/plan-marshall/plan-marshall-mcp/pulls/<pr-number>/comments`. For each one:
    - If it's clearly valid and fixable: fix it, commit, push, then reply explaining the fix and resolve the comment
    - If you disagree or it's out of scope: reply explaining why, then resolve the comment
    - If you're uncertain (not 100% confident): **ask the user** before acting

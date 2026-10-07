@@ -4,7 +4,7 @@
 
 ## Status
 
-[![Java CI with Maven](https://github.com/cuioss/plan-marshall-mcp/actions/workflows/maven.yml/badge.svg)](https://github.com/cuioss/plan-marshall-mcp/actions/workflows/maven.yml)
+[![Java CI with Maven](https://github.com/plan-marshall/plan-marshall-mcp/actions/workflows/maven.yml/badge.svg)](https://github.com/plan-marshall/plan-marshall-mcp/actions/workflows/maven.yml)
 [![License: proprietary](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE.md)
 
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=cuioss_plan-marshall-mcp&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=cuioss_plan-marshall-mcp)
