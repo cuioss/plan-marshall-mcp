@@ -151,8 +151,9 @@ CI: reusable workflows from `cuioss/cuioss-organization`, pinned by full SHA wit
 configuration in `.github/project.yml`. Releases of `cuioss-organization` and of the cui parent open
 their update PRs here through the App `plan-marshall-release-bot` (labelled `skip-bot-review`, merged by
 auto-merge). SonarCloud analyses the project in the organisation `plan-marshall`; CodeRabbit is
-configured by `.coderabbit.yaml`. Required checks: `build / conclusion`,
-`integration-tests / conclusion`.
+configured by `.coderabbit.yaml`. The required checks are those of the
+ruleset `main-branch-protection`, which is their only authoritative list: read them with
+`gh api repos/plan-marshall/plan-marshall-mcp/rulesets` and the ruleset's id.
 
 ## IDE Detection
 
