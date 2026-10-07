@@ -27,6 +27,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -93,6 +94,7 @@ class ListenStreamTest {
     }
 
     @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
     @DisplayName("acknowledges the listen, serves tool calls beside it and sends nothing more on its stream")
     void shouldKeepListenStreamSilent() throws Exception {
         var listen = TestRuntime.statelessMessage(5, "subscriptions/listen",
