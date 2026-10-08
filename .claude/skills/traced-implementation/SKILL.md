@@ -240,11 +240,11 @@ implementation details." sentence stands. Paths are relative to `doc/` (the modu
 `doc/Requirements.adoc`, like the existing `link:specification/…` links):
 
 ```
-Implementation: link:../pm-modules/pm-workflow/src/main/java/de/cuioss/pm/workflow/state/StateRenderer.java[StateRenderer],
-link:../pm-mcp-server/src/main/java/de/cuioss/pm/mcp/server/tool/PmStateTool.java[PmStateTool]
+Implementation: link:../pm-modules/pm-workflow/src/main/java/de/planmarshall/workflow/state/StateRenderer.java[StateRenderer],
+link:../pm-mcp-server/src/main/java/de/planmarshall/mcp/server/tool/PmStateTool.java[PmStateTool]
 
-Verified by: link:../pm-mcp-server/src/test/java/de/cuioss/pm/mcp/server/tool/PmStateToolTest.java[PmStateToolTest],
-link:../pm-mcp-server/src/test/java/de/cuioss/pm/mcp/server/PmStateIT.java[PmStateIT]
+Verified by: link:../pm-mcp-server/src/test/java/de/planmarshall/mcp/server/tool/PmStateToolTest.java[PmStateToolTest],
+link:../pm-mcp-server/src/test/java/de/planmarshall/mcp/server/PmStateIT.java[PmStateIT]
 
 Documentation: link:concepts/hypermedia.adoc#_state_representation[Concepts § State Representation],
 link:user/mcp-tools.adoc#_pm_state[User Guide § pm_state]
