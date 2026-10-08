@@ -15,6 +15,7 @@ import java.util.Set;
 
 
 import de.planmarshall.mcp.server.web.WebListener;
+import de.planmarshall.runtime.security.CredentialKind;
 import io.quarkus.security.identity.IdentityProviderManager;
 import io.quarkus.security.identity.SecurityIdentity;
 import io.quarkus.security.identity.request.AuthenticationRequest;

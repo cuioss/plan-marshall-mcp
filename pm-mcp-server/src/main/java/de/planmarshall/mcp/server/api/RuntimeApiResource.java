@@ -15,11 +15,11 @@ import java.util.Map;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.mcp.server.PmMcpLogMessages;
 import de.planmarshall.mcp.server.runtime.RuntimeContext;
 import de.planmarshall.mcp.server.web.WebListener;
-import de.planmarshall.mcp.server.web.WebListenerConflictException;
-import de.planmarshall.mcp.server.web.WebState;
+import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.runtime.web.WebListenerConflictException;
+import de.planmarshall.runtime.web.WebState;
 import io.quarkus.runtime.Quarkus;
 import io.smallrye.mutiny.Multi;
 import io.vertx.core.Vertx;

@@ -18,8 +18,9 @@ import java.util.Map;
 
 import de.planmarshall.api.MachinePaths;
 import de.planmarshall.mcp.server.runtime.PmMcpd;
-import de.planmarshall.mcp.server.runtime.RuntimeLock;
-import de.planmarshall.mcp.server.runtime.StartupSequence;
+import de.planmarshall.runtime.start.RuntimeLock;
+import de.planmarshall.runtime.start.StartupSequence;
+import de.planmarshall.runtime.test.TestBases;
 import io.quarkus.test.common.QuarkusTestResourceLifecycleManager;
 
 /**

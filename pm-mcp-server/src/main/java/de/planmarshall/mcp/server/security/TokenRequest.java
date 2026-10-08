@@ -12,6 +12,7 @@ package de.planmarshall.mcp.server.security;
 import java.util.Map;
 
 
+import de.planmarshall.runtime.security.CredentialKind;
 import io.quarkus.security.identity.request.BaseAuthenticationRequest;
 
 /**

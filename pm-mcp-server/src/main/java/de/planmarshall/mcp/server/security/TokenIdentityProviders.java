@@ -15,6 +15,9 @@ import java.util.Map;
 
 
 import de.planmarshall.mcp.server.runtime.RuntimeContext;
+import de.planmarshall.runtime.security.DeviceRegistry;
+import de.planmarshall.runtime.security.JobTokenRegistry;
+import de.planmarshall.runtime.security.Secrets;
 import io.quarkus.security.AuthenticationFailedException;
 import io.quarkus.security.identity.AuthenticationRequestContext;
 import io.quarkus.security.identity.IdentityProvider;

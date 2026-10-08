@@ -12,6 +12,8 @@ package de.planmarshall.mcp.server.security;
 import java.util.Optional;
 
 
+import de.planmarshall.runtime.security.DeviceRegistry;
+import de.planmarshall.runtime.security.JobTokenRegistry;
 import io.quarkus.arc.DefaultBean;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;

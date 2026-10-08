@@ -8,16 +8,10 @@
  * the root of this repository.
  */
 /**
- * The credential store of the runtime (PM-CRED-2, PM-CRED-3; doc/specification/cli-and-security/
- * 02-credentials-and-operator.adoc, OS Keyring Backends &amp; Fallback File Store): exactly one active
- * {@link de.planmarshall.mcp.server.credentials.SecretStore} per machine, chosen at runtime start by
- * {@link de.planmarshall.mcp.server.credentials.SecretStoreSelector}: the macOS login Keychain
- * (Security.framework through FFM), the Linux Secret Service (D-Bus over the JDK Unix domain socket
- * channel), otherwise the permission-guarded file store below {@code <PM_MCP_BASE>/credentials/}.
- * Every keyring entry lives under one service name ({@link de.planmarshall.mcp.server.credentials.ServiceName}).
- * The local API writes, deletes and reports the status of an entry at
- * {@code /api/v1/credentials/{key}} ({@link de.planmarshall.mcp.server.credentials.CredentialsResource});
- * it never returns a secret.
+ * The credential resource of the local API and the producer of the active store: the local API writes,
+ * deletes and reports the status of an entry at {@code /api/v1/credentials/{key}}
+ * ({@link de.planmarshall.mcp.server.credentials.CredentialsResource}) and never returns a secret; the stores
+ * themselves are {@link de.planmarshall.runtime.credentials.SecretStore} of {@code pm-runtime}.
  *
  * @since 0.1
  */

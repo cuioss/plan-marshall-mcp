@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Optional;
 
 
+import de.planmarshall.runtime.security.CredentialKind;
 import io.quarkus.security.credential.Credential;
 import io.vertx.core.MultiMap;
 import org.junit.jupiter.api.DisplayName;

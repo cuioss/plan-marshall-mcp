@@ -23,7 +23,8 @@ owns the state machine.
 
 The normative requirements are defined in [Requirements](doc/Requirements.adoc), the technical
 implementation blueprints in [Specification](doc/Specification.adoc), and the delivery order in the
-[Roadmap](doc/roadmap.adoc).
+[Roadmap](doc/roadmap.adoc). How the implemented system is built is described in the
+[Developer Guide](doc/DeveloperGuide.adoc).
 
 > [!NOTE]
 > The project is at its beginning: roadmap Milestone 0 (verification first) is complete. Each verified technique

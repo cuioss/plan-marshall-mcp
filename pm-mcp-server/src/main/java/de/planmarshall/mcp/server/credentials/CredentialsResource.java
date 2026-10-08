@@ -13,7 +13,11 @@ import java.util.Map;
 
 
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.mcp.server.PmMcpLogMessages;
+import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.runtime.credentials.CredentialAccount;
+import de.planmarshall.runtime.credentials.InvalidCredentialNameException;
+import de.planmarshall.runtime.credentials.SecretStore;
+import de.planmarshall.runtime.credentials.SecretStoreException;
 import io.quarkus.security.Authenticated;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;

@@ -24,8 +24,8 @@ import java.util.Map;
 
 
 import de.planmarshall.mcp.server.test.DaemonProcess;
-import de.planmarshall.mcp.server.test.TestBases;
 import de.planmarshall.mcp.server.test.VerificationResults;
+import de.planmarshall.runtime.test.TestBases;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 

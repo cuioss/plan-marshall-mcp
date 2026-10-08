@@ -12,9 +12,9 @@ package de.planmarshall.mcp.server.test;
 import java.util.Optional;
 
 
-import de.planmarshall.mcp.server.security.DeviceRegistry;
-import de.planmarshall.mcp.server.security.JobTokenRegistry;
-import de.planmarshall.mcp.server.security.Secrets;
+import de.planmarshall.runtime.security.DeviceRegistry;
+import de.planmarshall.runtime.security.JobTokenRegistry;
+import de.planmarshall.runtime.security.Secrets;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 

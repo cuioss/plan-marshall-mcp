@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Set;
 
 
+import de.planmarshall.runtime.security.CredentialKind;
 import io.vertx.core.MultiMap;
 import lombok.experimental.UtilityClass;
 
