@@ -60,19 +60,19 @@ class CredentialNamingTest {
         Path home;
 
         @Test
-        @DisplayName("is de.planmarshall-mcp for the default base, also through a symbolic link")
+        @DisplayName("is de.planmarshall.mcp for the default base, also through a symbolic link")
         void defaultBase() throws Exception {
             var base = Files.createDirectories(home.resolve(".plan-marshall-mcp"));
             var link = Files.createSymbolicLink(home.resolve("link"), base);
 
-            assertEquals("de.planmarshall-mcp", ServiceName.of(base, home));
-            assertEquals("de.planmarshall-mcp", ServiceName.of(link, home));
+            assertEquals("de.planmarshall.mcp", ServiceName.of(base, home));
+            assertEquals("de.planmarshall.mcp", ServiceName.of(link, home));
         }
 
         @Test
         @DisplayName("is qualified by the first 16 hex characters of the SHA-256 of the canonical base")
         void otherBase() {
-            assertEquals("de.planmarshall-mcp/3e816ceebf0393f4",
+            assertEquals("de.planmarshall.mcp/3e816ceebf0393f4",
                     ServiceName.of(Path.of("/nonexistent/x/../pm-base"), home));
         }
     }

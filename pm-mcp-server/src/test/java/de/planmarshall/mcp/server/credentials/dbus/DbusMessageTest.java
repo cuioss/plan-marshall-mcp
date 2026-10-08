@@ -52,7 +52,7 @@ class DbusMessageTest {
             + "f702f736563726574730000000000000000020173001e0000006f72672e667265656465736b746f702e5365637265"
             + "742e536572766963650000030173000b0000005365617263684974656d73000000000006017300170000006f72672e"
             + "667265656465736b746f702e73656372657473000801670005617b73737d0000000000004700000000000000070000"
-            + "0073657276696365001000000064652e6375696f73732e706d2d6d637000000000000000000e00000063726564656e"
+            + "0073657276696365001300000064652e706c616e6d61727368616c6c2e6d637000000000000e00000063726564656e"
             + "7469616c5f6b657900000600000067697468756200";
 
     /** Reply to {@code Hello}: {@code METHOD_RETURN}, flags 1, serial 7, reply serial 1, body ":1.42". */
@@ -101,7 +101,7 @@ class DbusMessageTest {
         @DisplayName("SearchItems with a dictionary a{ss}")
         void searchItems() {
             var attributes = new LinkedHashMap<String, String>();
-            attributes.put("service", "de.planmarshall-mcp");
+            attributes.put("service", "de.planmarshall.mcp");
             attributes.put("credential_key", "github");
             var message = DbusMessage.methodCall(3, "org.freedesktop.secrets", "/org/freedesktop/secrets",
                     "org.freedesktop.Secret.Service", "SearchItems", "a{ss}", List.of(attributes));

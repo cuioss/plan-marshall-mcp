@@ -158,7 +158,7 @@ class CredentialsResourceTest {
         void secretService() throws Exception {
             try (var _ = new FakeBus(base.resolve("bus"), 4242, new FakeSecretService())) {
                 assertStatusNeverRevealsTheSecret(new SecretServiceStore(base.resolve("bus"), 4242,
-                        "de.planmarshall-mcp", Duration.ofSeconds(5)));
+                        "de.planmarshall.mcp", Duration.ofSeconds(5)));
             }
         }
 
@@ -166,7 +166,7 @@ class CredentialsResourceTest {
         @EnabledOnOs(OS.MAC)
         @DisplayName("macOS login keychain")
         void keychain() throws Exception {
-            assertStatusNeverRevealsTheSecret(new KeychainSecretStore("de.planmarshall-mcp.test/" + UUID.randomUUID()));
+            assertStatusNeverRevealsTheSecret(new KeychainSecretStore("de.planmarshall.mcp.test/" + UUID.randomUUID()));
         }
 
         @Test

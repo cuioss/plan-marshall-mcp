@@ -23,15 +23,15 @@ import lombok.experimental.UtilityClass;
 /**
  * The keyring service name of an instance (doc/specification/cli-and-security/
  * 02-credentials-and-operator.adoc, service-name rule; PM-CRED-2, PM-DIST-5):
- * {@code de.planmarshall-mcp} for the default {@code PM_MCP_BASE}, otherwise
- * {@code de.planmarshall-mcp/<instance_hash>} with the first 16 hex characters of the SHA-256 of the
+ * {@code de.planmarshall.mcp} for the default {@code PM_MCP_BASE}, otherwise
+ * {@code de.planmarshall.mcp/<instance_hash>} with the first 16 hex characters of the SHA-256 of the
  * canonical absolute path of {@code <PM_MCP_BASE>}.
  */
 @UtilityClass
 public class ServiceName {
 
     /** The service name of the default instance. */
-    public static final String DEFAULT = "de.planmarshall-mcp";
+    public static final String DEFAULT = "de.planmarshall.mcp";
 
     /**
      * @param base     {@code <PM_MCP_BASE>}

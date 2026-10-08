@@ -36,7 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
 class SecretServiceStoreTest {
 
     private static final long UID = 4242;
-    private static final String SERVICE = "de.planmarshall-mcp";
+    private static final String SERVICE = "de.planmarshall.mcp";
     private static final CredentialAccount GITHUB = CredentialAccount.global("github");
     private static final CredentialAccount PROJECT_GITHUB = CredentialAccount.project("p1", "github");
 

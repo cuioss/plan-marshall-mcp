@@ -66,9 +66,9 @@ class SecretStoreSelectorTest {
         var selection = SecretStoreSelector.select(paths(MachinePaths.Os.MACOS), Map.of(), home, keyrings(true, true));
 
         assertSame(keychain, selection.store());
-        assertEquals("de.planmarshall-mcp", selection.service());
+        assertEquals("de.planmarshall.mcp", selection.service());
         assertTrue(selection.fallbackReason().isEmpty());
-        assertEquals(List.of("keychain:de.planmarshall-mcp"), probes);
+        assertEquals(List.of("keychain:de.planmarshall.mcp"), probes);
     }
 
     @Test
@@ -90,7 +90,7 @@ class SecretStoreSelectorTest {
         var selection = SecretStoreSelector.select(paths(MachinePaths.Os.LINUX), env, home, keyrings(true, true));
 
         assertSame(secretService, selection.store());
-        assertEquals(List.of("secret-service:/run/user/1/bus:de.planmarshall-mcp"), probes);
+        assertEquals(List.of("secret-service:/run/user/1/bus:de.planmarshall.mcp"), probes);
     }
 
     @Test

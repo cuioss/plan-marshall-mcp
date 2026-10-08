@@ -36,7 +36,7 @@ import org.junit.jupiter.api.condition.OS;
 @DisplayName("SecretServiceStore against the session keyring")
 class SecretServiceIT {
 
-    private final String service = "de.planmarshall-mcp.test/" + UUID.randomUUID();
+    private final String service = "de.planmarshall.mcp.test/" + UUID.randomUUID();
     private final CredentialAccount global = CredentialAccount.global("github");
     private final CredentialAccount project = CredentialAccount.project("p1", "github");
     private SecretServiceStore store;

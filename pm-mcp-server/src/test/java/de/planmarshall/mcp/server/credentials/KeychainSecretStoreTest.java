@@ -32,7 +32,7 @@ import org.junit.jupiter.api.condition.OS;
 @DisplayName("KeychainSecretStore against the macOS login keychain")
 class KeychainSecretStoreTest {
 
-    private final String service = "de.planmarshall-mcp.test/" + UUID.randomUUID();
+    private final String service = "de.planmarshall.mcp.test/" + UUID.randomUUID();
     private final KeychainSecretStore store = new KeychainSecretStore(service);
     private final CredentialAccount global = CredentialAccount.global("github");
     private final CredentialAccount project = CredentialAccount.project("p1", "github");
