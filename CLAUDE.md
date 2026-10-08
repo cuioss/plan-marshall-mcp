@@ -50,6 +50,8 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Integration tests: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests"`
 - Native binaries and their integration tests: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pnative,integration-tests"` with `GRAALVM_HOME` and `JAVA_HOME` set to a GraalVM 25 installation
 - Without `.plan/execute-script.py` (it is not tracked, for example on a fresh clone): `./mvnw` with the same arguments.
+- `.mvn/maven.config` passes `.mvn/settings.xml` (the organisation's package registry, no token) as global settings;
+  the token is the server `plan-marshall` of `~/.m2/settings.xml` (`doc/developer/registry-setup.adoc`).
 - Use a Bash timeout of 600000ms for build commands.
 - Analyze each build's TOON result: `status`, `errors[N]{file,line,message,category}`, `log_file`.
 
