@@ -37,7 +37,7 @@ import jakarta.ws.rs.sse.Sse;
 
 /**
  * The runtime resources of the local API {@code /api/v1}: status, the runtime-wide event stream, the web
- * access switch, and stop (doc/specification/runtime-model/01-processes-and-transport.adoc, Local API).
+ * access switch, and stop (plan-marshall-documentation: doc/specification/runtime-model/01-processes-and-transport.adoc, Local API).
  * Every request is authenticated by the path policy before it reaches a method.
  *
  * @since 0.1

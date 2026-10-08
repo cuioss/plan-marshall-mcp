@@ -23,7 +23,7 @@ import io.vertx.core.http.HttpServerRequest;
 /**
  * The request handler of the web listener: {@code Host} validation, the Origin check on state-changing
  * requests, the security headers on every response, and the route restriction to {@code /api/v1/} and the
- * static web app (doc/specification/cli-and-security/03-web-server.adoc, Request Validation & Security
+ * static web app (plan-marshall-documentation: doc/specification/cli-and-security/03-web-server.adoc, Request Validation & Security
  * Headers, API Access). {@code /api/v1/} is handed to the runtime's own HTTP root handler, so both listeners
  * share one router and one security chain; {@code /mcp} and every other path never reach it.
  *

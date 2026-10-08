@@ -27,7 +27,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import lombok.experimental.UtilityClass;
 
 /**
- * The identity providers, one per token kind (doc/specification/cli-and-security/03-web-server.adoc,
+ * The identity providers, one per token kind (plan-marshall-documentation: doc/specification/cli-and-security/03-web-server.adoc,
  * Authentication Seam). Each compares in constant time and builds a {@link PmIdentity} from the request's
  * connection metadata.
  *

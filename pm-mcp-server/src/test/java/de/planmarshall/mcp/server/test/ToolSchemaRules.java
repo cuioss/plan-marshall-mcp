@@ -19,7 +19,7 @@ import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 
 /**
- * The flat-schema constraints of doc/specification/mcp-tools/01-core-workflow-tools.adoc, Architectural
+ * The flat-schema constraints of plan-marshall-documentation: doc/specification/mcp-tools/01-core-workflow-tools.adoc, Architectural
  * Constraints, item 3, as a checker over one {@code inputSchema}.
  */
 public final class ToolSchemaRules {

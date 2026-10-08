@@ -41,7 +41,7 @@ import jakarta.interceptor.Interceptor;
 @ApplicationScoped
 public class CoreTools {
 
-    /** The core tool set (doc/specification/mcp-tools/01-core-workflow-tools.adoc, Architectural Constraints). */
+    /** The core tool set (plan-marshall-documentation: doc/specification/mcp-tools/01-core-workflow-tools.adoc, Architectural Constraints). */
     public static final List<String> NAMES = List.of("pm_state", "pm_do", "pm_wait", "pm_plans", "pm_epics",
             "pm_build", "pm_lsp", "pm_skills", "pm_skill", "pm_skill_file");
 

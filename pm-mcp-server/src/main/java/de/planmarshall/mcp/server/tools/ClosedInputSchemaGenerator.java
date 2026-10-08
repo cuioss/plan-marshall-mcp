@@ -26,7 +26,7 @@ import jakarta.inject.Singleton;
 /**
  * Closes the input schema the MCP server generates for annotated tools ({@code @Tool}): the generated schema
  * gets {@code additionalProperties: false} and loses {@code $schema} and {@code title}, so that every schema in
- * {@code tools/list} keeps the flat-schema constraints (doc/specification/mcp-tools/01-core-workflow-tools.adoc,
+ * {@code tools/list} keeps the flat-schema constraints (plan-marshall-documentation: doc/specification/mcp-tools/01-core-workflow-tools.adoc,
  * Architectural Constraints, item 3). Programmatic tools with an explicit schema are not affected.
  *
  * @since 0.1
