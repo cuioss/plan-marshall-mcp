@@ -58,16 +58,18 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Always build and test through Maven and JUnit; never run `javac` directly or write ad-hoc verifier classes.
 - The quality gate (`-Ppre-commit`) rewrites files (license headers, OpenRewrite recipes, import
   order). Review every resulting diff and commit it; then run Full verify again.
-- Java level: `maven.compiler-plugin.release` (25) in the root `pom.xml`. The root `pre-commit`
-  profile overrides the parent's recipe list without `UpgradeToJava21`, which would downgrade the
+- Java level: `maven.compiler-plugin.release` (25) in the parent POM `pm-mcp-parent`, whose `pre-commit`
+  profile overrides the recipe list of the cui parent without `UpgradeToJava21`, which would downgrade the
   release and break unnamed variables (`_`).
 - The compiler runs with `failOnWarning`: fix deprecations and warnings, don't suppress them.
 
 ## Dependencies and Versions
 
-- Parent `de.cuioss:cui-quarkus-parent` supplies Quarkus (`version.quarkus`), cui-http and
-  cui-java-tools versions. Never declare `version.quarkus` locally.
-- Root `pom.xml` imports `quarkus-bom` **first** (smallrye-config convergence; the org
+- Parent `de.planmarshall:pm-mcp-parent`, resolved from the organisation's registry, inherits from
+  `de.cuioss:cui-quarkus-parent`, which supplies Quarkus (`version.quarkus`), cui-http and cui-java-tools versions.
+  Never declare `version.quarkus` locally. The managed third-party versions and the plugin management live in the
+  parent; a change there is a release of the parent. The root `pom.xml` manages the modules of this repository only.
+- `pm-mcp-parent` imports `quarkus-bom` **first** (smallrye-config convergence; the org
   `quarkus-alignment` CI job fails on a split Quarkus line), then `quarkus-mcp-server-bom`.
 - Never add dependencies without asking the user first.
 - Pre-1.0: no deprecation cycles, no backward-compatibility shims.
@@ -151,11 +153,14 @@ The repository lives in the `plan-marshall` organisation (`plan-marshall/plan-ma
 
 **Publishing only to the organisation's registry:** plan-marshall-mcp is proprietary. Its artifacts go to the GitHub
 Packages registry of the organisation `plan-marshall` and nowhere else, never to Maven Central or another public
-registry; that deployment is set up by Milestone 1 through the parent POM and does not exist yet. Today there is
+registry. The parent POM `de.planmarshall:pm-mcp-parent` (repository `plan-marshall/pm-mcp-parent`) carries that
+target for every module (`https://maven.pkg.github.com/plan-marshall/${pm.repository}`, with `pm.repository` set in
+the root `pom.xml`), pins it against a target on the command line, keeps the Maven Central publishing of the cui
+parent out of the build, and fails the build for any other target. This repository deploys nothing yet: there is
 no release workflow, snapshot deploy is off (`.github/project.yml`), the CI build receives no Sonatype or GPG
-credentials, and the root `pom.xml` skips `central-publishing-maven-plugin` and points `distributionManagement`
-at `target/` — even `mvn deploy` stays local. Never re-enable any of these, and never add a deployment target
-other than the organisation's registry, without the user's explicit decision.
+credentials, and the root `pom.xml` skips `maven-deploy-plugin`, so even `mvn deploy` uploads nothing. Never
+re-enable any of these, never weaken the guards of the parent, and never add a deployment target other than the
+organisation's registry, without the user's explicit decision.
 
 CI: reusable workflows from `cuioss/cuioss-organization`, pinned by full SHA with a version comment;
 configuration in `.github/project.yml`. Releases of `cuioss-organization` and of the cui parent open
