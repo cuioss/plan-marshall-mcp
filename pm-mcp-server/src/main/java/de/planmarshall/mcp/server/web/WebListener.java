@@ -39,7 +39,7 @@ import jakarta.enterprise.event.Observes;
 
 /**
  * The web listener: a second Vert.x HTTP server on TCP beside the Unix-socket listener, opened and closed while
- * the runtime runs (doc/specification/cli-and-security/03-web-server.adoc).
+ * the runtime runs (plan-marshall-documentation: doc/specification/cli-and-security/03-web-server.adoc).
  * <p>
  * Loopback mode serves plain HTTP on {@code 127.0.0.1:<port>}; LAN mode serves HTTPS on all interfaces with
  * the runtime's self-signed certificate ({@link WebTls}). The listener knows its connections, so the

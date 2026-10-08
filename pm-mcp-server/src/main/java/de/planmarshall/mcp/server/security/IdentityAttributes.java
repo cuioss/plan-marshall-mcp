@@ -21,7 +21,7 @@ import lombok.experimental.UtilityClass;
 
 /**
  * The attribute names of a {@link PmIdentity} and the mapping of the relay's connection-metadata headers onto
- * them (doc/specification/runtime-model/03-relay.adoc, Connection Metadata).
+ * them (plan-marshall-documentation: doc/specification/runtime-model/03-relay.adoc, Connection Metadata).
  *
  * @since 0.1
  */

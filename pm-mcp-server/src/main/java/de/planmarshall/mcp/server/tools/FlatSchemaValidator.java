@@ -20,7 +20,7 @@ import io.vertx.core.json.JsonObject;
 
 /**
  * Stage 1 argument validation of a tool call: plain Java over the closed flat schema, no JSON Schema library
- * (doc/specification/mcp-tools/01-core-workflow-tools.adoc, Two-Stage Schema Validation). It understands
+ * (plan-marshall-documentation: doc/specification/mcp-tools/01-core-workflow-tools.adoc, Two-Stage Schema Validation). It understands
  * exactly the keyword subset the schemas may use: {@code properties}, {@code required},
  * {@code additionalProperties: false}, and per property {@code type}, {@code enum}, {@code pattern},
  * {@code minimum}/{@code maximum} and {@code minLength}/{@code maxLength}.

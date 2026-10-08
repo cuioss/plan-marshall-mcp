@@ -16,7 +16,7 @@ import jakarta.enterprise.event.Observes;
 
 /**
  * Keeps the runtime sessionless for the {@code initialize} of a session-opening host
- * (doc/specification/runtime-model/03-relay.adoc, Host Protocol Forms).
+ * (plan-marshall-documentation: doc/specification/runtime-model/03-relay.adoc, Host Protocol Forms).
  * <p>
  * quarkus-mcp-server 2.0.2 answers {@code initialize} (protocol {@code 2025-11-25}) by registering a connection
  * and issuing {@code Mcp-Session-Id}; only {@code server/discover} and requests with {@code _meta} protocol

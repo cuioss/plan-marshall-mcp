@@ -1,6 +1,6 @@
 # plan-marshall-mcp
 
-<img align="right" width="300" src="doc/resources/planmarshall.png" alt="Plan Marshall">
+<img align="right" width="300" src="https://raw.githubusercontent.com/plan-marshall/plan-marshall-documentation/main/doc/resources/planmarshall.png" alt="Plan Marshall">
 
 ## Status
 
@@ -21,15 +21,16 @@ the answer is a representation of that state together with the valid next transi
 (hypermedia-driven workflow). The model follows links and contributes judgment only; the server
 owns the state machine.
 
-The normative requirements are defined in [Requirements](doc/Requirements.adoc), the technical
-implementation blueprints in [Specification](doc/Specification.adoc), and the delivery order in the
-[Roadmap](doc/roadmap.adoc). How the implemented system is built is described in the
-[Developer Guide](doc/DeveloperGuide.adoc).
+The normative requirements are defined in [Requirements](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/Requirements.adoc), the technical
+implementation blueprints in [Specification](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/Specification.adoc), and the delivery order in the
+[Roadmap](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/roadmap.adoc). All documents live in the repository
+[plan-marshall-documentation](https://github.com/plan-marshall/plan-marshall-documentation). How the implemented
+system is built is described in the [Developer Guide](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/DeveloperGuide.adoc).
 
 > [!NOTE]
 > The project is at its beginning: roadmap Milestone 0 (verification first) is complete. Each verified technique
 > exists in its target module in a first, minimal form; the workflow engine and the job runtime are not built
-> yet. The measurements are recorded in the [Evaluation Reference](doc/specification/evaluation.adoc).
+> yet. The measurements are recorded in the [Evaluation Reference](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/specification/evaluation.adoc).
 
 ## Modules
 
@@ -40,14 +41,14 @@ implementation blueprints in [Specification](doc/Specification.adoc), and the de
 [pm-mcp-clients](https://github.com/plan-marshall/pm-mcp-clients), and the parent POM in
 [pm-mcp-parent](https://github.com/plan-marshall/pm-mcp-parent). The listing of the modules, their dependencies, and
 the specification each implements is the
-[Module Structure Specification](doc/specification/module-structure.adoc).
+[Module Structure Specification](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/specification/module-structure.adoc).
 
 ## Technology
 
 Java 25, Quarkus (via `de.cuioss:cui-quarkus-parent`),
 [Quarkus MCP Server](https://github.com/quarkiverse/quarkus-mcp-server),
 [cui-http](https://github.com/cuioss/cui-http), picocli, and GraalVM native image for the four binaries.
-See [Technology Requirements](doc/requirements/09-technology.adoc).
+See [Technology Requirements](https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/requirements/09-technology.adoc).
 
 ## Build
 

@@ -22,7 +22,7 @@ import io.smallrye.mutiny.Uni;
 
 /**
  * The security identity of an authenticated request: the credential kind, the principal it resolved to, and
- * the attributes of the request's connection metadata (doc/specification/runtime-model/03-relay.adoc,
+ * the attributes of the request's connection metadata (plan-marshall-documentation: doc/specification/runtime-model/03-relay.adoc,
  * Connection Metadata). Handlers read these attributes, never an HTTP header.
  * <p>
  * The identity has no roles and no permissions; resources are only authenticated.

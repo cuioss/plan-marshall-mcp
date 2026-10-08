@@ -7,7 +7,8 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 plan-marshall-mcp (PM-MCP) is a local MCP server that takes over the process logic of plan-marshall
 through a hypermedia-driven workflow: the server drives plans and epics, and harness processes are
 supervised workers of configured roles (the harness as worker). The design describes the target state,
-most of which is not implemented yet: requirements in `doc/Requirements.adoc` (modules in
+most of which is not implemented yet. The documents live in the repository `plan-marshall/plan-marshall-documentation`
+(check it out beside this repository; every `doc/…` path below is a path in it): requirements in `doc/Requirements.adoc` (modules in
 `doc/requirements/`), technical specifications in `doc/Specification.adoc` (documents in `doc/specification/`), delivery staging in
 `doc/roadmap.adoc`, defect archetypes and fixtures to guard during implementation in
 `doc/ImplementationWatch.adoc` (documents in `doc/implementation-watch/`, one per specification that has watch items, plus `cross-cutting.adoc`).
@@ -125,26 +126,25 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 ## Documentation
 
-AsciiDoc (`.adoc`) for all project documentation. Requirements go into `doc/requirements/`,
-technical specifications into `doc/specification/` (traceability rules in `doc/Specification.adoc`; a reference
-specification with status `REFERENCE`, such as `evaluation.adoc`, records evidence and defines nothing),
-research notes and open proposals into `doc/discussions/` (a decided proposal is applied and then deleted).
-The normative documents state the target only: no decision ids, decision dates, or history narration.
-Model roles are verified against the corpus `test/model/verification/` (`validate.py`).
-Documentation of the implemented system goes into three trees: concepts (`doc/Concepts.adoc`, `doc/concepts/`), developer (`doc/DeveloperGuide.adoc`,
-`doc/developer/`) and user (`doc/UserGuide.adoc`, `doc/user/`). Don't create new documents without asking,
-except topic documents inside those three trees written by `traced-implementation`.
+Every document of the project lives in `plan-marshall/plan-marshall-documentation`
+(https://github.com/plan-marshall/plan-marshall-documentation), not here: requirements, specifications,
+implementation watch, roadmap, and the concept, developer and user documentation. Its `CLAUDE.md` states where a
+document goes and how links are written. This repository keeps `README.md`, this file, and the model verification
+corpus `test/model/verification/` (`validate.py`), against which model roles are verified.
 
-Every concrete implementation follows the project skill `traced-implementation`: each planned task traces
-to its requirements, specification sections and watch items (the _Implementation watch_ line below a
-heading, plus `doc/implementation-watch/cross-cutting.adoc`) and assigns each specified statement its
-destination (code, test, concept, developer or user documentation); after implementation, coverage is
-verified against all three; a requirement the implementation proves wrong is corrected (with evidence) in
-the same plan, never worked around in code; the same PR writes the concept, developer and user
-documentation for the slice from the specification and watch corpus (describing the implemented system,
-verified against the code), deletes the implemented specification sections and watch items, and links each
-requirement to its classes, tests and documentation (`Implementation:` / `Verified by:` / `Documentation:`
-lines).
+Every concrete implementation follows the project skill `traced-implementation`, which lives in the documentation
+repository with `doc-review` (`.claude/skills/` there; the skills of the same name here only point to them): each
+planned task traces to its requirements, specification sections and watch items and assigns each specified statement
+its destination (code, test, concept, developer or user documentation); after implementation, coverage is verified
+against all three; a requirement the implementation proves wrong is corrected (with evidence) in the same plan,
+never worked around in code. An implementation is two pull requests that name each other: the code pull request
+here, and the documentation pull request there, which writes the documentation for the slice, deletes the
+implemented specification sections and watch items, links each requirement to its classes, tests and documentation
+by absolute links, and is merged after the code pull request.
+
+A reference from code or from this file to a document is its path in the documentation repository
+(`doc/specification/…`) or an absolute link
+`https://github.com/plan-marshall/plan-marshall-documentation/blob/main/doc/<path>`.
 
 ## Git Workflow
 

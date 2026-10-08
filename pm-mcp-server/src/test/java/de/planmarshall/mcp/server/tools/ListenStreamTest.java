@@ -34,7 +34,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 /**
  * Pins what the runtime relies on in quarkus-mcp-server: a host's {@code subscriptions/listen} is acknowledged at
  * once and its stream stays open, and the runtime sends nothing on it
- * (doc/specification/runtime-model/03-relay.adoc, Host Protocol Forms).
+ * (plan-marshall-documentation: doc/specification/runtime-model/03-relay.adoc, Host Protocol Forms).
  */
 @QuarkusTest
 @DisplayName("A subscriptions/listen stream is accepted and stays silent")
