@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.TreeSet;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.regex.Pattern;
 
 
 import org.eclipse.jgit.internal.JGitText;
@@ -42,6 +43,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 class JgitNativeMetadataTest {
 
     static final String DIRECTORY = "META-INF/native-image/de.planmarshall/pm-mcp-server-jgit/";
+    private static final Pattern ANONYMOUS = Pattern.compile("\\$\\d");
 
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"reflect-config.json", "resource-config.json"})
@@ -89,7 +91,7 @@ class JgitNativeMetadataTest {
     private static boolean isEnum(String name, ClassLoader loader) {
         try {
             return Class.forName(name, false, loader).isEnum();
-        } catch (ClassNotFoundException | LinkageError e) {
+        } catch (ClassNotFoundException | LinkageError _) {
             return false;
         }
     }
@@ -118,7 +120,7 @@ class JgitNativeMetadataTest {
             for (JarEntry entry : file.stream().toList()) {
                 String name = entry.getName();
                 if (name.endsWith(".class") && !name.contains("-info") && !name.startsWith("META-INF")
-                        && !name.matches(".*\\$[0-9].*")) {
+                        && !ANONYMOUS.matcher(name).find()) {
                     names.add(name.substring(0, name.length() - ".class".length()).replace('/', '.'));
                 }
             }

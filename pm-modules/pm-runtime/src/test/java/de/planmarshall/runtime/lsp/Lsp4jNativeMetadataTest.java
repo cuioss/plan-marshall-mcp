@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.TreeSet;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.regex.Pattern;
 
 
 import org.eclipse.lsp4j.jsonrpc.Endpoint;
@@ -45,6 +46,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 class Lsp4jNativeMetadataTest {
 
     static final String DIRECTORY = "META-INF/native-image/de.planmarshall/pm-runtime-lsp4j/";
+    private static final Pattern ANONYMOUS = Pattern.compile("\\$\\d");
     private static final String ALL_MEMBERS = "\"allDeclaredConstructors\":true,\"allPublicConstructors\":true,"
             + "\"allDeclaredMethods\":true,\"allPublicMethods\":true,\"allDeclaredFields\":true,\"allPublicFields\":true";
 
@@ -112,7 +114,7 @@ class Lsp4jNativeMetadataTest {
         try {
             Class<?> type = Class.forName(name, false, loader);
             return type.isInterface() && !type.isAnnotation();
-        } catch (ClassNotFoundException | LinkageError e) {
+        } catch (ClassNotFoundException | LinkageError _) {
             return false;
         }
     }
@@ -125,7 +127,7 @@ class Lsp4jNativeMetadataTest {
             for (JarEntry entry : file.stream().toList()) {
                 String name = entry.getName();
                 if (name.endsWith(".class") && !name.contains("-info") && !name.startsWith("META-INF")
-                        && !name.matches(".*\\$[0-9].*")) {
+                        && !ANONYMOUS.matcher(name).find()) {
                     names.add(name.substring(0, name.length() - ".class".length()).replace('/', '.'));
                 }
             }
