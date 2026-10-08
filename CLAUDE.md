@@ -17,7 +17,8 @@ Current state: roadmap Milestone 0 is complete; Milestone 1 is next. Part A esta
 its target module, minimal and real: the always-on daemon `pm-mcpd` (`pm-mcp-server`), reached through the
 `pm-mcp serve` STDIO relay (`pm-relay`), the operator CLI `pm-operator`, and the job launcher `pm-exec`, all four
 built as native binaries on the host (no container image; PM-TECH-1/3, `doc/specification/runtime-model.adoc`),
-beside the library modules of `pm-modules`. The measurements of both parts, on macOS and Linux, are the reference
+beside the library modules of `pm-modules`. The client contract `pm-api` and the three client binaries now live in
+the repository `plan-marshall/pm-mcp-clients` and are resolved from the organisation's registry. The measurements of both parts, on macOS and Linux, are the reference
 specification `doc/specification/evaluation.adoc`. The code is a first form of each technique: the specifications
 stay the target, the workflow engine and the job runtime do not exist yet (the core tools answer as stubs, the
 job-token and device registries are empty), and there is no experiment-only code in the tree.
@@ -25,15 +26,15 @@ job-token and device registries are empty), and there is no experiment-only code
 ## Modules
 
 The target module structure (PM-IMPL-1 in `doc/requirements/14-implementation.adoc`): `pm-mcp-server`
-(Quarkus daemon assembly) beside the aggregators `pm-modules` (library modules, with the nested
-`pm-providers`) and `pm-clients`. Milestone 0 created the modules its techniques live in; Milestone 1 adds the
+(Quarkus daemon assembly) beside the aggregator `pm-modules` (library modules, with the nested
+`pm-providers`); the client modules are in `pm-mcp-clients`. Milestone 0 created the modules its techniques live in; Milestone 1 adds the
 rest. The only listing of the modules, their dependencies and the specification each implements is
 `doc/specification/module-structure.adoc`; name modules from there and never repeat the listing
 elsewhere. Every module gets minimal real code and tests, never an empty shell.
 
 That listing also defines the target repositories: Milestone 1 splits this repository into `pm-mcp-parent`,
-`pm-mcp-clients`, `pm-mcp-core`, `plan-marshall-documentation` and the private assembly that stays here. Until a
-module has moved, it is built here as before. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
+`pm-mcp-clients`, `pm-mcp-core`, `plan-marshall-documentation` and the private assembly that stays here.
+`pm-mcp-parent` and `pm-mcp-clients` exist; until a module has moved, it is built here as before. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
 belong in `pm-mcp-server`; model-facing content (workflow units, roles, skills, bundles) belongs nowhere else.
 
 ## Development Notes
@@ -49,6 +50,12 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Tests (one module): `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "test -pl <module-path> -am"`
 - Integration tests: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pintegration-tests"`
 - Native binaries and their integration tests: `python3 .plan/execute-script.py plan-marshall:build-maven:maven run --command-args "verify -Pnative,integration-tests"` with `GRAALVM_HOME` and `JAVA_HOME` set to a GraalVM 25 installation
+- The native layout of `pm-e2e` needs `pm-mcp`, `pm-operator` and `pm-exec` as native binaries, which this
+  repository no longer builds: it takes them from a checkout of `plan-marshall/pm-mcp-clients` **beside this
+  repository** (`../pm-mcp-clients`, or `-Dpm.clients.checkout=<path>`), built there with `./mvnw verify -Pnative`.
+  Without them the native layout is skipped and the build output says so (`pm-e2e: native layout skipped: …`); a
+  native run that prints that line has not tested the release layout. The JVM layout needs no checkout: it takes
+  the client JARs from the registry.
 - Without `.plan/execute-script.py` (it is not tracked, for example on a fresh clone): `./mvnw` with the same arguments.
 - `.mvn/maven.config` passes `.mvn/settings.xml` (the organisation's package registry, no token) as global settings;
   the token is the server `plan-marshall` of `~/.m2/settings.xml` (`doc/developer/registry-setup.adoc`).
@@ -65,6 +72,9 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 ## Dependencies and Versions
 
+- `pm-api`, `pm-exec`, `pm-relay` and `pm-operator` come from `pm-mcp-clients` as `SNAPSHOT` versions, named by the
+  one property `version.pm-mcp-clients` in the root `pom.xml`; a change to them is a pull request there, and its
+  merge deploys the `SNAPSHOT` this repository builds against.
 - Parent `de.planmarshall:pm-mcp-parent`, resolved from the organisation's registry, inherits from
   `de.cuioss:cui-quarkus-parent`, which supplies Quarkus (`version.quarkus`), cui-http and cui-java-tools versions.
   Never declare `version.quarkus` locally. The managed third-party versions and the plugin management live in the
@@ -103,8 +113,6 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - Minimum 80% instruction and branch coverage per module. Locally, a `-Pcoverage` run enforces it through
   the JaCoCo `check` of the parent's profile (merged Maven and `quarkus-jacoco` data). CI never runs that
   check: it runs `verify -Psonar`, and the bar there is the SonarCloud quality gate on new code.
-- pm-exec's Linux-only kernel class `LinuxCalls` is excluded from the JaCoCo report and check on macOS only
-  (profile `macos-coverage` in its pom); on Linux it counts in full.
 - Keep a `@QuarkusMain` entry point thin and unit-test its logic in separate classes.
 - Behaviour of the packaged binaries belongs in `*IT` tests (run with `-Pintegration-tests`; they start the
   packaged daemon and the client binaries as processes, natively with `-Pnative`), not in unit tests. A test that

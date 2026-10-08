@@ -40,9 +40,10 @@ import org.junit.jupiter.api.Assumptions;
  * {@code pm-exec} and {@code pm-mcpd}, and a short private {@code PM_MCP_BASE} below {@code /tmp} (the socket path
  * must fit {@code sun_path}).
  * <ul>
- * <li>{@link Mode#NATIVE}: copies of the native images under the sibling modules' {@code target/}, plus the Netty
- * transport library beside {@code pm-mcpd} as the release ships it. Used when they are the current build output
- * (the {@code pm-mcpd} runner newer than the runner JAR); otherwise the test is skipped.</li>
+ * <li>{@link Mode#NATIVE}: copies of the native image {@code pm-mcpd} of this build and of the three native client
+ * binaries of a checkout of {@code pm-mcp-clients}, plus the Netty transport library beside {@code pm-mcpd} as the
+ * release ships it. Used when {@code pm-mcpd} is the current build output (its runner newer than the runner JAR)
+ * and the client binaries are built; otherwise the test is skipped.</li>
  * <li>{@link Mode#JVM}: launcher scripts; {@code pm-mcpd} runs {@code java -jar quarkus-run.jar}, the clients run
  * their JARs (staged by the {@code maven-dependency-plugin} into {@code target/e2e-jvm-lib}). Used when the runner
  * JAR is the current build output.</li>
@@ -72,7 +73,14 @@ final class ReleaseLayout implements AutoCloseable {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final Path ROOT = Path.of("").toAbsolutePath().getParent().getParent();
+    private static final System.Logger LOGGER = System.getLogger(ReleaseLayout.class.getName());
     private static final Path SERVER_TARGET = ROOT.resolve("pm-mcp-server/target");
+    /**
+     * The checkout of {@code pm-mcp-clients} whose native build supplies {@code pm-mcp}, {@code pm-operator} and
+     * {@code pm-exec}: the system property {@code pm.clients.checkout}, else the directory beside this repository.
+     */
+    private static final Path CLIENTS = Path.of(System.getProperty("pm.clients.checkout",
+            ROOT.resolveSibling("pm-mcp-clients").toString())).toAbsolutePath().normalize();
     private static final Path RUNNER_JAR = SERVER_TARGET.resolve("quarkus-app/quarkus-run.jar");
     private static final Path JVM_LIB = Path.of("target", "e2e-jvm-lib").toAbsolutePath();
     private static final boolean MACOS = System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("mac");
@@ -104,14 +112,17 @@ final class ReleaseLayout implements AutoCloseable {
         Path library = null;
         if (mode == Mode.NATIVE) {
             var sources = new LinkedHashMap<String, Path>();
-            sources.put("pm-mcp", ROOT.resolve("pm-clients/pm-relay/target/pm-mcp"));
-            sources.put("pm-operator", ROOT.resolve("pm-clients/pm-operator/target/pm-operator"));
-            sources.put("pm-exec", ROOT.resolve("pm-modules/pm-exec/target/pm-exec"));
+            sources.put("pm-mcp", CLIENTS.resolve("pm-relay/target/pm-mcp"));
+            sources.put("pm-operator", CLIENTS.resolve("pm-operator/target/pm-operator"));
+            sources.put("pm-exec", CLIENTS.resolve("pm-exec/target/pm-exec"));
             sources.put("pm-mcpd", runner.orElse(SERVER_TARGET.resolve("pm-mcp-server-runner")));
             var missing = sources.entrySet().stream().filter(entry -> !Files.isExecutable(entry.getValue()))
                     .map(Map.Entry::getKey).toList();
             abortUnless(home, missing.isEmpty(), "native layout skipped: native binaries " + missing
-                    + " not built; run with -Pnative");
+                    + " not found. pm-mcp, pm-operator and pm-exec come from a checkout of pm-mcp-clients at "
+                    + CLIENTS + (Files.isDirectory(CLIENTS) ? ", which is not built natively"
+                    : ", which does not exist")
+                    + "; clone it there (or set -Dpm.clients.checkout) and run './mvnw verify -Pnative' in it");
             abortUnless(home, nativeCurrent, "native layout skipped: the pm-mcpd native runner is older than "
                     + "the runner JAR, so the native binaries are not the current build output");
             for (var entry : sources.entrySet()) {
@@ -137,9 +148,14 @@ final class ReleaseLayout implements AutoCloseable {
         return new ReleaseLayout(mode, home, Path.of("/tmp", "pme-" + HexFormat.of().formatHex(bytes)), library);
     }
 
+    /**
+     * Skips the test when a layout cannot be staged, and writes the reason to the build output: a skipped test is
+     * only a count in the summary otherwise, and a native layout that never runs would go unnoticed.
+     */
     private static void abortUnless(Path home, boolean condition, String message) {
         if (!condition) {
             delete(home);
+            LOGGER.log(System.Logger.Level.WARNING, "pm-e2e: {0}", message);
             Assumptions.abort(message);
         }
     }
