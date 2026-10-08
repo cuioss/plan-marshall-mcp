@@ -14,9 +14,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.File;
-import java.nio.file.Path;
-
 
 import io.netty.channel.socket.InternetProtocolFamily;
 import io.vertx.core.net.SocketAddress;
@@ -25,7 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 
-@DisplayName("Native transport and library path")
+@DisplayName("Native transport")
 class NativeTransportTest {
 
     @Test
@@ -51,25 +48,5 @@ class NativeTransportTest {
         var channel = transport.datagramChannel();
         assertNotNull(channel);
         assertNotNull(transport.datagramChannel(InternetProtocolFamily.IPv4));
-    }
-
-    @Test
-    @DisplayName("prepends the executable directory to the library path")
-    void shouldPrependLibraryPath() {
-        var dir = Path.of("/opt/pm/bin");
-
-        assertEquals("/opt/pm/bin", NativeLibraryPath.prepend(dir, null));
-        assertEquals("/opt/pm/bin", NativeLibraryPath.prepend(dir, ""));
-        assertEquals("/opt/pm/bin" + File.pathSeparator + "/usr/lib", NativeLibraryPath.prepend(dir, "/usr/lib"));
-    }
-
-    @Test
-    @DisplayName("leaves the library path of a JVM alone")
-    void shouldIgnoreJvm() {
-        var before = System.getProperty(NativeLibraryPath.LIBRARY_PATH);
-
-        NativeLibraryPath.includeExecutableDirectory();
-
-        assertEquals(before, System.getProperty(NativeLibraryPath.LIBRARY_PATH));
     }
 }

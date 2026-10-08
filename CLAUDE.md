@@ -84,7 +84,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - `private static final CuiLogger LOGGER = new CuiLogger(X.class);` (cui-java-tools). No slf4j,
   log4j, `System.out`/`System.err`.
 - `%s` placeholders only; exception first.
-- INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` (prefix `PM_MCP`,
+- INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` of `pm-runtime` (prefix `PM_MCP`,
   ranges INFO 001-099, WARN 100-199, ERROR 200-299), each documented in `doc/LogMessages.adoc`.
 
 ### Testing

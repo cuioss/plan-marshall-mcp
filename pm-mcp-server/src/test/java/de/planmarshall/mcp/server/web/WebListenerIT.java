@@ -36,11 +36,11 @@ import javax.net.ssl.TrustManagerFactory;
 
 
 import de.planmarshall.mcp.server.test.DaemonProcess;
-import de.planmarshall.mcp.server.test.TestBases;
 import de.planmarshall.mcp.server.test.TestRuntime;
 import de.planmarshall.mcp.server.test.TestSecrets;
 import de.planmarshall.mcp.server.test.UdsHttp;
 import de.planmarshall.mcp.server.test.VerificationResults;
+import de.planmarshall.runtime.test.TestBases;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;

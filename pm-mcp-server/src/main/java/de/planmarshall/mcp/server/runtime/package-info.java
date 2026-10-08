@@ -8,8 +8,8 @@
  * the root of this repository.
  */
 /**
- * Runtime lifecycle of {@code pm-mcpd}: the entry point, the startup sequence (singleton lock, stale-file
- * cleanup, directory and permission verification, runtime token, socket bind and runtime record) and the
- * identity of the running instance.
+ * Runtime lifecycle of {@code pm-mcpd}: the entry point, the socket bind with the runtime record after the
+ * start sequence of {@code pm-runtime} ({@link de.planmarshall.runtime.start.StartupSequence}), the Netty
+ * transport, and the identity of the running instance.
  */
 package de.planmarshall.mcp.server.runtime;

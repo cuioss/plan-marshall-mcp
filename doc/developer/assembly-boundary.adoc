@@ -1,0 +1,98 @@
+= The Assembly Boundary
+:toc: left
+:toclevels: 2
+:toc-title: Table of Contents
+:nofooter:
+
+link:../DeveloperGuide.adoc[Developer Guide] » The Assembly Boundary
+
+== The Rule
+_Requirements: link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]_
+
+`pm-mcp-server` is the Quarkus assembly of the daemon `pm-mcpd`, and it holds wiring only: the entry point, the listeners, the authentication mechanism with its identity providers, the REST resources, the MCP tools, and the CDI producers. Whatever the daemon does without a framework type lives in the library module `pm-runtime` (package `de.planmarshall.runtime`).
+
+A class belongs in `pm-mcp-server` only if it references a type of one of these namespaces: `io.quarkus`, `io.quarkiverse.mcp`, `jakarta`, `io.vertx`, or `io.netty`. The one exception is a record that such a class exchanges, for example the body of a REST resource. A nested class counts with its top-level class.
+
+The reason is the repository cut: `pm-mcp-server` stays in the repository that is closed first, while `pm-runtime` moves to a public library repository. A framework-free class left in the assembly has no plain JUnit test and grows the private repository back into the one that holds the logic.
+
+== The Build Test
+_Requirements: link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]_
+
+link:../../pm-mcp-server/src/test/java/de/planmarshall/mcp/server/architecture/AssemblyHoldsWiringOnlyTest.java[`AssemblyHoldsWiringOnlyTest`] reads the compiled classes below `de/planmarshall/mcp/server/` with the class-file API of the JDK and looks at the constant pool of each: the class entries and the type descriptors, which include the annotations. It fails with the names of the top-level classes that reference no framework type and are not a record referenced by a class that does.
+
+Its control runs the same rule over four fixture classes in the test sources (`architecture/fixture`): a framework-free class and a record nobody references trip the rule, a class that takes a Vert.x `JsonObject` and the record it returns do not.
+
+When the test names a class of yours:
+
+* Move the class and its test to `pm-runtime`, into the package of its subject.
+* If the class mixes logic with a framework type, split it: the logic moves, and a thin class with the framework type stays and calls it.
+* Do not add an annotation or an unused framework field to pass the test.
+
+== What Lives in `pm-runtime`
+_Requirements: link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1], link:../Requirements.adoc#PM-CRED-2[PM-CRED-2], link:../Requirements.adoc#PM-CRED-3[PM-CRED-3]_
+
+[cols="1,3", options="header"]
+|===
+|Package |Content
+
+|`de.planmarshall.runtime`
+|`PmMcpLogMessages`, the log messages of the daemon (link:../LogMessages.adoc[Log Messages]). The classes of the assembly log through it as well.
+
+|`…runtime.start`
+|The start sequence up to the socket bind (`StartupSequence`): the singleton lock, the removal of a stale socket and runtime record, the check of the base directory and its permissions, and the runtime token. `NativeLibraryPath` and `PosixModes` are its helpers.
+
+|`…runtime.credentials`, `…credentials.dbus`
+|The credential stores behind `SecretStore` (macOS Keychain through FFM, Linux Secret Service over D-Bus, the file store), the selection of the one active store, and the keyring service name.
+
+|`…runtime.security`
+|The token kinds, the registries of job tokens and paired devices as interfaces, and the digest and constant-time comparison of secrets.
+
+|`…runtime.web`
+|The state of web access and the self-signed TLS certificate of the web listener.
+
+|`…runtime.lsp`
+|The language server client on LSP4J.
+
+|`…runtime.ingest`
+|The level-1 ingestion validator on `commonmark` and the URL validation of `cui-http`.
+|===
+
+`pm-runtime` depends on `pm-core` and, for `MachinePaths`, on `pm-api`. It is the only module that depends on `commonmark` and LSP4J; `pm-mcp-server` declares neither.
+
+The assembly reaches these classes in two ways. Services are produced through CDI: `SecretStoreProducer` produces the active `SecretStore`, and `EmptyRegistries` the default `JobTokenRegistry` and `DeviceRegistry`. The start sequence runs in `PmMcpd` before the container starts, so it is called directly.
+
+== Tests and Fixtures
+_Requirements: link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1]_
+
+* The unit tests of `pm-runtime` are plain JUnit 5 without Quarkus. The module meets the coverage minimum on its own.
+* `pm-runtime` builds a test JAR, which `pm-mcp-server` uses in test scope. It carries the fixtures both modules need: `TestBases` (short temporary base directories, so that the socket path fits), `FakeBus` and `FakeSecretService` (an in-test D-Bus with a Secret Service), and `VerificationResults` of the credential tests.
+* `SecretServiceIT` runs against a real Secret Service on Linux and lives in `pm-runtime`, because it uses package-private parts of the store. `pm-runtime` therefore has the `integration-tests` profile of the other modules. The tests that start the packaged daemon (`KeyringIT`, `StartupFiguresIT`) stay in `pm-mcp-server`.
+* The credential backends call native code through FFM, so the test JVMs of `pm-runtime` run with `--enable-native-access=ALL-UNNAMED`.
+
+== Native-Image Metadata
+_Requirements: link:../Requirements.adoc#PM-IMPL-1[PM-IMPL-1], link:../Requirements.adoc#PM-TECH-3[PM-TECH-3]_
+
+The metadata of a class travels with its module, below `META-INF/native-image/de.planmarshall/<name>/`, and the native build of `pm-mcpd` picks it up from the JAR:
+
+[cols="1,1,3", options="header"]
+|===
+|Module |Directory |Content
+
+|`pm-runtime`
+|`pm-runtime-credentials`
+|The FFM downcall descriptors of the Keychain and `getuid` calls, and the build arguments that enable the foreign API.
+
+|`pm-runtime`
+|`pm-runtime-lsp4j`
+|Reflection and proxy entries of LSP4J, and the entry of `PoolLanguageClient`, whose methods LSP4J calls reflectively. `Lsp4jNativeMetadataTest` computes the files from the LSP4J JARs and fails when they drift.
+
+|`pm-mcp-server`
+|`pm-mcp-server-jgit`
+|Reflection and resource entries of JGit and the run-time initialisation of its classes, guarded by `JgitNativeMetadataTest`.
+
+|`pm-mcp-server`
+|`pm-mcp-server`, `pm-mcp-server-macos`, `pm-mcp-server-linux`
+|The Netty transport of the platform.
+|===
+
+Run either drift test with `-Dpm.native-metadata.write=true` to rewrite its files after a version change. A class of `pm-runtime` cannot use `@RegisterForReflection`, which is a Quarkus annotation; it gets an entry in the metadata of the module instead. A missed entry fails only in the native build, so a change here is verified with `verify -Pnative,integration-tests`.

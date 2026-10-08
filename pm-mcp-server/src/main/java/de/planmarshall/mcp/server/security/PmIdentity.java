@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Set;
 
 
+import de.planmarshall.runtime.security.CredentialKind;
 import io.quarkus.security.credential.Credential;
 import io.quarkus.security.identity.SecurityIdentity;
 import io.smallrye.mutiny.Uni;

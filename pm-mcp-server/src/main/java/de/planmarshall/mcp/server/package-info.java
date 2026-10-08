@@ -8,6 +8,7 @@
  * the root of this repository.
  */
 /**
- * The PM-MCP daemon assembly {@code pm-mcpd}: local adapter, MCP tools and log messages.
+ * The PM-MCP daemon assembly {@code pm-mcpd}: local adapter, MCP tools, and the CDI wiring of the services of
+ * {@code pm-runtime}.
  */
 package de.planmarshall.mcp.server;

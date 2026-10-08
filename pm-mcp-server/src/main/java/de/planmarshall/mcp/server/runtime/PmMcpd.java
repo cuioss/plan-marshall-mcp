@@ -18,6 +18,8 @@ import java.security.SecureRandom;
 
 
 import de.planmarshall.api.MachinePaths;
+import de.planmarshall.runtime.start.NativeLibraryPath;
+import de.planmarshall.runtime.start.StartupSequence;
 import io.quarkus.runtime.Quarkus;
 import io.quarkus.runtime.annotations.QuarkusMain;
 
