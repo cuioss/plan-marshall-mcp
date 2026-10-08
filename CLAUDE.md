@@ -17,8 +17,10 @@ Current state: roadmap Milestone 0 is complete; Milestone 1 is next. Part A esta
 its target module, minimal and real: the always-on daemon `pm-mcpd` (`pm-mcp-server`), reached through the
 `pm-mcp serve` STDIO relay (`pm-relay`), the operator CLI `pm-operator`, and the job launcher `pm-exec`, all four
 built as native binaries on the host (no container image; PM-TECH-1/3, `doc/specification/runtime-model.adoc`),
-beside the library modules of `pm-modules`. The client contract `pm-api` and the three client binaries now live in
-the repository `plan-marshall/pm-mcp-clients` and are resolved from the organisation's registry. The measurements of both parts, on macOS and Linux, are the reference
+beside the library modules. The client contract `pm-api` and the three client binaries live in the repository
+`plan-marshall/pm-mcp-clients`, the plain-Java engine (`pm-core`, `pm-runtime`, the provider modules) in
+`plan-marshall/pm-mcp-core`; this repository resolves both from the organisation's registry and holds the daemon
+assembly `pm-mcp-server` and the end-to-end tests `pm-e2e`. The measurements of both parts, on macOS and Linux, are the reference
 specification `doc/specification/evaluation.adoc`. The code is a first form of each technique: the specifications
 stay the target, the workflow engine and the job runtime do not exist yet (the core tools answer as stubs, the
 job-token and device registries are empty), and there is no experiment-only code in the tree.
@@ -26,15 +28,15 @@ job-token and device registries are empty), and there is no experiment-only code
 ## Modules
 
 The target module structure (PM-IMPL-1 in `doc/requirements/14-implementation.adoc`): `pm-mcp-server`
-(Quarkus daemon assembly) beside the aggregator `pm-modules` (library modules, with the nested
-`pm-providers`); the client modules are in `pm-mcp-clients`. Milestone 0 created the modules its techniques live in; Milestone 1 adds the
+(Quarkus daemon assembly) and `pm-e2e` here; the client modules are in `pm-mcp-clients`, the library modules
+in `pm-mcp-core`. Milestone 0 created the modules its techniques live in; Milestone 1 adds the
 rest. The only listing of the modules, their dependencies and the specification each implements is
 `doc/specification/module-structure.adoc`; name modules from there and never repeat the listing
 elsewhere. Every module gets minimal real code and tests, never an empty shell.
 
 That listing also defines the target repositories: Milestone 1 splits this repository into `pm-mcp-parent`,
 `pm-mcp-clients`, `pm-mcp-core`, `plan-marshall-documentation` and the private assembly that stays here.
-`pm-mcp-parent` and `pm-mcp-clients` exist; until a module has moved, it is built here as before. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
+`pm-mcp-parent`, `pm-mcp-clients` and `pm-mcp-core` exist; the documents are still here. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
 belong in `pm-mcp-server`; model-facing content (workflow units, roles, skills, bundles) belongs nowhere else.
 
 ## Development Notes
@@ -72,9 +74,11 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 
 ## Dependencies and Versions
 
-- `pm-api`, `pm-exec`, `pm-relay` and `pm-operator` come from `pm-mcp-clients` as `SNAPSHOT` versions, named by the
-  one property `version.pm-mcp-clients` in the root `pom.xml`; a change to them is a pull request there, and its
-  merge deploys the `SNAPSHOT` this repository builds against.
+- `pm-api`, `pm-exec`, `pm-relay` and `pm-operator` come from `pm-mcp-clients`, and `pm-core`, `pm-runtime` and the
+  provider modules from `pm-mcp-core`, as `SNAPSHOT` versions, each repository named by one property in the root
+  `pom.xml` (`version.pm-mcp-clients`, `version.pm-mcp-core`). A change to one of them is a pull request in its
+  repository, and its merge deploys the `SNAPSHOT` this repository builds against; a local build takes the latest
+  `SNAPSHOT` from the registry (or from `~/.m2` after `./mvnw install` in a checkout of that repository).
 - Parent `de.planmarshall:pm-mcp-parent`, resolved from the organisation's registry, inherits from
   `de.cuioss:cui-quarkus-parent`, which supplies Quarkus (`version.quarkus`), cui-http and cui-java-tools versions.
   Never declare `version.quarkus` locally. The managed third-party versions and the plugin management live in the
@@ -98,7 +102,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - `private static final CuiLogger LOGGER = new CuiLogger(X.class);` (cui-java-tools). No slf4j,
   log4j, `System.out`/`System.err`.
 - `%s` placeholders only; exception first.
-- INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` of `pm-runtime` (prefix `PM_MCP`,
+- INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` of `pm-runtime` in `pm-mcp-core` (prefix `PM_MCP`,
   ranges INFO 001-099, WARN 100-199, ERROR 200-299), each documented in `doc/LogMessages.adoc`.
 
 ### Testing
