@@ -33,8 +33,9 @@ implementation blueprints in [Specification](doc/Specification.adoc), and the de
 
 ## Modules
 
-`pm-mcp-server` (the Quarkus daemon `pm-mcpd`) beside the aggregator `pm-modules` (library modules, with the
-nested `pm-providers`, and the end-to-end tests `pm-e2e`). The client contract `pm-api`, the job launcher
+`pm-mcp-server` (the Quarkus daemon `pm-mcpd`) and the end-to-end tests `pm-e2e`. The plain-Java engine
+(`pm-core`, `pm-runtime`, the provider modules) lives in
+[pm-mcp-core](https://github.com/plan-marshall/pm-mcp-core). The client contract `pm-api`, the job launcher
 `pm-exec`, the STDIO relay `pm-mcp` and the operator CLI `pm-operator` live in
 [pm-mcp-clients](https://github.com/plan-marshall/pm-mcp-clients), and the parent POM in
 [pm-mcp-parent](https://github.com/plan-marshall/pm-mcp-parent). The listing of the modules, their dependencies, and
