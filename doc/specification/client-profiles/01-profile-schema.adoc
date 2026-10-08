@@ -627,11 +627,16 @@ _See Requirement link:../../Requirements.adoc#PM-CLIENT-5[PM-CLIENT-5: Versioned
 |Machine
 |`<PM_MCP_BASE>/profiles/<client_id>.json`, each with its verification record `<PM_MCP_BASE>/profiles/verification/<client_id>.json`
 |`pm-operator profile install`, from a candidate the profile verification wrote on this machine; never by hand and never by a model (the directory lies below `<PM_MCP_BASE>`, which no job and no host session can write)
+
+|Project
+|`<PM_MCP_BASE>/projects/<project_id>/profiles/<client_id>.json`, each with its verification record `…/profiles/verification/<client_id>.json`
+|`pm-operator profile install --project`, the same way; it lies in the per-project machine store, never in the repository, so no commit and no pull request can change how a harness is started (link:../../Requirements.adoc#PM-EXT-6[PM-EXT-6])
 |===
 
-* *Whole documents*: a machine profile replaces the shipped profile of the same `client_id` as a whole; the two are never merged. A machine profile of a `client_id` the release does not ship adds a harness.
-* *Bound to its verification*: a machine profile is valid only together with a verification record whose `profile_digest` equals the SHA-256 of the canonical JSON (RFC 8785) of the profile document. A profile without such a record, or one edited after its verification, is refused as `profile_unverified` and the shipped profile of that `client_id`, if any, stays in force; the refusal is reported by `pm-operator status` and `pm-operator profile show`.
-* *Bound to the harness version*: the record names the harness version it was measured on. When the enrolled harness reports a version outside `headless.supported_versions`, the launch refusal `harness_version_unsupported` applies as for a shipped profile; a new verification on the new version produces a new candidate.
+* *Whole documents, nearest set wins*: the effective profile of a `client_id` for a project is the document of the project set, else of the machine set, else of the shipped set, always as a whole; documents are never merged. A machine profile of a `client_id` the release does not ship adds a harness.
+* *A project profile changes how a harness works, not which harness it is*: a project profile exists only for a `client_id` that the machine or the shipped set defines, and its `detection`, `identity`, and `headless.executable` equal those of that profile; validation refuses it otherwise. Detection and the operator checks are therefore the same in every project of the machine.
+* *Bound to its verification*: a machine or project profile is valid only together with a verification record whose `profile_digest` equals the SHA-256 of the canonical JSON (RFC 8785) of the profile document, and whose HMAC sidecar (`<client_id>.json.hmac`, written with the key of the enrolment store) verifies. A profile without such a record, one edited after its verification, or a record that fails its HMAC is refused as `profile_unverified`, and the profile of the next set stays in force; the refusal is reported by `pm-operator status` and `pm-operator profile show`.
+* *Bound to the harness that was measured*: the record names the harness by executable name, exact version, and the SHA-256 of the executable file. When the enrolled harness reports a version outside `headless.supported_versions`, the launch refusal `harness_version_unsupported` applies as for a shipped profile; when its version or digest differs from the record of a machine or project profile inside that range, launches go on and `pm-operator status` reports the profile as `verified_on_other_build` until it is verified again.
 * *Read by the client binaries*: `pm-mcp` and `pm-operator` read the `detection` and `identity` objects of the machine profiles beside those of the shipped ones (link:../cli-and-security/01-cli-and-installer.adoc#cli-file-reads[CLI, Coordination & Security Specification, Direct file reads]), so a harness the operator added is detected at entry and counts for the operator checks. A machine profile the runtime refuses is ignored by them as well.
 
 [#profile-verification]
@@ -647,9 +652,9 @@ _Implementation watch: link:../../implementation-watch/client-profiles.adoc#PM-W
 ----
 pm-operator profile verify <client_id> [--draft <file>] [--executable <path>]
                                        [--stage <stage>]... [--trials <n>]     [op]
-pm-operator profile install <client_id>                                         [op]
-pm-operator profile show <client_id> [--candidate]
-pm-operator profile remove <client_id>                                          [op]
+pm-operator profile install <client_id> [--project]                             [op]
+pm-operator profile show <client_id> [--candidate] [--project]
+pm-operator profile remove <client_id> [--project]                              [op]
 ----
 
 *How it runs.* The verb is a request to the runtime, which runs the stages as jobs of its own: the real job launcher, the real job relay `pm-mcp serve --job`, and the real supervisor, with compiled probe tasks in place of a plan. No project is involved: every probe worker runs in a workspace of its own that the runtime creates in the user's temporary directory (`pm-mcp-probe-<run_id>/`, mode `0700`) and removes afterwards; it lies outside `<PM_MCP_BASE>`, which no job may read or write, and it is the only project root in the worker's write set. The harness uses the operator's own login, so a run costs model tokens; the verb prints the stages, the number of worker starts, and the trials before it starts and asks for confirmation. A probe worker is confined like every job where the platform has a confinement.
@@ -700,12 +705,17 @@ pm-operator profile remove <client_id>                                          
 {
   "format_version": 1,
   "client_id": "antigravity",
-  "profile_digest": "sha256:…",
+  "profile_schema_version": 1,
+  "profile_digest": "sha256:9f2c…",
   "verified_at": "2026-10-08T08:36:00Z",
-  "tool_version": "0.4.0",
-  "harness_version": "1.3.1",
+  "tool": { "version": "0.4.0", "commit": "02ffcbd22b43de8d673b3b6abe77f755a1442398" },
+  "harness": {
+    "executable": "agy",
+    "version": "1.3.1",
+    "executable_sha256": "sha256:41d0…",
+    "models": ["gemini-3.8-flash-low"]
+  },
   "platform": { "os": "linux", "arch": "x86_64", "confinement": "landlock", "landlock_abi": 8 },
-  "models": ["gemini-3.8-flash-low"],
   "stages": {
     "identity":  { "status": "passed" },
     "detection": { "status": "passed" },
@@ -717,17 +727,17 @@ pm-operator profile remove <client_id>                                          
     "faults":    { "status": "passed", "trials": 10 }
   },
   "values": [
-    { "pointer": "/headless/classes/zero_tool", "status": "measured", "value": null,
-      "evidence": "launch without tools refused by the harness" },
-    { "pointer": "/headless/classes/writer/tool_set", "status": "measured", "value": "advisory",
-      "evidence": "call outside the tool set succeeded" },
-    { "pointer": "/detection/primary_signals", "status": "confirmed",
-      "evidence": "ANTIGRAVITY_AGENT added for commands, absent for the MCP server" }
+    { "pointer": "/headless/classes/zero_tool", "status": "measured", "code": "launch_without_tools_refused" },
+    { "pointer": "/headless/classes/writer/tool_set", "status": "measured", "code": "outside_call_succeeded" },
+    { "pointer": "/detection/primary_signals", "status": "confirmed", "code": "added_for_commands_only" },
+    { "pointer": "/worker/silence_grace_seconds", "status": "measured", "code": "stall_detected", "figures": { "min_ms": 50050, "max_ms": 50090, "trials": 10 } }
   ]
 }
 ----
 
 * `stages.<stage>.status` is `passed`, `failed`, or `not_run`. `values` holds one entry per profile value a stage settles, with `status` `measured` (the tool determined it), `confirmed` (a proposal of the tool the operator confirmed at install), `declared` (taken from the draft, because the tool cannot test it), or `not_measured` (its stage failed or did not run).
+* *What ran is tracked exactly*: `tool` names the release and the commit of the `pm-mcpd` that ran the verification, taken from the binary and never from an argument; `harness` names the executable by its name, the exact version its version probe printed, the SHA-256 of the executable file the run started, and every model a stage ran with; `platform` names operating system, architecture, and confinement. The record holds no path, no host name, no user name, no environment value, and no model output.
+* *The record is closed data*: its schema admits no free text. `code` is a value of the closed list of outcome codes of its stage, and `figures` holds integers under a closed set of keys (`min_ms`, `max_ms`, `trials`, `chars`, `count`). A record with an unknown member, an unknown code, or a string that is not one of its closed forms is refused.
 * *The candidate claims only what was measured*:
 ** `worker.eligible` is `true` only when `faults` passed every fault with at least 10 trials on a platform with a confinement; otherwise it is `false`, whatever the draft says.
 ** `headless.classes.zero_tool` is non-null only when the `classes` stage passed it and `isolation` measured an exclusive configuration with settings control; otherwise `null`.
@@ -737,13 +747,49 @@ pm-operator profile remove <client_id>                                          
 * *Install*: `pm-operator profile install <client_id>` shows the candidate against the effective profile value by value, lists every value that is `declared` or `not_measured`, asks the operator to confirm the proposed detection signals, and on confirmation moves candidate and record into the machine set (<<profile-sets>>) under the lock of the machine store. The runtime loads it for workers started afterwards; running workers keep the profile of their job record.
 * *Runtime check on load*: the runtime honours a machine profile's `worker.eligible: true` and a non-null `zero_tool` only when its record shows the stages above as `passed` for the platform the runtime runs on; a record from another platform leaves the profile usable for entry and rendering and its harness ineligible for workers.
 
+[#profile-hardening]
+=== A Profile Is Untrusted Input
+
+_Implementation watch: link:../../implementation-watch/client-profiles.adoc#PM-WATCH-CLIENT-13[PM-WATCH-CLIENT-13]_
+
+A profile starts a process and puts text in front of a model, and a profile may come from somewhere else than the machine that uses it (a draft the operator received, a profile offered for a later release, link:../../later-improvements.adoc[Later Improvements]). The reader therefore treats every profile, draft, and verification record as hostile data. The rules below are part of profile validation in every set, the shipped one included, and each has a refusing fixture.
+
+[cols="1,4"]
+|===
+|Rule |Content
+
+|Closed shape
+|Every object of the profile and of the record refuses unknown members, every enumeration is closed, and every array has an upper bound (64 items; `argv` and each `args` 128). A document is at most 64 KiB and is parsed with the streaming reader, bounded in depth (16) and in string length before any value is used.
+
+|Strings
+|Every string is NFC, a single line, without control characters, and at most 256 characters (an `argv`, `args`, or `env` item 1,024). A value that names something is matched against the pattern of its kind: identifiers, variable names, tool names (`^[A-Za-z0-9_.:-]{1,64}$`), model identifiers, JSON Pointers (RFC 6901), home-relative paths.
+
+|Text a model reads
+|`display_name`, the tool names of `tools`, the `replacement` of an idiom, `skill_loading.load_directive_template`, and the `commands` entries are rendered into skills and representations. Each is limited to the characters of an identifier, a command name, or a call expression (letters, digits, and `_ . : / - $ = , ( ) " { } < >` and the space), with the closed placeholders as the only `{{…}}`; none can carry a sentence, a line break, or markup.
+
+|Launch
+|`headless.executable` is a bare name; its path comes only from the harness enrolment, which the operator made with the path, version, and digest shown. `argv`, `args`, and `env` values are passed without a shell. They may hold only literals and the closed set of slots; an item that names a URL, an absolute path, or a home path outside `writable_paths` is refused, since a launch reaches files and servers only through its slots. `env` may set no variable of the loader, of an interpreter, or of the job environment (`PATH`, `HOME`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHON*`, `JAVA_TOOL_OPTIONS`, `PM_MCP_*`) and none that matches a credential pattern.
+
+|Paths
+|`writable_paths`, `mcp_config.path`, and `data_home.login_file` are relative, hold no `..` and no symbolic-link traversal out of their root, and never name a harness home as a whole, a settings, skill, or command file a bundle manages, or anything below `<PM_MCP_BASE>`.
+
+|Patterns
+|`identity.version_pattern` is the only regular expression. It is at most 128 characters, uses no backreference and no look-around, has exactly one capture group, and is applied to at most 4 KiB of probe output under a time bound.
+
+|Claims
+|No value of a profile is believed because the profile says so: `worker.eligible`, a runnable `zero_tool` class, and an `enforced` tool set count only with the stages of the bound record `passed` on the runtime's platform (<<profile-verification>>), and a record is believed only from the verification of this machine or of the release.
+|===
+
+*Install shows what will run*: `pm-operator profile install` prints the executable, the complete `argv`, the `args` of every class, and the `env` of the candidate before it asks for confirmation, because no rule can decide whether a harness flag is harmless.
+
 [#profile-override-hierarchy]
 === Profile Override Hierarchy
 
-The runtime resolves a client profile from three layers in order of increasing precedence:
+The runtime resolves a client profile from four layers in order of increasing precedence:
 
 1. *Compiled Binary Baseline* (`classpath:/profiles/<client_id>.json`): The profile documents compiled into the binaries (<<harness-as-data>>).
 2. *Machine Profile* (`<PM_MCP_BASE>/profiles/<client_id>.json`): A verified profile the operator installed on the machine; it replaces the compiled document of the same `client_id` as a whole (<<profile-sets>>).
-3. *Machine-Wide Operator Overrides* (`machine-config.json`, the closed object `client_profiles.<client_id>.connection`, link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas Specification, Machine Configuration]): Optional override of the connection settings `bounded_wait_seconds`, `idle_timeout_seconds`, and `progress_resets_timeout` across all repositories on the workstation, set with `pm-operator config`. No other profile key can be overridden: the `worker` block, the `headless` block, and the `detection` and `identity` objects that form the host-detection table (xref:02-placeholders-and-detection.adoc#host-detection-table[Host-Detection Table]) are never touched by an override.
+3. *Project Profile* (`<PM_MCP_BASE>/projects/<project_id>/profiles/<client_id>.json`): A verified profile the operator installed for one project; it replaces the machine or compiled document as a whole for that project's workers and sessions (<<profile-sets>>).
+4. *Machine-Wide Operator Overrides* (`machine-config.json`, the closed object `client_profiles.<client_id>.connection`, link:../store-schemas/12-machine-stores.adoc#machine-config[Store Schemas Specification, Machine Configuration]): Optional override of the connection settings `bounded_wait_seconds`, `idle_timeout_seconds`, and `progress_resets_timeout` across all repositories on the workstation, set with `pm-operator config`. No other profile key can be overridden: the `worker` block, the `headless` block, and the `detection` and `identity` objects that form the host-detection table (xref:02-placeholders-and-detection.adoc#host-detection-table[Host-Detection Table]) are never touched by an override.
 
 Harness, model, and effort of a worker come only from its role artifact (link:../model-work/01-roles-and-configuration.adoc[Model Work Specification, Roles & Configuration]), an operator file, rendered into the `{{model}}` and `{{effort}}` slots of `headless`; a profile carries no model choice. A change of a role artifact applies to the next worker of the role; nothing is re-installed. No git-tracked configuration carries client profile overrides, role sets, or model pins (`PM-WORK-1`, `PM-EXT-6`); the closed team schemas admit no such key, so a `client_profiles` block in a team file is the finding `unknown_config_key` (`config_invalid`).
