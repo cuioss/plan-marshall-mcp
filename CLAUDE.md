@@ -31,6 +31,11 @@ rest. The only listing of the modules, their dependencies and the specification 
 `doc/specification/module-structure.adoc`; name modules from there and never repeat the listing
 elsewhere. Every module gets minimal real code and tests, never an empty shell.
 
+That listing also defines the target repositories: Milestone 1 splits this repository into `pm-mcp-parent`,
+`pm-mcp-clients`, `pm-mcp-core`, `plan-marshall-documentation` and the private assembly that stays here. Until a
+module has moved, it is built here as before. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
+belong in `pm-mcp-server`; model-facing content (workflow units, roles, skills, bundles) belongs nowhere else.
+
 ## Development Notes
 
 ### Build Commands
@@ -142,10 +147,13 @@ The repository lives in the `plan-marshall` organisation (`plan-marshall/plan-ma
 7. Do **NOT** enable auto-merge unless explicitly instructed. Wait for user approval.
 8. Return to main: `git checkout main && git pull`
 
-**No publishing:** plan-marshall-mcp is proprietary and publishes nothing to external repositories. There is
+**Publishing only to the organisation's registry:** plan-marshall-mcp is proprietary. Its artifacts go to the GitHub
+Packages registry of the organisation `plan-marshall` and nowhere else, never to Maven Central or another public
+registry; that deployment is set up by Milestone 1 through the parent POM and does not exist yet. Today there is
 no release workflow, snapshot deploy is off (`.github/project.yml`), the CI build receives no Sonatype or GPG
 credentials, and the root `pom.xml` skips `central-publishing-maven-plugin` and points `distributionManagement`
-at `target/` — even `mvn deploy` stays local. Never re-enable any of these without the user's explicit decision.
+at `target/` — even `mvn deploy` stays local. Never re-enable any of these, and never add a deployment target
+other than the organisation's registry, without the user's explicit decision.
 
 CI: reusable workflows from `cuioss/cuioss-organization`, pinned by full SHA with a version comment;
 configuration in `.github/project.yml`. Releases of `cuioss-organization` and of the cui parent open
