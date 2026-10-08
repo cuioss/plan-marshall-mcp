@@ -9,6 +9,9 @@
  */
 package de.planmarshall.provider.ci;
 
+import de.cuioss.http.client.handler.HttpHandler;
+import de.cuioss.http.client.handler.RedirectNotAllowedException;
+import de.cuioss.http.client.handler.RedirectPolicy;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpHeaders;
@@ -26,9 +29,6 @@ import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import de.cuioss.http.client.handler.HttpHandler;
-import de.cuioss.http.client.handler.RedirectNotAllowedException;
-import de.cuioss.http.client.handler.RedirectPolicy;
 import de.planmarshall.provider.ci.CiResponse.Outcome;
 
 /**

@@ -9,8 +9,8 @@
  */
 package de.planmarshall.mcp.server.credentials;
 
-import de.planmarshall.mcp.server.PmMcpLogMessages;
 import de.cuioss.tools.logging.CuiLogger;
+import de.planmarshall.mcp.server.PmMcpLogMessages;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;

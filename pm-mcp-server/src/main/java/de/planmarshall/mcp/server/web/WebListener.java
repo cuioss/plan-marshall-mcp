@@ -19,9 +19,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 
+import de.cuioss.tools.logging.CuiLogger;
 import de.planmarshall.mcp.server.PmMcpLogMessages;
 import de.planmarshall.mcp.server.runtime.RuntimeContext;
-import de.cuioss.tools.logging.CuiLogger;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.vertx.http.runtime.VertxHttpRecorder;
 import io.vertx.core.Future;
