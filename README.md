@@ -33,9 +33,11 @@ implementation blueprints in [Specification](doc/Specification.adoc), and the de
 
 ## Modules
 
-`pm-mcp-server` (the Quarkus daemon `pm-mcpd`) beside the aggregators `pm-modules` (library modules, with the
-nested `pm-providers`, the job launcher `pm-exec`, and the end-to-end tests `pm-e2e`) and `pm-clients` (the
-STDIO relay `pm-mcp` and the operator CLI `pm-operator`). The listing of the modules, their dependencies, and
+`pm-mcp-server` (the Quarkus daemon `pm-mcpd`) beside the aggregator `pm-modules` (library modules, with the
+nested `pm-providers`, and the end-to-end tests `pm-e2e`). The client contract `pm-api`, the job launcher
+`pm-exec`, the STDIO relay `pm-mcp` and the operator CLI `pm-operator` live in
+[pm-mcp-clients](https://github.com/plan-marshall/pm-mcp-clients), and the parent POM in
+[pm-mcp-parent](https://github.com/plan-marshall/pm-mcp-parent). The listing of the modules, their dependencies, and
 the specification each implements is the
 [Module Structure Specification](doc/specification/module-structure.adoc).
 

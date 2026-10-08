@@ -71,6 +71,11 @@ class WebListenerIT {
         TestBases.delete(base);
     }
 
+    /** The daemon's own output, which names the reason when it refuses to open the listener. */
+    private static String daemonLog() {
+        return "daemon log:\n" + daemon.output();
+    }
+
     private static int freePort() throws IOException {
         try (var socket = new ServerSocket(0)) {
             return socket.getLocalPort();
@@ -84,7 +89,8 @@ class WebListenerIT {
     }
 
     private static LanListener lanEnabled(int port) throws IOException {
-        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status());
+        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status(),
+                WebListenerIT::daemonLog);
         return () -> assertEquals(200, putWeb("{\"enabled\":false}").status());
     }
 
@@ -123,7 +129,8 @@ class WebListenerIT {
             assertTrue(firstEventMillis < 900, "first event after " + firstEventMillis + " ms");
 
             var openStarted = System.nanoTime();
-            assertEquals(200, putWeb("{\"enabled\":true,\"lan\":false,\"port\":" + port + "}").status());
+            assertEquals(200, putWeb("{\"enabled\":true,\"lan\":false,\"port\":" + port + "}").status(),
+                    WebListenerIT::daemonLog);
             var openMillis = (System.nanoTime() - openStarted) / 1_000_000;
 
             assertEquals(401, web(port, "GET", "/api/v1/status", device));
