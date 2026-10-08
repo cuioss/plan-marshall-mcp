@@ -37,7 +37,8 @@ elsewhere. Every module gets minimal real code and tests, never an empty shell.
 
 That listing also defines the target repositories: Milestone 1 splits this repository into `pm-mcp-parent`,
 `pm-mcp-clients`, `pm-mcp-core`, `plan-marshall-documentation` and the private assembly that stays here.
-`pm-mcp-parent`, `pm-mcp-clients` and `pm-mcp-core` exist; the documents are still here. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
+`pm-mcp-parent`, `pm-mcp-clients` and `pm-mcp-core` exist, and the documents are in
+`plan-marshall-documentation`. A class that needs no Quarkus, CDI, Vert.x or MCP type does not
 belong in `pm-mcp-server`; model-facing content (workflow units, roles, skills, bundles) belongs nowhere else.
 
 ## Development Notes
