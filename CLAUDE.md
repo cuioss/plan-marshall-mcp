@@ -29,7 +29,7 @@ job-token and device registries are empty), and there is no experiment-only code
 ## Modules
 
 The target module structure (PM-IMPL-1 in `doc/requirements/14-implementation.adoc`): `pm-mcp-server`
-(Quarkus daemon assembly) and `pm-e2e` here; the client modules are in `pm-mcp-clients`, the library modules
+(Quarkus daemon assembly), `pm-e2e` and `pm-conformance` here; the client modules are in `pm-mcp-clients`, the library modules
 in `pm-mcp-core`. Milestone 0 created the modules its techniques live in; Milestone 1 adds the
 rest. The only listing of the modules, their dependencies and the specification each implements is
 `doc/specification/module-structure.adoc`; name modules from there and never repeat the listing
@@ -60,6 +60,11 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
   Without them the native layout is skipped and the build output says so (`pm-e2e: native layout skipped: …`); a
   native run that prints that line has not tested the release layout. The JVM layout needs no checkout: it takes
   the client JARs from the registry.
+- Conformance harness: `./mvnw verify -Pconformance`. `pm-conformance` is a module of the build with the profile
+  `conformance` only: `verify`, `-Pintegration-tests`, `-Pcoverage` and the CI builds never build or run it. Never
+  add it to the modules of the root POM, and never activate the profile by default or from another profile.
+- The enforcer executions of the root POM keep `pm-e2e` and `pm-conformance` away from the classes of
+  `pm-mcp-server`; `BuildGuardsIT` of `pm-mcp-server` proves each with a fixture project below `src/guard-controls`.
 - Without `.plan/execute-script.py` (it is not tracked, for example on a fresh clone): `./mvnw` with the same arguments.
 - `.mvn/settings.xml` lists the organisation registry before Maven Central, and `.mvn/maven.config` switches on
   Maven's group id filter (`.mvn/rrf/`), which lets the registry be asked for `de.planmarshall` only. The parent POM
@@ -107,7 +112,7 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
 - `private static final CuiLogger LOGGER = new CuiLogger(X.class);` (cui-java-tools). No slf4j,
   log4j, `System.out`/`System.err`.
 - `%s` placeholders only; exception first.
-- INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` of `pm-runtime` in `pm-mcp-core` (prefix `PM_MCP`,
+- INFO/WARN/ERROR messages as `LogRecord` constants in `PmMcpLogMessages` of `pm-core` in `pm-mcp-core` (package `de.planmarshall.core.log`, prefix `PM_MCP`,
   ranges INFO 001-099, WARN 100-199, ERROR 200-299), each documented in `doc/LogMessages.adoc`.
 
 ### Testing

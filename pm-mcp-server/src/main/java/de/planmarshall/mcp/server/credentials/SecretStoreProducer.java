@@ -10,7 +10,7 @@
 package de.planmarshall.mcp.server.credentials;
 
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.core.log.PmMcpLogMessages;
 import de.planmarshall.runtime.credentials.SecretStore;
 import de.planmarshall.runtime.credentials.SecretStoreSelector;
 import io.quarkus.runtime.StartupEvent;

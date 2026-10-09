@@ -19,7 +19,7 @@ import java.nio.file.StandardOpenOption;
 
 
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.core.log.PmMcpLogMessages;
 import de.planmarshall.runtime.start.PosixModes;
 import de.planmarshall.runtime.start.StartupSequence;
 import io.quarkus.runtime.Quarkus;

@@ -17,7 +17,7 @@ import java.util.List;
 
 
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.core.log.PmMcpLogMessages;
 import io.quarkiverse.mcp.server.ToolManager;
 import io.quarkiverse.mcp.server.ToolResponse;
 import io.quarkus.runtime.StartupEvent;
