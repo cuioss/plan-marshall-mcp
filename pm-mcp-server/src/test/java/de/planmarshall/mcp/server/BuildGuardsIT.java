@@ -11,13 +11,15 @@ package de.planmarshall.mcp.server;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
-import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -41,15 +43,22 @@ class BuildGuardsIT {
             "e2e-assembly-classes, binaries-only",
             "conformance-assembly, no-assembly"})
     @DisplayName("a fixture that breaks a rule fails the build")
-    void fixtureFails(String fixture, String execution) throws Exception {
+    void fixtureFails(String fixture, String execution, @TempDir Path temp) throws Exception {
         var root = Path.of(System.getProperty("pm.root"));
         var pom = root.resolve("src/guard-controls").resolve(fixture).resolve("pom.xml");
+        // The output goes to a file: reading the pipe to its end would wait for a build that hangs, and the
+        // time limit below would never apply.
+        var log = temp.resolve("fixture.log");
         var builder = new ProcessBuilder(root.resolve("mvnw").toString(), "-B", "--no-transfer-progress", "-f",
-                pom.toString(), "validate").directory(pom.getParent().toFile()).redirectErrorStream(true);
+                pom.toString(), "validate").directory(pom.getParent().toFile()).redirectErrorStream(true)
+                .redirectOutput(log.toFile());
 
         var process = builder.start();
-        var output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertTrue(process.waitFor(5, TimeUnit.MINUTES), "the build of the fixture did not end");
+        if (!process.waitFor(5, TimeUnit.MINUTES)) {
+            process.destroyForcibly();
+            fail("the build of the fixture did not end:\n" + Files.readString(log));
+        }
+        var output = Files.readString(log);
 
         assertNotEquals(0, process.exitValue(), output);
         assertTrue(output.contains("enforce (" + execution + ")"), output);

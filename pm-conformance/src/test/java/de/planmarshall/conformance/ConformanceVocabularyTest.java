@@ -11,40 +11,43 @@ package de.planmarshall.conformance;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import java.util.Arrays;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 
+/**
+ * Each test compares the whole vocabulary with its expected values, so that a value added to an enumeration
+ * fails here until its value is stated.
+ */
 @DisplayName("Closed vocabularies of the conformance harness")
 class ConformanceVocabularyTest {
 
-    @ParameterizedTest(name = "{0} is {1}")
-    @CsvSource({"HELD, held", "VIOLATED, violated", "INDETERMINATE, indeterminate"})
-    @DisplayName("a verdict carries its value")
-    void verdicts(Verdict verdict, String wireName) {
-        assertEquals(wireName, verdict.wireName());
-    }
-
-    @ParameterizedTest(name = "{0} is {1}")
-    @CsvSource({"ENGINE, engine", "CHECK, check", "GUIDANCE, guidance"})
-    @DisplayName("an enforcement class carries its value")
-    void enforcementClasses(EnforcementClass enforcementClass, String wireName) {
-        assertEquals(wireName, enforcementClass.wireName());
+    @Test
+    @DisplayName("the verdicts are held, violated and indeterminate")
+    void verdicts() {
+        assertEquals(Map.of("HELD", "held", "VIOLATED", "violated", "INDETERMINATE", "indeterminate"),
+                wireNames(Verdict.values(), Verdict::wireName));
     }
 
     @Test
-    @DisplayName("an attribution carries its value")
+    @DisplayName("the enforcement classes are engine, check and guidance")
+    void enforcementClasses() {
+        assertEquals(Map.of("ENGINE", "engine", "CHECK", "check", "GUIDANCE", "guidance"),
+                wireNames(EnforcementClass.values(), EnforcementClass::wireName));
+    }
+
+    @Test
+    @DisplayName("the attributions are isolated and realistic_context")
     void attributions() {
-        assertEquals("isolated", Attribution.ISOLATED.wireName());
-        assertEquals("realistic_context", Attribution.REALISTIC_CONTEXT.wireName());
+        assertEquals(Map.of("ISOLATED", "isolated", "REALISTIC_CONTEXT", "realistic_context"),
+                wireNames(Attribution.values(), Attribution::wireName));
     }
 
-    @Test
-    @DisplayName("the vocabularies are closed at three, three and two values")
-    void closed() {
-        assertEquals(3, Verdict.values().length);
-        assertEquals(3, EnforcementClass.values().length);
-        assertEquals(2, Attribution.values().length);
+    private static <E extends Enum<E>> Map<String, String> wireNames(E[] values, Function<E, String> wireName) {
+        return Arrays.stream(values).collect(Collectors.toMap(Enum::name, wireName));
     }
 }
