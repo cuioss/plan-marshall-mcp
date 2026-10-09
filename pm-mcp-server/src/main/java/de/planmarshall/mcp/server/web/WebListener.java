@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -62,7 +63,8 @@ import jakarta.inject.Inject;
 public class WebListener {
 
     private static final CuiLogger LOGGER = new CuiLogger(WebListener.class);
-    private static final long TIMEOUT_SECONDS = 10;
+    private static final Duration WAIT = Duration.ofSeconds(10);
+    private static final String CAUSE_SHUTDOWN = "runtime shutdown";
     private static final String LOOPBACK = "127.0.0.1";
     private static final String ALL_INTERFACES = "0.0.0.0";
 
@@ -84,6 +86,7 @@ public class WebListener {
     private final Vertx vertx;
     private final RuntimeContext context;
     private final PortCandidates candidates;
+    private final Duration wait;
     private final Set<HttpConnection> connections = ConcurrentHashMap.newKeySet();
     private HttpServer server;
     private WebState state = WebState.disabled();
@@ -94,13 +97,14 @@ public class WebListener {
      */
     @Inject
     public WebListener(Vertx vertx, RuntimeContext context) {
-        this(vertx, context, WebListener::kernelCandidate);
+        this(vertx, context, WebListener::kernelCandidate, WAIT);
     }
 
-    WebListener(Vertx vertx, RuntimeContext context, PortCandidates candidates) {
+    WebListener(Vertx vertx, RuntimeContext context, PortCandidates candidates, Duration wait) {
         this.vertx = vertx;
         this.context = context;
         this.candidates = candidates;
+        this.wait = wait;
     }
 
     /**
@@ -122,16 +126,20 @@ public class WebListener {
      * @param enabled whether web access is to be enabled
      * @param lan     the exposure: all interfaces over TLS instead of loopback
      * @param port    the port, {@code 0} for any free port
+     * @param cause   what asked for it, for the log
      * @return the new state, with the port the listener bound
      * @throws WebListenerConflictException if the port is occupied on a local address, no free port was found
      *                                      for port {@code 0}, or the listener is open with the other exposure
      */
-    public synchronized WebState apply(boolean enabled, boolean lan, int port) throws WebListenerConflictException {
+    public synchronized WebState apply(boolean enabled, boolean lan, int port, String cause)
+            throws WebListenerConflictException {
         if (!enabled) {
-            close();
+            close(cause);
             state = new WebState(false, state.lan(), port, false);
             return state;
         }
+        LOGGER.info(PmMcpLogMessages.INFO.WEB_LISTENER_OPEN_REQUESTED, lan ? ALL_INTERFACES : LOOPBACK, port, lan,
+                cause);
         if (server != null) {
             if (state.lan() != lan || port != 0 && state.port() != port) {
                 throw new WebListenerConflictException("web access is enabled with lan=%s on port %s; disable it first"
@@ -145,7 +153,7 @@ public class WebListener {
 
     void onShutdown(@Observes ShutdownEvent event) {
         synchronized (this) {
-            close();
+            close(CAUSE_SHUTDOWN);
         }
     }
 
@@ -218,15 +226,17 @@ public class WebListener {
         var hosts = new HashSet<String>();
         var origins = new HashSet<String>();
         for (var name : hostNames) {
-            var hostPort = (name.contains(":") ? "[" + name + "]" : name) + ":" + port;
-            hosts.add(hostPort);
-            origins.add(scheme + hostPort);
+            var authority = WebRequestHandler.authority((name.contains(":") ? "[" + name + "]" : name) + ":" + port);
+            hosts.add(authority);
+            origins.add(scheme + authority);
         }
         var created = vertx.createHttpServer(options)
                 .connectionHandler(connection -> {
                     connections.add(connection);
                     connection.closeHandler(_ -> connections.remove(connection));
                 })
+                .exceptionHandler(failure -> LOGGER.warn(PmMcpLogMessages.WARN.WEB_LISTENER_CONNECTION_FAILED, port,
+                        describe(failure)))
                 .requestHandler(new WebRequestHandler(hosts, origins, VertxHttpRecorder.getRootHandler()));
         try {
             await(created.listen());
@@ -235,6 +245,11 @@ public class WebListener {
             throw e;
         }
         return created;
+    }
+
+    /** The failure as one line: a client can cause it at will, so its stack trace is not logged. */
+    private static String describe(Throwable failure) {
+        return failure.getClass().getSimpleName() + ": " + failure.getMessage();
     }
 
     /** A port the kernel names as free for the address; whether it is free on every address shows at the bind. */
@@ -246,10 +261,11 @@ public class WebListener {
         }
     }
 
-    private void close() {
+    private void close(String cause) {
         if (server == null) {
             return;
         }
+        LOGGER.info(PmMcpLogMessages.INFO.WEB_LISTENER_CLOSING, state.port(), cause);
         try {
             await(server.close());
         } catch (ExecutionException | TimeoutException e) {
@@ -260,9 +276,9 @@ public class WebListener {
         LOGGER.info(PmMcpLogMessages.INFO.WEB_LISTENER_CLOSED, state.port());
     }
 
-    private static <T> T await(Future<T> future) throws ExecutionException, TimeoutException {
+    private <T> T await(Future<T> future) throws ExecutionException, TimeoutException {
         try {
-            return future.toCompletionStage().toCompletableFuture().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            return future.toCompletionStage().toCompletableFuture().get(wait.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new ExecutionException(e);

@@ -17,6 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,7 +52,8 @@ class WebListenerPortSelectionTest {
     }
 
     private WebListener listener(WebListener.PortCandidates candidates) {
-        return new WebListener(vertx, new RuntimeContext(Optional.of("/nonexistent"), "test"), candidates);
+        return new WebListener(vertx, new RuntimeContext(Optional.of("/nonexistent"), "test"), candidates,
+                Duration.ofSeconds(10));
     }
 
     @Test
@@ -62,7 +64,7 @@ class WebListenerPortSelectionTest {
             var asked = new AtomicInteger();
             var listener = listener(host -> asked.getAndIncrement() == 0 ? occupied : WebListener.kernelCandidate(host));
 
-            var state = listener.apply(true, false, 0);
+            var state = listener.apply(true, false, 0, "test");
 
             try {
                 assertTrue(state.open());
@@ -72,7 +74,7 @@ class WebListenerPortSelectionTest {
                 LogAsserts.assertLogMessagePresentContaining(TestLogLevel.WARN, "PM_MCP-112");
                 LogAsserts.assertLogMessagePresentContaining(TestLogLevel.WARN, String.valueOf(occupied));
             } finally {
-                listener.apply(false, false, 0);
+                listener.apply(false, false, 0, "test");
             }
         }
     }
@@ -87,7 +89,7 @@ class WebListenerPortSelectionTest {
                 return foreign.getLocalPort();
             });
 
-            assertThrows(WebListenerConflictException.class, () -> listener.apply(true, false, 0));
+            assertThrows(WebListenerConflictException.class, () -> listener.apply(true, false, 0, "test"));
 
             assertEquals(WebListener.PORT_CANDIDATES, asked.get());
             assertFalse(listener.state().open());

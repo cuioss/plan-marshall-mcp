@@ -50,6 +50,7 @@ public class RuntimeApiResource {
     static final String CODE = "code";
     static final Duration HEARTBEAT = Duration.ofSeconds(1);
     static final long STOP_DELAY_MILLIS = 100;
+    private static final String WEB_REQUEST = "PUT /api/v1/web";
 
     private final RuntimeContext context;
     private final WebListener webListener;
@@ -140,7 +141,8 @@ public class RuntimeApiResource {
         }
         var port = setting.port() == null ? WebState.DEFAULT_PORT : setting.port();
         try {
-            return Response.ok(webListener.apply(setting.enabled(), Boolean.TRUE.equals(setting.lan()), port))
+            return Response.ok(webListener.apply(setting.enabled(), Boolean.TRUE.equals(setting.lan()), port,
+                    WEB_REQUEST))
                     .build();
         } catch (WebListenerConflictException e) {
             return Response.status(Response.Status.CONFLICT).entity(Map.of(CODE, WebListenerConflictException.CODE))

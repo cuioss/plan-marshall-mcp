@@ -9,6 +9,8 @@
  */
 package de.planmarshall.mcp.server.web;
 
+import java.net.Inet6Address;
+import java.util.HexFormat;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -49,6 +51,8 @@ final class WebRequestHandler implements Handler<HttpServerRequest> {
             <body><p>The web app is not part of this build.</p></body></html>
             """;
 
+    private static final String NO_AUTHORITY = "";
+    private static final String SCHEME_SEPARATOR = "://";
     private static final Set<HttpMethod> STATE_CHANGING = Set.of(HttpMethod.POST, HttpMethod.PUT,
             HttpMethod.PATCH, HttpMethod.DELETE);
     private static final Pattern NOT_NORMALIZED = Pattern.compile(
@@ -59,8 +63,9 @@ final class WebRequestHandler implements Handler<HttpServerRequest> {
     private final Handler<HttpServerRequest> api;
 
     /**
-     * @param hosts   the accepted {@code Host} values ({@code host:port}), lower case
-     * @param origins the listener's own origins ({@code scheme://host:port}), lower case
+     * @param hosts   the accepted {@code Host} values ({@code host:port}), as {@link #authority(String)} gives them
+     * @param origins the listener's own origins ({@code scheme://host:port}), as {@link #origin(String)} gives
+     *                them
      * @param api     the runtime's HTTP root handler serving {@code /api/v1/}
      */
     WebRequestHandler(Set<String> hosts, Set<String> origins, Handler<HttpServerRequest> api) {
@@ -74,7 +79,7 @@ final class WebRequestHandler implements Handler<HttpServerRequest> {
         var response = request.response();
         SECURITY_HEADERS.forEach(response::putHeader);
         var host = request.getHeader(HttpHeaders.HOST);
-        if (host == null || !hosts.contains(host.toLowerCase(Locale.ROOT))) {
+        if (host == null || !hosts.contains(authority(host))) {
             response.setStatusCode(403).end();
             return;
         }
@@ -85,7 +90,7 @@ final class WebRequestHandler implements Handler<HttpServerRequest> {
         }
         var origin = request.getHeader(HttpHeaders.ORIGIN);
         if (STATE_CHANGING.contains(method) && origin != null
-                && !origins.contains(origin.toLowerCase(Locale.ROOT))) {
+                && !origins.contains(origin(origin))) {
             response.setStatusCode(403).end();
             return;
         }
@@ -101,6 +106,43 @@ final class WebRequestHandler implements Handler<HttpServerRequest> {
         } else {
             response.setStatusCode(404).end();
         }
+    }
+
+    /**
+     * The form in which a {@code Host} value is compared. An IPv6 literal is compared by its address, since one
+     * address has many spellings (a browser sends the compressed one, a certificate lists the full one); a
+     * name and an IPv4 address are compared in lower case.
+     *
+     * @param authority {@code host} or {@code host:port}, an IPv6 address in brackets
+     * @return the form to compare; a value no listener accepts for a malformed, scoped or IPv4-mapped literal
+     */
+    static String authority(String authority) {
+        var value = authority.toLowerCase(Locale.ROOT);
+        if (!value.startsWith("[")) {
+            return value;
+        }
+        var end = value.indexOf(']');
+        if (end < 0 || value.indexOf('%') >= 0) {
+            return NO_AUTHORITY;
+        }
+        try {
+            return Inet6Address.ofLiteral(value.substring(1, end)) instanceof Inet6Address address
+                    ? "[" + HexFormat.of().formatHex(address.getAddress()) + "]" + value.substring(end + 1)
+                    : NO_AUTHORITY;
+        } catch (IllegalArgumentException _) {
+            return NO_AUTHORITY;
+        }
+    }
+
+    /**
+     * @param origin an {@code Origin} value, {@code scheme://host:port}
+     * @return the form to compare, its host as {@link #authority(String)} gives it
+     */
+    static String origin(String origin) {
+        var separator = origin.indexOf(SCHEME_SEPARATOR);
+        return separator < 0 ? origin.toLowerCase(Locale.ROOT)
+                : origin.substring(0, separator + SCHEME_SEPARATOR.length()).toLowerCase(Locale.ROOT)
+                + authority(origin.substring(separator + SCHEME_SEPARATOR.length()));
     }
 
     private static boolean isMcp(String path) {
