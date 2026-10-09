@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
@@ -38,6 +39,8 @@ import org.junit.jupiter.params.provider.CsvSource;
 @DisplayName("Build guards of the repository")
 class BuildGuardsIT {
 
+    private static final String VERSION_TOKEN = "@project.version@";
+
     @ParameterizedTest(name = "{0} fails in {1}")
     @CsvSource({
             "e2e-assembly-classes, binaries-only",
@@ -45,7 +48,7 @@ class BuildGuardsIT {
     @DisplayName("a fixture that breaks a rule fails the build")
     void fixtureFails(String fixture, String execution, @TempDir Path temp) throws Exception {
         var root = Path.of(System.getProperty("pm.root"));
-        var pom = root.resolve("src/guard-controls").resolve(fixture).resolve("pom.xml");
+        var pom = materialise(root, fixture);
         // The output goes to a file: reading the pipe to its end would wait for a build that hangs, and the
         // time limit below would never apply.
         var log = temp.resolve("fixture.log");
@@ -63,5 +66,19 @@ class BuildGuardsIT {
         assertNotEquals(0, process.exitValue(), output);
         assertTrue(output.contains("enforce (" + execution + ")"), output);
         assertTrue(output.contains("BUILD FAILURE"), output);
+    }
+
+    /**
+     * Writes the fixture below {@code target/guard-controls} of the repository, with the version of this build as
+     * the version of its parent. The copy lies as deep below the root as its template, so the relative path to
+     * the root POM holds, and inside the repository, so Maven finds its {@code .mvn}.
+     */
+    private static Path materialise(Path root, String fixture) throws IOException {
+        var template = Files.readString(root.resolve("src/guard-controls").resolve(fixture).resolve("pom.xml"));
+        assertTrue(template.contains(VERSION_TOKEN), "the fixture names no " + VERSION_TOKEN);
+        var pom = root.resolve("target/guard-controls").resolve(fixture).resolve("pom.xml");
+        Files.createDirectories(pom.getParent());
+        Files.writeString(pom, template.replace(VERSION_TOKEN, System.getProperty("pm.version")));
+        return pom;
     }
 }

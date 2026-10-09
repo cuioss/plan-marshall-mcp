@@ -61,10 +61,12 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
   native run that prints that line has not tested the release layout. The JVM layout needs no checkout: it takes
   the client JARs from the registry.
 - Conformance harness: `./mvnw verify -Pconformance`. `pm-conformance` is a module of the build with the profile
-  `conformance` only: `verify`, `-Pintegration-tests`, `-Pcoverage` and the CI builds never build or run it. Never
+  `conformance` only: `verify`, `-Pintegration-tests`, `-Pcoverage` and the checks of a pull request never build or run
+  it; the nightly workflow compiles it and runs nothing of it. Never
   add it to the modules of the root POM, and never activate the profile by default or from another profile.
 - The enforcer executions of the root POM keep `pm-e2e` and `pm-conformance` away from the classes of
-  `pm-mcp-server`; `BuildGuardsIT` of `pm-mcp-server` proves each with a fixture project below `src/guard-controls`.
+  `pm-mcp-server`; `BuildGuardsIT` of `pm-mcp-server` proves each with a fixture project below `src/guard-controls`, a template that
+  the test writes to `target/guard-controls` with the version of the build.
 - Without `.plan/execute-script.py` (it is not tracked, for example on a fresh clone): `./mvnw` with the same arguments.
 - `.mvn/settings.xml` lists the organisation registry before Maven Central, and `.mvn/maven.config` switches on
   Maven's group id filter (`.mvn/rrf/`), which lets the registry be asked for `de.planmarshall` only. The parent POM
