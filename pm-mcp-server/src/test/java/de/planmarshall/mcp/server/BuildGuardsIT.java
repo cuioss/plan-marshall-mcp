@@ -58,7 +58,9 @@ class BuildGuardsIT {
 
         var process = builder.start();
         if (!process.waitFor(5, TimeUnit.MINUTES)) {
-            process.destroyForcibly();
+            // mvnw is a script and Maven its child: both are ended, and the log is read when they are gone
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
+            process.destroyForcibly().waitFor(30, TimeUnit.SECONDS);
             fail("the build of the fixture did not end:\n" + Files.readString(log));
         }
         var output = Files.readString(log);
