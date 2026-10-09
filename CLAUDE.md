@@ -61,6 +61,9 @@ Never hard-code build tool invocations; use the resolved canonical commands belo
   native run that prints that line has not tested the release layout. The JVM layout needs no checkout: it takes
   the client JARs from the registry.
 - Without `.plan/execute-script.py` (it is not tracked, for example on a fresh clone): `./mvnw` with the same arguments.
+- `.mvn/settings.xml` lists the organisation registry before Maven Central, and `.mvn/maven.config` switches on
+  Maven's group id filter (`.mvn/rrf/`), which lets the registry be asked for `de.planmarshall` only. The parent POM
+  checks both in every build; never reorder the repositories or widen the filter.
 - `.mvn/maven.config` passes `.mvn/settings.xml` (the organisation's package registry, no token) as global settings;
   the token is the server `plan-marshall` of `~/.m2/settings.xml` (`doc/developer/registry-setup.adoc`).
 - Use a Bash timeout of 600000ms for build commands.
