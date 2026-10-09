@@ -165,14 +165,20 @@ public class WebListener {
                 throw new WebListenerConflictException("TLS material unavailable: " + e.getMessage(), e);
             }
         }
-        if (port != 0) {
-            server = listen(host, port, hostNames, keyCert);
-        } else {
-            server = listenOnFreePort(host, hostNames, keyCert);
-        }
+        server = port != 0 ? listenOn(host, port, hostNames, keyCert) : listenOnFreePort(host, hostNames, keyCert);
         var bound = server.actualPort();
         LOGGER.info(PmMcpLogMessages.INFO.WEB_LISTENER_OPENED, host, bound, lan);
         return bound;
+    }
+
+    private HttpServer listenOn(String host, int port, Set<String> hostNames, PemKeyCertOptions keyCert)
+            throws WebListenerConflictException {
+        try {
+            return listen(host, port, hostNames, keyCert);
+        } catch (ExecutionException | TimeoutException e) {
+            LOGGER.warn(PmMcpLogMessages.WARN.WEB_LISTENER_FAILED, port, e.getMessage());
+            throw new WebListenerConflictException("port %s cannot be bound".formatted(port), e);
+        }
     }
 
     private HttpServer listenOnFreePort(String host, Set<String> hostNames, PemKeyCertOptions keyCert)
@@ -186,15 +192,24 @@ public class WebListener {
             }
             try {
                 return listen(host, candidate, hostNames, keyCert);
-            } catch (WebListenerConflictException _) {
-                // logged by listen with the candidate; the next candidate is tried
+            } catch (ExecutionException e) {
+                // the candidate is occupied on a local address: rejected, the next one is tried
+                LOGGER.warn(PmMcpLogMessages.WARN.WEB_LISTENER_FAILED, candidate, e.getMessage());
+            } catch (TimeoutException e) {
+                // no answer of the bind is no conflict of this candidate: no further candidate is tried
+                LOGGER.warn(PmMcpLogMessages.WARN.WEB_LISTENER_FAILED, candidate, e.getMessage());
+                throw new WebListenerConflictException("port %s cannot be bound".formatted(candidate), e);
             }
         }
         throw new WebListenerConflictException("no free port among %s candidates".formatted(PORT_CANDIDATES), null);
     }
 
+    /**
+     * Binds one server. A bind that does not answer in time is given up: the server is closed, which takes
+     * effect when the bind completes, so no listener is left running outside {@link #server}.
+     */
     private HttpServer listen(String host, int port, Set<String> hostNames, PemKeyCertOptions keyCert)
-            throws WebListenerConflictException {
+            throws ExecutionException, TimeoutException {
         var options = new HttpServerOptions().setPort(port).setHost(host).setReuseAddress(false);
         if (keyCert != null) {
             options.setSsl(true).setKeyCertOptions(keyCert);
@@ -215,9 +230,9 @@ public class WebListener {
                 .requestHandler(new WebRequestHandler(hosts, origins, VertxHttpRecorder.getRootHandler()));
         try {
             await(created.listen());
-        } catch (ExecutionException | TimeoutException e) {
-            LOGGER.warn(PmMcpLogMessages.WARN.WEB_LISTENER_FAILED, port, e.getMessage());
-            throw new WebListenerConflictException("port %s cannot be bound".formatted(port), e);
+        } catch (TimeoutException e) {
+            created.close();
+            throw e;
         }
         return created;
     }

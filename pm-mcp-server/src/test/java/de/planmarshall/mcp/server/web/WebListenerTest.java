@@ -261,6 +261,10 @@ class WebListenerTest {
             var expected = new LinkedHashMap<String, Boolean>();
             for (var host : new String[]{"127.0.0.1", "::1"}) {
                 var address = InetAddress.getByName(host);
+                if (!binds(address, 0, false)) {
+                    // the address cannot be bound at all on this machine: nothing to characterise
+                    continue;
+                }
                 measured.put(host + " with SO_REUSEADDR", binds(address, listener.port(), true));
                 expected.put(host + " with SO_REUSEADDR", takenWithReuse);
                 measured.put(host + " without SO_REUSEADDR", binds(address, listener.port(), false));

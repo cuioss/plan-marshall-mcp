@@ -125,8 +125,9 @@ public class RuntimeApiResource {
      *
      * @param setting the requested setting
      * @param request the HTTP request, for the listener it arrived on
-     * @return {@code 200} with the {@code web} object once the listener opened or closed, its {@code port} the
-     *         port the listener bound
+     * @return {@code 200} with the {@code web} object once the listener opened or closed; while the listener is
+     *         open its {@code port} is the port the listener bound, in the answer to a close it is the port of
+     *         the request and names no listener
      */
     @PUT
     @Path("web")
