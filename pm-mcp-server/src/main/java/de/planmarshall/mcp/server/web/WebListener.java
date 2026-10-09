@@ -10,6 +10,8 @@
 package de.planmarshall.mcp.server.web;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.security.GeneralSecurityException;
 import java.util.HashSet;
 import java.util.Set;
@@ -36,6 +38,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
+import jakarta.inject.Inject;
 
 /**
  * The web listener: a second Vert.x HTTP server on TCP beside the Unix-socket listener, opened and closed while
@@ -45,6 +48,13 @@ import jakarta.enterprise.event.Observes;
  * the runtime's self-signed certificate ({@link WebTls}). The listener knows its connections, so the
  * authentication mechanism tells a web request from a socket request by the connection it arrived on.
  * Closing the server ends its connections, browser streams included; the socket listener is untouched.
+ * <p>
+ * The listener binds without address reuse, so a port that another socket holds on any local address is a
+ * conflict: with address reuse macOS lets the wildcard bind succeed beside a listener on {@code 127.0.0.1},
+ * and loopback clients then reach that listener instead of this one. Port {@code 0} asks for any free port:
+ * the listener takes candidates from the kernel, binds each explicitly, which is the conflict check, and
+ * gives up after {@value #PORT_CANDIDATES} of them; the kernel's own choice for a bind to port {@code 0}
+ * does not make that check.
  *
  * @since 0.1
  */
@@ -54,9 +64,26 @@ public class WebListener {
     private static final CuiLogger LOGGER = new CuiLogger(WebListener.class);
     private static final long TIMEOUT_SECONDS = 10;
     private static final String LOOPBACK = "127.0.0.1";
+    private static final String ALL_INTERFACES = "0.0.0.0";
+
+    /** The number of candidates tried for port {@code 0} before the open fails. */
+    static final int PORT_CANDIDATES = 8;
+
+    /** The source of port candidates for port {@code 0}. */
+    @FunctionalInterface
+    interface PortCandidates {
+
+        /**
+         * @param host the address the listener binds
+         * @return a port to try
+         * @throws IOException if no candidate can be named
+         */
+        int next(String host) throws IOException;
+    }
 
     private final Vertx vertx;
     private final RuntimeContext context;
+    private final PortCandidates candidates;
     private final Set<HttpConnection> connections = ConcurrentHashMap.newKeySet();
     private HttpServer server;
     private WebState state = WebState.disabled();
@@ -65,9 +92,15 @@ public class WebListener {
      * @param vertx   the runtime's Vert.x instance
      * @param context the runtime identity, for the TLS directory
      */
+    @Inject
     public WebListener(Vertx vertx, RuntimeContext context) {
+        this(vertx, context, WebListener::kernelCandidate);
+    }
+
+    WebListener(Vertx vertx, RuntimeContext context, PortCandidates candidates) {
         this.vertx = vertx;
         this.context = context;
+        this.candidates = candidates;
     }
 
     /**
@@ -88,10 +121,10 @@ public class WebListener {
      *
      * @param enabled whether web access is to be enabled
      * @param lan     the exposure: all interfaces over TLS instead of loopback
-     * @param port    the port
-     * @return the new state
-     * @throws WebListenerConflictException if the port is occupied or the listener is open with the other
-     *                                      exposure
+     * @param port    the port, {@code 0} for any free port
+     * @return the new state, with the port the listener bound
+     * @throws WebListenerConflictException if the port is occupied on a local address, no free port was found
+     *                                      for port {@code 0}, or the listener is open with the other exposure
      */
     public synchronized WebState apply(boolean enabled, boolean lan, int port) throws WebListenerConflictException {
         if (!enabled) {
@@ -100,14 +133,13 @@ public class WebListener {
             return state;
         }
         if (server != null) {
-            if (state.lan() != lan || state.port() != port) {
+            if (state.lan() != lan || port != 0 && state.port() != port) {
                 throw new WebListenerConflictException("web access is enabled with lan=%s on port %s; disable it first"
                         .formatted(state.lan(), state.port()), null);
             }
             return state;
         }
-        open(lan, port);
-        state = new WebState(true, lan, port, true);
+        state = new WebState(true, lan, open(lan, port), true);
         return state;
     }
 
@@ -117,30 +149,63 @@ public class WebListener {
         }
     }
 
-    private void open(boolean lan, int port) throws WebListenerConflictException {
-        var options = new HttpServerOptions().setPort(port).setHost(lan ? "0.0.0.0" : LOOPBACK);
+    private int open(boolean lan, int port) throws WebListenerConflictException {
+        var host = lan ? ALL_INTERFACES : LOOPBACK;
         var hostNames = new HashSet<>(Set.of(LOOPBACK, "localhost"));
+        PemKeyCertOptions keyCert = null;
         if (lan) {
             hostNames.add("::1");
-        }
-        if (lan) {
             try {
                 var tls = WebTls.loadOrCreate(context.paths().base().resolve("web").resolve("tls"));
                 hostNames.addAll(tls.names());
-                options.setSsl(true).setKeyCertOptions(new PemKeyCertOptions()
+                keyCert = new PemKeyCertOptions()
                         .setCertValue(Buffer.buffer(tls.certificatePem()))
-                        .setKeyValue(Buffer.buffer(tls.privateKeyPem())));
+                        .setKeyValue(Buffer.buffer(tls.privateKeyPem()));
             } catch (IOException | GeneralSecurityException e) {
                 throw new WebListenerConflictException("TLS material unavailable: " + e.getMessage(), e);
             }
         }
-        var scheme = lan ? "https://" : "http://";
+        if (port != 0) {
+            server = listen(host, port, hostNames, keyCert);
+        } else {
+            server = listenOnFreePort(host, hostNames, keyCert);
+        }
+        var bound = server.actualPort();
+        LOGGER.info(PmMcpLogMessages.INFO.WEB_LISTENER_OPENED, host, bound, lan);
+        return bound;
+    }
+
+    private HttpServer listenOnFreePort(String host, Set<String> hostNames, PemKeyCertOptions keyCert)
+            throws WebListenerConflictException {
+        for (int attempt = 0; attempt < PORT_CANDIDATES; attempt++) {
+            int candidate;
+            try {
+                candidate = candidates.next(host);
+            } catch (IOException e) {
+                throw new WebListenerConflictException("no port candidate: " + e.getMessage(), e);
+            }
+            try {
+                return listen(host, candidate, hostNames, keyCert);
+            } catch (WebListenerConflictException _) {
+                // logged by listen with the candidate; the next candidate is tried
+            }
+        }
+        throw new WebListenerConflictException("no free port among %s candidates".formatted(PORT_CANDIDATES), null);
+    }
+
+    private HttpServer listen(String host, int port, Set<String> hostNames, PemKeyCertOptions keyCert)
+            throws WebListenerConflictException {
+        var options = new HttpServerOptions().setPort(port).setHost(host).setReuseAddress(false);
+        if (keyCert != null) {
+            options.setSsl(true).setKeyCertOptions(keyCert);
+        }
+        var scheme = keyCert != null ? "https://" : "http://";
         var hosts = new HashSet<String>();
         var origins = new HashSet<String>();
         for (var name : hostNames) {
-            var host = (name.contains(":") ? "[" + name + "]" : name) + ":" + port;
-            hosts.add(host);
-            origins.add(scheme + host);
+            var hostPort = (name.contains(":") ? "[" + name + "]" : name) + ":" + port;
+            hosts.add(hostPort);
+            origins.add(scheme + hostPort);
         }
         var created = vertx.createHttpServer(options)
                 .connectionHandler(connection -> {
@@ -154,8 +219,16 @@ public class WebListener {
             LOGGER.warn(PmMcpLogMessages.WARN.WEB_LISTENER_FAILED, port, e.getMessage());
             throw new WebListenerConflictException("port %s cannot be bound".formatted(port), e);
         }
-        server = created;
-        LOGGER.info(PmMcpLogMessages.INFO.WEB_LISTENER_OPENED, options.getHost(), port, lan);
+        return created;
+    }
+
+    /** A port the kernel names as free for the address; whether it is free on every address shows at the bind. */
+    static int kernelCandidate(String host) throws IOException {
+        try (var socket = new ServerSocket()) {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(host, 0));
+            return socket.getLocalPort();
+        }
     }
 
     private void close() {
