@@ -10,7 +10,7 @@
 package de.planmarshall.mcp.server.tools;
 
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.core.log.PmMcpLogMessages;
 import io.quarkiverse.mcp.server.Tool;
 import io.quarkiverse.mcp.server.ToolArg;
 

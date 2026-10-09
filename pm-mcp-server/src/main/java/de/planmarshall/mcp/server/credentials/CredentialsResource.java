@@ -13,7 +13,7 @@ import java.util.Map;
 
 
 import de.cuioss.tools.logging.CuiLogger;
-import de.planmarshall.runtime.PmMcpLogMessages;
+import de.planmarshall.core.log.PmMcpLogMessages;
 import de.planmarshall.runtime.credentials.CredentialAccount;
 import de.planmarshall.runtime.credentials.InvalidCredentialNameException;
 import de.planmarshall.runtime.credentials.SecretStore;
