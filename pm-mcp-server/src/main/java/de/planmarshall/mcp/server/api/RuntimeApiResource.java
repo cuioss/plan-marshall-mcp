@@ -86,7 +86,7 @@ public class RuntimeApiResource {
      *
      * @param enabled whether web access is enabled
      * @param lan     whether the listener serves the LAN over TLS
-     * @param port    the port, default {@value WebState#DEFAULT_PORT}
+     * @param port    the port, default {@value WebState#DEFAULT_PORT}; {@code 0} for any free port
      */
     public record WebSetting(Boolean enabled, Boolean lan, Integer port) {
     }
@@ -125,7 +125,9 @@ public class RuntimeApiResource {
      *
      * @param setting the requested setting
      * @param request the HTTP request, for the listener it arrived on
-     * @return {@code 200} with the {@code web} object once the listener opened or closed
+     * @return {@code 200} with the {@code web} object once the listener opened or closed; while the listener is
+     *         open its {@code port} is the port the listener bound, in the answer to a close it is the port of
+     *         the request and names no listener
      */
     @PUT
     @Path("web")

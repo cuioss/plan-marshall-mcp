@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.URI;
@@ -76,22 +77,19 @@ class WebListenerIT {
         return "daemon log:\n" + daemon.output();
     }
 
-    private static int freePort() throws IOException {
-        try (var socket = new ServerSocket(0)) {
-            return socket.getLocalPort();
+    /** An open LAN listener on the port it bound; closing it closes the listener again. */
+    private record LanListener(int port) implements AutoCloseable {
+        @Override
+        public void close() throws IOException {
+            assertEquals(200, putWeb("{\"enabled\":false}").status());
         }
     }
 
-    /** An open LAN listener; closing it closes the listener again. */
-    private interface LanListener extends AutoCloseable {
-        @Override
-        void close() throws IOException;
-    }
-
-    private static LanListener lanEnabled(int port) throws IOException {
-        assertEquals(200, putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + port + "}").status(),
-                WebListenerIT::daemonLog);
-        return () -> assertEquals(200, putWeb("{\"enabled\":false}").status());
+    /** Opens the LAN listener on a port of its own choice (port 0). */
+    private static LanListener lanEnabled() throws IOException {
+        var opened = putWeb("{\"enabled\":true,\"lan\":true,\"port\":0}");
+        assertEquals(200, opened.status(), WebListenerIT::daemonLog);
+        return new LanListener(new JsonObject(opened.body()).getInteger("port"));
     }
 
     private static UdsHttp.Response putWeb(String body) throws IOException {
@@ -119,7 +117,6 @@ class WebListenerIT {
     @Test
     @DisplayName("opens and closes the web listener while an SSE stream on the socket keeps running")
     void shouldOpenAndCloseBesideStream() throws Exception {
-        var port = freePort();
         var device = Map.of("Authorization", "Bearer " + TestSecrets.DEVICE_SECRET);
         var started = System.nanoTime();
         try (var events = UdsHttp.open(daemon.paths().socket(), "GET", "/api/v1/events",
@@ -129,9 +126,10 @@ class WebListenerIT {
             assertTrue(firstEventMillis < 900, "first event after " + firstEventMillis + " ms");
 
             var openStarted = System.nanoTime();
-            assertEquals(200, putWeb("{\"enabled\":true,\"lan\":false,\"port\":" + port + "}").status(),
-                    WebListenerIT::daemonLog);
+            var opened = putWeb("{\"enabled\":true,\"lan\":false,\"port\":0}");
             var openMillis = (System.nanoTime() - openStarted) / 1_000_000;
+            assertEquals(200, opened.status(), WebListenerIT::daemonLog);
+            int port = new JsonObject(opened.body()).getInteger("port");
 
             assertEquals(401, web(port, "GET", "/api/v1/status", device));
             assertEquals(401, web(port, "GET", "/api/v1/status", Map.of("Authorization",
@@ -164,8 +162,8 @@ class WebListenerIT {
     @Test
     @DisplayName("serves HTTPS with the self-signed ECDSA certificate in LAN mode")
     void shouldServeTls() throws Exception {
-        var port = freePort();
-        try (var _ = lanEnabled(port)) {
+        try (var listener = lanEnabled()) {
+            var port = listener.port();
             var pem = Files.readString(daemon.paths().base().resolve("web/tls/cert.pem"));
             var certificate = CertificateFactory.getInstance("X.509")
                     .generateCertificate(new ByteArrayInputStream(pem.getBytes(StandardCharsets.US_ASCII)));
@@ -186,6 +184,19 @@ class WebListenerIT {
                                 "signature_algorithm", ((X509Certificate) certificate).getSigAlgName()),
                         true);
             }
+        }
+    }
+
+    @Test
+    @DisplayName("refuses LAN mode on a port another listener holds on loopback")
+    void shouldRefuseLanOnPortHeldOnLoopback() throws Exception {
+        try (var foreign = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            var response = putWeb("{\"enabled\":true,\"lan\":true,\"port\":" + foreign.getLocalPort() + "}");
+
+            assertEquals(409, response.status(), WebListenerIT::daemonLog);
+            assertEquals("web_listener_conflict", new JsonObject(response.body()).getString("code"));
+        } finally {
+            putWeb("{\"enabled\":false}");
         }
     }
 }
