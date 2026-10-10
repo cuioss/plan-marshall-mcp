@@ -148,10 +148,12 @@ repository with `doc-review` (`.claude/skills/` there; the skills of the same na
 planned task traces to its requirements, specification sections and watch items and assigns each specified statement
 its destination (code, test, concept, developer or user documentation); after implementation, coverage is verified
 against all three; a requirement the implementation proves wrong is corrected (with evidence) in the same plan,
-never worked around in code. An implementation is two pull requests that name each other: the code pull request
-here, and the documentation pull request there, which writes the documentation for the slice, deletes the
-implemented specification sections and watch items, links each requirement to its classes, tests and documentation
-by absolute links, and is merged after the code pull request.
+never worked around in code. The plan that implements a change updates the documents there directly, as part of its
+own work: beside the code pull request here it opens the documentation pull request there, which writes the
+documentation for the slice, deletes the implemented specification sections and watch items, and links each
+requirement to its classes, tests and documentation by absolute links. Neither pull request has to name the other,
+and the plan merges the documentation pull request itself, without a separate approval, once the code is on `main`
+here.
 
 A reference from code or from this file to a document is its path in the documentation repository
 (`doc/specification/…`) or an absolute link
@@ -164,8 +166,8 @@ The work of this repository is planned as work packages in `doc/plans/`, one fil
 of the other repositories). A package is ready when it is open and everything it depends on is done; the roadmap milestone it serves says for which exit it
 is needed, not when it may start. The plan files hold the tasks only: requirements, specifications and watch
 items stay in `plan-marshall-documentation` and are linked by relative paths that assume the repositories checked
-out beside each other. Claim a package with a draft pull request that names it and sets it to `in progress`,
-after checking that no open pull request already names it.
+out beside each other. A package is worked in the usual plan-marshall flow of the section "Git Workflow" (branch,
+commits, pull request at finalize), and its row in the index is set to `done` within those commits.
 
 ## Git Workflow
 
